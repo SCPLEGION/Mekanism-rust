@@ -2,6 +2,10 @@
 
 # Mekanism for Minecraft 26.3 #
 
+> **Note:** This repository is an AI-driven project to port the entire Mekanism codebase to Rust,
+> for use with Horizon, the Minecraft Java-to-Rust port. It is an unofficial fork of Mekanism, and
+> the code here is a work in progress. The original Java sources are kept as the reference for the port.
+
 Mekanism is an independent Minecraft add-on featuring high-tech machinery that can be used to create powerful tools, 
 armor, and weapons. You can find more detail on the features on the [**Official Wiki**](https://wiki.aidancbrady.com/wiki/Mekanism).
 With features ranging from jetpacks and balloons to factories and energy cubes, the mod does not have a single unifying goal.
