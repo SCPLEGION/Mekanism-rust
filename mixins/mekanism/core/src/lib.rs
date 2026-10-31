@@ -5,6 +5,7 @@
 // and these. Everything here is plain data and functions, so `cargo test` runs it without a game.
 
 pub mod energy;
+pub mod factory;
 pub mod generator;
 pub mod heat;
 pub mod machine;

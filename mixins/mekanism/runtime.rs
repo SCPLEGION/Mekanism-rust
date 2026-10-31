@@ -8,6 +8,7 @@ use horizon_client::containers::{ModBlockEntity, ModContainer};
 use horizon_client::items::ItemStack;
 use horizon_world::nbt::{Compound, JavaString, Tag};
 use mekanism_core::energy::{Action, EnergyContainer};
+use mekanism_core::factory::{self, Factory};
 use mekanism_core::generator::HeatGenerator;
 use mekanism_core::machine::{self, ElectricMachine, Operation, Slot};
 use mekanism_core::tier::{self, BaseTier};
@@ -17,11 +18,15 @@ use std::sync::Arc;
 /// The mod id players turn on and off in Options > Mods.
 const MOD_ID: &str = "mekanism";
 const HEAT_GENERATOR: &str = "mekanismgenerators:heat_generator";
+/// The slots in a row of the chest menu a factory shows.
+const FACTORY_ROW: usize = 9;
 
 /// What a Mekanism block entity is, from its block (and block entity) id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Machine(&'static str, u64),
+    /// processes, recipe kind, energy per tick
+    Factory(usize, &'static str, u64),
     HeatGenerator,
     EnergyCube(BaseTier),
 }
@@ -29,6 +34,9 @@ enum Kind {
 fn kind(id: &str) -> Option<Kind> {
     if let Some((recipe, usage)) = machine::machine(id) {
         return Some(Kind::Machine(recipe, usage));
+    }
+    if let Some((processes, recipe, usage)) = factory::factory(id) {
+        return Some(Kind::Factory(processes, recipe, usage));
     }
     if id == HEAT_GENERATOR {
         return Some(Kind::HeatGenerator);
@@ -64,6 +72,19 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
     if container.is_some() {
         return;
     }
+    // A factory: its inputs on the top row of a two-row chest menu, each process's output below it.
+    if let Some(Kind::Factory(n, ..)) = kind(block) {
+        let inputs: Vec<usize> = (0..n).collect();
+        let outputs: Vec<usize> = (FACTORY_ROW..FACTORY_ROW + n).collect();
+        *container = Some(ModContainer {
+            slots: 2 * FACTORY_ROW,
+            faces: [outputs.clone(), inputs.clone(), inputs.clone(), inputs.clone(), inputs.clone(), inputs.clone()],
+            inputs,
+            outputs,
+            menu: Some("minecraft:generic_9x2".into()),
+        });
+        return;
+    }
     let (inputs, outputs) = match kind(block) {
         Some(Kind::Machine(..)) => (vec![0, 1], vec![2]),
         Some(Kind::HeatGenerator) => (vec![1], vec![]),
@@ -87,6 +108,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     };
     let active = match k {
         Kind::Machine(recipe, usage) => tick_machine(game, entity, recipe, usage),
+        Kind::Factory(n, recipe, usage) => tick_factory(game, entity, n, recipe, usage),
         Kind::HeatGenerator => tick_generator(game, pos, entity),
         Kind::EnergyCube(t) => {
             tick_cube(game, pos, entity, t);
@@ -153,6 +175,37 @@ fn tick_machine(game: &mut Game<'_>, entity: &mut ModBlockEntity, recipe: &str, 
         m.ticks_required as i32,
     ];
     Some(m.active)
+}
+
+fn tick_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize, recipe: &str, usage: u64) -> Option<bool> {
+    let mut f = Factory::new(n, usage, upgrades(&entity.nbt));
+    f.machine.energy.stored = get_long(&entity.nbt, "energy").min(f.machine.energy.capacity);
+    if let Some(Tag::IntArray(saved)) = entity.nbt.get(&JavaString::from("progress")) {
+        for (p, v) in f.progress.iter_mut().zip(saved) {
+            *p = (*v).max(0) as u32;
+        }
+    }
+    let mut inputs: Vec<Slot> = (0..n).map(|i| slot(entity.items.get(i).cloned().flatten())).collect();
+    let mut outputs: Vec<Slot> = (0..n)
+        .map(|i| slot(entity.items.get(FACTORY_ROW + i).cloned().flatten()))
+        .collect();
+    let operations: Vec<Option<(Operation, u32)>> = (0..n)
+        .map(|i| {
+            let (op, max, _) = find_operation(game, recipe, entity.items.get(i).cloned().flatten(), &Slot::default());
+            op.map(|o| (o, max))
+        })
+        .collect();
+    f.tick(&mut inputs, &mut outputs, &operations);
+    for i in 0..n {
+        set_slot(entity, i, &inputs[i]);
+        set_slot(entity, FACTORY_ROW + i, &outputs[i]);
+    }
+    put_long(&mut entity.nbt, "energy", f.machine.energy.stored);
+    entity.nbt.insert(
+        "progress".into(),
+        Tag::IntArray(f.progress.iter().map(|p| (*p).min(i32::MAX as u32) as i32).collect()),
+    );
+    Some(f.active)
 }
 
 fn max_stack(game: &Game<'_>, id: &str) -> u32 {
@@ -250,7 +303,7 @@ pub(super) fn install_upgrade(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
     let want = if sneaking { held.count } else { 1 };
     let installed = game.native_with_mod_block_entity(pos, |m| {
-        if !matches!(self::kind(&m.id), Some(Kind::Machine(..))) {
+        if !matches!(self::kind(&m.id), Some(Kind::Machine(..) | Kind::Factory(..))) {
             return None;
         }
         let mut u = upgrades(&m.nbt);
@@ -452,6 +505,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool) -> Option<(u64, u64)> {
             ElectricMachine::with_upgrades(usage, upgrades(nbt)).energy.capacity,
             u64::MAX,
         )),
+        Kind::Factory(n, _, usage) => Some((Factory::new(n, usage, upgrades(nbt)).machine.energy.capacity, u64::MAX)),
         Kind::EnergyCube(t) if facing_away => Some(tier::energy_cube(t)),
         _ => None,
     }

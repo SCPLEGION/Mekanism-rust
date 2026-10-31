@@ -120,3 +120,7 @@ running on clients (block entity sync), only their `lit` state.
   right texture, and spells the name out with `minecraft:item_name`. Modules get the same treatment.
 - The furnace menu's flame now shows stored energy as thousandths of capacity, since data slots are
   16 bits.
+- **Factories** (basic 3, advanced 5, elite 7, ultimate 9 processes) for enriching, crushing and smelting.
+  They show a two-row chest menu: the inputs are on the top row and each process's output is below its
+  input. All processes share one energy store sized for one operation of each, and each process uses the
+  machine's energy per tick. Upgrades work as they do on machines. Input sorting is not ported yet.
