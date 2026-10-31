@@ -13,6 +13,7 @@ pub mod heat;
 pub mod machine;
 pub mod recipe_table;
 pub mod recipes;
+pub mod sides;
 pub mod tier;
 pub mod upgrades;
 

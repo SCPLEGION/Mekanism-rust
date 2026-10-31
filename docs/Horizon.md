@@ -229,3 +229,14 @@ tank contents in a screen.
   Chemical Injection Chamber runs its water-vapour recipes.
 - Not yet: the condensentrating mode (chemical → fluid), its mode button, and speed upgrades
   (`2^upgrades` operations a tick in Mekanism).
+
+## Side configuration (milestone 12)
+
+- Right click a face of any Mekanism block with the **Configurator** to cycle it: Default (what the block
+  does unconfigured), None, Input, Output. Chat says the face and its new mode. The modes are kept in the
+  block entity's NBT (`sides`, two bits per face).
+- One mode per face covers energy and chemicals: a face set to None or Input gives nothing out, and one
+  set to None or Output takes nothing in. Cables and tubes respect their neighbours' faces too.
+- Simpler than Mekanism's `TileComponentConfig`: there is no separate setting per energy, chemical and
+  item, no colours on the block and no configuration screen, and hoppers still use the furnace's fixed
+  faces. The chat message goes through the game's `system_message`; whether it reaches a LAN or server player is untested.
