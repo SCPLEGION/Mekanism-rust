@@ -127,3 +127,18 @@ running on clients (block entity sync), only their `lit` state.
 - **Energy cubes keep their energy** when broken outside creative. The cube drops itself with the energy
   in `minecraft:custom_data` (`mekanism:energy`), and placing it puts the energy back. The tooltip shows
   "Stored Energy" with SI prefixes, as Mekanism does.
+
+## Generators and cables (milestone 4, first part)
+
+- **Solar Generator** (2 FE/t) and **Advanced Solar Generator** (12 FE/t) work the way
+  `TileEntitySolarGenerator` does. They make power only in the overworld, by day, under open sky. Output
+  scales with the sky light factor (rain lowers it) and with the biome: cool biomes help, while hot or
+  humid ones hurt.
+- **Wind Generator**, 1 to 5 FE/t depending on the height of its top (four blocks up) between Y 24 and
+  the top of the level. It needs open sky and is recalculated once a second, as Mekanism does. Here it
+  is one block and not five.
+- **Universal cables**, all four tiers (8 k to 8.192 MFE/t). They use the iron bars template, so they
+  join up on the four sides without new Horizon shapes. A cable holds one tick of what it carries. It
+  feeds the machines and cubes beside it, then lets its energy run on to emptier cables, so energy never
+  flows back. Mekanism pools a whole cable network instead, and the throughput per cable is the same.
+  Proper six-way shapes wait for H2.

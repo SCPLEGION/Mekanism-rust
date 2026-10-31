@@ -152,3 +152,87 @@ mod tests {
         assert_eq!(g.producing, 0);
     }
 }
+
+/// `GeneratorsConfig.solarGeneration` and `advancedSolarGeneration`: FE a tick at full sun.
+pub const SOLAR_GENERATION: u64 = 2;
+pub const ADVANCED_SOLAR_GENERATION: u64 = 12;
+/// `GeneratorsStorageConfig`: a generator stores 20 ticks of its peak.
+pub const SOLAR_STORAGE: u64 = 2 * 20;
+pub const ADVANCED_SOLAR_STORAGE: u64 = 12 * 20;
+pub const WIND_STORAGE: u64 = 5 * 20;
+/// `windGenerationMin`, `windGenerationMax`, `windGenerationMinY`.
+pub const WIND_GENERATION_MIN: u64 = 1;
+pub const WIND_GENERATION_MAX: u64 = 5;
+pub const WIND_MIN_Y: i32 = 24;
+
+/// `TileEntitySolarGenerator.getProduction`: the peak scaled by the sun's brightness (the sky light
+/// factor with weather) and the biome's multiplier, nothing without the sun.
+pub fn solar_production(peak: u64, sees_sun: bool, brightness: f32, biome_multiplier: f32) -> u64 {
+    if !sees_sun {
+        return 0;
+    }
+    let p = peak as f32 * (brightness.max(0.0) * biome_multiplier);
+    if p >= i32::MAX as f32 {
+        i32::MAX as u64
+    } else {
+        p.max(0.0) as u64
+    }
+}
+
+/// `SolarCheck`'s peak multiplier: cooler biomes help, humid ones (that can rain) hurt.
+pub fn solar_biome_multiplier(temperature: f32, downfall: f32, can_rain: bool) -> f32 {
+    let temp = 0.3 * (0.8 - temperature);
+    let humidity = if can_rain { -0.3 * downfall } else { 0.0 };
+    1.0 + temp + humidity
+}
+
+/// `TileEntityWindGenerator.getMultiplier` for a generator whose top (4 blocks up) is at `top_y` and
+/// sees the sky: linear from the min height to the top of the level. `min_build` is the level's min Y
+/// and `max_level` its highest buildable Y.
+pub fn wind_multiplier(top_y: i32, min_build: i32, max_level: i32) -> f64 {
+    let min_y = WIND_MIN_Y.max(min_build);
+    let max_y = max_level;
+    if max_y <= min_y {
+        return 1.0;
+    }
+    let y = top_y.clamp(min_y, max_y);
+    let slope = (WIND_GENERATION_MAX - WIND_GENERATION_MIN) as f64 / f64::from(max_y - min_y);
+    (WIND_GENERATION_MIN as f64 + slope * f64::from(y - min_y)) / WIND_GENERATION_MIN as f64
+}
+
+/// `getCurrentGeneration`.
+pub fn wind_generation(multiplier: f64) -> u64 {
+    let g = WIND_GENERATION_MIN as f64 * multiplier;
+    if g >= f64::from(i32::MAX) {
+        i32::MAX as u64
+    } else {
+        g.max(0.0) as u64
+    }
+}
+
+#[cfg(test)]
+mod sun_and_wind_tests {
+    use super::*;
+
+    #[test]
+    fn solar_needs_the_sun_and_scales_with_it() {
+        assert_eq!(solar_production(SOLAR_GENERATION, false, 1.0, 1.0), 0);
+        assert_eq!(solar_production(SOLAR_GENERATION, true, 1.0, 1.0), 2);
+        assert_eq!(
+            solar_production(ADVANCED_SOLAR_GENERATION, true, 0.5, 1.0),
+            6
+        );
+        // Plains: 0.8 and 0.4 downfall; a desert is hot and dry.
+        assert!((solar_biome_multiplier(0.8, 0.4, true) - 0.88).abs() < 1e-6);
+        assert!((solar_biome_multiplier(2.0, 0.0, false) - 0.64).abs() < 1e-6);
+    }
+
+    #[test]
+    fn wind_grows_with_height() {
+        // Overworld: min -64, top buildable 319.
+        assert_eq!(wind_multiplier(0, -64, 319), 1.0);
+        assert_eq!(wind_multiplier(319, -64, 319), 5.0);
+        assert_eq!(wind_generation(wind_multiplier(319, -64, 319)), 5);
+        assert_eq!(wind_generation(wind_multiplier(100, -64, 319)), 2);
+    }
+}

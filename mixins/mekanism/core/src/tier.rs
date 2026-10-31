@@ -69,3 +69,32 @@ mod tests {
         assert_eq!(energy_cube(BaseTier::Ultimate), (256_000_000, 256_000));
     }
 }
+
+/// `CableTier`: what a universal cable of each tier carries in a tick (FE).
+pub fn universal_cable(tier: BaseTier) -> Option<u64> {
+    match tier {
+        BaseTier::Basic => Some(8_000),
+        BaseTier::Advanced => Some(128_000),
+        BaseTier::Elite => Some(1_024_000),
+        BaseTier::Ultimate => Some(8_192_000),
+        BaseTier::Creative => None,
+    }
+}
+
+/// How much a cable holding `mine` hands a neighbouring cable holding `theirs`: half the difference,
+/// so energy runs down the cable line and never back and forth.
+pub fn cable_share(mine: u64, theirs: u64) -> u64 {
+    mine.saturating_sub(theirs) / 2
+}
+
+#[cfg(test)]
+mod cable_tests {
+    use super::*;
+
+    #[test]
+    fn cables_carry_their_tier_and_level_out() {
+        assert_eq!(universal_cable(BaseTier::Elite), Some(1_024_000));
+        assert_eq!(cable_share(100, 20), 40);
+        assert_eq!(cable_share(20, 100), 0);
+    }
+}
