@@ -240,3 +240,15 @@ tank contents in a screen.
 - Simpler than Mekanism's `TileComponentConfig`: there is no separate setting per energy, chemical and
   item, no colours on the block and no configuration screen, and hoppers still use the furnace's fixed
   faces. The chat message goes through the game's `system_message`; whether it reaches a LAN or server player is untested.
+
+## Induction Matrix (milestone 13)
+
+- A hollow box of **Induction Casing** and **Induction Ports**, 3 to 18 blocks on each side, with
+  **Induction Cells** (8 G to 4 T FE each) and **Providers** (256 k to 131 MFE/t each) inside; the rest of
+  the inside may be air. Each port checks the matrix once a second.
+- Ports take energy in on every face. Set a port's face to Output with the Configurator and it gives energy
+  out of that face, up to the matrix's rate (all providers together). Mekanism applies the rate to the
+  whole matrix; here each output face may move that much.
+- The energy lives in the matrix's first port (the lowest by x, then y, then z). Other ports buffer one tick
+  and hand it on. Breaking that port loses the stored energy, unlike Mekanism, which keeps it in the
+  multiblock's saved data. There is no matrix screen yet.
