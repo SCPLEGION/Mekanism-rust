@@ -134,6 +134,11 @@ pub const PURIFIER_USAGE: u64 = 10;
 pub const PURIFIER_TICKS: u32 = 200;
 pub const PURIFIER_TANK: u64 = 210;
 
+/// `TileEntityMetallurgicInfuser`: 5 FE a tick, 200 ticks, a 1,000 mB infuse tank.
+pub const INFUSER_USAGE: u64 = 5;
+pub const INFUSER_TICKS: u32 = 200;
+pub const INFUSER_TANK: u64 = 1_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;

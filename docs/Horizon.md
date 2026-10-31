@@ -173,3 +173,14 @@ tank contents in a screen.
 - The rest of the chain already runs: the Crusher turns clumps into dirty dust and the Enrichment Chamber
   turns dirty dust into dust, so one ore gives three ingots.
 - Not yet: the middle slot does not take oxygen items, and upgrades do not apply to the chamber.
+
+## Metallurgic infusing (milestone 7)
+
+- **Metallurgic Infuser**: `metallurgic_infusing` recipes (31: enriched iron, steel, alloys, circuits,
+  mycelium, podzol...), 5 FE/t over 200 ticks. Slots: the item to infuse, the infuse item, the output.
+  The infuse item (coal, redstone, diamond dust, bio fuel... 24 `chemical_conversion` recipes) turns into
+  infuse chemical in a 1,000 mB tank, one item at a time when it all fits. The recipe takes its infuse
+  chemical at the end of the operation. Flame = infuse tank, arrow = progress.
+- Mekanism names infuse chemicals in recipes by tag (`#mekanism:carbon`), and each such tag holds the one
+  chemical of the same name, so `gen_recipe_table.py` writes the chemical itself.
+- This makes Mekanism's crafting chain playable: alloys and control circuits come from the infuser.
