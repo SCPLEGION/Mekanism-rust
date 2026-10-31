@@ -97,17 +97,61 @@ pub fn separate_water(
     oxygen: &mut ChemicalTank,
     energy: &mut crate::energy::EnergyContainer,
 ) -> bool {
+    let mut fluid = ChemicalTank::new(SEPARATOR_FLUID);
+    fluid.insert("minecraft:water", *water);
+    let done = separate(&mut fluid, hydrogen, oxygen, energy);
+    *water = fluid.amount;
+    done
+}
+
+/// A chemical or fluid and an amount in mB.
+pub type Amount = (&'static str, u64);
+
+/// `separating` recipes (`recipe/separator/`): a fluid, the mB one operation takes, and the two
+/// chemicals (left, right) with their mB.
+pub const SEPARATING: &[(&str, u64, Amount, Amount)] = &[
+    (
+        "minecraft:water",
+        WATER_PER_OPERATION,
+        ("mekanism:hydrogen", HYDROGEN_PER_OPERATION),
+        ("mekanism:oxygen", OXYGEN_PER_OPERATION),
+    ),
+    (
+        "mekanism:brine",
+        10,
+        ("mekanism:sodium", 1),
+        ("mekanism:chlorine", 1),
+    ),
+];
+
+pub fn separates(fluid: &str) -> bool {
+    SEPARATING.iter().any(|r| r.0 == fluid)
+}
+
+/// One operation of the Electrolytic Separator on whatever fluid it holds, at 4 FE.
+pub fn separate(
+    fluid: &mut ChemicalTank,
+    left: &mut ChemicalTank,
+    right: &mut ChemicalTank,
+    energy: &mut crate::energy::EnergyContainer,
+) -> bool {
+    let Some(&(_, need, (l, ln), (r, rn))) = SEPARATING
+        .iter()
+        .find(|r| fluid.chemical.as_deref() == Some(r.0))
+    else {
+        return false;
+    };
     let fits = |t: &ChemicalTank, c: &str, n: u64| t.accepts(c) && t.amount + n <= t.capacity;
-    if *water < WATER_PER_OPERATION
-        || !fits(hydrogen, "mekanism:hydrogen", HYDROGEN_PER_OPERATION)
-        || !fits(oxygen, "mekanism:oxygen", OXYGEN_PER_OPERATION)
+    if fluid.amount < need
+        || !fits(left, l, ln)
+        || !fits(right, r, rn)
         || !energy.consume(SEPARATOR_USAGE)
     {
         return false;
     }
-    *water -= WATER_PER_OPERATION;
-    hydrogen.insert("mekanism:hydrogen", HYDROGEN_PER_OPERATION);
-    oxygen.insert("mekanism:oxygen", OXYGEN_PER_OPERATION);
+    fluid.extract(need);
+    left.insert(l, ln);
+    right.insert(r, rn);
     true
 }
 

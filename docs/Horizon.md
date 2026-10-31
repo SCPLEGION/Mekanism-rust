@@ -151,8 +151,8 @@ before cables: machines push to every side, tanks out of their bottom.
 
 - **Chemical Oxidizer**: `oxidizing` recipes (25, sulfur dust → sulfur dioxide and the like), 15 FE/t over
   100 ticks, into a 10,000 mB tank. The furnace menu's first slot takes the item.
-- **Electrolytic Separator** on water: put water buckets in the first slot (the empty bucket comes out of the
-  last). Each tick splits 2 mB of water into 2 mB hydrogen and 1 mB oxygen for 4 FE, into two 2,400 mB
+- **Electrolytic Separator**: put water or brine buckets in the first slot (the empty bucket comes out of the
+  last). Brine (10 mB → 1 sodium + 1 chlorine) works since milestone 9. Each tick splits 2 mB of water into 2 mB hydrogen and 1 mB oxygen for 4 FE, into two 2,400 mB
   tanks. Flame = water, arrow = hydrogen.
 - **Gas-Burning Generator**: burns hydrogen (2 FE/mB) or ethene (8 FE/mB), up to 10 mB a tick scaled by how full its 1,000 mB tank is,
   into a 2,000 FE store and pushes the energy out like the other generators.
@@ -196,3 +196,18 @@ tank contents in a screen.
   tanks. Each input tank takes one of the two chemicals, in either order. With an oxidizer making sulfur
   dioxide and a separator making oxygen beside it, it makes sulfur trioxide. Hydrogen chloride waits for
   chlorine (brine and the Thermal Evaporation Plant).
+
+## Thermal Evaporation (milestone 9)
+
+- **Thermal Evaporation Plant**: a 4x4 tower of Thermal Evaporation Blocks, 3 to 18 high: a full floor,
+  then hollow rings, with the controller and any valves in the rings. The controller checks the tower
+  once a second. Its water tank holds 64 buckets per quarter of the tower's volume.
+- **Heat**: each Advanced Solar Generator on a top corner that sees the sun adds 0.2 K a tick, and the
+  tower loses 0.02 K per square root of its difference from 300 K, so four solars settle at 1,900 K
+  (`EvaporationMultiblockData.simulateEnvironment`). The tower makes `(T − 300) × 0.4 × height / 18`
+  operations a tick of 10 mB water → 1 mB brine, or one every few ticks below 1.
+- **Slots** (furnace menu): water buckets in the first (the empty bucket comes out of the last), an empty
+  bucket in the middle one fills with brine. Valves pass brine to an Electrolytic Separator beside them,
+  which makes sodium and chlorine; hydrogen and chlorine in a Chemical Infuser make hydrogen chloride.
+- Differences: heat leaks towards 300 K, not the biome's own temperature; water comes only from buckets
+  (no fluid pipes or pumps yet); the lithium recipe is not run; there is no tower screen.
