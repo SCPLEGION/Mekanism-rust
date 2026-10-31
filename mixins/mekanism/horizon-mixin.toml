@@ -1,0 +1,27 @@
+[mod]
+id = "mekanism"
+version = "0.1.0"
+priority = 100
+
+[compatibility]
+horizon_revision = "1b06b53500606ec4f88cc0551e8cf24293e9c484"
+
+# All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
+[[crate]]
+id = "core"
+path = "core"
+
+# Glue that lives inside the game crate: translates game types to mekanism_core's.
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "mekanism"
+source = "runtime.rs"
+
+[[injection]]
+id = "world-lifecycle"
+hook = "world_lifecycle"
+hook_version = 1
+kind = "HEAD"
+helper = "lifecycle.rs"
+bindings = [{ name = "phase", ty = "crate::game::native_lifecycle::WorldPhase", value = "phase" }]
