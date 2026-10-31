@@ -47,6 +47,8 @@ enum Kind {
     Evaporation,
     /// A Rotary Condensentrator, decondensentrating: a fluid into its chemical.
     Rotary,
+    /// An Induction Matrix's port; the casing, cells and providers have no block entity.
+    InductionPort,
     Infuser,
     Separator,
     GasGenerator,
@@ -75,6 +77,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:chemical_infuser" => return Some(Kind::ChemicalInfuser),
         "mekanism:thermal_evaporation_controller" => return Some(Kind::Evaporation),
         "mekanism:rotary_condensentrator" => return Some(Kind::Rotary),
+        "mekanism:induction_port" => return Some(Kind::InductionPort),
         "mekanism:metallurgic_infuser" => return Some(Kind::Infuser),
         "mekanism:electrolytic_separator" => return Some(Kind::Separator),
         _ => {}
@@ -190,6 +193,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
         Kind::Evaporation => tick_evaporation(game, pos, entity),
         Kind::Rotary => tick_rotary(game, pos, entity),
+        Kind::InductionPort => {
+            tick_induction_port(game, pos, entity);
+            None
+        }
         Kind::Infuser => tick_infuser(game, entity),
         Kind::Separator => tick_separator(game, pos, entity),
         Kind::GasGenerator => tick_gas_generator(game, pos, entity),
@@ -1125,6 +1132,146 @@ fn give_back_bucket(entity: &mut ModBlockEntity) -> bool {
     true
 }
 
+// --- Induction Matrix --------------------------------------------------------------------------------
+
+/// A formed matrix: its storage and rate, and its ports, the first of which keeps the energy.
+struct FormedMatrix {
+    matrix: mekanism_core::matrix::Matrix,
+    ports: Vec<[i32; 3]>,
+}
+
+/// `MatrixValidator`, simplified: the frame blocks joined to `start` must be exactly the shell of a box
+/// 3 to 18 on each side, and everything inside must be cells, providers or air.
+fn find_matrix(game: &Game<'_>, start: [i32; 3]) -> Option<FormedMatrix> {
+    use mekanism_core::matrix::{is_frame, MAX_SIZE, MIN_SIZE};
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut todo = vec![start];
+    let (mut lo, mut hi) = (start, start);
+    while let Some(at) = todo.pop() {
+        for k in 0..3 {
+            lo[k] = lo[k].min(at[k]);
+            hi[k] = hi[k].max(at[k]);
+            if hi[k] - lo[k] >= MAX_SIZE {
+                return None;
+            }
+        }
+        for (_, d) in DIRECTIONS {
+            let next = [at[0] + d[0], at[1] + d[1], at[2] + d[2]];
+            if !seen.contains(&next) && is_frame(block_name(game, next)) {
+                seen.insert(next);
+                todo.push(next);
+            }
+        }
+    }
+    if (0..3).any(|k| hi[k] - lo[k] + 1 < MIN_SIZE) {
+        return None;
+    }
+    let mut matrix = mekanism_core::matrix::Matrix::default();
+    let mut ports = Vec::new();
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                let at = [x, y, z];
+                let shell = x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2];
+                let name = block_name(game, at);
+                if shell {
+                    if !seen.contains(&at) {
+                        return None;
+                    }
+                    if name == "mekanism:induction_port" {
+                        ports.push(at);
+                    }
+                } else if !matrix.add_inside(name) {
+                    return None;
+                }
+            }
+        }
+    }
+    (matrix.capacity > 0).then_some(FormedMatrix { matrix, ports })
+}
+
+/// An Induction Port. Once a second it checks its matrix and writes the matrix's capacity and rate
+/// into its NBT. The first port (`master`) holds the energy; others hand what they took in to it. A
+/// face the Configurator set to Output gives energy out, up to the matrix's rate.
+fn tick_induction_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
+    if ticker == 0 {
+        let formed = find_matrix(game, pos);
+        let (capacity, rate, master) = match &formed {
+            Some(f) => (f.matrix.capacity, f.matrix.rate, f.ports.first().copied().unwrap_or(pos)),
+            None => (0, 0, pos),
+        };
+        put_long(&mut entity.nbt, "capacity", capacity);
+        put_long(&mut entity.nbt, "rate", rate);
+        put_long(&mut entity.nbt, "master", u64::from(master == pos));
+        for (key, v) in ["mx", "my", "mz"].into_iter().zip(master) {
+            entity.nbt.insert(key.into(), Tag::Int(v));
+        }
+    }
+    let rate = get_long(&entity.nbt, "rate");
+    if rate == 0 {
+        return;
+    }
+    let master = ["mx", "my", "mz"].map(|key| match entity.nbt.get(&JavaString::from(key)) {
+        Some(Tag::Int(v)) => *v,
+        _ => 0,
+    });
+    let is_master = master == pos;
+    let capacity = get_long(&entity.nbt, "capacity");
+    if !is_master {
+        // Hand this port's buffer to the master.
+        let mine = get_long(&entity.nbt, "energy");
+        if mine > 0 {
+            let taken = game
+                .native_with_mod_block_entity(master, |m| {
+                    let stored = get_long(&m.nbt, "energy");
+                    let n = mine.min(get_long(&m.nbt, "capacity").saturating_sub(stored));
+                    put_long(&mut m.nbt, "energy", stored + n);
+                    n
+                })
+                .unwrap_or(0);
+            put_long(&mut entity.nbt, "energy", mine - taken);
+        }
+    }
+    let sides = sides_of(&entity.nbt);
+    for (i, (_, d)) in DIRECTIONS.into_iter().enumerate() {
+        if sides.get(i) != mekanism_core::sides::SideMode::Output {
+            continue;
+        }
+        // Draw up to the rate from the matrix, offer it out of this face, and put back what is left.
+        let draw = |stored: u64| stored.min(rate);
+        let mut out = EnergyContainer::new(rate, u64::MAX);
+        if is_master {
+            let stored = get_long(&entity.nbt, "energy").min(capacity);
+            out.stored = draw(stored);
+            put_long(&mut entity.nbt, "energy", stored - out.stored);
+        } else {
+            out.stored = game
+                .native_with_mod_block_entity(master, |m| {
+                    let stored = get_long(&m.nbt, "energy");
+                    put_long(&mut m.nbt, "energy", stored - draw(stored));
+                    draw(stored)
+                })
+                .unwrap_or(0);
+        }
+        if out.stored == 0 {
+            continue;
+        }
+        push_energy(game, pos, &mut out, Some(d), false);
+        let left = out.stored;
+        if is_master {
+            let stored = get_long(&entity.nbt, "energy");
+            put_long(&mut entity.nbt, "energy", stored + left);
+        } else {
+            game.native_with_mod_block_entity(master, |m| {
+                let stored = get_long(&m.nbt, "energy");
+                put_long(&mut m.nbt, "energy", stored + left);
+            });
+        }
+    }
+}
+
 // --- Thermal Evaporation Plant -----------------------------------------------------------------------
 
 const EVAPORATION_PARTS: [&str; 3] = [
@@ -1414,6 +1561,11 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Advanced(m) => Some((m.usage * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
         Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE, u64::MAX)),
         Kind::Rotary => Some((machine::STORAGE_MULTIPLIER * chem::ROTARY_USAGE, u64::MAX)),
+        // The matrix's first port holds its energy; the others take a tick's worth and pass it on.
+        Kind::InductionPort if get_long(nbt, "rate") > 0 => {
+            let rate = get_long(nbt, "rate");
+            Some(if get_long(nbt, "master") == 1 { (get_long(nbt, "capacity"), rate) } else { (rate, rate) })
+        }
         Kind::Infuser => Some((chem::INFUSER_USAGE * u64::from(chem::INFUSER_TICKS), u64::MAX)),
         _ => None,
     }
