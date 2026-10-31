@@ -56,9 +56,13 @@ enum Kind {
     Separator,
     GasGenerator,
     ChemicalTank(BaseTier),
+    DigitalMiner,
 }
 
 fn kind(id: &str) -> Option<Kind> {
+    if id == "mekanism:digital_miner" {
+        return Some(Kind::DigitalMiner);
+    }
     if let Some((recipe, usage)) = machine::machine(id) {
         return Some(Kind::Machine(recipe, usage));
     }
@@ -168,6 +172,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::Infuser) => (vec![0, 1], vec![2]),
         // An energy cube's charge slot (top) and discharge slot (bottom).
         Some(Kind::EnergyCube(_)) => (vec![0, 1], vec![]),
+        // The miner's energy slot; what it mines goes into the container above it.
+        Some(Kind::DigitalMiner) => (vec![1], vec![]),
         _ => return,
     };
     *container = Some(ModContainer {
@@ -225,6 +231,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             tick_tube(game, pos, entity, rate);
             None
         }
+        Kind::DigitalMiner => tick_miner(game, pos, entity),
     };
     if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_)) {
         show_connections(game, pos, entity);
@@ -423,7 +430,7 @@ pub(super) fn install_upgrade(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
     let want = if sneaking { held.count } else { 1 };
     let installed = game.native_with_mod_block_entity(pos, |m| {
-        if !matches!(self::kind(&m.id), Some(Kind::Machine(..) | Kind::Factory(..))) {
+        if !matches!(self::kind(&m.id), Some(Kind::Machine(..) | Kind::Factory(..) | Kind::DigitalMiner)) {
             return None;
         }
         let mut u = upgrades(&m.nbt);
@@ -1194,6 +1201,85 @@ fn give_back_bucket(entity: &mut ModBlockEntity) -> bool {
     true
 }
 
+// --- Digital Miner ----------------------------------------------------------------------------------
+
+/// The Digital Miner, simplified: it mines the ores (`#c:ores`) in its region, one every `ticksPerMine`
+/// (speed upgrades shorten it, energy upgrades cut the 40 FE/t), from the top down, and puts what they drop
+/// into the container above it; what does not fit drops on top of it. Mekanism mines what its filters
+/// name, into its own 27 slots, from a 3x3x2 machine.
+fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    use mekanism_core::miner;
+    let u = upgrades(&entity.nbt);
+    let usage = u.energy_per_tick(miner::ENERGY_USAGE);
+    let delay_length = u.ticks(miner::TICKS_PER_MINE).max(1);
+    let mut energy = EnergyContainer::new(miner::STORAGE.max(usage), u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(energy.capacity);
+    discharge_slot(entity, 1, &mut energy);
+    let mut delay = get_int(&entity.nbt, "delay").min(delay_length);
+    let active = energy.consume(usage);
+    if active {
+        delay = delay.saturating_sub(1);
+        if delay == 0 {
+            mine_next(game, pos, entity);
+            delay = delay_length;
+        }
+    }
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "delay", delay);
+    entity.data = vec![
+        (energy.stored * 1000 / energy.capacity.max(1)) as i32,
+        1000,
+        (delay_length - delay) as i32,
+        delay_length as i32,
+    ];
+    Some(active)
+}
+
+/// Mines the next ore of the miner's region, looking at up to `SCAN_LIMIT` positions from its cursor.
+fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    use mekanism_core::miner;
+    let cursor = get_int(&entity.nbt, "cursor") % miner::total_size();
+    let mut looked = 0;
+    let mut found = None;
+    for index in miner::scan_order(cursor, miner::SCAN_LIMIT) {
+        looked += 1;
+        let at = miner::position(pos, index);
+        if at == pos {
+            continue;
+        }
+        let state = game.world.block(at[0], at[1], at[2]);
+        let facts = game.res.facts().get(state);
+        if facts.hardness < 0.0 || !world_items!(game).block_in_tag(miner::ORE_TAG, &facts.name) {
+            continue;
+        }
+        found = Some((at, state));
+        break;
+    }
+    put_int(&mut entity.nbt, "cursor", (cursor + looked) % miner::total_size());
+    let Some((at, state)) = found else {
+        return;
+    };
+    let registry = game.pack.assets.registry;
+    let drops = match &game.world_tables {
+        Some(t) => &t.items,
+        None => game.res.items(),
+    }
+    .block_drops_with(registry, state, None, &[], &mut game.world.random);
+    let block = horizon_core::position::BlockPos::new(at[0], at[1], at[2]);
+    game.with_level(|b, level, ticks| b.destroy_block(level, ticks, block, false));
+    let above = [pos[0], pos[1] + 1, pos[2]];
+    let mut lost = Vec::new();
+    for stack in drops.into_iter().filter(|s| s.count > 0 && &*s.item != "minecraft:air") {
+        if let Some(left) = game.native_insert_item(above, horizon_core::geometry::Direction::Down, stack) {
+            lost.push(Some(left));
+        }
+    }
+    if !lost.is_empty() {
+        let top = horizon_core::position::BlockPos::new(above[0], above[1], above[2]);
+        game.with_level(|_, level, _| level.drop_lost_contents(top, lost));
+    }
+}
+
 // --- Transmitter shapes -----------------------------------------------------------------------------
 
 /// The kind of thing a transmitter carries, from its block id: tiers of one kind join each other.
@@ -1789,6 +1875,10 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
             Some(if get_long(nbt, "master") == 1 { (get_long(nbt, "capacity"), rate) } else { (rate, rate) })
         }
         Kind::Infuser => Some((chem::INFUSER_USAGE * u64::from(chem::INFUSER_TICKS), u64::MAX)),
+        Kind::DigitalMiner => {
+            let usage = upgrades(nbt).energy_per_tick(mekanism_core::miner::ENERGY_USAGE);
+            Some((mekanism_core::miner::STORAGE.max(usage), u64::MAX))
+        }
         _ => None,
     }
 }

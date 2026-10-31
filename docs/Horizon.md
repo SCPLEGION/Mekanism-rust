@@ -330,3 +330,14 @@ tank contents in a screen.
   face cycles that face for the chosen type, and chat names the type.
 - Simplified: still four modes per face (Default, None, Input, Output) with no colours or screen; item faces
   only limit transporter pulls, not hoppers.
+
+## Digital Miner (milestone 20)
+
+- The Digital Miner (`mekanism-core`'s `miner`) mines every block in Mekanism's `c:ores` tag in a 21 × 21
+  area centred on it, from y 60 down to y 0, one block every 80 ticks (speed upgrades shorten it), using
+  40 FE per tick out of a 50,000 FE buffer (energy upgrades lower it). Its scan resumes where it stopped and
+  checks at most 4,096 positions a tick.
+- Each mined block's vanilla drops (no tool, no enchantments) go into the container above the miner;
+  what does not fit is dropped above it. Slot 1 discharges energy items.
+- Simplified: no filters, no silk touch, no radius or height settings and no screen; the area and depths
+  are Mekanism's defaults.

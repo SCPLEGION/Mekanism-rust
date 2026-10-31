@@ -13,6 +13,7 @@ pub mod generator;
 pub mod heat;
 pub mod machine;
 pub mod matrix;
+pub mod miner;
 pub mod recipe_table;
 pub mod recipes;
 pub mod sides;
