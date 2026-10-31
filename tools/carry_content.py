@@ -67,6 +67,65 @@ TOOL_TEMPLATES = [("_paxel", "minecraft:iron_pickaxe"), ("_pickaxe", "minecraft:
                   ("_leggings", "minecraft:iron_leggings"), ("_boots", "minecraft:iron_boots"),
                   ("_shield", "minecraft:shield"), ("_bucket", "minecraft:water_bucket")]
 
+# Transmitters copy the mushroom stem: its six direction properties carry the connections, `false` where a
+# side joins (a stem's face is false where the same block touches it, so the template's own updates agree),
+# and the bundle sets the sides that join a machine. `occludes: false` (Horizon content mods) makes it
+# see-through, and `shapes` its centre box.
+PIPE_TEMPLATE = "minecraft:mushroom_stem"
+# Centre box per size, in pixels (transmitter_small.obj and transmitter_large.obj).
+PIPE_SIZES = {"small": (5, 11), "large": (4, 12)}
+DIRECTIONS = ("north", "east", "south", "west", "up", "down")
+# The arm model points north; the blockstate turns it to each side.
+ARM_ROTATION = {"north": {}, "east": {"y": 90}, "south": {"y": 180}, "west": {"y": 270}, "up": {"x": 270},
+                "down": {"x": 90}}
+
+
+def pipe_declaration(size):
+    lo, hi = (v / 16 for v in PIPE_SIZES[size])
+    box = [[lo, lo, lo, hi, hi, hi]]
+    return {"template": PIPE_TEMPLATE,
+            "properties": {"occludes": False, "hardness": 1.0, "sounds": "minecraft:iron_bars"},
+            "shapes": {"property": "up", "values": {"true": box, "false": box}}}
+
+
+def pipe_models(ns, out, name, blockstate):
+    """Vanilla element models for a transmitter whose blockstate uses Mekanism's OBJ model: a centre cube
+    and an arm per joined side, as a multipart blockstate. Returns its size, or None."""
+    try:
+        model_id = blockstate["variants"][""]["model"]
+    except (KeyError, TypeError):
+        return None
+    size = "large" if "/large/" in model_id else "small"
+    models = out / "assets" / ns / "models"
+    model = json.loads((models / (model_id.split(":", 1)[1] + ".json")).read_text())
+    textures = model.get("textures", {})
+    center = textures.get("center_opaque") or textures.get("center_down")
+    side = textures.get("side_opaque") or textures.get("side")
+    if not center or not side:
+        return None
+    lo, hi = PIPE_SIZES[size]
+    cube = {d: {"texture": "#center"} for d in DIRECTIONS}
+    write_json(models / "block" / "transmitter" / "horizon" / f"{name}_center.json", {
+        "parent": "block/block",
+        "textures": {"particle": center, "center": center},
+        "elements": [{"from": [lo, lo, lo], "to": [hi, hi, hi], "faces": cube}],
+    })
+    arm_faces = {d: {"texture": "#side", "uv": [0, 0, 16, 16]} for d in ("east", "west", "up", "down")}
+    arm_faces["north"] = {"texture": "#center", "cullface": "north"}
+    write_json(models / "block" / "transmitter" / "horizon" / f"{name}_arm.json", {
+        "textures": {"particle": center, "center": center, "side": side},
+        "elements": [{"from": [lo, lo, 0], "to": [hi, hi, lo], "faces": arm_faces}],
+    })
+    base = f"{ns}:block/transmitter/horizon/{name}"
+    parts = [{"apply": {"model": f"{base}_center"}}]
+    for d in DIRECTIONS:
+        parts.append({"when": {d: "false"}, "apply": {"model": f"{base}_arm", **ARM_ROTATION[d]}})
+    write_json(out / "assets" / ns / "blockstates" / f"{name}.json", {"multipart": parts})
+    # The item shows the bare centre, as Mekanism's item model does.
+    write_json(models / "item" / f"{name}.json", {"parent": f"{base}_center"})
+    return size
+
+
 # Items that hold energy in custom_data (mekanism:energy) stack to one, as Mekanism's do.
 SINGLE_ITEMS = {"energy_tablet", "atomic_disassembler", "electric_bow"}
 # ItemAtomicDisassembler's Tool: no drops from #mekanism:incorrect_for_disassembler, drops from every other
@@ -88,7 +147,7 @@ def block_template(name, blockstate):
         # No vanilla block with a block entity has no state at all; these wait for their milestone.
         return "minecraft:furnace" if "facing" in states else "minecraft:iron_block"
     if name.endswith(TRANSMITTERS):
-        return "minecraft:iron_bars"
+        return PIPE_TEMPLATE
     if "glass" in name:
         return "minecraft:glass"
     if name.endswith("_slab"):
@@ -274,7 +333,13 @@ def build_module(ns, out):
             # The furnace's `lit` stands in for Mekanism's `active`: same meaning, same two values.
             path.write_text(json.dumps(rename_property(blockstate, "active", "lit"), indent=2) + "\n")
             report["active_as_lit"] = report.get("active_as_lit", 0) + 1
-        write_json(declared / "block" / f"{name}.json", {"template": template})
+        declaration = {"template": template}
+        if template == PIPE_TEMPLATE:
+            size = pipe_models(ns, out, name, blockstate)
+            if size:
+                declaration = pipe_declaration(size)
+                report["pipes"] = report.get("pipes", 0) + 1
+        write_json(declared / "block" / f"{name}.json", declaration)
     items = 0
     for path in sorted((out / "assets" / ns / "items").glob("*.json")):
         if path.stem in blocks:

@@ -141,7 +141,7 @@ running on clients (block entity sync), only their `lit` state.
   join up on the four sides without new Horizon shapes. A cable holds one tick of what it carries. It
   feeds the machines and cubes beside it, then lets its energy run on to emptier cables, so energy never
   flows back. Mekanism pools a whole cable network instead, and the throughput per cable is the same.
-  Proper six-way shapes wait for H2.
+  Six-way shapes came in milestone 17.
 
 ## Chemicals (milestone 5, first part)
 
@@ -287,3 +287,21 @@ tank contents in a screen.
   its loot, except those in `#mekanism:incorrect_for_disassembler`.
 - Simplified: one mode only (no slow, fast or vein mining, no mode key); no attack damage from energy;
   generators and advanced machines have no energy slot.
+
+## Six-way transmitters (milestone 17)
+
+- Every transmitter (universal cables, pressurized tubes, logistical transporters, and the mechanical pipes
+  and thermodynamic conductors that do nothing yet) is now a pipe: a centre cube and an arm toward each side
+  it joins, drawn by plain block models that `tools/carry_content.py` writes in place of Mekanism's OBJ
+  models (which Horizon does not load). Small transmitters are 6 pixels across, large ones 8, as the OBJ
+  models are.
+- The block copies the mushroom stem for its six direction properties. A side is `false` where it joins,
+  because a stem's own updates already set a face to `false` where the same block touches it. Twice a
+  second the bundle sets the rest: a side joins another transmitter of its kind (any tier), or a block it
+  serves (cables: anything with energy; tubes: chemical machines and tanks; transporters: any block with
+  slots, and vanilla chests, barrels, furnaces, hoppers, droppers, dispensers and shulker boxes).
+- The block is see-through and lets light pass, and its outline and collision are the centre cube. This
+  uses `"occludes": false`, which the Horizon fork's `milestone/h5-see-through-blocks` branch adds to
+  content-mod block declarations, so the bundle is pinned to that commit.
+- Simplified: the arms are not part of the outline or collision; a transmitter still conducts redstone as
+  the stem does; side configuration does not cut arms off.
