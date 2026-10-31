@@ -239,4 +239,4 @@ tank contents in a screen.
   set to None or Output takes nothing in. Cables and tubes respect their neighbours' faces too.
 - Simpler than Mekanism's `TileComponentConfig`: there is no separate setting per energy, chemical and
   item, no colours on the block and no configuration screen, and hoppers still use the furnace's fixed
-  faces. Messages show in the chat of the player who clicks only in single player for now.
+  faces. The chat message goes through the game's `system_message`; whether it reaches a LAN or server player is untested.
