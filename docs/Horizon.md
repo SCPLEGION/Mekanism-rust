@@ -417,3 +417,22 @@ fission reactor that burns the fuel comes next.
   the steam or waste, the reactor stops (SCRAM) and says so. There are no port modes, logic adapter or
   screen, and the tanks are lost if the first port is broken. Steam drives the Industrial Turbine, which
   comes next.
+
+## Industrial Turbine (milestone 26)
+
+`mekanism-core`'s `turbine`, with `TurbineMultiblockData.tick`'s formula:
+
+- Build a box, 3 to 17 blocks on each side, of Turbine Casing, Turbine Valves, Turbine Vents and
+  Structural Glass. Inside goes a shaft of Turbine Rotors topped by a Rotational Complex in a layer of
+  Pressure Dispersers, with Electromagnetic Coils (and Saturating Condensers) above. Each rotor counts as
+  carrying its two blades, up to 28. Valves check the structure once a second, and the first valve runs
+  it.
+- Steam comes in from the tubes and chemical tanks beside the valves (a fission reactor's steam, piped
+  over). It holds 64 buckets per block below the dispersers. The flow is the smaller of dispersers ×
+  1,280 mB × that volume and vents × 32,000 mB, scaled by how full the steam tank is. Each 100 mB makes
+  5/28 × min(blades, 4 × coils) energy, which goes out of every valve into cables and machines.
+  Condensers turn up to 64,000 mB of the used steam a tick into water, given to the pipes and fluid tanks
+  beside the valves (back to the reactor).
+- A right click with an empty hand on a valve shows the steam, production and stored energy.
+- Simplified: blades are not placed by hand, the layout inside is not checked beyond which blocks are
+  allowed, and nothing spins.

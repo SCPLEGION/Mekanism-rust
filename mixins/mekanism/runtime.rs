@@ -13,6 +13,7 @@ use mekanism_core::evaporation as evap;
 use mekanism_core::gear;
 use mekanism_core::nuclear;
 use mekanism_core::fission;
+use mekanism_core::turbine;
 use mekanism_core::sides::{Sides, Transmission};
 use mekanism_core::factory::{self, Factory};
 use mekanism_core::generator::HeatGenerator;
@@ -66,6 +67,8 @@ enum Kind {
     Centrifuge,
     /// A Fission Reactor's port; the first port of a formed reactor runs it.
     FissionPort,
+    /// An Industrial Turbine's valve; the first valve runs it.
+    TurbineValve,
     /// A mechanical pipe and the mB of fluid it carries in a tick.
     Pipe(u64),
 }
@@ -101,6 +104,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:chemical_dissolution_chamber" => return Some(Kind::Dissolution),
         "mekanism:isotopic_centrifuge" => return Some(Kind::Centrifuge),
         "mekanismgenerators:fission_reactor_port" => return Some(Kind::FissionPort),
+        TURBINE_VALVE => return Some(Kind::TurbineValve),
         _ => {}
     }
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_universal_cable")) {
@@ -235,6 +239,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             tick_fission_port(game, pos, entity);
             None
         }
+        Kind::TurbineValve => tick_turbine_valve(game, pos, entity),
         Kind::Advanced(m) => tick_advanced(game, entity, m),
         Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
         Kind::Evaporation => tick_evaporation(game, pos, entity),
@@ -1464,7 +1469,12 @@ fn serves(family: &str, kind: Kind) -> bool {
         ),
         "pipe" => matches!(
             kind,
-            Kind::FluidTank(_) | Kind::Separator | Kind::Rotary | Kind::HeatGenerator | Kind::FissionPort
+            Kind::FluidTank(_)
+                | Kind::Separator
+                | Kind::Rotary
+                | Kind::HeatGenerator
+                | Kind::FissionPort
+                | Kind::TurbineValve
         ),
         "tube" => matches!(
             kind,
@@ -1478,6 +1488,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Dissolution
                 | Kind::Centrifuge
                 | Kind::FissionPort
+                | Kind::TurbineValve
         ),
         // The blocks with item slots (`block_entity_container`).
         "transporter" => matches!(
@@ -2643,28 +2654,7 @@ pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 /// of a box 3 to 18 on each side, with fuel assemblies, control rods or air inside. The reactor and its
 /// ports.
 fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, Vec<[i32; 3]>)> {
-    let mut seen = std::collections::HashSet::from([start]);
-    let mut todo = vec![start];
-    let (mut lo, mut hi) = (start, start);
-    while let Some(at) = todo.pop() {
-        for k in 0..3 {
-            lo[k] = lo[k].min(at[k]);
-            hi[k] = hi[k].max(at[k]);
-            if hi[k] - lo[k] >= fission::MAX_SIZE {
-                return None;
-            }
-        }
-        for (_, d) in DIRECTIONS {
-            let next = [at[0] + d[0], at[1] + d[1], at[2] + d[2]];
-            if !seen.contains(&next) && fission::is_frame(block_name(game, next)) {
-                seen.insert(next);
-                todo.push(next);
-            }
-        }
-    }
-    if (0..3).any(|k| hi[k] - lo[k] + 1 < fission::MIN_SIZE) {
-        return None;
-    }
+    let (lo, hi, seen) = find_box(game, start, fission::is_frame, fission::MIN_SIZE, fission::MAX_SIZE)?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
     let mut reactor = fission::Reactor { volume: size(0) * size(1) * size(2), ..Default::default() };
     let mut ports = Vec::new();
@@ -2691,6 +2681,40 @@ fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, V
 }
 
 const FISSION_PORT: &str = "mekanismgenerators:fission_reactor_port";
+
+/// The frame blocks joined to `start` (`is_frame`) and the box they span, `min` to `max` on each side.
+#[allow(clippy::type_complexity)]
+fn find_box(
+    game: &Game<'_>,
+    start: [i32; 3],
+    is_frame: fn(&str) -> bool,
+    min: i32,
+    max: i32,
+) -> Option<([i32; 3], [i32; 3], std::collections::HashSet<[i32; 3]>)> {
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut todo = vec![start];
+    let (mut lo, mut hi) = (start, start);
+    while let Some(at) = todo.pop() {
+        for k in 0..3 {
+            lo[k] = lo[k].min(at[k]);
+            hi[k] = hi[k].max(at[k]);
+            if hi[k] - lo[k] >= max {
+                return None;
+            }
+        }
+        for (_, d) in DIRECTIONS {
+            let next = [at[0] + d[0], at[1] + d[1], at[2] + d[2]];
+            if !seen.contains(&next) && is_frame(block_name(game, next)) {
+                seen.insert(next);
+                todo.push(next);
+            }
+        }
+    }
+    if (0..3).any(|k| hi[k] - lo[k] + 1 < min) {
+        return None;
+    }
+    Some((lo, hi, seen))
+}
 const FISSILE_FUEL: &str = "mekanism:fissile_fuel";
 
 fn get_pos(nbt: &Compound, key: &str) -> Option<[i32; 3]> {
@@ -2825,6 +2849,154 @@ pub(super) fn use_fission_port(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
             })
             .unwrap_or_else(|| "Fission Reactor: not formed".to_owned()),
     };
+    if let Some(player) = game.native_acting_player() {
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
+    true
+}
+
+// --- Industrial Turbine ------------------------------------------------------------------------------
+
+const TURBINE_VALVE: &str = "mekanismgenerators:turbine_valve";
+
+/// `TurbineValidator`, simplified: the frame blocks joined to `start` must be exactly the shell of a
+/// box 3 to 17 on each side, with rotors, a rotational complex, pressure dispersers, coils, condensers
+/// or air inside; the steam is below the lowest disperser. The turbine and its valves.
+fn find_turbine(game: &Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, Vec<[i32; 3]>)> {
+    let (lo, hi, seen) = find_box(game, start, turbine::is_frame, turbine::MIN_SIZE, turbine::MAX_SIZE)?;
+    let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
+    let mut t = turbine::Turbine { volume: size(0) * size(1) * size(2), ..Default::default() };
+    let mut valves = Vec::new();
+    let mut disperser_y = None;
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                let at = [x, y, z];
+                let shell = x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2];
+                let name = block_name(game, at);
+                if shell {
+                    if !seen.contains(&at) {
+                        return None;
+                    }
+                    match name {
+                        TURBINE_VALVE => valves.push(at),
+                        "mekanismgenerators:turbine_vent" => t.vents += 1,
+                        _ => {}
+                    }
+                } else {
+                    if !t.add_inside(name) {
+                        return None;
+                    }
+                    if name == "mekanism:pressure_disperser" {
+                        disperser_y = Some(disperser_y.map_or(y, |d: i32| d.min(y)));
+                    }
+                }
+            }
+        }
+    }
+    t.lower_volume = size(0) * size(2) * (disperser_y? - lo[1]) as u64;
+    (t.rotors > 0 && t.coils > 0).then_some((t, valves))
+}
+
+/// An Industrial Turbine valve. Once a second each valve checks its turbine; the first valve runs it: it
+/// takes steam from the tubes and chemical tanks beside the valves, turns it into energy given out of
+/// every valve, and gives condensed water to the pipes and fluid tanks beside them.
+fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
+    if ticker == 0 {
+        match find_turbine(game, pos) {
+            Some((t, valves)) => {
+                for (key, v) in [
+                    ("rotors", t.rotors),
+                    ("dispersers", t.dispersers),
+                    ("coils", t.coils),
+                    ("condensers", t.condensers),
+                    ("vents", t.vents),
+                    ("volume", t.volume),
+                    ("lower_volume", t.lower_volume),
+                ] {
+                    put_long(&mut entity.nbt, key, v);
+                }
+                entity.nbt.insert("master".into(), Tag::IntArray(valves.first().copied().unwrap_or(pos).to_vec()));
+                entity.nbt.insert("valves".into(), Tag::IntArray(valves.concat()));
+            }
+            None => {
+                put_long(&mut entity.nbt, "rotors", 0);
+                entity.nbt.remove(&JavaString::from("master"));
+            }
+        }
+    }
+    let g = |key: &str| get_long(&entity.nbt, key);
+    let t = turbine::Turbine {
+        rotors: g("rotors"),
+        dispersers: g("dispersers"),
+        coils: g("coils"),
+        condensers: g("condensers"),
+        vents: g("vents"),
+        volume: g("volume"),
+        lower_volume: g("lower_volume"),
+    };
+    if t.rotors == 0 || get_pos(&entity.nbt, "master") != Some(pos) {
+        return None;
+    }
+    let valves: Vec<[i32; 3]> = match entity.nbt.get(&JavaString::from("valves")) {
+        Some(Tag::IntArray(v)) => v.chunks(3).filter(|c| c.len() == 3).map(|c| [c[0], c[1], c[2]]).collect(),
+        _ => vec![pos],
+    };
+    let mut steam = get_tank(&entity.nbt, "steam", t.steam_capacity());
+    let mut water = get_tank(&entity.nbt, "water", (t.condensers * turbine::CONDENSER_RATE).max(1_000));
+    let mut energy = EnergyContainer::new(t.energy_capacity(), u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(energy.capacity);
+    for &v in &valves {
+        pull_from_carriers(game, v, &mut steam, "mekanism:steam");
+    }
+    let (used, made, condensed) = t.tick(steam.amount, energy.capacity - energy.stored);
+    steam.extract(used);
+    energy.insert(made, Action::Execute);
+    if water.accepts("minecraft:water") {
+        water.insert("minecraft:water", condensed);
+    }
+    for &v in &valves {
+        push_energy(game, v, &mut energy, None, false);
+        if water.amount > 0 {
+            push_chemical(game, v, &mut water, None, u64::MAX, false);
+        }
+    }
+    put_tank(&mut entity.nbt, "steam", &steam);
+    put_tank(&mut entity.nbt, "water", &water);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_long(&mut entity.nbt, "production", made);
+    Some(made > 0)
+}
+
+/// A right click with an empty hand on a turbine valve shows the turbine's steam, production and energy.
+pub(super) fn show_turbine(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || game.inventory.get(game.selected).cloned().flatten().is_some() {
+        return false;
+    }
+    let master = game.native_with_mod_block_entity(pos, |m| {
+        (kind(&m.id) == Some(Kind::TurbineValve)).then(|| get_pos(&m.nbt, "master"))
+    });
+    let Some(Some(master)) = master else {
+        return false;
+    };
+    let line = master
+        .and_then(|master| {
+            game.native_with_mod_block_entity(master, |m| {
+                let mut c = Compound::new();
+                if let Some(t) = m.nbt.get(&JavaString::from("steam")) {
+                    c.insert("t".into(), t.clone());
+                }
+                format!(
+                    "Industrial Turbine: steam {} mB, producing {}/t, stored {}",
+                    get_tank(&c, "t", u64::MAX).amount,
+                    mekanism_core::energy::format_fe(get_long(&m.nbt, "production")),
+                    mekanism_core::energy::format_fe(get_long(&m.nbt, "energy")),
+                )
+            })
+        })
+        .unwrap_or_else(|| "Industrial Turbine: not formed".to_owned());
     if let Some(player) = game.native_acting_player() {
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
