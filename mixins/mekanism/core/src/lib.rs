@@ -20,6 +20,7 @@ pub mod recipe_table;
 pub mod recipes;
 pub mod sides;
 pub mod tier;
+pub mod turbine;
 pub mod upgrades;
 
 /// The four modules of Mekanism and their namespaces, as the Java build registers them.
