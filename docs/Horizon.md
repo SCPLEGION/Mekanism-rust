@@ -211,3 +211,12 @@ tank contents in a screen.
   which makes sodium and chlorine; hydrogen and chlorine in a Chemical Infuser make hydrogen chloride.
 - Differences: heat leaks towards 300 K, not the biome's own temperature; water comes only from buckets
   (no fluid pipes or pumps yet); the lithium recipe is not run; there is no tower screen.
+
+## Ore quadrupling (milestone 10)
+
+- **Chemical Injection Chamber**: `injecting` recipes (109; ore → 4 shards on hydrogen chloride, and the
+  water-vapour recipes), 15 FE/t over 200 ticks, 1 mB a tick. It is the third advanced machine and takes
+  either chemical; with one in its tank, only that chemical's recipes run. Hydrogen chloride comes from
+  a Chemical Infuser (hydrogen + chlorine) beside it, or from salt in its middle slot.
+- With the Purification Chamber (shard → clump), Crusher and Enrichment Chamber, one ore gives four dusts.
+  Water vapour has no source yet (Rotary Condensentrator).
