@@ -128,6 +128,12 @@ pub const OXIDIZER_USAGE: u64 = 15;
 pub const OXIDIZER_TICKS: u32 = 100;
 pub const OXIDIZER_TANK: u64 = 10_000;
 
+/// `TileEntityPurificationChamber` (an advanced electric machine): 10 FE a tick (`UsageConfig`), 200
+/// ticks, and a 210 mB tank for the chemical it uses each tick (`TileEntityAdvancedElectricMachine.MAX_GAS`).
+pub const PURIFIER_USAGE: u64 = 10;
+pub const PURIFIER_TICKS: u32 = 200;
+pub const PURIFIER_TANK: u64 = 210;
+
 #[cfg(test)]
 mod tests {
     use super::*;

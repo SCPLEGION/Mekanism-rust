@@ -110,6 +110,29 @@ pub fn find_oxidizing(
         .find(|r| count >= r.input_count && r.input.matches(item, in_tag))
 }
 
+/// An item and a chemical used a little each tick (`per_tick_usage`) make an item: purifying.
+#[derive(Clone, Copy, Debug)]
+pub struct ItemChemicalRecipe {
+    pub id: &'static str,
+    pub input: Ingredient,
+    pub input_count: u32,
+    pub chemical: &'static str,
+    /// mB used each tick of the operation.
+    pub chemical_amount: u64,
+    pub output: &'static str,
+    pub output_count: u32,
+}
+
+pub fn find_purifying(
+    item: &str,
+    count: u32,
+    in_tag: &dyn Fn(&str, &str) -> bool,
+) -> Option<&'static ItemChemicalRecipe> {
+    crate::recipe_table::PURIFYING
+        .iter()
+        .find(|r| count >= r.input_count && r.input.matches(item, in_tag))
+}
+
 /// The recipe types this port runs, with their tables.
 pub fn table(kind: &str) -> &'static [ItemRecipe] {
     match kind {
@@ -155,5 +178,12 @@ mod tests {
             table("enriching").len()
         );
         assert!(table("crushing").len() > 50, "{}", table("crushing").len());
+    }
+
+    #[test]
+    fn osmium_ore_purifies_into_three_clumps_with_oxygen() {
+        let r = find_purifying("mekanism:osmium_ore", 1, &tags).expect("a recipe");
+        assert_eq!((r.output, r.output_count), ("mekanism:clump_osmium", 3));
+        assert_eq!((r.chemical, r.chemical_amount), ("mekanism:oxygen", 1));
     }
 }
