@@ -206,3 +206,30 @@ mod tests {
         assert_eq!(DisassemblerMode::from_name("slow"), Some(Slow));
     }
 }
+
+/// The jetpack (`ItemJetpack`, GearConfig's jetpack capacity): hydrogen it holds.
+pub const JETPACK_CAPACITY: u64 = 24_000;
+/// `ItemJetpack.useJetpackFuel`: thrust per mB of hydrogen, one mB a tick.
+pub const JETPACK_THRUST: f64 = 0.15;
+
+/// `IJetpackItem.handleJetpackMotion` in its normal mode: the velocity a tick of thrust adds, from the
+/// player's velocity.
+pub fn jetpack_normal(motion: [f64; 3], thrust: f64) -> [f64; 3] {
+    [0.08 * motion[0], thrust * (-motion[1]).exp().min(1.0), 0.08 * motion[2]]
+}
+
+#[cfg(test)]
+mod jetpack_tests {
+    use super::*;
+
+    #[test]
+    fn thrust_fades_as_the_player_rises() {
+        let still = jetpack_normal([0.0, 0.0, 0.0], JETPACK_THRUST);
+        assert_eq!(still, [0.0, 0.15, 0.0]);
+        let rising = jetpack_normal([1.0, 1.0, 0.0], JETPACK_THRUST);
+        assert!((rising[1] - 0.15 * (-1f64).exp()).abs() < 1e-12);
+        assert!((rising[0] - 0.08).abs() < 1e-12);
+        // Falling, the thrust is full.
+        assert_eq!(jetpack_normal([0.0, -2.0, 0.0], JETPACK_THRUST)[1], 0.15);
+    }
+}

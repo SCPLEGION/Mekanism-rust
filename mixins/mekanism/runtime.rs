@@ -2411,3 +2411,107 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
     let line = format!("Stored Energy: {}", mekanism_core::energy::format_fe(energy));
     lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0x55, 0xFF, 0xFF, 0xFF)));
 }
+
+// --- Jetpack ----------------------------------------------------------------------------------------
+
+const JETPACKS: [&str; 2] = ["mekanism:jetpack", "mekanism:jetpack_armored"];
+/// The client's word, each tick it thrusts, that its wearer spends a mB of hydrogen.
+const JETPACK_CHANNEL: &str = "mekanism:jetpack";
+
+fn jetpack_fuel(stack: &ItemStack) -> u64 {
+    item_tank(stack, CHEMICAL_KEY, gear::JETPACK_CAPACITY)
+        .filter(|t| t.chemical.as_deref() == Some("mekanism:hydrogen"))
+        .map_or(0, |t| t.amount)
+}
+
+fn set_jetpack_fuel(stack: &mut ItemStack, amount: u64) {
+    let mut tank = ChemicalTank::new(gear::JETPACK_CAPACITY);
+    tank.insert("mekanism:hydrogen", amount);
+    let mut c = Compound::new();
+    put_tank(&mut c, "t", &tank);
+    let value = match c.get(&JavaString::from("t")) {
+        Some(Tag::Compound(t)) => t.clone(),
+        _ => Compound::new(),
+    };
+    set_custom_compound(stack, CHEMICAL_KEY, value);
+}
+
+/// The window's tick (`CommonPlayerTickHandler.tickEnd` for the local player): holding jump with a
+/// fuelled jetpack on, outside creative flight, thrusts in its normal mode and stops the fall, and tells
+/// the server, which spends the hydrogen.
+pub(super) fn client_tick(game: &mut Game<'_>) {
+    if !game.native_window() || !game.native_on(MOD_ID) || !game.native_playing() {
+        return;
+    }
+    let Some(chest) = game.armor[1].as_ref().filter(|s| JETPACKS.contains(&&*s.item)) else {
+        return;
+    };
+    if jetpack_fuel(chest) == 0 || !game.keys.contains(&winit::keyboard::KeyCode::Space) {
+        return;
+    }
+    let Some(p) = game.player.as_mut().filter(|p| !p.flying && !p.spectator) else {
+        return;
+    };
+    let d = gear::jetpack_normal([p.velocity.x, p.velocity.y, p.velocity.z], gear::JETPACK_THRUST);
+    p.velocity.x += d[0];
+    p.velocity.y += d[1];
+    p.velocity.z += d[2];
+    p.fall_distance = 0.0;
+    game.native_send_to_server(JETPACK_CHANNEL, &[1]);
+}
+
+/// A client's packet, with its player swapped in (API 26): a jetpack thrust spends one mB of the
+/// hydrogen in the jetpack they wear and stops their fall here too.
+pub(super) fn server_payload(game: &mut Game<'_>, channel: &str) {
+    if channel != JETPACK_CHANNEL || !game.native_on(MOD_ID) {
+        return;
+    }
+    let Some(chest) = game.armor[1].as_mut().filter(|s| JETPACKS.contains(&&*s.item)) else {
+        return;
+    };
+    let fuel = jetpack_fuel(chest);
+    if fuel == 0 {
+        return;
+    }
+    set_jetpack_fuel(chest, fuel - 1);
+    if let Some(p) = game.player.as_mut() {
+        p.fall_distance = 0.0;
+    }
+}
+
+/// A right click on a chemical tank holding hydrogen with a jetpack in hand fills the jetpack, as
+/// Mekanism's chemical tank fills an item in its slot.
+pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) {
+        return false;
+    }
+    let selected = game.selected;
+    let Some(held) = game.inventory.get(selected).cloned().flatten().filter(|s| JETPACKS.contains(&&*s.item)) else {
+        return false;
+    };
+    let fuel = jetpack_fuel(&held);
+    let room = gear::JETPACK_CAPACITY - fuel;
+    let taken = game.native_with_mod_block_entity(pos, |m| {
+        let Some(Kind::ChemicalTank(t)) = kind(&m.id) else {
+            return None;
+        };
+        let mut tank = get_tank(&m.nbt, "chemical", chem::chemical_tank(t).0);
+        if tank.chemical.as_deref() != Some("mekanism:hydrogen") {
+            return Some(0);
+        }
+        let n = tank.extract(room);
+        put_tank(&mut m.nbt, "chemical", &tank);
+        Some(n)
+    });
+    let Some(Some(n)) = taken else {
+        return false;
+    };
+    let mut held = held;
+    set_jetpack_fuel(&mut held, fuel + n);
+    game.inventory[selected] = Some(held);
+    if let Some(player) = game.native_acting_player() {
+        let line = format!("Jetpack: {} / {} mB hydrogen", fuel + n, gear::JETPACK_CAPACITY);
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
+    true
+}

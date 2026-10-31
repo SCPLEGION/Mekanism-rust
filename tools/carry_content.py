@@ -349,6 +349,13 @@ def build_module(ns, out):
             item["max_stack_size"] = 1
         if path.stem == "atomic_disassembler":
             item["components"] = {"minecraft:tool": DISASSEMBLER_TOOL}
+        # Jetpacks are worn on the chest: the iron chestplate's slot, without its iron look; the plain
+        # jetpack gives no armour (the armored one keeps the chestplate's).
+        if path.stem in ("jetpack", "jetpack_armored"):
+            item["template"] = "minecraft:iron_chestplate"
+            item["components"] = {"minecraft:equippable": {"slot": "chest"}}
+            if path.stem == "jetpack":
+                item["components"]["minecraft:attribute_modifiers"] = []
         write_json(declared / "item" / f"{path.stem}.json", item)
         items += 1
     report["blocks"] = len(blocks)

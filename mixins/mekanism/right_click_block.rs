@@ -6,6 +6,7 @@ fn on_right_click_block(game: &mut crate::game::Game<'_>, pos: [i32; 3], face: [
         return;
     }
     if crate::game::mekanism::configure_side(game, pos, face) || crate::game::mekanism::install_upgrade(game, pos)
+        || crate::game::mekanism::fill_jetpack(game, pos)
         || crate::game::mekanism::use_fluid_tank(game, pos)
     {
         *canceled = true;
