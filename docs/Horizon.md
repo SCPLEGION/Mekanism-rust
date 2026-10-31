@@ -376,5 +376,5 @@ Needs the Horizon fork's `milestone/h6-payload-as-player` (API 26: a mod packet 
   window moves its player and tells the server on the `mekanism:jetpack` channel, and the server spends a
   mB of the wearer's hydrogen a tick and clears their fall too.
 - Simplified: normal mode only (no hover or vector modes, no mode key), no flame particles or sound,
-  and the jetpacks look like iron chestplates' items while worn invisibly. A dedicated server with
+  and a worn jetpack does not show on the player. A dedicated server with
   `allow-flight=false` can kick a long flight for floating, as vanilla does.
