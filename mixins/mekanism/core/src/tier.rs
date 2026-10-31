@@ -99,6 +99,29 @@ pub fn pressurized_tube(tier: BaseTier) -> Option<u64> {
     }
 }
 
+/// `FluidTankTier`: a fluid tank's capacity and the mB a tick it gives out of its bottom.
+pub fn fluid_tank(tier: BaseTier) -> (u64, u64) {
+    match tier {
+        BaseTier::Basic => (32_000, 1_000),
+        BaseTier::Advanced => (64_000, 4_000),
+        BaseTier::Elite => (128_000, 16_000),
+        BaseTier::Ultimate => (256_000, 64_000),
+        BaseTier::Creative => (i64::MAX as u64, i32::MAX as u64),
+    }
+}
+
+/// `PipeTier`: the mB a mechanical pipe pulls in a tick (250 to 32,000). A pipe here holds one tick of
+/// it, as a pressurized tube does.
+pub fn mechanical_pipe(tier: BaseTier) -> Option<u64> {
+    match tier {
+        BaseTier::Basic => Some(250),
+        BaseTier::Advanced => Some(1_000),
+        BaseTier::Elite => Some(8_000),
+        BaseTier::Ultimate => Some(32_000),
+        BaseTier::Creative => None,
+    }
+}
+
 /// `TransporterTier`: items a logistical transporter pulls at a time (1, 16, 32, 64).
 pub fn transporter_pull(tier: BaseTier) -> Option<u32> {
     match tier {
@@ -121,5 +144,13 @@ mod cable_tests {
         assert_eq!(cable_share(20, 100), 0);
         assert_eq!(pressurized_tube(BaseTier::Advanced), Some(2_000));
         assert_eq!(transporter_pull(BaseTier::Elite), Some(32));
+    }
+
+    #[test]
+    fn fluid_tiers_match_mekanism() {
+        assert_eq!(fluid_tank(BaseTier::Basic), (32_000, 1_000));
+        assert_eq!(fluid_tank(BaseTier::Ultimate), (256_000, 64_000));
+        assert_eq!(mechanical_pipe(BaseTier::Elite), Some(8_000));
+        assert_eq!(mechanical_pipe(BaseTier::Creative), None);
     }
 }
