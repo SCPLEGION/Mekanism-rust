@@ -49,6 +49,8 @@ enum Kind {
     Rotary,
     /// An Induction Matrix's port; the casing, cells and providers have no block entity.
     InductionPort,
+    /// A logistical transporter and how many items it pulls at a time.
+    Transporter(u32),
     Infuser,
     Separator,
     GasGenerator,
@@ -88,6 +90,10 @@ fn kind(id: &str) -> Option<Kind> {
     }
     if let Some(m) = chem::ADVANCED_MACHINES.iter().find(|m| m.block == id) {
         return Some(Kind::Advanced(m));
+    }
+    if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_logistical_transporter")) {
+        let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
+        return tier::transporter_pull(tier).map(Kind::Transporter);
     }
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_pressurized_tube")) {
         let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
@@ -193,6 +199,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
         Kind::Evaporation => tick_evaporation(game, pos, entity),
         Kind::Rotary => tick_rotary(game, pos, entity),
+        Kind::Transporter(pull) => {
+            tick_transporter(game, pos, entity, pull);
+            None
+        }
         Kind::InductionPort => {
             tick_induction_port(game, pos, entity);
             None
@@ -1130,6 +1140,92 @@ fn give_back_bucket(entity: &mut ModBlockEntity) -> bool {
         Some(_) => return false,
     }
     true
+}
+
+// --- Logistical transporters ------------------------------------------------------------------------
+
+fn is_transporter(name: &str) -> bool {
+    name.strip_prefix("mekanism:").is_some_and(|n| n.ends_with("_logistical_transporter"))
+}
+
+/// The output slots of a Mekanism block's container, as `block_entity_container` lays them out.
+fn output_slots(block: &str) -> Vec<usize> {
+    let mut container = None;
+    block_entity_container(block, &mut container);
+    container.map_or(Vec::new(), |c| c.outputs)
+}
+
+/// A logistical transporter, simplified: twice a second it pulls up to its tier's count from the first
+/// filled output slot of a Mekanism machine beside it (when that machine's face gives out), and sends it
+/// at once along the connected transporters into the nearest container that takes it: a chest, a
+/// furnace, a hopper or another machine's input, through the side it faces. What fits nowhere goes back.
+/// Mekanism moves items visibly along the pipe at the tier's speed and sorts by colour and filters.
+fn tick_transporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, pull: u32) {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 10);
+    if ticker != 0 {
+        return;
+    }
+    for (_, d) in DIRECTIONS {
+        let source = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        let back = [-d[0], -d[1], -d[2]];
+        let taken = game.native_with_mod_block_entity(source, |m| {
+            if kind(&m.id).is_none() || !sides_of(&m.nbt).get(face_index(back)).gives_out() {
+                return None;
+            }
+            for slot in output_slots(&m.id) {
+                if let Some(Some(stack)) = m.items.get(slot).cloned() {
+                    let n = stack.count.min(pull);
+                    m.items[slot] = (stack.count > n).then(|| ItemStack { count: stack.count - n, ..stack.clone() });
+                    return Some((slot, ItemStack { count: n, ..stack }));
+                }
+            }
+            None
+        });
+        let Some(Some((slot, stack))) = taken else {
+            continue;
+        };
+        let left = route_items(game, pos, source, stack);
+        if let Some(left) = left {
+            game.native_with_mod_block_entity(source, |m| {
+                let slot_stack = m.items.get(slot).cloned().flatten();
+                m.items[slot] = Some(match slot_stack {
+                    Some(s) if s.item == left.item => ItemStack { count: s.count + left.count, ..s },
+                    _ => left,
+                });
+            });
+        }
+        return;
+    }
+}
+
+/// Walks the transporters joined to `start`, nearest first, offering `stack` to every container beside
+/// them except `source`. Returns what no container took.
+fn route_items(game: &mut Game<'_>, start: [i32; 3], source: [i32; 3], stack: ItemStack) -> Option<ItemStack> {
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut queue = std::collections::VecDeque::from([start]);
+    let mut stack = Some(stack);
+    while let Some(node) = queue.pop_front() {
+        for (_, d) in DIRECTIONS {
+            let at = [node[0] + d[0], node[1] + d[1], node[2] + d[2]];
+            if at == source || seen.contains(&at) {
+                continue;
+            }
+            if is_transporter(block_name(game, at)) {
+                if seen.len() < 512 {
+                    seen.insert(at);
+                    queue.push_back(at);
+                }
+                continue;
+            }
+            let face = horizon_core::geometry::Direction::ALL[face_index([-d[0], -d[1], -d[2]])];
+            stack = game.native_insert_item(at, face, stack.take()?);
+            if stack.is_none() {
+                return None;
+            }
+        }
+    }
+    stack
 }
 
 // --- Induction Matrix --------------------------------------------------------------------------------

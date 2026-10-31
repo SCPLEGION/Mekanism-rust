@@ -99,6 +99,17 @@ pub fn pressurized_tube(tier: BaseTier) -> Option<u64> {
     }
 }
 
+/// `TransporterTier`: items a logistical transporter pulls at a time (1, 16, 32, 64).
+pub fn transporter_pull(tier: BaseTier) -> Option<u32> {
+    match tier {
+        BaseTier::Basic => Some(1),
+        BaseTier::Advanced => Some(16),
+        BaseTier::Elite => Some(32),
+        BaseTier::Ultimate => Some(64),
+        BaseTier::Creative => None,
+    }
+}
+
 #[cfg(test)]
 mod cable_tests {
     use super::*;
@@ -109,5 +120,6 @@ mod cable_tests {
         assert_eq!(cable_share(100, 20), 40);
         assert_eq!(cable_share(20, 100), 0);
         assert_eq!(pressurized_tube(BaseTier::Advanced), Some(2_000));
+        assert_eq!(transporter_pull(BaseTier::Elite), Some(32));
     }
 }
