@@ -262,5 +262,7 @@ tank contents in a screen.
   hopper or another machine's input, through the side the transporter touches, as a hopper would
   (`native_insert_item`). Whatever fits nowhere goes back into the machine.
 - Simplified: items arrive at once instead of travelling along the pipe; there is no colour sorting, no
-  diversion or restrictive transporters, no Logistical Sorter, and transporters do not pull from vanilla
-  containers, because Horizon offers mods no way to take items out of them yet.
+  diversion or restrictive transporters, and no Logistical Sorter.
+- Since milestone 15 (Horizon API 24, `native_extract_item`), transporters pull from any container beside
+  them as a hopper would: chests, barrels, a furnace's output, a machine's outputs. The bundle is pinned to
+  the Horizon fork's `milestone/h3-extract-item` commit from then on.
