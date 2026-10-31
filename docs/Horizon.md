@@ -453,3 +453,27 @@ washing and 10 crystallizing recipes. With milestone 10's injection chamber, an 
    clumps.
 
 Simplified: the washer and crystallizer have no screens of their own and no bucket or upgrade slots.
+
+## Fusion Reactor (milestone 28)
+
+`mekanism-core`'s `fusion`, with `FusionReactorMultiblockData`'s heat model (plasma and casing
+temperatures, `burnFuel`, `injectFuel`, `transferHeat`) and Mekanism's default config:
+
+- Build the 5×5×5 reactor of `FusionReactorValidator`: on each face, the corners are left out, the ring
+  around the middle cross is Fusion Reactor Frame, and the cross is frame, Fusion Reactor Ports, Reactor
+  Glass or a Logic Adapter. The Fusion Reactor Controller goes in the middle of the top; inside is air.
+  Ports check the structure once a second, and the first port runs the reactor.
+- Deuterium and tritium come in from the tubes and chemical tanks beside its ports (1,000 mB each), and
+  water from the pipes and fluid tanks beside them (1,000 buckets per injection). Each tick it injects up
+  to the injection rate (2 to 98, even) of D-T fuel. Fuel burns while the plasma is over 100 MK, 10 MJ of
+  heat per mB. The plasma heats the casing, the casing's heat goes 5% into energy through the
+  thermocouples and, with water in, boils it into steam. Energy (1 GJ buffer) and steam go out of every
+  port into cables, tubes and tanks.
+- At injection rate 2 and air cooled, the casing settles at 200 MK and makes 1 MJ a tick, Mekanism's
+  figures. With water, more of the heat goes to steam for an Industrial Turbine.
+- A right click with an empty hand on the controller or a port steps the injection rate; sneak + right
+  click ignites it. The action bar shows whether it burns, the rate, temperatures, production and tanks.
+- Simplified: ignition stands in for the lasers and the hohlraum (the plasma is heated to the
+  temperature it needs at that rate). There is no screen, no damage to things inside, no biome
+  temperature, and the tanks are lost if the first port is broken. Deuterium and tritium have no source
+  yet: that comes next.
