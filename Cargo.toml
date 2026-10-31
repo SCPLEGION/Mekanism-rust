@@ -1,0 +1,8 @@
+# Mekanism for Horizon: the Rust port.
+#
+# The Java sources under src/ stay as the reference and as the behaviour oracle. The Rust lives in
+# mixins/mekanism/: a horizon-mixins bundle (hooks and glue that compile inside Horizon's game crate)
+# and its bundle crate `mekanism-core` (all game logic, no Horizon dependency, tested on its own).
+[workspace]
+members = ["mixins/mekanism/core"]
+resolver = "2"
