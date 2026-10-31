@@ -39,6 +39,7 @@ enum Kind {
     Tube(u64),
     Oxidizer,
     Purifier,
+    Infuser,
     Separator,
     GasGenerator,
     ChemicalTank(BaseTier),
@@ -64,6 +65,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanismgenerators:gas_burning_generator" => return Some(Kind::GasGenerator),
         "mekanism:chemical_oxidizer" => return Some(Kind::Oxidizer),
         "mekanism:purification_chamber" => return Some(Kind::Purifier),
+        "mekanism:metallurgic_infuser" => return Some(Kind::Infuser),
         "mekanism:electrolytic_separator" => return Some(Kind::Separator),
         _ => {}
     }
@@ -130,6 +132,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::Oxidizer) => (vec![0], vec![]),
         Some(Kind::Separator) => (vec![0], vec![2]),
         Some(Kind::Purifier) => (vec![0], vec![2]),
+        // The item to infuse in the first slot, the infuse item (coal, redstone...) in the middle one.
+        Some(Kind::Infuser) => (vec![0, 1], vec![2]),
         _ => return,
     };
     *container = Some(ModContainer {
@@ -164,6 +168,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         }
         Kind::Oxidizer => tick_oxidizer(game, pos, entity),
         Kind::Purifier => tick_purifier(game, pos, entity),
+        Kind::Infuser => tick_infuser(game, entity),
         Kind::Separator => tick_separator(game, pos, entity),
         Kind::GasGenerator => tick_gas_generator(game, pos, entity),
         Kind::ChemicalTank(t) => {
@@ -784,6 +789,72 @@ fn tick_purifier(game: &mut Game<'_>, _pos: [i32; 3], entity: &mut ModBlockEntit
     Some(active)
 }
 
+/// The Metallurgic Infuser: the middle slot's item (coal, redstone, diamond dust...) turns into infuse
+/// chemical in a 1,000 mB tank (`chemical_conversion`), and an item with enough of it becomes the
+/// recipe's output after 200 ticks at 5 FE a tick (`metallurgic_infusing`: iron + 10 carbon → enriched
+/// iron).
+fn tick_infuser(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = chem::INFUSER_USAGE * u64::from(chem::INFUSER_TICKS);
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut tank = get_tank(&entity.nbt, "infuse", chem::INFUSER_TANK);
+    let mut progress = get_int(&entity.nbt, "progress");
+    let mut active = false;
+    let items = world_items!(game);
+    let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
+    // ChemicalInventorySlot: one item at a time, when all of its chemical fits.
+    if let Some(Some(infuse)) = entity.items.get(1).cloned()
+        && let Some(c) = mekanism_core::recipes::find_conversion(&infuse.item, &in_tag)
+        && tank.accepts(c.output)
+        && tank.amount + c.amount <= tank.capacity
+    {
+        tank.insert(c.output, c.amount);
+        entity.items[1] = (infuse.count > 1).then(|| ItemStack { count: infuse.count - 1, ..infuse });
+    }
+    let recipe = match (entity.items.first().cloned().flatten(), tank.chemical.clone()) {
+        (Some(stack), Some(chemical)) => {
+            mekanism_core::recipes::find_infusing(&stack.item, stack.count, &chemical, &in_tag).map(|r| (stack, *r))
+        }
+        _ => None,
+    };
+    let out = entity.items.get(2).cloned().flatten();
+    match recipe {
+        Some((stack, r)) if tank.amount >= r.chemical_amount => {
+            let max = items.get(r.output).map_or(64, |i| i.max_stack);
+            let fits = match &out {
+                None => true,
+                Some(o) => &*o.item == r.output && o.count + r.output_count <= max,
+            };
+            if fits && energy.consume(chem::INFUSER_USAGE) {
+                active = true;
+                progress += 1;
+                if progress >= chem::INFUSER_TICKS {
+                    progress = 0;
+                    tank.extract(r.chemical_amount);
+                    let left = stack.count - r.input_count;
+                    entity.items[0] = (left > 0).then(|| ItemStack { count: left, ..stack });
+                    entity.items[2] = Some(match out {
+                        Some(o) => ItemStack { count: o.count + r.output_count, ..o },
+                        None => stack_of(r.output, r.output_count),
+                    });
+                }
+            }
+        }
+        _ => progress = 0,
+    }
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "progress", progress);
+    put_tank(&mut entity.nbt, "infuse", &tank);
+    // The flame shows the infuse tank, the arrow the progress.
+    entity.data = vec![
+        (tank.amount * 1000 / chem::INFUSER_TANK) as i32,
+        1000,
+        progress as i32,
+        chem::INFUSER_TICKS as i32,
+    ];
+    Some(active)
+}
+
 /// The Electrolytic Separator on water: water buckets fill its 24,000 mB tank, each tick splits 2 mB
 /// into hydrogen and oxygen at 4 FE, and the gases go out to the tanks and generators beside it.
 fn tick_separator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
@@ -956,6 +1027,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Oxidizer => Some((chem::OXIDIZER_USAGE * u64::from(chem::OXIDIZER_TICKS), u64::MAX)),
         Kind::Separator => Some((machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE, u64::MAX)),
         Kind::Purifier => Some((chem::PURIFIER_USAGE * u64::from(chem::PURIFIER_TICKS), u64::MAX)),
+        Kind::Infuser => Some((chem::INFUSER_USAGE * u64::from(chem::INFUSER_TICKS), u64::MAX)),
         _ => None,
     }
 }

@@ -133,6 +133,30 @@ pub fn find_purifying(
         .find(|r| count >= r.input_count && r.input.matches(item, in_tag))
 }
 
+/// `metallurgic_infusing`: an item and the infuse chemical in the tank (used at the end of the
+/// operation). The same item can infuse with several chemicals (dirt: fungi → mycelium, bio → podzol).
+pub fn find_infusing(
+    item: &str,
+    count: u32,
+    chemical: &str,
+    in_tag: &dyn Fn(&str, &str) -> bool,
+) -> Option<&'static ItemChemicalRecipe> {
+    crate::recipe_table::METALLURGIC_INFUSING
+        .iter()
+        .find(|r| r.chemical == chemical && count >= r.input_count && r.input.matches(item, in_tag))
+}
+
+/// `chemical_conversion`: an item put in a machine's chemical slot turns into chemical (coal → 10
+/// carbon).
+pub fn find_conversion(
+    item: &str,
+    in_tag: &dyn Fn(&str, &str) -> bool,
+) -> Option<&'static ChemicalRecipe> {
+    crate::recipe_table::CHEMICAL_CONVERSION
+        .iter()
+        .find(|r| r.input.matches(item, in_tag))
+}
+
 /// The recipe types this port runs, with their tables.
 pub fn table(kind: &str) -> &'static [ItemRecipe] {
     match kind {
@@ -185,5 +209,23 @@ mod tests {
         let r = find_purifying("mekanism:osmium_ore", 1, &tags).expect("a recipe");
         assert_eq!((r.output, r.output_count), ("mekanism:clump_osmium", 3));
         assert_eq!((r.chemical, r.chemical_amount), ("mekanism:oxygen", 1));
+    }
+
+    #[test]
+    fn coal_gives_carbon_and_steel_takes_it() {
+        let none = |_: &str, _: &str| false;
+        let c = find_conversion("minecraft:coal", &|t, i| {
+            t == "c:coal" && i == "minecraft:coal"
+        })
+        .expect("coal");
+        assert_eq!(c.output, "mekanism:carbon");
+        let iron = |t: &str, i: &str| t == "c:ingots/iron" && i == "minecraft:iron_ingot";
+        let r = find_infusing("minecraft:iron_ingot", 1, "mekanism:carbon", &iron)
+            .expect("enriched iron");
+        assert_eq!(r.output, "mekanism:enriched_iron");
+        let dirt = |chemical| find_infusing("minecraft:dirt", 1, chemical, &none).map(|r| r.output);
+        assert_eq!(dirt("mekanism:fungi"), Some("minecraft:mycelium"));
+        assert_eq!(dirt("mekanism:bio"), Some("minecraft:podzol"));
+        assert_eq!(dirt("mekanism:carbon"), None);
     }
 }
