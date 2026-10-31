@@ -10,6 +10,7 @@ use horizon_world::nbt::{Compound, JavaString, Tag};
 use mekanism_core::chemical::{self as chem, ChemicalTank};
 use mekanism_core::energy::{Action, EnergyContainer};
 use mekanism_core::evaporation as evap;
+use mekanism_core::gear;
 use mekanism_core::sides::Sides;
 use mekanism_core::factory::{self, Factory};
 use mekanism_core::generator::HeatGenerator;
@@ -161,6 +162,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::Rotary) => (vec![0], vec![2]),
         // The item to infuse in the first slot, the infuse item (coal, redstone...) in the middle one.
         Some(Kind::Infuser) => (vec![0, 1], vec![2]),
+        // An energy cube's charge slot (top) and discharge slot (bottom).
+        Some(Kind::EnergyCube(_)) => (vec![0, 1], vec![]),
         _ => return,
     };
     *container = Some(ModContainer {
@@ -234,6 +237,11 @@ fn tick_machine(game: &mut Game<'_>, entity: &mut ModBlockEntity, recipe: &str, 
     let mut m = ElectricMachine::with_upgrades(usage, upgrades(&entity.nbt));
     m.energy.stored = get_long(&entity.nbt, "energy").min(m.energy.capacity);
     m.progress = get_int(&entity.nbt, "progress");
+    // The middle slot is the machine's energy slot (the combiner's holds its extra input instead): an
+    // energy tablet or cube there runs the machine.
+    if recipe != "combining" {
+        discharge_slot(entity, 1, &mut m.energy);
+    }
     let mut input = slot(entity.items.first().cloned().flatten());
     let mut middle = slot(entity.items.get(1).cloned().flatten());
     let mut output = slot(entity.items.get(2).cloned().flatten());
@@ -609,6 +617,9 @@ fn tick_cube(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, ti
     let (capacity, rate) = tier::energy_cube(tier);
     let mut energy = EnergyContainer::new(capacity, rate);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    // The top slot charges the item in it from the cube; the bottom one empties its item into it.
+    charge_slot(entity, 0, &mut energy);
+    discharge_slot(entity, 1, &mut energy);
     // A cube's default side configuration: energy goes out of its front only.
     let front = game
         .native_block_property(pos, "facing")
@@ -1732,6 +1743,79 @@ fn with_energy(item: &str, energy: u64) -> ItemStack {
     ItemStack { extra: Some(Box::new(data)), ..stack_of(item, 1) }
 }
 
+/// Sets the energy an item holds, keeping its other components and other custom data.
+fn set_energy(stack: &mut ItemStack, energy: u64) {
+    let extra = stack.extra.get_or_insert_with(Default::default);
+    let at = extra.other.iter().position(|(k, d)| k == "minecraft:custom_data" && matches!(d, Tag::Compound(_)));
+    let at = at.unwrap_or_else(|| {
+        extra.other.retain(|(k, _)| k != "minecraft:custom_data");
+        extra.other.push(("minecraft:custom_data".to_owned(), Tag::Compound(Compound::new())));
+        extra.other.len() - 1
+    });
+    if let Tag::Compound(c) = &mut extra.other[at].1 {
+        put_long(c, ENERGY_KEY, energy);
+    }
+}
+
+/// The item in `entity`'s slot `index` and its energy container, when it holds energy.
+fn energy_item(entity: &ModBlockEntity, index: usize) -> Option<(gear::ItemEnergy, u64)> {
+    let stack = entity.items.get(index)?.as_ref()?;
+    let item = gear::item_energy(&stack.item)?;
+    Some((item, stored_energy(stack).min(item.capacity)))
+}
+
+fn put_item_energy(entity: &mut ModBlockEntity, index: usize, before: u64, after: u64) {
+    if after != before
+        && let Some(Some(stack)) = entity.items.get_mut(index)
+    {
+        set_energy(stack, after);
+    }
+}
+
+/// `EnergyInventorySlot.charge`: fills the item in slot `index` from `source`.
+fn charge_slot(entity: &mut ModBlockEntity, index: usize, source: &mut EnergyContainer) {
+    if let Some((item, stored)) = energy_item(entity, index) {
+        let after = gear::charge(item, stored, source);
+        put_item_energy(entity, index, stored, after);
+    }
+}
+
+/// `EnergyInventorySlot.discharge`: empties the item in slot `index` into `target`.
+fn discharge_slot(entity: &mut ModBlockEntity, index: usize, target: &mut EnergyContainer) {
+    if let Some((item, stored)) = energy_item(entity, index) {
+        let after = gear::discharge(item, stored, target);
+        put_item_energy(entity, index, stored, after);
+    }
+}
+
+// --- Atomic Disassembler -----------------------------------------------------------------------------
+
+const DISASSEMBLER: &str = "mekanism:atomic_disassembler";
+
+/// `ItemAtomicDisassembler.getDestroySpeed` (hook point `native_destroy_speed`, API 25): fast while it
+/// holds the energy for the block, slower as it runs out, not at all when empty.
+pub(super) fn destroy_speed(game: &Game<'_>, stack: Option<&ItemStack>, hardness: f32, speed: &mut f32) {
+    let Some(stack) = stack.filter(|s| &*s.item == DISASSEMBLER) else {
+        return;
+    };
+    if game.native_on(MOD_ID) {
+        *speed = gear::destroy_speed(stored_energy(stack), hardness);
+    }
+}
+
+/// `ItemAtomicDisassembler.mineBlock`: breaking a block spends the disassembler's energy for it.
+pub(super) fn spend_disassembler_energy(game: &mut Game<'_>, pos: [i32; 3]) {
+    if !game.native_on(MOD_ID) || game.creative {
+        return;
+    }
+    let state = game.world.block(pos[0], pos[1], pos[2]);
+    let hardness = game.res.facts().get(state).hardness;
+    if let Some(stack) = game.held_mut().as_mut().filter(|s| &*s.item == DISASSEMBLER) {
+        let stored = stored_energy(stack);
+        set_energy(stack, stored.saturating_sub(gear::destroy_energy(hardness)));
+    }
+}
+
 /// Breaking an energy cube that holds energy outside creative: the block goes as `Level.destroyBlock`
 /// takes it (particles, sound, no loot) and drops the cube with its energy, as Mekanism's loot copies
 /// the energy component. True when it did, so the game's own break is canceled.
@@ -1740,20 +1824,22 @@ pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         return false;
     }
     let held = game.native_with_mod_block_entity(pos, |m| match kind(&m.id) {
-        Some(Kind::EnergyCube(_)) => Some((m.id.clone(), get_long(&m.nbt, "energy"))),
+        Some(Kind::EnergyCube(_)) => Some((m.id.clone(), get_long(&m.nbt, "energy"), m.items.clone())),
         _ => None,
     });
-    let Some(Some((id, energy))) = held else {
+    let Some(Some((id, energy, items))) = held else {
         return false;
     };
     if energy == 0 {
         return false;
     }
     let at = horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]);
-    let cube = with_energy(&id, energy);
+    // The items in its charge and discharge slots drop beside it.
+    let mut drops = items;
+    drops.push(Some(with_energy(&id, energy)));
     game.with_level(|b, level, ticks| {
         b.destroy_block(level, ticks, at, false);
-        level.drop_lost_contents(at, vec![Some(cube)]);
+        level.drop_lost_contents(at, drops);
     });
     true
 }

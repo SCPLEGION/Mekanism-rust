@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "75c68b395c845952bc2cd57ae0ac4510cf6a3ca0"
+horizon_revision = "d0d5bbbc5a5249d1f625c9b2d54e6652cd14337d"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -118,4 +118,17 @@ bindings = [
   { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
   { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
   { name = "lines", ty = "&mut Vec<(horizon_client::text::Text, u32)>", value = "&mut *lines" },
+]
+
+[[injection]]
+id = "destroy-speed"
+hook = "destroy_speed"
+hook_version = 1
+kind = "HEAD"
+helper = "destroy_speed.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "stack", ty = "Option<&horizon_client::items::ItemStack>", value = "stack" },
+  { name = "hardness", ty = "f32", value = "hardness" },
+  { name = "speed", ty = "&mut f32", value = "&mut *speed" },
 ]
