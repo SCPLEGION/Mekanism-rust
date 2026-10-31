@@ -80,6 +80,7 @@ helper = "right_click_block.rs"
 bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "face", ty = "[i32; 3]", value = "face" },
   { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
 ]
 
