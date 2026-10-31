@@ -28,7 +28,12 @@ enum Kind {
     /// processes, recipe kind, energy per tick
     Factory(usize, &'static str, u64),
     HeatGenerator,
+    /// peak FE a tick, storage
+    Solar(u64, u64),
+    Wind,
     EnergyCube(BaseTier),
+    /// A universal cable and what it carries in a tick.
+    Cable(u64),
 }
 
 fn kind(id: &str) -> Option<Kind> {
@@ -40,6 +45,19 @@ fn kind(id: &str) -> Option<Kind> {
     }
     if id == HEAT_GENERATOR {
         return Some(Kind::HeatGenerator);
+    }
+    use mekanism_core::generator as g;
+    match id {
+        "mekanismgenerators:solar_generator" => return Some(Kind::Solar(g::SOLAR_GENERATION, g::SOLAR_STORAGE)),
+        "mekanismgenerators:advanced_solar_generator" => {
+            return Some(Kind::Solar(g::ADVANCED_SOLAR_GENERATION, g::ADVANCED_SOLAR_STORAGE));
+        }
+        "mekanismgenerators:wind_generator" => return Some(Kind::Wind),
+        _ => {}
+    }
+    if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_universal_cable")) {
+        let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
+        return tier::universal_cable(tier).map(Kind::Cable);
     }
     let tier = id.strip_prefix("mekanism:")?.strip_suffix("_energy_cube")?;
     BaseTier::ALL
@@ -110,14 +128,21 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         Kind::Machine(recipe, usage) => tick_machine(game, entity, recipe, usage),
         Kind::Factory(n, recipe, usage) => tick_factory(game, entity, n, recipe, usage),
         Kind::HeatGenerator => tick_generator(game, pos, entity),
+        Kind::Solar(peak, storage) => tick_solar(game, pos, entity, peak, storage),
+        Kind::Wind => tick_wind(game, pos, entity),
         Kind::EnergyCube(t) => {
             tick_cube(game, pos, entity, t);
+            None
+        }
+        Kind::Cable(rate) => {
+            tick_cable(game, pos, entity, rate);
             None
         }
     };
     if let Some(active) = active {
         let lit = if active { "true" } else { "false" };
-        if game.native_block_property(pos, "lit").as_deref() != Some(lit) {
+        // Blocks without the furnace's `lit` (the solar generator's iron block) show no state.
+        if game.native_block_property(pos, "lit").is_some_and(|now| now != lit) {
             game.native_set_block_property(pos, "lit", lit);
         }
     }
@@ -420,7 +445,7 @@ fn tick_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
         }
     }
     g.tick();
-    push_energy(game, pos, &mut g.energy, None);
+    push_energy(game, pos, &mut g.energy, None, false);
     put_long(&mut entity.nbt, "energy", g.energy.stored);
     put_int(&mut entity.nbt, "lava", g.lava);
     entity.nbt.insert("heat".into(), Tag::Double(g.heat.heat.to_bits()));
@@ -428,6 +453,74 @@ fn tick_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     let warm = (g.heat.temperature() - mekanism_core::heat::AMBIENT_TEMP).clamp(0.0, 200.0) as i32;
     entity.data = vec![g.lava as i32, mekanism_core::generator::TANK_CAPACITY as i32, warm, 200];
     Some(g.active)
+}
+
+// --- Solar and wind ---------------------------------------------------------------------------------
+
+/// `Level.canSeeSky`: nothing above `pos` that blocks the sky up to the top of the level.
+fn can_see_sky(game: &Game<'_>, pos: [i32; 3]) -> bool {
+    let top = game.world.top_y();
+    (pos[1] + 1..top).all(|y| {
+        let f = game.res.facts().get(game.world.block(pos[0], y, pos[2]));
+        !f.full_collision && f.fluid == horizon_client::blocks::Fluid::None
+    })
+}
+
+fn overworld(game: &Game<'_>) -> bool {
+    game.dim == super::Dim::Overworld
+}
+
+/// The solar generator's sun: `LightLevelUtils.canSeeSun` and `getSunBrightness` (the sky light
+/// factor, with the weather), and `SolarCheck`'s biome multiplier.
+fn tick_solar(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, peak: u64, storage: u64) -> Option<bool> {
+    let mut energy = EnergyContainer::new(storage, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(storage);
+    let sees_sun = overworld(game) && game.sky_darken() < 4 && can_see_sky(game, pos);
+    let produced = if sees_sun {
+        let mut sky = game.res.environment().sample(game.world.day_time, None, None);
+        let (rain, thunder) = game.world.weather.levels(1.0);
+        horizon_client::environment::apply_weather(&mut sky, rain, thunder);
+        let biome = game.world.chunks.get(&(pos[0] >> 4, pos[2] >> 4)).map(|c| {
+            let b = &game.res.biomes().list[c.biome(pos[0], pos[1], pos[2]) as usize];
+            (b.temperature, b.downfall, b.precipitation)
+        });
+        let (t, d, rains) = biome.unwrap_or((0.8, 0.4, true));
+        let m = mekanism_core::generator::solar_biome_multiplier(t, d, rains);
+        mekanism_core::generator::solar_production(peak, true, sky.sky_light_factor, m)
+    } else {
+        0
+    };
+    energy.insert(produced, Action::Execute);
+    push_energy(game, pos, &mut energy, None, false);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    entity.data = vec![(energy.stored * 1000 / storage.max(1)) as i32, 1000, produced as i32, peak as i32];
+    Some(produced > 0)
+}
+
+/// The wind generator: its multiplier is worked out once a second, from the height of its top.
+fn tick_wind(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    use mekanism_core::generator as g;
+    let mut energy = EnergyContainer::new(g::WIND_STORAGE, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(g::WIND_STORAGE);
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
+    let mut multiplier = get_double(&entity.nbt, "multiplier").unwrap_or(0.0);
+    if ticker == 0 {
+        let top = [pos[0], pos[1] + 4, pos[2]];
+        let fluid = game.res.facts().get(game.world.block(top[0], top[1], top[2])).fluid;
+        multiplier = if fluid == horizon_client::blocks::Fluid::None && can_see_sky(game, top) {
+            g::wind_multiplier(top[1], game.world.bottom_y(), game.world.top_y() - 1)
+        } else {
+            0.0
+        };
+        entity.nbt.insert("multiplier".into(), Tag::Double(multiplier.to_bits()));
+    }
+    let produced = if multiplier > 0.0 { g::wind_generation(multiplier) } else { 0 };
+    energy.insert(produced, Action::Execute);
+    push_energy(game, pos, &mut energy, None, false);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    entity.data = vec![(energy.stored * 1000 / g::WIND_STORAGE) as i32, 1000, produced as i32, g::WIND_GENERATION_MAX as i32];
+    Some(produced > 0)
 }
 
 // --- Energy cubes -----------------------------------------------------------------------------------
@@ -441,10 +534,44 @@ fn tick_cube(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, ti
         .native_block_property(pos, "facing")
         .and_then(|f| direction(&f));
     if let Some(front) = front {
-        push_energy(game, pos, &mut energy, Some(front));
+        push_energy(game, pos, &mut energy, Some(front), false);
     }
     put_long(&mut entity.nbt, "energy", energy.stored);
     entity.data = vec![(energy.stored * 1000 / capacity.max(1)) as i32, 1000, 0, 0];
+}
+
+// --- Universal cables -------------------------------------------------------------------------------
+
+/// A cable holds one tick of what it carries. It gives to the machines and cubes beside it first, then
+/// lets its energy run on to emptier cables (`tier::cable_share`), so a line of cables carries energy
+/// from generators to machines without it flowing back. Mekanism pools a whole cable network instead;
+/// the throughput per cable is the same.
+fn tick_cable(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, rate: u64) {
+    let mut energy = EnergyContainer::new(rate, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(rate);
+    if energy.stored > 0 {
+        push_energy(game, pos, &mut energy, None, true);
+    }
+    for (_, d) in DIRECTIONS {
+        if energy.stored == 0 {
+            break;
+        }
+        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        let mine = energy.stored;
+        let given = game.native_with_mod_block_entity(at, |m| {
+            let Some(Kind::Cable(their_rate)) = kind(&m.id) else {
+                return 0;
+            };
+            let theirs = get_long(&m.nbt, "energy");
+            let give = tier::cable_share(mine, theirs).min(their_rate.saturating_sub(theirs));
+            put_long(&mut m.nbt, "energy", theirs + give);
+            give
+        });
+        if let Some(given) = given {
+            energy.extract(given, Action::Execute);
+        }
+    }
+    put_long(&mut entity.nbt, "energy", energy.stored);
 }
 
 // --- Energy between blocks --------------------------------------------------------------------------
@@ -464,7 +591,13 @@ fn direction(name: &str) -> Option<[i32; 3]> {
 
 /// Pushes `from`'s energy into the Mekanism blocks beside `pos` that accept it, on every side or only
 /// `only`; split evenly the way Mekanism's emitter splits to its targets (what one refuses goes on).
-fn push_energy(game: &mut Game<'_>, pos: [i32; 3], from: &mut EnergyContainer, only: Option<[i32; 3]>) {
+fn push_energy(
+    game: &mut Game<'_>,
+    pos: [i32; 3],
+    from: &mut EnergyContainer,
+    only: Option<[i32; 3]>,
+    from_cable: bool,
+) {
     let sides: Vec<[i32; 3]> = DIRECTIONS
         .iter()
         .map(|(_, d)| *d)
@@ -482,7 +615,7 @@ fn push_energy(game: &mut Game<'_>, pos: [i32; 3], from: &mut EnergyContainer, o
             .and_then(|f| direction(&f))
             .map_or(true, |front| front != back);
         let taken = game.native_with_mod_block_entity(at, |m| {
-            let Some((capacity, rate)) = receiver(&m.id, &m.nbt, accepted) else {
+            let Some((capacity, rate)) = receiver(&m.id, &m.nbt, accepted, from_cable) else {
                 return 0;
             };
             let mut to = EnergyContainer::new(capacity, rate);
@@ -499,7 +632,7 @@ fn push_energy(game: &mut Game<'_>, pos: [i32; 3], from: &mut EnergyContainer, o
 
 /// The energy a neighbour takes: (capacity, rate) when `id` is a Mekanism block that accepts energy on
 /// the side it is offered; a cube refuses on its front (`facing_away` is false there).
-fn receiver(id: &str, nbt: &Compound, facing_away: bool) -> Option<(u64, u64)> {
+fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Option<(u64, u64)> {
     match kind(id)? {
         Kind::Machine(_, usage) => Some((
             ElectricMachine::with_upgrades(usage, upgrades(nbt)).energy.capacity,
@@ -507,6 +640,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool) -> Option<(u64, u64)> {
         )),
         Kind::Factory(n, _, usage) => Some((Factory::new(n, usage, upgrades(nbt)).machine.energy.capacity, u64::MAX)),
         Kind::EnergyCube(t) if facing_away => Some(tier::energy_cube(t)),
+        Kind::Cable(rate) if !from_cable => Some((rate, rate)),
         _ => None,
     }
 }
