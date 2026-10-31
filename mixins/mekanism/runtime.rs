@@ -57,6 +57,9 @@ enum Kind {
     GasGenerator,
     ChemicalTank(BaseTier),
     DigitalMiner,
+    FluidTank(BaseTier),
+    /// A mechanical pipe and the mB of fluid it carries in a tick.
+    Pipe(u64),
 }
 
 fn kind(id: &str) -> Option<Kind> {
@@ -103,6 +106,13 @@ fn kind(id: &str) -> Option<Kind> {
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_pressurized_tube")) {
         let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
         return tier::pressurized_tube(tier).map(Kind::Tube);
+    }
+    if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_fluid_tank")) {
+        return BaseTier::ALL.into_iter().find(|t| t.name() == tier).map(Kind::FluidTank);
+    }
+    if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_mechanical_pipe")) {
+        let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
+        return tier::mechanical_pipe(tier).map(Kind::Pipe);
     }
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_chemical_tank")) {
         return BaseTier::ALL.into_iter().find(|t| t.name() == tier).map(Kind::ChemicalTank);
@@ -232,8 +242,16 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             None
         }
         Kind::DigitalMiner => tick_miner(game, pos, entity),
+        Kind::FluidTank(t) => {
+            tick_fluid_tank(game, pos, entity, t);
+            None
+        }
+        Kind::Pipe(rate) => {
+            tick_pipe(game, pos, entity, rate);
+            None
+        }
     };
-    if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_)) {
+    if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Pipe(_)) {
         show_connections(game, pos, entity);
     }
     if let Some(active) = active {
@@ -715,11 +733,14 @@ fn put_tank(nbt: &mut Compound, key: &str, t: &ChemicalTank) {
 /// `d` is the receiver's offset from the giver: a tank takes nothing into its bottom, its output side.
 fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, d: [i32; 3]) -> Option<(&'static str, u64)> {
     let kind = kind(id)?;
-    // Fluids (water, brine) share the chemical code here but go only into the separator, since there
-    // are no fluid pipes or fluid tanks yet.
+    // Fluids (water, lava, brine) share the chemical code here and go into the blocks with a fluid
+    // tank: mechanical pipes, fluid tanks (not into their bottom), the separator and the rotary.
     if FLUIDS.contains(&chemical) {
         return match kind {
+            Kind::Pipe(rate) if !from_tube => Some(("fluid", rate)),
+            Kind::FluidTank(t) if d != [0, 1, 0] => Some(("fluid", tier::fluid_tank(t).0)),
             Kind::Separator if chem::separates(chemical) => Some(("fluid", chem::SEPARATOR_FLUID)),
+            Kind::Rotary if chem::rotary_chemical(chemical).is_some() => Some(("fluid", chem::ROTARY_TANK)),
             _ => None,
         };
     }
@@ -828,7 +849,7 @@ fn set_custom_string(stack: &mut ItemStack, key: &str, value: &str) {
     }
 }
 
-const FLUIDS: [&str; 2] = ["minecraft:water", "mekanism:brine"];
+const FLUIDS: [&str; 3] = ["minecraft:water", "minecraft:lava", "mekanism:brine"];
 
 /// Pushes up to `rate` of `from`'s chemical into the tanks and generators beside `pos` (or only the one
 /// at `only`) that accept it.
@@ -1135,10 +1156,12 @@ fn tick_separator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     Some(active)
 }
 
-/// The fluid in a bucket item: vanilla's water bucket, or a Mekanism `<fluid>_bucket`.
+/// The fluid in a bucket item: vanilla's water or lava bucket, or a Mekanism `<fluid>_bucket`.
 fn bucket_fluid(item: &str) -> Option<String> {
-    if item == "minecraft:water_bucket" {
-        return Some("minecraft:water".into());
+    match item {
+        "minecraft:water_bucket" => return Some("minecraft:water".into()),
+        "minecraft:lava_bucket" => return Some("minecraft:lava".into()),
+        _ => {}
     }
     let fluid = item.strip_suffix("_bucket")?;
     fluid.starts_with("mekanism:").then(|| fluid.to_owned())
@@ -1189,6 +1212,16 @@ fn tick_rotary(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
 }
 
 /// Puts an empty bucket into the last slot, if it has room for one.
+/// The bucket that holds `fluid`: the reverse of `bucket_fluid`.
+fn fluid_bucket(fluid: &str) -> Option<String> {
+    match fluid {
+        "minecraft:water" => Some("minecraft:water_bucket".into()),
+        "minecraft:lava" => Some("minecraft:lava_bucket".into()),
+        f if f.starts_with("mekanism:") => Some(format!("{f}_bucket")),
+        _ => None,
+    }
+}
+
 fn give_back_bucket(entity: &mut ModBlockEntity) -> bool {
     let out = entity.items.get(2).cloned().flatten();
     match out {
@@ -1313,8 +1346,15 @@ fn serves(family: &str, kind: Kind) -> bool {
     match family {
         "cable" => !matches!(
             kind,
-            Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::ChemicalTank(_) | Kind::Evaporation
+            Kind::Cable(_)
+                | Kind::Tube(_)
+                | Kind::Transporter(_)
+                | Kind::ChemicalTank(_)
+                | Kind::Evaporation
+                | Kind::FluidTank(_)
+                | Kind::Pipe(_)
         ),
+        "pipe" => matches!(kind, Kind::FluidTank(_) | Kind::Separator | Kind::Rotary),
         "tube" => matches!(
             kind,
             Kind::Oxidizer
@@ -1360,6 +1400,7 @@ fn show_connections(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         let name = block_name(game, at).to_owned();
         let joined = pipe_family(&name) == Some(family)
             || (family == "transporter" && vanilla_container(&name))
+            || (family == "pipe" && name == EVAPORATION_VALVE)
             || game
                 .native_with_mod_block_entity(at, |m| kind(&m.id))
                 .flatten()
@@ -1711,14 +1752,13 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         brine.extract(1_000);
         entity.items[1] = Some(stack_of("mekanism:brine_bucket", 1));
     }
-    // Valves give brine to the separators beside them.
-    for y in y0..top {
-        if brine.amount == 0 {
-            break;
-        }
-        let valves: Vec<[i32; 3]> =
-            tower.perimeter(y).filter(|&at| block_name(game, at) == "mekanism:thermal_evaporation_valve").collect();
-        for valve in valves {
+    // Valves take water from the pipes and fluid tanks beside them and give brine to the pipes, tanks
+    // and separators beside them.
+    let valves: Vec<[i32; 3]> =
+        (y0..top).flat_map(|y| tower.perimeter(y).collect::<Vec<_>>()).filter(|&at| block_name(game, at) == EVAPORATION_VALVE).collect();
+    for valve in valves {
+        pull_fluid(game, valve, &mut water, "minecraft:water");
+        if brine.amount > 0 {
             push_chemical(game, valve, &mut brine, None, u64::MAX, false);
         }
     }
@@ -1763,7 +1803,31 @@ fn tick_chemical_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
 /// A pressurized tube feeds the tanks, machines and generators beside it, then lets the rest run on
 /// to emptier tubes carrying the same chemical, as `tick_cable` does with energy.
 fn tick_tube(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, rate: u64) {
-    let mut tank = get_tank(&entity.nbt, "chemical", rate);
+    tick_carrier(game, pos, entity, rate, "chemical", |k| match k {
+        Kind::Tube(rate) => Some(rate),
+        _ => None,
+    });
+}
+
+/// A mechanical pipe does with fluids what a pressurized tube does with chemicals.
+fn tick_pipe(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, rate: u64) {
+    tick_carrier(game, pos, entity, rate, "fluid", |k| match k {
+        Kind::Pipe(rate) => Some(rate),
+        _ => None,
+    });
+}
+
+/// A tube or pipe holding `rate` in its `key` tank: it feeds the blocks beside it, then shares the rest
+/// with the emptier carriers of its own kind (`same` gives their rate).
+fn tick_carrier(
+    game: &mut Game<'_>,
+    pos: [i32; 3],
+    entity: &mut ModBlockEntity,
+    rate: u64,
+    key: &str,
+    same: fn(Kind) -> Option<u64>,
+) {
+    let mut tank = get_tank(&entity.nbt, key, rate);
     if tank.amount == 0 {
         return;
     }
@@ -1775,23 +1839,135 @@ fn tick_tube(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, ra
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
         let mine = tank.amount;
         let given = game.native_with_mod_block_entity(at, |m| {
-            let Some(Kind::Tube(their_rate)) = kind(&m.id) else {
+            let Some(their_rate) = kind(&m.id).and_then(same) else {
                 return 0;
             };
-            let mut theirs = get_tank(&m.nbt, "chemical", their_rate);
+            let mut theirs = get_tank(&m.nbt, key, their_rate);
             if !theirs.accepts(&chemical) {
                 return 0;
             }
             let give = tier::cable_share(mine, theirs.amount);
             let n = theirs.insert(&chemical, give);
-            put_tank(&mut m.nbt, "chemical", &theirs);
+            put_tank(&mut m.nbt, key, &theirs);
             n
         });
         if let Some(n) = given {
             tank.extract(n);
         }
     }
-    put_tank(&mut entity.nbt, "chemical", &tank);
+    put_tank(&mut entity.nbt, key, &tank);
+}
+
+const EVAPORATION_VALVE: &str = "mekanism:thermal_evaporation_valve";
+
+/// Fills `into` with `fluid` from the mechanical pipes and fluid tanks beside `pos`, as Mekanism's pipes
+/// push into a block that takes the fluid.
+fn pull_fluid(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTank, fluid: &str) {
+    for (_, d) in DIRECTIONS {
+        let room = into.capacity - into.amount;
+        if room == 0 || !into.accepts(fluid) {
+            return;
+        }
+        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        let taken = game.native_with_mod_block_entity(at, |m| {
+            let capacity = match kind(&m.id)? {
+                Kind::Pipe(rate) => rate,
+                Kind::FluidTank(t) => tier::fluid_tank(t).0,
+                _ => return None,
+            };
+            let mut theirs = get_tank(&m.nbt, "fluid", capacity);
+            if theirs.chemical.as_deref() != Some(fluid) {
+                return None;
+            }
+            let n = theirs.extract(room);
+            put_tank(&mut m.nbt, "fluid", &theirs);
+            Some(n)
+        });
+        if let Some(Some(n)) = taken {
+            into.insert(fluid, n);
+        }
+    }
+}
+
+// --- Fluid tanks ------------------------------------------------------------------------------------
+
+/// A fluid tank takes from every side and gives out of its bottom at its tier's rate, as a chemical
+/// tank does.
+fn tick_fluid_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, tier: BaseTier) {
+    let (capacity, rate) = tier::fluid_tank(tier);
+    let mut tank = get_tank(&entity.nbt, "fluid", capacity);
+    if tank.amount > 0 {
+        push_chemical(game, pos, &mut tank, Some([0, -1, 0]), rate, false);
+        put_tank(&mut entity.nbt, "fluid", &tank);
+    }
+}
+
+/// A right click on a fluid tank (`BlockFluidTank.useItemOn`): a full bucket empties into it, an empty
+/// bucket fills from it, and an empty hand shows what it holds on the action bar.
+pub(super) fn use_fluid_tank(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) {
+        return false;
+    }
+    let selected = game.selected;
+    let held = game.inventory.get(selected).cloned().flatten();
+    let creative = game.creative;
+    let done = game.native_with_mod_block_entity(pos, |m| {
+        let Some(Kind::FluidTank(t)) = kind(&m.id) else {
+            return None;
+        };
+        let mut tank = get_tank(&m.nbt, "fluid", tier::fluid_tank(t).0);
+        let mut gives = None;
+        let mut used = false;
+        match held.as_ref() {
+            Some(h) if &*h.item == "minecraft:bucket" => {
+                if let Some(bucket) = tank.chemical.as_deref().and_then(fluid_bucket)
+                    && tank.amount >= 1_000
+                {
+                    tank.extract(1_000);
+                    gives = Some(bucket);
+                    used = true;
+                }
+            }
+            Some(h) => {
+                if let Some(f) = bucket_fluid(&h.item)
+                    && FLUIDS.contains(&f.as_str())
+                    && tank.accepts(&f)
+                    && tank.amount + 1_000 <= tank.capacity
+                {
+                    tank.insert(&f, 1_000);
+                    gives = Some("minecraft:bucket".to_owned());
+                    used = true;
+                }
+            }
+            None => {}
+        }
+        put_tank(&mut m.nbt, "fluid", &tank);
+        let line = match tank.chemical.as_deref() {
+            Some(f) if tank.amount > 0 => format!("Fluid Tank: {} / {} mB {f}", tank.amount, tank.capacity),
+            _ => format!("Fluid Tank: empty / {} mB", tank.capacity),
+        };
+        Some((used, gives, line))
+    });
+    let Some(Some((used, gives, line))) = done else {
+        return false;
+    };
+    if let Some(player) = game.native_acting_player() {
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
+    let empty_hand = held.is_none();
+    let Some(held) = held.filter(|_| used) else {
+        return empty_hand;
+    };
+    if !creative && let Some(item) = gives {
+        let left = held.count - 1;
+        if left == 0 {
+            game.inventory[selected] = Some(stack_of(&item, 1));
+        } else {
+            game.inventory[selected] = Some(ItemStack { count: left, ..held });
+            game.give_or_drop(stack_of(&item, 1));
+        }
+    }
+    true
 }
 
 // --- Energy between blocks --------------------------------------------------------------------------

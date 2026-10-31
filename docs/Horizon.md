@@ -341,3 +341,18 @@ tank contents in a screen.
   what does not fit is dropped above it. Slot 1 discharges energy items.
 - Simplified: no filters, no silk touch, no radius or height settings and no screen; the area and depths
   are Mekanism's defaults.
+
+## Fluid tanks and mechanical pipes (milestone 21)
+
+- Fluid Tanks (basic to ultimate, plus creative) hold 32,000 to 256,000 mB (`FluidTankTier`). They take
+  fluid from every side and give it out of their bottom at 1,000 to 64,000 mB a tick. A right click with a
+  bucket fills or empties one (water, lava and Mekanism's fluid buckets), and a right click with an empty
+  hand shows what it holds on the action bar.
+- Mechanical Pipes carry 250 to 32,000 mB a tick (`PipeTier`'s pull rate). They feed the fluid tanks,
+  Electrolytic Separators and Rotary Condensentrators beside them, then share the rest with emptier pipes,
+  as pressurized tubes do with chemicals. They join (M17's shapes) the blocks they serve and the Thermal
+  Evaporation Plant's valves.
+- The plant's valves now take water from the pipes and tanks beside them, and give brine to pipes and
+  tanks as well as separators.
+- Simplified: no fluid screens; tanks drop empty when broken; the Heat Generator does not take lava from
+  pipes yet (only lava buckets).
