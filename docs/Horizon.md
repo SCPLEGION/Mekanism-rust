@@ -498,3 +498,21 @@ deuterium and tritium:
 Simplified: the pump only pumps the block right below it, and only water; liquid lithium goes straight
 from the tower into tubes as a chemical, with no rotary condensentrator step; the activator ignores the
 biome's temperature and rain.
+
+## Thermoelectric Boiler (milestone 30)
+
+`mekanism-core`'s `boiler`, with `BoilerMultiblockData.tick`'s boiling and Mekanism's default config:
+
+- Build a box, 3 to 18 blocks on each side, of Boiler Casing, Boiler Valves and Structural Glass. Inside
+  goes one full layer of Pressure Dispersers, with at least one Superheating Element below it. It holds
+  16 buckets of water per block below the dispersers and 160 buckets of steam per block above them.
+  Valves check the structure once a second, and the first valve runs it.
+- Water comes in from the pipes and fluid tanks beside its valves, and steam goes out of every valve into
+  tubes and chemical tanks (an Industrial Turbine's valves).
+- Heat comes from **Resistive Heaters** placed against its walls. Each one turns its energy usage (100 FE
+  a tick; a right click with an empty hand steps it through 1k, 10k, 100k and 1M) into 60% as much heat.
+  The casing holds 50 heat per block of the box. Over 100 °C, 70% of the heat above the boiling point
+  (capped at 16 MJ a tick per superheating element) boils water at 50 heat per mB of steam.
+- A right click with an empty hand on a valve shows the temperature, boil rate, superheaters and tanks.
+- Simplified: no heated coolant (sodium) from a fission reactor, no valve modes or screen, and the tanks
+  are lost if the first valve is broken.

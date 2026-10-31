@@ -14,6 +14,7 @@ use mekanism_core::gear;
 use mekanism_core::nuclear;
 use mekanism_core::fission;
 use mekanism_core::fusion;
+use mekanism_core::boiler;
 use mekanism_core::isotopes;
 use mekanism_core::turbine;
 use mekanism_core::sides::{Sides, Transmission};
@@ -77,6 +78,10 @@ enum Kind {
     Pump,
     /// The Solar Neutron Activator: lithium into tritium in the sun.
     Activator,
+    /// A Thermoelectric Boiler's valve; the first valve runs it.
+    BoilerValve,
+    /// The Resistive Heater: energy into heat for a boiler.
+    Heater,
     /// The Chemical Washer: dirty slurry and water into clean slurry.
     Washer,
     /// The Chemical Crystallizer: a chemical into an item.
@@ -120,6 +125,8 @@ fn kind(id: &str) -> Option<Kind> {
         fusion::PORT => return Some(Kind::FusionPort),
         "mekanism:electric_pump" => return Some(Kind::Pump),
         "mekanism:solar_neutron_activator" => return Some(Kind::Activator),
+        boiler::VALVE => return Some(Kind::BoilerValve),
+        boiler::HEATER => return Some(Kind::Heater),
         "mekanism:chemical_washer" => return Some(Kind::Washer),
         "mekanism:chemical_crystallizer" => return Some(Kind::Crystallizer),
         _ => {}
@@ -265,6 +272,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         }
         Kind::Pump => tick_pump(game, pos, entity),
         Kind::Activator => tick_activator(game, pos, entity),
+        Kind::BoilerValve => tick_boiler_valve(game, pos, entity),
+        Kind::Heater => tick_heater(entity),
         Kind::Washer => tick_washer(game, pos, entity),
         Kind::Crystallizer => tick_crystallizer(entity),
         Kind::Advanced(m) => tick_advanced(game, entity, m),
@@ -1585,6 +1594,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::FusionPort
                 | Kind::Washer
                 | Kind::Pump
+                | Kind::BoilerValve
         ),
         "tube" => matches!(
             kind,
@@ -1603,6 +1613,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Washer
                 | Kind::Crystallizer
                 | Kind::Activator
+                | Kind::BoilerValve
         ),
         // The blocks with item slots (`block_entity_container`).
         "transporter" => matches!(
@@ -2319,6 +2330,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Advanced(m) => Some((m.usage * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
         Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE, u64::MAX)),
         Kind::Rotary => Some((machine::STORAGE_MULTIPLIER * chem::ROTARY_USAGE, u64::MAX)),
+        Kind::Heater => Some((machine::STORAGE_MULTIPLIER * heater_usage(nbt), u64::MAX)),
         Kind::Pump => {
             let u = upgrades(nbt);
             let usage = u.energy_per_tick(isotopes::PUMP_USAGE);
@@ -3253,6 +3265,222 @@ pub(super) fn use_fusion(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
             })
         })
         .unwrap_or_else(|| "Fusion Reactor: not formed".to_owned());
+    if let Some(player) = game.native_acting_player() {
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
+    true
+}
+
+// --- Thermoelectric Boiler ---------------------------------------------------------------------------
+
+/// `BoilerValidator`, simplified: the frame blocks joined to `start` must be the shell of a box 3 to 18
+/// on each side, with air, superheating elements and one full layer of pressure dispersers inside, the
+/// elements below the dispersers. The boiler, its valves and the Resistive Heaters touching its walls.
+#[allow(clippy::type_complexity)]
+fn find_boiler(game: &Game<'_>, start: [i32; 3]) -> Option<(boiler::Boiler, Vec<[i32; 3]>, Vec<[i32; 3]>)> {
+    let (lo, hi, seen) = find_box(game, start, boiler::is_frame, boiler::MIN_SIZE, boiler::MAX_SIZE)?;
+    let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
+    let mut b = boiler::Boiler { volume: size(0) * size(1) * size(2), ..Default::default() };
+    let mut valves = Vec::new();
+    let mut dispersers = Vec::new();
+    let mut elements = Vec::new();
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                let at = [x, y, z];
+                let shell = x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2];
+                let name = block_name(game, at);
+                if shell {
+                    if !seen.contains(&at) {
+                        return None;
+                    }
+                    if name == boiler::VALVE {
+                        valves.push(at);
+                    }
+                    continue;
+                }
+                match name {
+                    boiler::DISPERSER => dispersers.push(at),
+                    boiler::ELEMENT => elements.push(at),
+                    "minecraft:air" | "minecraft:cave_air" => {}
+                    _ => return None,
+                }
+            }
+        }
+    }
+    // One full layer of dispersers, with the elements below it.
+    let layer = dispersers.first()?[1];
+    let inner = (size(0) - 2) * (size(2) - 2);
+    if dispersers.len() as u64 != inner || dispersers.iter().any(|d| d[1] != layer) || elements.is_empty() || elements.iter().any(|e| e[1] >= layer) {
+        return None;
+    }
+    b.elements = elements.len() as u64;
+    b.water_volume = inner * (layer - lo[1] - 1) as u64;
+    b.steam_volume = inner * (hi[1] - layer - 1) as u64;
+    if b.water_volume == 0 || b.steam_volume == 0 {
+        return None;
+    }
+    // Heaters against a wall, outside the box.
+    let mut heaters = Vec::new();
+    for x in lo[0] - 1..=hi[0] + 1 {
+        for y in lo[1] - 1..=hi[1] + 1 {
+            for z in lo[2] - 1..=hi[2] + 1 {
+                let at = [x, y, z];
+                let outside = (0..3).filter(|&k| at[k] < lo[k] || at[k] > hi[k]).count();
+                if outside == 1 && block_name(game, at) == boiler::HEATER {
+                    heaters.push(at);
+                }
+            }
+        }
+    }
+    Some((b, valves, heaters))
+}
+
+fn positions(nbt: &Compound, key: &str) -> Vec<[i32; 3]> {
+    match nbt.get(&JavaString::from(key)) {
+        Some(Tag::IntArray(v)) => v.chunks(3).filter(|c| c.len() == 3).map(|c| [c[0], c[1], c[2]]).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn boiler_of(nbt: &Compound) -> boiler::Boiler {
+    boiler::Boiler {
+        elements: get_long(nbt, "elements"),
+        volume: get_long(nbt, "volume"),
+        water_volume: get_long(nbt, "water_volume"),
+        steam_volume: get_long(nbt, "steam_volume"),
+    }
+}
+
+/// A Thermoelectric Boiler valve. Once a second each valve checks its boiler; the first valve runs it:
+/// it takes water from the pipes and fluid tanks beside the valves and the heat of the Resistive
+/// Heaters against its walls, loses a little heat to the air, boils water over 100 °C into steam and
+/// gives the steam out of every valve.
+fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
+    if ticker == 0 {
+        match find_boiler(game, pos) {
+            Some((b, valves, heaters)) => {
+                for (key, v) in [
+                    ("elements", b.elements),
+                    ("volume", b.volume),
+                    ("water_volume", b.water_volume),
+                    ("steam_volume", b.steam_volume),
+                ] {
+                    put_long(&mut entity.nbt, key, v);
+                }
+                entity.nbt.insert("master".into(), Tag::IntArray(valves.first().copied().unwrap_or(pos).to_vec()));
+                entity.nbt.insert("valves".into(), Tag::IntArray(valves.concat()));
+                entity.nbt.insert("heaters".into(), Tag::IntArray(heaters.concat()));
+            }
+            None => {
+                put_long(&mut entity.nbt, "volume", 0);
+                entity.nbt.remove(&JavaString::from("master"));
+            }
+        }
+    }
+    let b = boiler_of(&entity.nbt);
+    if b.volume == 0 || get_pos(&entity.nbt, "master") != Some(pos) {
+        return None;
+    }
+    let mut water = get_tank(&entity.nbt, "water", b.water_capacity());
+    let mut steam = get_tank(&entity.nbt, "steam", b.steam_capacity());
+    for &v in &positions(&entity.nbt, "valves") {
+        pull_from_carriers(game, v, &mut water, "minecraft:water");
+    }
+    let mut casing = mekanism_core::heat::HeatCapacitor::new(
+        b.heat_capacity(),
+        boiler::CASING_INVERSE_CONDUCTION,
+        boiler::CASING_INVERSE_INSULATION,
+    );
+    if let Some(heat) = get_double(&entity.nbt, "heat") {
+        casing.heat = heat;
+    }
+    for &h in &positions(&entity.nbt, "heaters") {
+        let given = game.native_with_mod_block_entity(h, |m| {
+            let heat = get_double(&m.nbt, "heat_out").unwrap_or(0.0);
+            m.nbt.insert("heat_out".into(), Tag::Double(0f64.to_bits()));
+            heat
+        });
+        casing.handle_heat(given.unwrap_or(0.0));
+    }
+    casing.lose_to_air(boiler::CASING_INVERSE_INSULATION);
+    let water_in = if water.accepts("minecraft:water") { water.amount } else { 0 };
+    let room = if steam.accepts("mekanism:steam") { steam.capacity - steam.amount } else { 0 };
+    let boiled = b.boil(&mut casing.heat, water_in, room);
+    water.extract(boiled);
+    steam.insert("mekanism:steam", boiled);
+    for &v in &positions(&entity.nbt, "valves") {
+        if steam.amount > 0 {
+            push_chemical(game, v, &mut steam, None, u64::MAX, false);
+        }
+    }
+    entity.nbt.insert("heat".into(), Tag::Double(casing.heat.to_bits()));
+    put_tank(&mut entity.nbt, "water", &water);
+    put_tank(&mut entity.nbt, "steam", &steam);
+    put_long(&mut entity.nbt, "boil_rate", boiled);
+    Some(boiled > 0)
+}
+
+/// The Resistive Heater: each tick it turns its energy usage (100 FE by default) into 60% as much heat,
+/// which a boiler beside it takes. Unused heat stays for a second at most.
+fn tick_heater(entity: &mut ModBlockEntity) -> Option<bool> {
+    let usage = heater_usage(&entity.nbt);
+    let mut energy = EnergyContainer::new(machine::STORAGE_MULTIPLIER * usage, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(energy.capacity);
+    let active = energy.consume(usage);
+    let mut heat = get_double(&entity.nbt, "heat_out").unwrap_or(0.0);
+    if active {
+        let made = usage as f64 * boiler::HEATER_EFFICIENCY;
+        heat = (heat + made).min(made * 20.0);
+    }
+    entity.nbt.insert("heat_out".into(), Tag::Double(heat.to_bits()));
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    Some(active)
+}
+
+fn heater_usage(nbt: &Compound) -> u64 {
+    match get_long(nbt, "usage") {
+        0 => boiler::HEATER_USAGE,
+        n => n,
+    }
+}
+
+/// A right click with an empty hand on a Resistive Heater steps its energy usage; on a boiler valve it
+/// shows the boiler's temperature, boil rate and tanks.
+pub(super) fn use_boiler(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || game.inventory.get(game.selected).cloned().flatten().is_some() {
+        return false;
+    }
+    let line = game.native_with_mod_block_entity(pos, |m| match kind(&m.id) {
+        Some(Kind::Heater) => {
+            let usage = boiler::next_heater_usage(heater_usage(&m.nbt));
+            put_long(&mut m.nbt, "usage", usage);
+            Some(Ok(format!("Resistive Heater: {usage} FE/t")))
+        }
+        Some(Kind::BoilerValve) => Some(Err(get_pos(&m.nbt, "master"))),
+        _ => None,
+    });
+    let line = match line.flatten() {
+        None => return false,
+        Some(Ok(line)) => line,
+        Some(Err(master)) => master
+            .and_then(|master| {
+                game.native_with_mod_block_entity(master, |m| {
+                    let b = boiler_of(&m.nbt);
+                    let heat = get_double(&m.nbt, "heat").unwrap_or(b.heat_capacity() * boiler::BOIL_TEMP);
+                    let [water, steam] = ["water", "steam"].map(|k| get_tank(&m.nbt, k, u64::MAX).amount);
+                    format!(
+                        "Boiler: {:.1} K, boiling {} mB/t, {} superheaters, water {water}, steam {steam}",
+                        heat / b.heat_capacity().max(1.0),
+                        get_long(&m.nbt, "boil_rate"),
+                        b.elements,
+                    )
+                })
+            })
+            .unwrap_or_else(|| "Boiler: not formed".to_owned()),
+    };
     if let Some(player) = game.native_acting_player() {
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
