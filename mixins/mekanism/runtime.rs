@@ -35,6 +35,8 @@ enum Kind {
     EnergyCube(BaseTier),
     /// A universal cable and what it carries in a tick.
     Cable(u64),
+    /// A pressurized tube and the mB it carries in a tick.
+    Tube(u64),
     Oxidizer,
     Separator,
     GasGenerator,
@@ -66,6 +68,10 @@ fn kind(id: &str) -> Option<Kind> {
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_universal_cable")) {
         let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
         return tier::universal_cable(tier).map(Kind::Cable);
+    }
+    if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_pressurized_tube")) {
+        let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
+        return tier::pressurized_tube(tier).map(Kind::Tube);
     }
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_chemical_tank")) {
         return BaseTier::ALL.into_iter().find(|t| t.name() == tier).map(Kind::ChemicalTank);
@@ -158,6 +164,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         Kind::GasGenerator => tick_gas_generator(game, pos, entity),
         Kind::ChemicalTank(t) => {
             tick_chemical_tank(game, pos, entity, t);
+            None
+        }
+        Kind::Tube(rate) => {
+            tick_tube(game, pos, entity, rate);
             None
         }
     };
@@ -623,10 +633,13 @@ fn put_tank(nbt: &mut Compound, key: &str, t: &ChemicalTank) {
     }
 }
 
-/// Where a neighbour keeps chemicals it accepts: its NBT key and capacity, for `chemical`.
-fn chemical_receiver(id: &str, chemical: &str) -> Option<(&'static str, u64)> {
+/// Where a neighbour keeps chemicals it accepts: its NBT key and capacity, for `chemical`. Tubes take
+/// from machines and tanks but not from other tubes, which share by gradient instead (`tick_tube`).
+/// `d` is the receiver's offset from the giver: a tank takes nothing into its bottom, its output side.
+fn chemical_receiver(id: &str, chemical: &str, from_tube: bool, d: [i32; 3]) -> Option<(&'static str, u64)> {
     match kind(id)? {
-        Kind::ChemicalTank(t) => Some(("chemical", chem::chemical_tank(t).0)),
+        Kind::Tube(rate) if !from_tube => Some(("chemical", rate)),
+        Kind::ChemicalTank(t) if d != [0, 1, 0] => Some(("chemical", chem::chemical_tank(t).0)),
         Kind::GasGenerator if chem::fuel(chemical).is_some() => Some(("fuel", chem::GAS_GENERATOR_TANK)),
         _ => None,
     }
@@ -634,7 +647,14 @@ fn chemical_receiver(id: &str, chemical: &str) -> Option<(&'static str, u64)> {
 
 /// Pushes up to `rate` of `from`'s chemical into the tanks and generators beside `pos` (or only the one
 /// at `only`) that accept it.
-fn push_chemical(game: &mut Game<'_>, pos: [i32; 3], from: &mut ChemicalTank, only: Option<[i32; 3]>, rate: u64) {
+fn push_chemical(
+    game: &mut Game<'_>,
+    pos: [i32; 3],
+    from: &mut ChemicalTank,
+    only: Option<[i32; 3]>,
+    rate: u64,
+    from_tube: bool,
+) {
     let mut budget = rate;
     for (_, d) in DIRECTIONS {
         if only.is_some_and(|o| o != d) {
@@ -649,7 +669,7 @@ fn push_chemical(game: &mut Game<'_>, pos: [i32; 3], from: &mut ChemicalTank, on
         }
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
         let taken = game.native_with_mod_block_entity(at, |m| {
-            let Some((key, capacity)) = chemical_receiver(&m.id, &chemical) else {
+            let Some((key, capacity)) = chemical_receiver(&m.id, &chemical, from_tube, d) else {
                 return 0;
             };
             let mut to = get_tank(&m.nbt, key, capacity);
@@ -693,7 +713,7 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
         }
         _ => progress = 0,
     }
-    push_chemical(game, pos, &mut tank, None, u64::MAX);
+    push_chemical(game, pos, &mut tank, None, u64::MAX, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "output", &tank);
@@ -736,8 +756,8 @@ fn tick_separator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     let mut hydrogen = get_tank(&entity.nbt, "left", chem::SEPARATOR_GAS);
     let mut oxygen = get_tank(&entity.nbt, "right", chem::SEPARATOR_GAS);
     let active = chem::separate_water(&mut water, &mut hydrogen, &mut oxygen, &mut energy);
-    push_chemical(game, pos, &mut hydrogen, None, u64::MAX);
-    push_chemical(game, pos, &mut oxygen, None, u64::MAX);
+    push_chemical(game, pos, &mut hydrogen, None, u64::MAX, false);
+    push_chemical(game, pos, &mut oxygen, None, u64::MAX, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_long(&mut entity.nbt, "water", water);
     put_tank(&mut entity.nbt, "left", &hydrogen);
@@ -769,9 +789,43 @@ fn tick_chemical_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     let (capacity, rate) = chem::chemical_tank(tier);
     let mut tank = get_tank(&entity.nbt, "chemical", capacity);
     if tank.amount > 0 {
-        push_chemical(game, pos, &mut tank, Some([0, -1, 0]), rate);
+        push_chemical(game, pos, &mut tank, Some([0, -1, 0]), rate, false);
         put_tank(&mut entity.nbt, "chemical", &tank);
     }
+}
+
+/// A pressurized tube feeds the tanks, machines and generators beside it, then lets the rest run on
+/// to emptier tubes carrying the same chemical, as `tick_cable` does with energy.
+fn tick_tube(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, rate: u64) {
+    let mut tank = get_tank(&entity.nbt, "chemical", rate);
+    if tank.amount == 0 {
+        return;
+    }
+    push_chemical(game, pos, &mut tank, None, u64::MAX, true);
+    for (_, d) in DIRECTIONS {
+        let Some(chemical) = tank.chemical.clone() else {
+            break;
+        };
+        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        let mine = tank.amount;
+        let given = game.native_with_mod_block_entity(at, |m| {
+            let Some(Kind::Tube(their_rate)) = kind(&m.id) else {
+                return 0;
+            };
+            let mut theirs = get_tank(&m.nbt, "chemical", their_rate);
+            if !theirs.accepts(&chemical) {
+                return 0;
+            }
+            let give = tier::cable_share(mine, theirs.amount);
+            let n = theirs.insert(&chemical, give);
+            put_tank(&mut m.nbt, "chemical", &theirs);
+            n
+        });
+        if let Some(n) = given {
+            tank.extract(n);
+        }
+    }
+    put_tank(&mut entity.nbt, "chemical", &tank);
 }
 
 // --- Energy between blocks --------------------------------------------------------------------------

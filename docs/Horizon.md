@@ -156,7 +156,11 @@ before cables: machines push to every side, tanks out of their bottom.
   tanks. Flame = water, arrow = hydrogen.
 - **Gas-Burning Generator**: burns hydrogen (2 FE/mB) or ethene (8 FE/mB), up to 10 mB a tick scaled by how full its 1,000 mB tank is,
   into a 2,000 FE store and pushes the energy out like the other generators.
-- **Chemical Tanks**, basic to ultimate (64k to 8.192M mB, 1k to 512k mB/t out of the bottom).
+- **Chemical Tanks**, basic to ultimate (64k to 8.192M mB, 1k to 512k mB/t out of the bottom). A tank takes
+  chemicals on every side but its bottom.
+- **Pressurized tubes**, all four tiers (750 to 256,000 mB/t), work like universal cables: on the iron
+  bars template, holding one tick of what they carry, feeding the blocks beside them and passing the rest
+  on to emptier tubes with the same chemical.
 
-Not yet: chemical pipes, the separator's other recipes (brine, sodium), side configuration, and showing
+Not yet: the separator's other recipes (brine, sodium), side configuration, and showing
 tank contents in a screen.
