@@ -394,8 +394,8 @@ The steps from uranium to fissile fuel all run now (`mekanism-core`'s `nuclear`)
    output to its neighbours.
 
 Simplified: no screens of their own (the dissolution chamber uses the furnace menu, with its progress on
-the arrow); no upgrades; the ore slurry recipes of the chamber wait for the washer and crystallizer. The
-fission reactor that burns the fuel comes next.
+the arrow); no upgrades; the ore slurry recipes came with milestone 27. The fission reactor that burns the
+fuel comes next.
 
 ## Fission Reactor (milestone 25)
 
@@ -436,3 +436,20 @@ fission reactor that burns the fuel comes next.
 - A right click with an empty hand on a valve shows the steam, production and stored energy.
 - Simplified: blades are not placed by hand, the layout inside is not checked beyond which blocks are
   allowed, and nothing spins.
+
+## Ore quintupling (milestone 27)
+
+`tools/gen_slurry_table.py` writes `core/src/slurry_table.rs` from the recipe data: 23 dissolution, 7
+washing and 10 crystallizing recipes. With milestone 10's injection chamber, an ore now goes 5×:
+
+1. The Chemical Dissolution Chamber dissolves an ore (or 3 raw ores, or a raw block) in sulfuric acid into
+   1,000 mB (2,000 mB, 9,000 mB) of its dirty slurry.
+2. The new **Chemical Washer** turns each mB of dirty slurry and 5 mB of water (piped in) into a mB of
+   clean slurry, at 5 FE a tick, and pushes it to the tanks and tubes beside it.
+3. The new **Chemical Crystallizer** turns 200 mB of clean slurry into a crystal in its last slot over 200
+   ticks at 15 FE a tick (brine into salt, antimatter into a pellet the same way). Pipe the slurry in, and
+   take the crystals with a hopper or transporter.
+4. The injection chamber turns crystals into shards, and the purification chamber turns shards into
+   clumps.
+
+Simplified: the washer and crystallizer have no screens of their own and no bucket or upgrade slots.

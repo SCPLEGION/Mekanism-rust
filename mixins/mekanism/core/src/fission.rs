@@ -65,7 +65,11 @@ impl Reactor {
 
 /// The next burn rate after `now`, wrapping to the lowest past the reactor's maximum.
 pub fn next_burn(now: u64, max: u64) -> u64 {
-    BURN_STEPS.iter().copied().find(|&s| s > now && s <= max).unwrap_or(DEFAULT_BURN_TENTHS.min(max.max(1)))
+    BURN_STEPS
+        .iter()
+        .copied()
+        .find(|&s| s > now && s <= max)
+        .unwrap_or(DEFAULT_BURN_TENTHS.min(max.max(1)))
 }
 
 /// One tick's burn: tenths burned, mB of fuel taken (whole mB, as `partial` tenths add up), water
@@ -78,10 +82,21 @@ pub struct Burn {
     pub waste: u64,
 }
 
-pub fn burn(rate_tenths: u64, partial: &mut u64, fuel: u64, water: u64, steam_room: u64, waste_room: u64) -> Option<Burn> {
+pub fn burn(
+    rate_tenths: u64,
+    partial: &mut u64,
+    fuel: u64,
+    water: u64,
+    steam_room: u64,
+    waste_room: u64,
+) -> Option<Burn> {
     let tenths = rate_tenths.min(fuel * 10 + *partial);
     if tenths == 0 {
-        return Some(Burn { fuel: 0, steam: 0, waste: 0 });
+        return Some(Burn {
+            fuel: 0,
+            steam: 0,
+            waste: 0,
+        });
     }
     let steam = tenths * STEAM_PER_TENTH;
     if water < steam || steam_room < steam {
@@ -94,7 +109,11 @@ pub fn burn(rate_tenths: u64, partial: &mut u64, fuel: u64, water: u64, steam_ro
     if waste_room < taken {
         return None;
     }
-    Some(Burn { fuel: taken, steam, waste: taken })
+    Some(Burn {
+        fuel: taken,
+        steam,
+        waste: taken,
+    })
 }
 
 #[cfg(test)]
@@ -117,12 +136,22 @@ mod tests {
     fn no_water_stops_the_reactor() {
         let mut partial = 0;
         assert_eq!(burn(10, &mut partial, 5, 19_999, u64::MAX, 100), None);
-        assert_eq!(burn(10, &mut partial, 0, 0, 0, 0), Some(Burn { fuel: 0, steam: 0, waste: 0 }));
+        assert_eq!(
+            burn(10, &mut partial, 0, 0, 0, 0),
+            Some(Burn {
+                fuel: 0,
+                steam: 0,
+                waste: 0
+            })
+        );
     }
 
     #[test]
     fn reactors_count_assemblies_and_step_rates() {
-        let mut r = Reactor { volume: 27, ..Default::default() };
+        let mut r = Reactor {
+            volume: 27,
+            ..Default::default()
+        };
         assert!(r.add_inside("mekanismgenerators:fission_fuel_assembly"));
         assert!(!r.add_inside("minecraft:stone"));
         assert_eq!((r.fuel_capacity(), r.max_burn_tenths()), (8_000, 10));

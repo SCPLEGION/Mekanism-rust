@@ -69,6 +69,10 @@ enum Kind {
     FissionPort,
     /// An Industrial Turbine's valve; the first valve runs it.
     TurbineValve,
+    /// The Chemical Washer: dirty slurry and water into clean slurry.
+    Washer,
+    /// The Chemical Crystallizer: a chemical into an item.
+    Crystallizer,
     /// A mechanical pipe and the mB of fluid it carries in a tick.
     Pipe(u64),
 }
@@ -105,6 +109,8 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:isotopic_centrifuge" => return Some(Kind::Centrifuge),
         "mekanismgenerators:fission_reactor_port" => return Some(Kind::FissionPort),
         TURBINE_VALVE => return Some(Kind::TurbineValve),
+        "mekanism:chemical_washer" => return Some(Kind::Washer),
+        "mekanism:chemical_crystallizer" => return Some(Kind::Crystallizer),
         _ => {}
     }
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_universal_cable")) {
@@ -186,6 +192,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         // The oxidizer's item goes in the first slot; the separator takes water buckets there and gives
         // the empty buckets back in the last.
         Some(Kind::Oxidizer | Kind::Dissolution) => (vec![0], vec![]),
+        // The crystallizer's crystals come out of the last slot.
+        Some(Kind::Crystallizer) => (vec![], vec![2]),
         Some(Kind::Separator) => (vec![0], vec![2]),
         // An advanced machine's middle slot takes items that turn into its chemical (flint → oxygen).
         Some(Kind::Advanced(_)) => (vec![0, 1], vec![2]),
@@ -240,6 +248,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             None
         }
         Kind::TurbineValve => tick_turbine_valve(game, pos, entity),
+        Kind::Washer => tick_washer(game, pos, entity),
+        Kind::Crystallizer => tick_crystallizer(entity),
         Kind::Advanced(m) => tick_advanced(game, entity, m),
         Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
         Kind::Evaporation => tick_evaporation(game, pos, entity),
@@ -768,6 +778,9 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
             Kind::FluidTank(t) if d != [0, 1, 0] => Some(("fluid", tier::fluid_tank(t).0)),
             Kind::Separator if chem::separates(chemical) => Some(("fluid", chem::SEPARATOR_FLUID)),
             Kind::Rotary if chem::rotary_chemical(chemical).is_some() => Some(("fluid", chem::ROTARY_TANK)),
+            Kind::Washer if chemical == "minecraft:water" => Some(("fluid", nuclear::WASHER_TANK)),
+            // Brine crystallizes into salt.
+            Kind::Crystallizer if nuclear::find_crystallizing(chemical).is_some() => Some(("input", nuclear::CRYSTALLIZER_TANK)),
             _ => None,
         };
     }
@@ -792,6 +805,8 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
         Kind::GasGenerator if chem::fuel(chemical).is_some() => Some(("fuel", chem::GAS_GENERATOR_TANK)),
         Kind::Dissolution if nuclear::dissolves_with(chemical) => Some(("input", nuclear::DISSOLUTION_TANK)),
         Kind::Centrifuge if nuclear::centrifuging(chemical).is_some() => Some(("input", nuclear::CENTRIFUGE_TANK)),
+        Kind::Washer if nuclear::find_washing(chemical).is_some() => Some(("input", nuclear::WASHER_TANK)),
+        Kind::Crystallizer if nuclear::find_crystallizing(chemical).is_some() => Some(("input", nuclear::CRYSTALLIZER_TANK)),
         _ => None,
     }
 }
@@ -977,7 +992,7 @@ fn tick_dissolution(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     let recipe = entity.items.first().cloned().flatten().and_then(|stack| {
         let items = world_items!(game);
         let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
-        nuclear::find_dissolution(&stack.item, &in_tag).map(|r| (stack, *r))
+        nuclear::find_dissolution(&stack.item, stack.count, &in_tag).map(|r| (stack, *r))
     });
     match recipe {
         Some((stack, r))
@@ -993,7 +1008,7 @@ fn tick_dissolution(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
                 if progress >= nuclear::DISSOLUTION_TICKS {
                     progress = 0;
                     output.insert(r.output, r.amount);
-                    let left = stack.count - 1;
+                    let left = stack.count - r.count;
                     entity.items[0] = (left > 0).then(|| ItemStack { count: left, ..stack });
                 }
             }
@@ -1043,6 +1058,77 @@ fn tick_centrifuge(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
         1000,
         (input.amount * 1000 / nuclear::CENTRIFUGE_TANK) as i32,
         1000,
+    ];
+    Some(active)
+}
+
+/// The Chemical Washer: each tick, a dirty slurry piped in and water from pipes make the clean slurry,
+/// pushed out to the tanks and tubes beside it.
+fn tick_washer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = machine::STORAGE_MULTIPLIER * nuclear::WASHER_USAGE;
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut input = get_tank(&entity.nbt, "input", nuclear::WASHER_TANK);
+    let mut water = get_tank(&entity.nbt, "fluid", nuclear::WASHER_TANK);
+    let mut output = get_tank(&entity.nbt, "output", nuclear::WASHER_TANK);
+    let mut active = false;
+    if let Some(r) = input.chemical.as_deref().and_then(nuclear::find_washing)
+        && input.amount >= r.input_amount
+        && water.chemical.as_deref() == Some("minecraft:water")
+        && water.amount >= r.water
+        && output.accepts(r.output)
+        && output.amount + r.amount <= output.capacity
+        && energy.consume(nuclear::WASHER_USAGE)
+    {
+        input.extract(r.input_amount);
+        water.extract(r.water);
+        output.insert(r.output, r.amount);
+        active = true;
+    }
+    push_chemical(game, pos, &mut output, None, u64::MAX, false);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_tank(&mut entity.nbt, "input", &input);
+    put_tank(&mut entity.nbt, "fluid", &water);
+    put_tank(&mut entity.nbt, "output", &output);
+    Some(active)
+}
+
+/// The Chemical Crystallizer: over 200 ticks, a clean slurry (or brine) piped in becomes its crystal (or
+/// salt) in the last slot.
+fn tick_crystallizer(entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = machine::STORAGE_MULTIPLIER * nuclear::CRYSTALLIZER_USAGE;
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut input = get_tank(&entity.nbt, "input", nuclear::CRYSTALLIZER_TANK);
+    let mut progress = get_int(&entity.nbt, "progress");
+    let mut active = false;
+    let out = entity.items.get(2).cloned().flatten();
+    match input.chemical.as_deref().and_then(nuclear::find_crystallizing) {
+        Some(r)
+            if input.amount >= r.amount
+                && out.as_ref().is_none_or(|o| &*o.item == r.output && o.count + r.count <= 64) =>
+        {
+            if energy.consume(nuclear::CRYSTALLIZER_USAGE) {
+                active = true;
+                progress += 1;
+                if progress >= nuclear::CRYSTALLIZER_TICKS {
+                    progress = 0;
+                    input.extract(r.amount);
+                    let count = out.map_or(0, |o| o.count) + r.count;
+                    entity.items[2] = Some(stack_of(r.output, count));
+                }
+            }
+        }
+        _ => progress = 0,
+    }
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "progress", progress);
+    put_tank(&mut entity.nbt, "input", &input);
+    entity.data = vec![
+        (energy.stored * 1000 / capacity) as i32,
+        1000,
+        progress as i32,
+        nuclear::CRYSTALLIZER_TICKS as i32,
     ];
     Some(active)
 }
@@ -1475,6 +1561,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::HeatGenerator
                 | Kind::FissionPort
                 | Kind::TurbineValve
+                | Kind::Washer
         ),
         "tube" => matches!(
             kind,
@@ -1489,6 +1576,8 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Centrifuge
                 | Kind::FissionPort
                 | Kind::TurbineValve
+                | Kind::Washer
+                | Kind::Crystallizer
         ),
         // The blocks with item slots (`block_entity_container`).
         "transporter" => matches!(
@@ -1498,6 +1587,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::HeatGenerator
                 | Kind::Oxidizer
                 | Kind::Dissolution
+                | Kind::Crystallizer
                 | Kind::Separator
                 | Kind::Advanced(_)
                 | Kind::Evaporation
@@ -2178,6 +2268,8 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Oxidizer => Some((chem::OXIDIZER_USAGE * u64::from(chem::OXIDIZER_TICKS), u64::MAX)),
         Kind::Dissolution => Some((machine::STORAGE_MULTIPLIER * nuclear::DISSOLUTION_USAGE, u64::MAX)),
         Kind::Centrifuge => Some((machine::STORAGE_MULTIPLIER * nuclear::CENTRIFUGE_USAGE, u64::MAX)),
+        Kind::Washer => Some((machine::STORAGE_MULTIPLIER * nuclear::WASHER_USAGE, u64::MAX)),
+        Kind::Crystallizer => Some((machine::STORAGE_MULTIPLIER * nuclear::CRYSTALLIZER_USAGE, u64::MAX)),
         Kind::Separator => Some((machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE, u64::MAX)),
         Kind::Advanced(m) => Some((m.usage * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
         Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE, u64::MAX)),
