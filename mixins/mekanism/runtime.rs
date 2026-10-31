@@ -11,6 +11,7 @@ use mekanism_core::chemical::{self as chem, ChemicalTank};
 use mekanism_core::energy::{Action, EnergyContainer};
 use mekanism_core::evaporation as evap;
 use mekanism_core::gear;
+use mekanism_core::nuclear;
 use mekanism_core::sides::{Sides, Transmission};
 use mekanism_core::factory::{self, Factory};
 use mekanism_core::generator::HeatGenerator;
@@ -58,6 +59,10 @@ enum Kind {
     ChemicalTank(BaseTier),
     DigitalMiner,
     FluidTank(BaseTier),
+    /// The Chemical Dissolution Chamber: an item and a chemical each tick into a chemical.
+    Dissolution,
+    /// The Isotopic Centrifuge: a chemical into another.
+    Centrifuge,
     /// A mechanical pipe and the mB of fluid it carries in a tick.
     Pipe(u64),
 }
@@ -90,6 +95,8 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:induction_port" => return Some(Kind::InductionPort),
         "mekanism:metallurgic_infuser" => return Some(Kind::Infuser),
         "mekanism:electrolytic_separator" => return Some(Kind::Separator),
+        "mekanism:chemical_dissolution_chamber" => return Some(Kind::Dissolution),
+        "mekanism:isotopic_centrifuge" => return Some(Kind::Centrifuge),
         _ => {}
     }
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_universal_cable")) {
@@ -170,7 +177,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::Solar(..)) if block.ends_with("advanced_solar_generator") => (vec![0], vec![]),
         // The oxidizer's item goes in the first slot; the separator takes water buckets there and gives
         // the empty buckets back in the last.
-        Some(Kind::Oxidizer) => (vec![0], vec![]),
+        Some(Kind::Oxidizer | Kind::Dissolution) => (vec![0], vec![]),
         Some(Kind::Separator) => (vec![0], vec![2]),
         // An advanced machine's middle slot takes items that turn into its chemical (flint → oxygen).
         Some(Kind::Advanced(_)) => (vec![0, 1], vec![2]),
@@ -218,6 +225,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             None
         }
         Kind::Oxidizer => tick_oxidizer(game, pos, entity),
+        Kind::Dissolution => tick_dissolution(game, pos, entity),
+        Kind::Centrifuge => tick_centrifuge(game, pos, entity),
         Kind::Advanced(m) => tick_advanced(game, entity, m),
         Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
         Kind::Evaporation => tick_evaporation(game, pos, entity),
@@ -768,6 +777,8 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
             Some((key, cap))
         }
         Kind::GasGenerator if chem::fuel(chemical).is_some() => Some(("fuel", chem::GAS_GENERATOR_TANK)),
+        Kind::Dissolution if nuclear::dissolves_with(chemical) => Some(("input", nuclear::DISSOLUTION_TANK)),
+        Kind::Centrifuge if nuclear::centrifuging(chemical).is_some() => Some(("input", nuclear::CENTRIFUGE_TANK)),
         _ => None,
     }
 }
@@ -936,6 +947,89 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
         1000,
         progress as i32,
         chem::OXIDIZER_TICKS as i32,
+    ];
+    Some(active)
+}
+
+/// The Chemical Dissolution Chamber: an item in the first slot and `per_tick` of the chemical piped in,
+/// every tick for 100 ticks, make the output chemical, pushed out to the tanks beside it.
+fn tick_dissolution(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = machine::STORAGE_MULTIPLIER * nuclear::DISSOLUTION_USAGE;
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut input = get_tank(&entity.nbt, "input", nuclear::DISSOLUTION_TANK);
+    let mut output = get_tank(&entity.nbt, "output", nuclear::DISSOLUTION_TANK);
+    let mut progress = get_int(&entity.nbt, "progress");
+    let mut active = false;
+    let recipe = entity.items.first().cloned().flatten().and_then(|stack| {
+        let items = world_items!(game);
+        let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
+        nuclear::find_dissolution(&stack.item, &in_tag).map(|r| (stack, *r))
+    });
+    match recipe {
+        Some((stack, r))
+            if input.chemical.as_deref() == Some(r.chemical)
+                && input.amount >= r.per_tick
+                && output.accepts(r.output)
+                && output.amount + r.amount <= output.capacity =>
+        {
+            if energy.consume(nuclear::DISSOLUTION_USAGE) {
+                active = true;
+                input.extract(r.per_tick);
+                progress += 1;
+                if progress >= nuclear::DISSOLUTION_TICKS {
+                    progress = 0;
+                    output.insert(r.output, r.amount);
+                    let left = stack.count - 1;
+                    entity.items[0] = (left > 0).then(|| ItemStack { count: left, ..stack });
+                }
+            }
+        }
+        Some(_) => {}
+        None => progress = 0,
+    }
+    push_chemical(game, pos, &mut output, None, u64::MAX, false);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "progress", progress);
+    put_tank(&mut entity.nbt, "input", &input);
+    put_tank(&mut entity.nbt, "output", &output);
+    entity.data = vec![
+        (energy.stored * 1000 / capacity) as i32,
+        1000,
+        progress as i32,
+        nuclear::DISSOLUTION_TICKS as i32,
+    ];
+    Some(active)
+}
+
+/// The Isotopic Centrifuge: each tick it turns its input (uranium hexafluoride, nuclear waste) into its
+/// output and pushes that to the tanks beside it.
+fn tick_centrifuge(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = machine::STORAGE_MULTIPLIER * nuclear::CENTRIFUGE_USAGE;
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut input = get_tank(&entity.nbt, "input", nuclear::CENTRIFUGE_TANK);
+    let mut output = get_tank(&entity.nbt, "output", nuclear::CENTRIFUGE_TANK);
+    let mut active = false;
+    if let Some((need, made, amount)) = input.chemical.as_deref().and_then(nuclear::centrifuging)
+        && input.amount >= need
+        && output.accepts(made)
+        && output.amount + amount <= output.capacity
+        && energy.consume(nuclear::CENTRIFUGE_USAGE)
+    {
+        input.extract(need);
+        output.insert(made, amount);
+        active = true;
+    }
+    push_chemical(game, pos, &mut output, None, u64::MAX, false);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_tank(&mut entity.nbt, "input", &input);
+    put_tank(&mut entity.nbt, "output", &output);
+    entity.data = vec![
+        (energy.stored * 1000 / capacity) as i32,
+        1000,
+        (input.amount * 1000 / nuclear::CENTRIFUGE_TANK) as i32,
+        1000,
     ];
     Some(active)
 }
@@ -1369,6 +1463,8 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Separator
                 | Kind::GasGenerator
                 | Kind::ChemicalTank(_)
+                | Kind::Dissolution
+                | Kind::Centrifuge
         ),
         // The blocks with item slots (`block_entity_container`).
         "transporter" => matches!(
@@ -1377,6 +1473,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Factory(..)
                 | Kind::HeatGenerator
                 | Kind::Oxidizer
+                | Kind::Dissolution
                 | Kind::Separator
                 | Kind::Advanced(_)
                 | Kind::Evaporation
@@ -2046,6 +2143,8 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::EnergyCube(t) if facing_away => Some(tier::energy_cube(t)),
         Kind::Cable(rate) if !from_cable => Some((rate, rate)),
         Kind::Oxidizer => Some((chem::OXIDIZER_USAGE * u64::from(chem::OXIDIZER_TICKS), u64::MAX)),
+        Kind::Dissolution => Some((machine::STORAGE_MULTIPLIER * nuclear::DISSOLUTION_USAGE, u64::MAX)),
+        Kind::Centrifuge => Some((machine::STORAGE_MULTIPLIER * nuclear::CENTRIFUGE_USAGE, u64::MAX)),
         Kind::Separator => Some((machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE, u64::MAX)),
         Kind::Advanced(m) => Some((m.usage * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
         Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE, u64::MAX)),
