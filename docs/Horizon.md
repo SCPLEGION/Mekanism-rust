@@ -354,5 +354,12 @@ tank contents in a screen.
   Evaporation Plant's valves.
 - The plant's valves now take water from the pipes and tanks beside them, and give brine to pipes and
   tanks as well as separators.
-- Simplified: no fluid screens; tanks drop empty when broken; the Heat Generator does not take lava from
-  pipes yet (only lava buckets).
+- Simplified: no fluid screens. Milestone 22 keeps tank contents on breaking and feeds the Heat Generator
+  from pipes.
+
+## Tanks keep their contents, lava by pipe (milestone 22)
+
+- Breaking a fluid tank or chemical tank that holds something (outside creative) drops it with its
+  contents in its custom data (`mekanism:fluid`, `mekanism:chemical`), as energy cubes keep their energy.
+  Placing it again restores them, and the item's tooltip shows "Stored: <amount> mB <id>".
+- The Heat Generator takes lava from the mechanical pipes and fluid tanks beside it, and pipes join it.

@@ -564,6 +564,11 @@ fn tick_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
             };
         }
     }
+    // Lava from the mechanical pipes and fluid tanks beside it.
+    let mut lava = ChemicalTank::new(u64::from(mekanism_core::generator::TANK_CAPACITY));
+    lava.insert("minecraft:lava", u64::from(g.lava));
+    pull_fluid(game, pos, &mut lava, "minecraft:lava");
+    g.lava = lava.amount as u32;
     g.tick();
     // The first slot charges an item from the generator (Mekanism's energy slot).
     charge_slot(entity, 0, &mut g.energy);
@@ -1354,7 +1359,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::FluidTank(_)
                 | Kind::Pipe(_)
         ),
-        "pipe" => matches!(kind, Kind::FluidTank(_) | Kind::Separator | Kind::Rotary),
+        "pipe" => matches!(kind, Kind::FluidTank(_) | Kind::Separator | Kind::Rotary | Kind::HeatGenerator),
         "tube" => matches!(
             kind,
             Kind::Oxidizer
@@ -2280,27 +2285,53 @@ pub(super) fn spend_disassembler_energy(game: &mut Game<'_>, pos: [i32; 3]) {
     }
 }
 
-/// Breaking an energy cube that holds energy outside creative: the block goes as `Level.destroyBlock`
-/// takes it (particles, sound, no loot) and drops the cube with its energy, as Mekanism's loot copies
-/// the energy component. True when it did, so the game's own break is canceled.
+/// The tank a block keeps in its item when broken (Mekanism's loot copies its fluid or chemical
+/// component): its key in the block entity's NBT and in the item's custom data.
+fn kept_tank(kind: Kind) -> Option<(&'static str, &'static str, u64)> {
+    match kind {
+        Kind::FluidTank(t) => Some(("fluid", FLUID_KEY, tier::fluid_tank(t).0)),
+        Kind::ChemicalTank(t) => Some(("chemical", CHEMICAL_KEY, chem::chemical_tank(t).0)),
+        _ => None,
+    }
+}
+
+const FLUID_KEY: &str = "mekanism:fluid";
+const CHEMICAL_KEY: &str = "mekanism:chemical";
+
+/// Breaking an energy cube that holds energy, or a fluid or chemical tank that holds something, outside
+/// creative: the block goes as `Level.destroyBlock` takes it (particles, sound, no loot) and drops its
+/// item with what it held, as Mekanism's loot copies the energy and tank components. True when it did,
+/// so the game's own break is canceled.
 pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     if !game.native_on(MOD_ID) || game.creative {
         return false;
     }
-    let held = game.native_with_mod_block_entity(pos, |m| match kind(&m.id) {
-        Some(Kind::EnergyCube(_)) => Some((m.id.clone(), get_long(&m.nbt, "energy"), m.items.clone())),
-        _ => None,
+    let held = game.native_with_mod_block_entity(pos, |m| {
+        let k = kind(&m.id)?;
+        let stack = match k {
+            Kind::EnergyCube(_) => {
+                let energy = get_long(&m.nbt, "energy");
+                (energy > 0).then(|| with_energy(&m.id, energy))?
+            }
+            _ => {
+                let (key, item_key, _) = kept_tank(k)?;
+                let Some(Tag::Compound(tank)) = m.nbt.get(&JavaString::from(key)) else {
+                    return None;
+                };
+                let mut stack = stack_of(&m.id, 1);
+                set_custom_compound(&mut stack, item_key, tank.clone());
+                stack
+            }
+        };
+        Some((stack, m.items.clone()))
     });
-    let Some(Some((id, energy, items))) = held else {
+    let Some(Some((stack, items))) = held else {
         return false;
     };
-    if energy == 0 {
-        return false;
-    }
     let at = horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]);
-    // The items in its charge and discharge slots drop beside it.
+    // The items in its slots drop beside it.
     let mut drops = items;
-    drops.push(Some(with_energy(&id, energy)));
+    drops.push(Some(stack));
     game.with_level(|b, level, ticks| {
         b.destroy_block(level, ticks, at, false);
         level.drop_lost_contents(at, drops);
@@ -2308,16 +2339,46 @@ pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     true
 }
 
-/// A placed energy cube takes the energy its item held.
+/// Sets a compound in an item's custom data, keeping the rest of it.
+fn set_custom_compound(stack: &mut ItemStack, key: &str, value: Compound) {
+    let extra = stack.extra.get_or_insert_with(Default::default);
+    let at = extra.other.iter().position(|(k, d)| k == "minecraft:custom_data" && matches!(d, Tag::Compound(_)));
+    let at = at.unwrap_or_else(|| {
+        extra.other.retain(|(k, _)| k != "minecraft:custom_data");
+        extra.other.push(("minecraft:custom_data".to_owned(), Tag::Compound(Compound::new())));
+        extra.other.len() - 1
+    });
+    if let Tag::Compound(c) = &mut extra.other[at].1 {
+        c.insert(key.into(), Tag::Compound(value));
+    }
+}
+
+/// The tank an item holds under `key` in its custom data.
+fn item_tank(stack: &ItemStack, key: &str, capacity: u64) -> Option<ChemicalTank> {
+    let mut c = Compound::new();
+    c.insert("t".into(), custom_data(stack)?.get(&JavaString::from(key))?.clone());
+    let tank = get_tank(&c, "t", capacity);
+    (tank.amount > 0).then_some(tank)
+}
+
+/// A placed energy cube or tank takes what its item held.
 pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
-    let energy = stored_energy(stack);
-    if energy == 0 || !game.native_on(MOD_ID) {
+    if !game.native_on(MOD_ID) || custom_data(stack).is_none() {
         return;
     }
-    game.native_with_mod_block_entity(pos, |m| {
-        if let Some(Kind::EnergyCube(t)) = kind(&m.id) {
+    let energy = stored_energy(stack);
+    game.native_with_mod_block_entity(pos, |m| match kind(&m.id) {
+        Some(Kind::EnergyCube(t)) if energy > 0 => {
             put_long(&mut m.nbt, "energy", energy.min(tier::energy_cube(t).0));
         }
+        Some(k) => {
+            if let Some((key, item_key, capacity)) = kept_tank(k)
+                && let Some(tank) = item_tank(stack, item_key, capacity)
+            {
+                put_tank(&mut m.nbt, key, &tank);
+            }
+        }
+        None => {}
     });
 }
 
@@ -2334,6 +2395,14 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
         let mode = disassembler_mode(stack);
         let line = format!("Mode: {} (efficiency {})", mode.label(), mode.efficiency());
         lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+    }
+    for key in [FLUID_KEY, CHEMICAL_KEY] {
+        if let Some(tank) = item_tank(stack, key, u64::MAX)
+            && let Some(id) = tank.chemical.as_deref()
+        {
+            let line = format!("Stored: {} mB {id}", tank.amount);
+            lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+        }
     }
     let energy = stored_energy(stack);
     if energy == 0 {
