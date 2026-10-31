@@ -54,3 +54,26 @@ python3 tools/package.py                   # target/mekanism-0.1.0.hnmod
 
 Install the `.hnmod` from the Horizon launcher's Mods page (or `horizon-launcher native-build <folder>
 --trust-native-code`). It is native code: the launcher builds a game for the instance it is installed in.
+
+## Content (milestone 1)
+
+`python3 tools/carry_content.py` turns this repository's data into four Horizon content mods, one per
+module and namespace (Horizon declares a content mod's blocks and items only under its own id):
+`target/content/{mekanism,mekanismgenerators,mekanismadditions,mekanismtools}-0.1.0.hmod`. Each carries
+the module's assets, data, and its additions to vanilla and `c` tags, plus:
+
+- a block declaration per blockstate, copying a vanilla template chosen from what the block is (ores →
+  iron ore, machines with a facing → furnace, transmitters → iron bars, slabs, stairs, fences, glass...);
+  for furnace-templated blocks the blockstate's `active` property is renamed to the furnace's `lit`;
+- an item declaration per item that is not a block's item (tools and armour copy the iron ones);
+- Mekanism's ores as vanilla `minecraft:ore` features with `OreType.java`'s default sizes.
+- NeoForge's convention (`c`) item tags on vanilla items that Mekanism's recipes use (`#c:ingots/iron`...),
+  written by hand in `tools/convention_tags.py`, since vanilla Horizon has none.
+
+`cargo horizon-mod check <file>` (from the Horizon repository) accepts all four. Put them in the game
+folder's `horizon-mods/` and turn them on under Options > Mods.
+
+Ores are placed by Mekanism's NeoForge biome modifiers (`data/mekanism/neoforge/biome_modifier/`), which
+the Horizon fork reads from content mods since its `milestone/m1-content` branch. Known gaps: the salt disk and the retrogen features use Mekanism's own feature types and are left out; models with
+NeoForge loaders (OBJ, transmitters) show as missing; machine recipe types (crushing, enriching...) load
+only once the native mod reads them; Tools' items keep the iron templates' damage and durability.
