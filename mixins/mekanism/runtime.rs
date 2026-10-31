@@ -38,6 +38,7 @@ enum Kind {
     /// A pressurized tube and the mB it carries in a tick.
     Tube(u64),
     Oxidizer,
+    Purifier,
     Separator,
     GasGenerator,
     ChemicalTank(BaseTier),
@@ -62,6 +63,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanismgenerators:wind_generator" => return Some(Kind::Wind),
         "mekanismgenerators:gas_burning_generator" => return Some(Kind::GasGenerator),
         "mekanism:chemical_oxidizer" => return Some(Kind::Oxidizer),
+        "mekanism:purification_chamber" => return Some(Kind::Purifier),
         "mekanism:electrolytic_separator" => return Some(Kind::Separator),
         _ => {}
     }
@@ -127,6 +129,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         // the empty buckets back in the last.
         Some(Kind::Oxidizer) => (vec![0], vec![]),
         Some(Kind::Separator) => (vec![0], vec![2]),
+        Some(Kind::Purifier) => (vec![0], vec![2]),
         _ => return,
     };
     *container = Some(ModContainer {
@@ -160,6 +163,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             None
         }
         Kind::Oxidizer => tick_oxidizer(game, pos, entity),
+        Kind::Purifier => tick_purifier(game, pos, entity),
         Kind::Separator => tick_separator(game, pos, entity),
         Kind::GasGenerator => tick_gas_generator(game, pos, entity),
         Kind::ChemicalTank(t) => {
@@ -640,6 +644,7 @@ fn chemical_receiver(id: &str, chemical: &str, from_tube: bool, d: [i32; 3]) -> 
     match kind(id)? {
         Kind::Tube(rate) if !from_tube => Some(("chemical", rate)),
         Kind::ChemicalTank(t) if d != [0, 1, 0] => Some(("chemical", chem::chemical_tank(t).0)),
+        Kind::Purifier if chemical == "mekanism:oxygen" => Some(("chemical", chem::PURIFIER_TANK)),
         Kind::GasGenerator if chem::fuel(chemical).is_some() => Some(("fuel", chem::GAS_GENERATOR_TANK)),
         _ => None,
     }
@@ -722,6 +727,59 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
         1000,
         progress as i32,
         chem::OXIDIZER_TICKS as i32,
+    ];
+    Some(active)
+}
+
+/// The Purification Chamber: an item and 1 mB of oxygen a tick for 200 ticks at 10 FE a tick
+/// (`purifying`: ore → 3 clumps). Oxygen comes in from the separator, tanks or tubes beside it.
+fn tick_purifier(game: &mut Game<'_>, _pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = chem::PURIFIER_USAGE * u64::from(chem::PURIFIER_TICKS);
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut tank = get_tank(&entity.nbt, "chemical", chem::PURIFIER_TANK);
+    let mut progress = get_int(&entity.nbt, "progress");
+    let mut active = false;
+    let recipe = entity.items.first().cloned().flatten().and_then(|stack| {
+        let items = world_items!(game);
+        let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
+        mekanism_core::recipes::find_purifying(&stack.item, stack.count, &in_tag).map(|r| (stack, *r))
+    });
+    let out = entity.items.get(2).cloned().flatten();
+    let fits = |r: &mekanism_core::recipes::ItemChemicalRecipe| match &out {
+        None => true,
+        Some(o) => &*o.item == r.output && o.count + r.output_count <= max_stack(game, r.output),
+    };
+    match recipe {
+        Some((stack, r)) if fits(&r) => {
+            if tank.chemical.as_deref() == Some(r.chemical)
+                && tank.amount >= r.chemical_amount
+                && energy.consume(chem::PURIFIER_USAGE)
+            {
+                active = true;
+                tank.extract(r.chemical_amount);
+                progress += 1;
+                if progress >= chem::PURIFIER_TICKS {
+                    progress = 0;
+                    let left = stack.count - r.input_count;
+                    entity.items[0] = (left > 0).then(|| ItemStack { count: left, ..stack });
+                    entity.items[2] = Some(match out {
+                        Some(o) => ItemStack { count: o.count + r.output_count, ..o },
+                        None => stack_of(r.output, r.output_count),
+                    });
+                }
+            }
+        }
+        _ => progress = 0,
+    }
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "progress", progress);
+    put_tank(&mut entity.nbt, "chemical", &tank);
+    entity.data = vec![
+        (energy.stored * 1000 / capacity) as i32,
+        1000,
+        progress as i32,
+        chem::PURIFIER_TICKS as i32,
     ];
     Some(active)
 }
@@ -897,6 +955,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Cable(rate) if !from_cable => Some((rate, rate)),
         Kind::Oxidizer => Some((chem::OXIDIZER_USAGE * u64::from(chem::OXIDIZER_TICKS), u64::MAX)),
         Kind::Separator => Some((machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE, u64::MAX)),
+        Kind::Purifier => Some((chem::PURIFIER_USAGE * u64::from(chem::PURIFIER_TICKS), u64::MAX)),
         _ => None,
     }
 }

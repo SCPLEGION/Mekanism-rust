@@ -164,3 +164,12 @@ before cables: machines push to every side, tanks out of their bottom.
 
 Not yet: the separator's other recipes (brine, sodium), side configuration, and showing
 tank contents in a screen.
+
+## Ore tripling (milestone 6)
+
+- **Purification Chamber**: `purifying` recipes (28, ore or raw ore → 3 clumps), 10 FE/t over 200 ticks,
+  using 1 mB of oxygen a tick from a 210 mB tank. Oxygen comes from an Electrolytic Separator, a chemical
+  tank or a pressurized tube beside it. Slots: input, (unused), output.
+- The rest of the chain already runs: the Crusher turns clumps into dirty dust and the Enrichment Chamber
+  turns dirty dust into dust, so one ore gives three ingots.
+- Not yet: the middle slot does not take oxygen items, and upgrades do not apply to the chamber.
