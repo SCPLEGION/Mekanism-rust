@@ -222,6 +222,9 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             None
         }
     };
+    if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_)) {
+        show_connections(game, pos, entity);
+    }
     if let Some(active) = active {
         let lit = if active { "true" } else { "false" };
         // Blocks without the furnace's `lit` (the solar generator's iron block) show no state.
@@ -1151,6 +1154,94 @@ fn give_back_bucket(entity: &mut ModBlockEntity) -> bool {
         Some(_) => return false,
     }
     true
+}
+
+// --- Transmitter shapes -----------------------------------------------------------------------------
+
+/// The kind of thing a transmitter carries, from its block id: tiers of one kind join each other.
+fn pipe_family(name: &str) -> Option<&'static str> {
+    let n = name.strip_prefix("mekanism:")?;
+    [
+        ("_universal_cable", "cable"),
+        ("_pressurized_tube", "tube"),
+        ("_logistical_transporter", "transporter"),
+        ("restrictive_transporter", "transporter"),
+        ("diversion_transporter", "transporter"),
+        ("_mechanical_pipe", "pipe"),
+        ("_thermodynamic_conductor", "conductor"),
+    ]
+    .into_iter()
+    .find_map(|(suffix, family)| n.ends_with(suffix).then_some(family))
+}
+
+/// Vanilla blocks with an inventory a transporter feeds and empties.
+fn vanilla_container(name: &str) -> bool {
+    let Some(n) = name.strip_prefix("minecraft:") else {
+        return false;
+    };
+    matches!(n, "chest" | "trapped_chest" | "barrel" | "furnace" | "blast_furnace" | "smoker" | "hopper" | "dropper" | "dispenser" | "brewing_stand")
+        || n.ends_with("shulker_box")
+}
+
+/// Whether a transmitter of `family` reaches into the Mekanism block `kind` (Mekanism's
+/// `TransmitterType` and the capabilities its neighbour offers).
+fn serves(family: &str, kind: Kind) -> bool {
+    match family {
+        "cable" => !matches!(
+            kind,
+            Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::ChemicalTank(_) | Kind::Evaporation
+        ),
+        "tube" => matches!(
+            kind,
+            Kind::Oxidizer
+                | Kind::Advanced(_)
+                | Kind::ChemicalInfuser
+                | Kind::Rotary
+                | Kind::Separator
+                | Kind::GasGenerator
+                | Kind::ChemicalTank(_)
+        ),
+        // The blocks with item slots (`block_entity_container`).
+        "transporter" => matches!(
+            kind,
+            Kind::Machine(..)
+                | Kind::Factory(..)
+                | Kind::HeatGenerator
+                | Kind::Oxidizer
+                | Kind::Separator
+                | Kind::Advanced(_)
+                | Kind::Evaporation
+                | Kind::Rotary
+                | Kind::Infuser
+                | Kind::EnergyCube(_)
+        ),
+        _ => false,
+    }
+}
+
+/// Twice a second a transmitter shows the sides it joins: its block's six direction properties (the
+/// mushroom stem template's) are `false` toward a transmitter of its kind or a block it serves. Mekanism
+/// renders the same from its connection cache.
+fn show_connections(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let ticker = get_int(&entity.nbt, "shape_ticker");
+    put_int(&mut entity.nbt, "shape_ticker", (ticker + 1) % 10);
+    if ticker != 0 {
+        return;
+    }
+    let Some(family) = pipe_family(&entity.id).or_else(|| pipe_family(block_name(game, pos))) else {
+        return;
+    };
+    for (side, d) in DIRECTIONS {
+        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        let name = block_name(game, at).to_owned();
+        let joined = pipe_family(&name) == Some(family)
+            || (family == "transporter" && vanilla_container(&name))
+            || game
+                .native_with_mod_block_entity(at, |m| kind(&m.id))
+                .flatten()
+                .is_some_and(|k| serves(family, k));
+        game.native_set_block_property(pos, side, if joined { "false" } else { "true" });
+    }
 }
 
 // --- Logistical transporters ------------------------------------------------------------------------
