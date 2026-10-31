@@ -11,6 +11,7 @@ use mekanism_core::energy::{Action, EnergyContainer};
 use mekanism_core::generator::HeatGenerator;
 use mekanism_core::machine::{self, ElectricMachine, Operation, Slot};
 use mekanism_core::tier::{self, BaseTier};
+use mekanism_core::upgrades::{Upgrade, Upgrades};
 use std::sync::Arc;
 
 /// The mod id players turn on and off in Options > Mods.
@@ -103,61 +104,242 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
 // --- Machines ---------------------------------------------------------------------------------------
 
 fn tick_machine(game: &mut Game<'_>, entity: &mut ModBlockEntity, recipe: &str, usage: u64) -> Option<bool> {
-    let mut m = ElectricMachine::new(usage);
+    let mut m = ElectricMachine::with_upgrades(usage, upgrades(&entity.nbt));
     m.energy.stored = get_long(&entity.nbt, "energy").min(m.energy.capacity);
     m.progress = get_int(&entity.nbt, "progress");
     let mut input = slot(entity.items.first().cloned().flatten());
+    let mut middle = slot(entity.items.get(1).cloned().flatten());
     let mut output = slot(entity.items.get(2).cloned().flatten());
-    let (operation, max_stack) = match entity.items.first().cloned().flatten() {
-        Some(stack) => find_operation(game, recipe, &stack),
-        None => (None, 64),
+    // The sawmill's secondary output waits in the machine until the output slot takes it; the machine
+    // stops meanwhile, as a full secondary slot stops it in Mekanism.
+    let mut waiting = secondary(&entity.nbt);
+    if let Some((item, count)) = waiting.clone() {
+        let max = max_stack(game, &item);
+        let fits = output.item.as_ref().is_none_or(|i| *i == item) && output.count + count <= max;
+        if fits {
+            output.item = Some(item);
+            output.count += count;
+            waiting = None;
+        }
+    }
+    let (operation, max_stack, chance) = if waiting.is_some() {
+        (None, 64, None)
+    } else {
+        find_operation(game, recipe, entity.items.first().cloned().flatten(), &middle)
     };
-    m.tick(&mut input, &mut output, operation.as_ref(), max_stack);
+    let before = output.count;
+    let extra = (recipe == "combining").then_some(&mut middle);
+    m.tick(&mut input, &mut output, extra, operation.as_ref(), max_stack);
+    if output.count != before
+        && let Some((item, count, p)) = chance
+        && roll(entity) < p
+    {
+        waiting = Some((item, count));
+    }
     set_slot(entity, 0, &input);
+    if recipe == "combining" {
+        set_slot(entity, 1, &middle);
+    }
     set_slot(entity, 2, &output);
     put_long(&mut entity.nbt, "energy", m.energy.stored);
     put_int(&mut entity.nbt, "progress", m.progress);
-    // The furnace menu's bars: the flame shows stored energy, the arrow the progress.
+    set_secondary(&mut entity.nbt, waiting.as_ref());
+    // The furnace menu's bars: the flame shows stored energy, the arrow the progress. Data slots are
+    // 16 bits, so energy goes as thousandths of the capacity.
     entity.data = vec![
-        m.energy.stored as i32,
-        m.energy.capacity as i32,
+        (m.energy.stored * 1000 / m.energy.capacity.max(1)) as i32,
+        1000,
         m.progress as i32,
         m.ticks_required as i32,
     ];
     Some(m.active)
 }
 
-/// The recipe for `stack` in machine kind `recipe`, and the output's stack size.
-fn find_operation(game: &Game<'_>, recipe: &str, stack: &ItemStack) -> (Option<Operation>, u32) {
-    let items = world_items!(game);
-    let max_stack = |id: &str| items.get(id).map_or(64, |i| i.max_stack);
-    if recipe == "smelting" {
-        let Some(cooking) = world_recipes!(game).cook("minecraft:smelting", stack) else {
-            return (None, 64);
-        };
-        let op = Operation {
-            input_count: 1,
-            output: cooking.result.item.to_string(),
-            output_count: cooking.result.count,
-        };
-        let max = max_stack(&op.output);
-        return (Some(op), max);
+fn max_stack(game: &Game<'_>, id: &str) -> u32 {
+    world_items!(game).get(id).map_or(64, |i| i.max_stack)
+}
+
+/// A Precision Sawmill's secondary output still waiting for the output slot.
+fn secondary(nbt: &Compound) -> Option<(String, u32)> {
+    let Some(Tag::Compound(c)) = nbt.get(&JavaString::from("secondary")) else {
+        return None;
+    };
+    let Some(Tag::String(id)) = c.get(&JavaString::from("id")) else {
+        return None;
+    };
+    Some((id.to_string().ok()?, get_int(c, "count").max(1)))
+}
+
+fn set_secondary(nbt: &mut Compound, waiting: Option<&(String, u32)>) {
+    match waiting {
+        Some((id, count)) => {
+            let mut c = Compound::new();
+            c.insert("id".into(), Tag::String(id.as_str().into()));
+            put_int(&mut c, "count", *count);
+            nbt.insert("secondary".into(), Tag::Compound(c));
+        }
+        None => {
+            nbt.remove(&JavaString::from("secondary"));
+        }
     }
+}
+
+/// A number in [0, 1) for the sawmill's chance: a splitmix64 step kept in the block entity, so each
+/// machine has its own sequence that survives saving.
+fn roll(entity: &mut ModBlockEntity) -> f64 {
+    let mut x = get_long(&entity.nbt, "seed") ^ 0x9E37_79B9_7F4A_7C15;
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    put_long(&mut entity.nbt, "seed", x & (i64::MAX as u64));
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// The upgrades installed in a machine (`upgrades` in its NBT: one count per upgrade name).
+fn upgrades(nbt: &Compound) -> Upgrades {
+    let Some(Tag::Compound(c)) = nbt.get(&JavaString::from("upgrades")) else {
+        return Upgrades::default();
+    };
+    let mut u = Upgrades::default();
+    for kind in Upgrade::ALL {
+        u.install(kind, get_int(c, kind.name()));
+    }
+    u
+}
+
+fn set_upgrades(nbt: &mut Compound, u: &Upgrades) {
+    let mut c = Compound::new();
+    for kind in Upgrade::ALL {
+        if u.get(kind) > 0 {
+            put_int(&mut c, kind.name(), u.get(kind));
+        }
+    }
+    nbt.insert("upgrades".into(), Tag::Compound(c));
+}
+
+/// The `mekanism:upgrade_type` in a stack's custom data (the carried recipes put it there).
+fn upgrade_of(stack: &ItemStack) -> Option<Upgrade> {
+    if &*stack.item != "mekanism:upgrade" {
+        return None;
+    }
+    let (_, data) = stack.extra.as_ref()?.other.iter().find(|(k, _)| k == "minecraft:custom_data")?;
+    let Tag::Compound(c) = data else {
+        return None;
+    };
+    match c.get(&JavaString::from("mekanism:upgrade_type")) {
+        Some(Tag::String(id)) => Upgrade::from_id(&id.to_string().ok()?),
+        _ => None,
+    }
+}
+
+/// Right click on a Mekanism machine holding a speed or energy upgrade: one goes in (all that fit when
+/// sneaking), as dropping it in the machine's upgrade tab does. True when the click was used.
+pub(super) fn install_upgrade(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) {
+        return false;
+    }
+    let selected = game.selected;
+    let Some(Some(held)) = game.inventory.get(selected).cloned() else {
+        return false;
+    };
+    let Some(kind) = upgrade_of(&held) else {
+        return false;
+    };
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let want = if sneaking { held.count } else { 1 };
+    let installed = game.native_with_mod_block_entity(pos, |m| {
+        if !matches!(self::kind(&m.id), Some(Kind::Machine(..))) {
+            return None;
+        }
+        let mut u = upgrades(&m.nbt);
+        let n = u.install(kind, want);
+        set_upgrades(&mut m.nbt, &u);
+        Some((n, u.get(kind)))
+    });
+    let Some(Some((n, now))) = installed else {
+        return false;
+    };
+    if n > 0 {
+        let left = held.count - n;
+        game.inventory[selected] = (left > 0).then(|| ItemStack { count: left, ..held });
+    }
+    if let Some(player) = game.native_acting_player() {
+        let line = format!("{} upgrades: {now}/{}", kind.name(), kind.max());
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
+    true
+}
+
+/// What the machine of kind `recipe` does with `stack` in its input (and `middle`, the Combiner's extra
+/// input): the operation, the output's stack size, and the sawmill's secondary output with its chance.
+#[allow(clippy::type_complexity)]
+fn find_operation(
+    game: &Game<'_>,
+    recipe: &str,
+    stack: Option<ItemStack>,
+    middle: &Slot,
+) -> (Option<Operation>, u32, Option<(String, u32, f64)>) {
+    let Some(stack) = stack else {
+        return (None, 64, None);
+    };
+    let items = world_items!(game);
+    let max = |id: &str| items.get(id).map_or(64, |i| i.max_stack);
     let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
-    let Some(r) = mekanism_core::recipes::find(
-        mekanism_core::recipes::table(recipe),
-        &stack.item,
-        stack.count,
-        &in_tag,
-    ) else {
-        return (None, 64);
+    let op = |input_count, extra_count, output: &str, output_count| Operation {
+        input_count,
+        extra_count,
+        output: output.to_owned(),
+        output_count,
     };
-    let op = Operation {
-        input_count: r.input_count,
-        output: r.output.to_owned(),
-        output_count: r.output_count,
-    };
-    (Some(op), max_stack(r.output))
+    match recipe {
+        "smelting" => {
+            let Some(cooking) = world_recipes!(game).cook("minecraft:smelting", &stack) else {
+                return (None, 64, None);
+            };
+            let out = cooking.result.item.to_string();
+            let m = max(&out);
+            (Some(op(1, 0, &out, cooking.result.count)), m, None)
+        }
+        "sawing" => {
+            let Some(r) = mekanism_core::recipes::find_sawing(&stack.item, stack.count, &in_tag) else {
+                return (None, 64, None);
+            };
+            // A recipe with only a secondary output gives it every time here.
+            let (main, chance) = match (r.main, r.secondary) {
+                (Some(main), Some((id, n))) => (main, Some((id.to_owned(), n, r.secondary_chance))),
+                (Some(main), None) => (main, None),
+                (None, Some(sec)) => (sec, None),
+                (None, None) => return (None, 64, None),
+            };
+            (Some(op(r.input_count, 0, main.0, main.1)), max(main.0), chance)
+        }
+        "combining" => {
+            let Some(extra) = middle.item.as_deref() else {
+                return (None, 64, None);
+            };
+            let Some(r) = mekanism_core::recipes::find_combining(
+                (&stack.item, stack.count),
+                (extra, middle.count),
+                &in_tag,
+            ) else {
+                return (None, 64, None);
+            };
+            (Some(op(r.main_count, r.extra_count, r.output, r.output_count)), max(r.output), None)
+        }
+        _ => {
+            let Some(r) = mekanism_core::recipes::find(
+                mekanism_core::recipes::table(recipe),
+                &stack.item,
+                stack.count,
+                &in_tag,
+            ) else {
+                return (None, 64, None);
+            };
+            (Some(op(r.input_count, 0, r.output, r.output_count)), max(r.output), None)
+        }
+    }
 }
 
 // --- Heat Generator ---------------------------------------------------------------------------------
@@ -247,7 +429,7 @@ fn push_energy(game: &mut Game<'_>, pos: [i32; 3], from: &mut EnergyContainer, o
             .and_then(|f| direction(&f))
             .map_or(true, |front| front != back);
         let taken = game.native_with_mod_block_entity(at, |m| {
-            let Some((capacity, rate)) = receiver(&m.id, accepted) else {
+            let Some((capacity, rate)) = receiver(&m.id, &m.nbt, accepted) else {
                 return 0;
             };
             let mut to = EnergyContainer::new(capacity, rate);
@@ -264,9 +446,12 @@ fn push_energy(game: &mut Game<'_>, pos: [i32; 3], from: &mut EnergyContainer, o
 
 /// The energy a neighbour takes: (capacity, rate) when `id` is a Mekanism block that accepts energy on
 /// the side it is offered; a cube refuses on its front (`facing_away` is false there).
-fn receiver(id: &str, facing_away: bool) -> Option<(u64, u64)> {
+fn receiver(id: &str, nbt: &Compound, facing_away: bool) -> Option<(u64, u64)> {
     match kind(id)? {
-        Kind::Machine(_, usage) => Some((ElectricMachine::new(usage).energy.capacity, u64::MAX)),
+        Kind::Machine(_, usage) => Some((
+            ElectricMachine::with_upgrades(usage, upgrades(nbt)).energy.capacity,
+            u64::MAX,
+        )),
         Kind::EnergyCube(t) if facing_away => Some(tier::energy_cube(t)),
         _ => None,
     }

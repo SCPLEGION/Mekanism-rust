@@ -11,6 +11,7 @@ pub mod machine;
 pub mod recipe_table;
 pub mod recipes;
 pub mod tier;
+pub mod upgrades;
 
 /// The four modules of Mekanism and their namespaces, as the Java build registers them.
 pub const NAMESPACES: [&str; 4] = [
