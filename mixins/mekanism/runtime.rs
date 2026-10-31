@@ -149,7 +149,11 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
     }
     let (inputs, outputs) = match kind(block) {
         Some(Kind::Machine(..)) => (vec![0, 1], vec![2]),
-        Some(Kind::HeatGenerator) => (vec![1], vec![]),
+        // The heat generator burns from the middle slot; generators charge an item in the first.
+        Some(Kind::HeatGenerator) => (vec![0, 1], vec![]),
+        Some(Kind::Wind | Kind::GasGenerator) => (vec![0], vec![]),
+        // The plain solar generator is an iron block with no menu.
+        Some(Kind::Solar(..)) if block.ends_with("advanced_solar_generator") => (vec![0], vec![]),
         // The oxidizer's item goes in the first slot; the separator takes water buckets there and gives
         // the empty buckets back in the last.
         Some(Kind::Oxidizer) => (vec![0], vec![]),
@@ -536,6 +540,8 @@ fn tick_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
         }
     }
     g.tick();
+    // The first slot charges an item from the generator (Mekanism's energy slot).
+    charge_slot(entity, 0, &mut g.energy);
     push_energy(game, pos, &mut g.energy, None, false);
     put_long(&mut entity.nbt, "energy", g.energy.stored);
     put_int(&mut entity.nbt, "lava", g.lava);
@@ -582,6 +588,7 @@ fn tick_solar(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, p
         0
     };
     energy.insert(produced, Action::Execute);
+    charge_slot(entity, 0, &mut energy);
     push_energy(game, pos, &mut energy, None, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
     entity.data = vec![(energy.stored * 1000 / storage.max(1)) as i32, 1000, produced as i32, peak as i32];
@@ -608,6 +615,7 @@ fn tick_wind(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) ->
     }
     let produced = if multiplier > 0.0 { g::wind_generation(multiplier) } else { 0 };
     energy.insert(produced, Action::Execute);
+    charge_slot(entity, 0, &mut energy);
     push_energy(game, pos, &mut energy, None, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
     entity.data = vec![(energy.stored * 1000 / g::WIND_STORAGE) as i32, 1000, produced as i32, g::WIND_GENERATION_MAX as i32];
@@ -1619,6 +1627,7 @@ fn tick_gas_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     let mut fuel = get_tank(&entity.nbt, "fuel", chem::GAS_GENERATOR_TANK);
     let (made, _) = chem::burn_fuel(&mut fuel, energy.capacity - energy.stored);
     energy.insert(made, Action::Execute);
+    charge_slot(entity, 0, &mut energy);
     push_energy(game, pos, &mut energy, None, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_tank(&mut entity.nbt, "fuel", &fuel);
@@ -1883,14 +1892,59 @@ fn discharge_slot(entity: &mut ModBlockEntity, index: usize, target: &mut Energy
 
 const DISASSEMBLER: &str = "mekanism:atomic_disassembler";
 
-/// `ItemAtomicDisassembler.getDestroySpeed` (hook point `native_destroy_speed`, API 25): fast while it
-/// holds the energy for the block, slower as it runs out, not at all when empty.
+/// The key in the disassembler's custom data that holds its mode (Mekanism's `disassembler_mode`).
+const MODE_KEY: &str = "mekanism:disassembler_mode";
+
+fn disassembler_mode(stack: &ItemStack) -> gear::DisassemblerMode {
+    let name = custom_data(stack).and_then(|c| match c.get(&JavaString::from(MODE_KEY)) {
+        Some(Tag::String(s)) => s.to_string().ok(),
+        _ => None,
+    });
+    name.as_deref().and_then(gear::DisassemblerMode::from_name).unwrap_or_default()
+}
+
+fn set_disassembler_mode(stack: &mut ItemStack, mode: gear::DisassemblerMode) {
+    let stored = stored_energy(stack);
+    set_energy(stack, stored);
+    if let Some(Tag::Compound(c)) = stack
+        .extra
+        .as_mut()
+        .and_then(|e| e.other.iter_mut().find(|(k, _)| k == "minecraft:custom_data"))
+        .map(|(_, d)| d)
+    {
+        c.insert(MODE_KEY.into(), Tag::String(mode.name().into()));
+    }
+}
+
+/// `ItemAtomicDisassembler.getDestroySpeed` (hook point `native_destroy_speed`, API 25): its mode's
+/// efficiency while it holds the energy for the block, slower as it runs out, not at all when empty.
 pub(super) fn destroy_speed(game: &Game<'_>, stack: Option<&ItemStack>, hardness: f32, speed: &mut f32) {
     let Some(stack) = stack.filter(|s| &*s.item == DISASSEMBLER) else {
         return;
     };
     if game.native_on(MOD_ID) {
-        *speed = gear::destroy_speed(stored_energy(stack), hardness);
+        *speed = gear::destroy_speed(disassembler_mode(stack), stored_energy(stack), hardness);
+    }
+}
+
+/// Sneak + right click with the disassembler cycles its mode (Mekanism's mode key), with the new mode on
+/// the action bar. Hook point `native_use_item`, API 13.
+pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut bool) {
+    if *claimed || &*stack.item != DISASSEMBLER || !game.native_on(MOD_ID) {
+        return;
+    }
+    if !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+        return;
+    }
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == DISASSEMBLER) else {
+        return;
+    };
+    let mode = disassembler_mode(held).next();
+    set_disassembler_mode(held, mode);
+    *claimed = true;
+    if let Some(player) = game.native_acting_player() {
+        let line = format!("Mode changed to: {} ({})", mode.label(), mode.efficiency());
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
 }
 
@@ -1903,7 +1957,8 @@ pub(super) fn spend_disassembler_energy(game: &mut Game<'_>, pos: [i32; 3]) {
     let hardness = game.res.facts().get(state).hardness;
     if let Some(stack) = game.held_mut().as_mut().filter(|s| &*s.item == DISASSEMBLER) {
         let stored = stored_energy(stack);
-        set_energy(stack, stored.saturating_sub(gear::destroy_energy(hardness)));
+        let cost = gear::destroy_energy(disassembler_mode(stack), hardness);
+        set_energy(stack, stored.saturating_sub(cost));
     }
 }
 
@@ -1952,6 +2007,11 @@ pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
 pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
     if !game.native_on(MOD_ID) || !stack.item.starts_with("mekanism") {
         return;
+    }
+    if &*stack.item == DISASSEMBLER {
+        let mode = disassembler_mode(stack);
+        let line = format!("Mode: {} (efficiency {})", mode.label(), mode.efficiency());
+        lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
     }
     let energy = stored_energy(stack);
     if energy == 0 {
