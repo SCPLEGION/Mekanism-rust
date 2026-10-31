@@ -41,6 +41,8 @@ for inj in m.get('injection', []):
     new = f'mekanism_hook_{name}'
     t += f'\n// BEGIN mekanism helper\n' + helper.replace(f'fn {name}', f'fn {new}', 1)
     args = ', '.join(b['value'] for b in inj['bindings'])
+    # An empty hook body (`fn native_tick(&mut self) {}`) opens up to take the call.
+    t = re.sub(r'(pub\(super\) fn ' + fn + r'\([^{]*)\{\}\n', r'\1{\n    }\n', t, count=1)
     t = re.sub(r'(pub\(super\) fn ' + fn + r'\([^{]*\{\n)', lambda mm: mm.group(1) + f'        {new}({args});\n', t, count=1)
 n.write_text(t)
 print('staged')

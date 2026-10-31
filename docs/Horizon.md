@@ -363,3 +363,18 @@ tank contents in a screen.
   contents in its custom data (`mekanism:fluid`, `mekanism:chemical`), as energy cubes keep their energy.
   Placing it again restores them, and the item's tooltip shows "Stored: <amount> mB <id>".
 - The Heat Generator takes lava from the mechanical pipes and fluid tanks beside it, and pipes join it.
+
+## Jetpack (milestone 23)
+
+Needs the Horizon fork's `milestone/h6-payload-as-player` (API 26: a mod packet runs as its sender).
+
+- The Jetpack and Armored Jetpack are worn on the chest (the plain one gives no armour). They hold 24,000 mB
+  of hydrogen in custom data (`mekanism:chemical`, shown in the tooltip). A right click on a chemical tank
+  that holds hydrogen, with a jetpack in hand, fills it.
+- Holding jump (Space) while wearing a fuelled jetpack thrusts in Mekanism's normal mode
+  (`IJetpackItem.handleJetpackMotion`: 0.15 up per tick, fading as you rise) and stops the fall. The
+  window moves its player and tells the server on the `mekanism:jetpack` channel, and the server spends a
+  mB of the wearer's hydrogen a tick and clears their fall too.
+- Simplified: normal mode only (no hover or vector modes, no mode key), no flame particles or sound,
+  and a worn jetpack does not show on the player. A dedicated server with
+  `allow-flight=false` can kick a long flight for floating, as vanilla does.
