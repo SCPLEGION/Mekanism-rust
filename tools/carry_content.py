@@ -27,6 +27,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 VERSION = "0.1.0"
@@ -212,6 +214,16 @@ def build_module(ns, out):
                 copy_tree(data / owner / "tags", out / "data" / owner / "tags", report, "tags")
             else:
                 skipped[owner] = skipped.get(owner, 0) + sum(1 for p in (data / owner).rglob("*") if p.is_file())
+
+    # NeoForge's convention tags on vanilla items, which Horizon (vanilla) lacks; only the mekanism mod
+    # carries them, and only where no carried file defines the tag.
+    if ns == "mekanism":
+        from convention_tags import TAGS
+        for path, values in TAGS.items():
+            out_file = out / "data/c/tags/item" / f"{path}.json"
+            if not out_file.exists():
+                write_json(out_file, {"values": values})
+                report["convention_tags"] = report.get("convention_tags", 0) + 1
 
     # Ores: rewrite the custom feature type; drop retrogen variants (Horizon has no retrogen).
     features = out / "data" / ns / "worldgen/feature"
