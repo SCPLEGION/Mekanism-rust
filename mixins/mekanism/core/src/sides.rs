@@ -1,7 +1,47 @@
 //! Side configuration, simplified: each face of a machine is left as the machine makes it, turned off,
-//! or limited to taking in or giving out. Mekanism's `TileComponentConfig` keeps a mode per face and per
-//! transmission type with colours and a screen; here one mode per face covers energy and chemicals,
-//! and the Configurator cycles it.
+//! or limited to taking in or giving out, for each transmission type (items, chemicals, energy), as
+//! Mekanism's `TileComponentConfig` keeps a mode per face and type. There is no screen: the Configurator
+//! cycles a face of the type it is set to.
+
+/// The kinds of thing a face passes (`TransmissionType`), in the Configurator's order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Transmission {
+    #[default]
+    Item,
+    Chemical,
+    Energy,
+}
+
+impl Transmission {
+    pub const ALL: [Transmission; 3] = [Self::Item, Self::Chemical, Self::Energy];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Item => "items",
+            Self::Chemical => "chemicals",
+            Self::Energy => "energy",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    /// The block entity NBT key of this type's faces. Energy keeps `sides`, the key the single
+    /// configuration used before.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Item => "sides_item",
+            Self::Chemical => "sides_chemical",
+            Self::Energy => "sides",
+        }
+    }
+
+    /// The Configurator's next mode (`ConfiguratorMode.adjust`).
+    pub fn next(self) -> Self {
+        Self::ALL[(self as usize + 1) % Self::ALL.len()]
+    }
+}
 
 /// What one face of a block does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +111,18 @@ impl Sides {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transmission_types_cycle_and_keep_their_own_keys() {
+        use Transmission::*;
+        assert_eq!(
+            [Item.next(), Chemical.next(), Energy.next()],
+            [Chemical, Energy, Item]
+        );
+        assert_eq!(Transmission::from_name("chemicals"), Some(Chemical));
+        assert_eq!(Energy.key(), "sides");
+        assert_ne!(Item.key(), Chemical.key());
+    }
 
     #[test]
     fn faces_cycle_independently_and_back_to_default() {

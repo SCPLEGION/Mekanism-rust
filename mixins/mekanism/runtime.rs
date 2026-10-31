@@ -11,7 +11,7 @@ use mekanism_core::chemical::{self as chem, ChemicalTank};
 use mekanism_core::energy::{Action, EnergyContainer};
 use mekanism_core::evaporation as evap;
 use mekanism_core::gear;
-use mekanism_core::sides::Sides;
+use mekanism_core::sides::{Sides, Transmission};
 use mekanism_core::factory::{self, Factory};
 use mekanism_core::generator::HeatGenerator;
 use mekanism_core::machine::{self, ElectricMachine, Operation, Slot};
@@ -186,7 +186,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     let Some(k) = kind(&entity.id) else {
         return;
     };
-    TICKING.set(Some((pos, sides_of(&entity.nbt))));
+    TICKING.set(Some((pos, [Transmission::Item, Transmission::Chemical, Transmission::Energy].map(|t| sides_of(&entity.nbt, t)))));
     let active = match k {
         Kind::Machine(recipe, usage) => tick_machine(game, entity, recipe, usage),
         Kind::Factory(n, recipe, usage) => tick_factory(game, entity, n, recipe, usage),
@@ -742,28 +742,29 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
 thread_local! {
     /// The block entity being ticked and its side configuration. `push_energy` and `push_chemical` are
     /// called with the ticking block's containers taken out of its NBT, so they read its sides here.
-    static TICKING: std::cell::Cell<Option<([i32; 3], Sides)>> = const { std::cell::Cell::new(None) };
+    static TICKING: std::cell::Cell<Option<([i32; 3], [Sides; 3])>> = const { std::cell::Cell::new(None) };
 }
 
-fn sides_of(nbt: &Compound) -> Sides {
-    Sides(get_long(nbt, "sides") as u32)
+/// The faces' modes for one transmission type.
+fn sides_of(nbt: &Compound, t: Transmission) -> Sides {
+    Sides(get_long(nbt, t.key()) as u32)
 }
 
 fn face_index(d: [i32; 3]) -> usize {
     DIRECTIONS.iter().position(|(_, v)| *v == d).unwrap_or(0)
 }
 
-/// Whether the block at `pos` may give out through face `d`, by its side configuration.
-fn gives_out(pos: [i32; 3], d: [i32; 3]) -> bool {
+/// Whether the block at `pos` may give out `t` through face `d`, by its side configuration.
+fn gives_out(pos: [i32; 3], d: [i32; 3], t: Transmission) -> bool {
     match TICKING.get() {
-        Some((at, sides)) if at == pos => sides.get(face_index(d)).gives_out(),
+        Some((at, sides)) if at == pos => sides[t as usize].get(face_index(d)).gives_out(),
         _ => true,
     }
 }
 
-/// Whether a receiver takes in through its face `back` (the one facing the giver).
-fn takes_in(nbt: &Compound, back: [i32; 3]) -> bool {
-    sides_of(nbt).get(face_index(back)).takes_in()
+/// Whether a receiver takes in `t` through its face `back` (the one facing the giver).
+fn takes_in(nbt: &Compound, back: [i32; 3], t: Transmission) -> bool {
+    sides_of(nbt, t).get(face_index(back)).takes_in()
 }
 
 /// The Configurator: a right click on a face of a Mekanism block cycles that face between Default,
@@ -773,22 +774,51 @@ pub(super) fn configure_side(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3])
         return false;
     }
     let holding = game.inventory.get(game.selected).cloned().flatten();
-    if !holding.is_some_and(|h| &*h.item == "mekanism:configurator") {
+    let Some(held) = holding.filter(|h| &*h.item == CONFIGURATOR) else {
         return false;
-    }
+    };
+    let t = configurator_mode(&held);
     let mode = game.native_with_mod_block_entity(pos, |m| {
         kind(&m.id)?;
-        let mut sides = sides_of(&m.nbt);
+        let mut sides = sides_of(&m.nbt, t);
         let mode = sides.cycle(face_index(face));
-        put_long(&mut m.nbt, "sides", u64::from(sides.0));
+        put_long(&mut m.nbt, t.key(), u64::from(sides.0));
         Some(mode)
     });
     let Some(Some(mode)) = mode else {
         return false;
     };
     let name = DIRECTIONS[face_index(face)].0;
-    game.system_message(horizon_client::text::Text::literal(format!("Side {name}: {}", mode.name())));
+    let line = format!("Side {name} ({}): {}", t.name(), mode.name());
+    game.system_message(horizon_client::text::Text::literal(line));
     true
+}
+
+const CONFIGURATOR: &str = "mekanism:configurator";
+/// The key in the Configurator's custom data that holds the type it configures (Mekanism's
+/// `configurator_mode`).
+const CONFIGURATOR_KEY: &str = "mekanism:configurator_mode";
+
+fn configurator_mode(stack: &ItemStack) -> Transmission {
+    let name = custom_data(stack).and_then(|c| match c.get(&JavaString::from(CONFIGURATOR_KEY)) {
+        Some(Tag::String(s)) => s.to_string().ok(),
+        _ => None,
+    });
+    name.as_deref().and_then(Transmission::from_name).unwrap_or_default()
+}
+
+/// Sets a string in an item's custom data, keeping the rest of it.
+fn set_custom_string(stack: &mut ItemStack, key: &str, value: &str) {
+    let extra = stack.extra.get_or_insert_with(Default::default);
+    let at = extra.other.iter().position(|(k, d)| k == "minecraft:custom_data" && matches!(d, Tag::Compound(_)));
+    let at = at.unwrap_or_else(|| {
+        extra.other.retain(|(k, _)| k != "minecraft:custom_data");
+        extra.other.push(("minecraft:custom_data".to_owned(), Tag::Compound(Compound::new())));
+        extra.other.len() - 1
+    });
+    if let Tag::Compound(c) = &mut extra.other[at].1 {
+        c.insert(key.into(), Tag::String(value.into()));
+    }
 }
 
 const FLUIDS: [&str; 2] = ["minecraft:water", "mekanism:brine"];
@@ -805,7 +835,7 @@ fn push_chemical(
 ) {
     let mut budget = rate;
     for (_, d) in DIRECTIONS {
-        if only.is_some_and(|o| o != d) || !gives_out(pos, d) {
+        if only.is_some_and(|o| o != d) || !gives_out(pos, d, Transmission::Chemical) {
             continue;
         }
         let Some(chemical) = from.chemical.clone() else {
@@ -817,7 +847,7 @@ fn push_chemical(
         }
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
         let taken = game.native_with_mod_block_entity(at, |m| {
-            if !takes_in(&m.nbt, [-d[0], -d[1], -d[2]]) {
+            if !takes_in(&m.nbt, [-d[0], -d[1], -d[2]], Transmission::Chemical) {
                 return 0;
             }
             let Some((key, capacity)) = chemical_receiver(&m.id, &m.nbt, &chemical, from_tube, d) else {
@@ -1275,7 +1305,7 @@ fn tick_transporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         // A Mekanism block's face must give out (side configuration); any container then gives what a
         // hopper there could take (API 24 `native_extract_item`).
         let closed = game
-            .native_with_mod_block_entity(source, |m| !sides_of(&m.nbt).get(face_index(back)).gives_out())
+            .native_with_mod_block_entity(source, |m| !sides_of(&m.nbt, Transmission::Item).get(face_index(back)).gives_out())
             .unwrap_or(false);
         if closed || is_transporter(block_name(game, source)) {
             continue;
@@ -1425,7 +1455,7 @@ fn tick_induction_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlock
             put_long(&mut entity.nbt, "energy", mine - taken);
         }
     }
-    let sides = sides_of(&entity.nbt);
+    let sides = sides_of(&entity.nbt, Transmission::Energy);
     for (i, (_, d)) in DIRECTIONS.into_iter().enumerate() {
         if sides.get(i) != mekanism_core::sides::SideMode::Output {
             continue;
@@ -1709,7 +1739,7 @@ fn push_energy(
         .collect();
     for (i, d) in sides.iter().enumerate() {
         let offer = from.extract(u64::MAX, Action::Simulate) / (sides.len() - i) as u64;
-        if offer == 0 || !gives_out(pos, *d) {
+        if offer == 0 || !gives_out(pos, *d, Transmission::Energy) {
             continue;
         }
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
@@ -1719,7 +1749,7 @@ fn push_energy(
             .and_then(|f| direction(&f))
             .map_or(true, |front| front != back);
         let taken = game.native_with_mod_block_entity(at, |m| {
-            if !takes_in(&m.nbt, back) {
+            if !takes_in(&m.nbt, back, Transmission::Energy) {
                 return 0;
             }
             let Some((capacity, rate)) = receiver(&m.id, &m.nbt, accepted, from_cable) else {
@@ -1930,6 +1960,10 @@ pub(super) fn destroy_speed(game: &Game<'_>, stack: Option<&ItemStack>, hardness
 /// Sneak + right click with the disassembler cycles its mode (Mekanism's mode key), with the new mode on
 /// the action bar. Hook point `native_use_item`, API 13.
 pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut bool) {
+    if !*claimed && &*stack.item == CONFIGURATOR {
+        configurator_use(game, claimed);
+        return;
+    }
     if *claimed || &*stack.item != DISASSEMBLER || !game.native_on(MOD_ID) {
         return;
     }
@@ -1944,6 +1978,24 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
     *claimed = true;
     if let Some(player) = game.native_acting_player() {
         let line = format!("Mode changed to: {} ({})", mode.label(), mode.efficiency());
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
+}
+
+/// Sneak + right click in the air with the Configurator switches the type it configures (items,
+/// chemicals, energy), as its mode key does in Mekanism.
+fn configurator_use(game: &mut Game<'_>, claimed: &mut bool) {
+    if !game.native_on(MOD_ID) || !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+        return;
+    }
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == CONFIGURATOR) else {
+        return;
+    };
+    let t = configurator_mode(held).next();
+    set_custom_string(held, CONFIGURATOR_KEY, t.name());
+    *claimed = true;
+    if let Some(player) = game.native_acting_player() {
+        let line = format!("Configurator: {}", t.name());
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
 }
@@ -2007,6 +2059,10 @@ pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
 pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
     if !game.native_on(MOD_ID) || !stack.item.starts_with("mekanism") {
         return;
+    }
+    if &*stack.item == CONFIGURATOR {
+        let line = format!("Configuring: {}", configurator_mode(stack).name());
+        lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
     }
     if &*stack.item == DISASSEMBLER {
         let mode = disassembler_mode(stack);

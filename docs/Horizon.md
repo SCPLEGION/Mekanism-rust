@@ -317,3 +317,16 @@ tank contents in a screen.
   tablet, cube or tool in their first slot from what they make. The plain Solar Generator (an iron block with
   no menu) has no slot.
 - Simplified: no radial menu or mode key (sneak + right click instead); no vein mining.
+
+## Side configuration per type (milestone 19)
+
+- Each face now has a mode per transmission type: items, chemicals and energy, as Mekanism's
+  `TileComponentConfig` keeps them. Energy keeps the `sides` NBT key from milestone 12; items and chemicals
+  use `sides_item` and `sides_chemical`. Energy out of machines, cubes and induction ports reads the energy
+  faces, chemicals (and the separator's and rotary's fluids) the chemical faces, and transporter pulls the
+  item faces.
+- The Configurator configures one type at a time: sneak + right click in the air switches between items,
+  chemicals and energy (Mekanism's mode key), shown on the action bar and in its tooltip. A right click on a
+  face cycles that face for the chosen type, and chat names the type.
+- Simplified: still four modes per face (Default, None, Input, Output) with no colours or screen; item faces
+  only limit transporter pulls, not hoppers.
