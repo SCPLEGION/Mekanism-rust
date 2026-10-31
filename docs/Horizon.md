@@ -142,3 +142,25 @@ running on clients (block entity sync), only their `lit` state.
   feeds the machines and cubes beside it, then lets its energy run on to emptier cables, so energy never
   flows back. Mekanism pools a whole cable network instead, and the throughput per cable is the same.
   Proper six-way shapes wait for H2.
+
+## Chemicals (milestone 5, first part)
+
+`mekanism-core`'s `chemical` module holds chemical tanks and the rules below; the runtime keeps each tank in
+the block entity's NBT (`id` and `amount`). Chemicals move only between touching blocks, like energy
+before cables: machines push to every side, tanks out of their bottom.
+
+- **Chemical Oxidizer**: `oxidizing` recipes (25, sulfur dust → sulfur dioxide and the like), 15 FE/t over
+  100 ticks, into a 10,000 mB tank. The furnace menu's first slot takes the item.
+- **Electrolytic Separator** on water: put water buckets in the first slot (the empty bucket comes out of the
+  last). Each tick splits 2 mB of water into 2 mB hydrogen and 1 mB oxygen for 4 FE, into two 2,400 mB
+  tanks. Flame = water, arrow = hydrogen.
+- **Gas-Burning Generator**: burns hydrogen (2 FE/mB) or ethene (8 FE/mB), up to 10 mB a tick scaled by how full its 1,000 mB tank is,
+  into a 2,000 FE store and pushes the energy out like the other generators.
+- **Chemical Tanks**, basic to ultimate (64k to 8.192M mB, 1k to 512k mB/t out of the bottom). A tank takes
+  chemicals on every side but its bottom.
+- **Pressurized tubes**, all four tiers (750 to 256,000 mB/t), work like universal cables: on the iron
+  bars template, holding one tick of what they carry, feeding the blocks beside them and passing the rest
+  on to emptier tubes with the same chemical.
+
+Not yet: the separator's other recipes (brine, sodium), side configuration, and showing
+tank contents in a screen.

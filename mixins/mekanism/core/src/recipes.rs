@@ -90,6 +90,26 @@ pub fn find_combining(
     })
 }
 
+/// An item-to-chemical recipe (`ItemStackToChemicalRecipe`): the Chemical Oxidizer's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChemicalRecipe {
+    pub id: &'static str,
+    pub input: Ingredient,
+    pub input_count: u32,
+    pub output: &'static str,
+    pub amount: u64,
+}
+
+pub fn find_oxidizing(
+    item: &str,
+    count: u32,
+    in_tag: &dyn Fn(&str, &str) -> bool,
+) -> Option<&'static ChemicalRecipe> {
+    crate::recipe_table::OXIDIZING
+        .iter()
+        .find(|r| count >= r.input_count && r.input.matches(item, in_tag))
+}
+
 /// The recipe types this port runs, with their tables.
 pub fn table(kind: &str) -> &'static [ItemRecipe] {
     match kind {

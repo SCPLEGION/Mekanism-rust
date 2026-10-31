@@ -87,6 +87,18 @@ pub fn cable_share(mine: u64, theirs: u64) -> u64 {
     mine.saturating_sub(theirs) / 2
 }
 
+/// `TubeTier`: a pressurized tube's transfer rate in mB a tick (750 to 256,000). A tube here holds one
+/// tick of it, the way a cable holds one tick of energy.
+pub fn pressurized_tube(tier: BaseTier) -> Option<u64> {
+    match tier {
+        BaseTier::Basic => Some(750),
+        BaseTier::Advanced => Some(2_000),
+        BaseTier::Elite => Some(64_000),
+        BaseTier::Ultimate => Some(256_000),
+        BaseTier::Creative => None,
+    }
+}
+
 #[cfg(test)]
 mod cable_tests {
     use super::*;
@@ -96,5 +108,6 @@ mod cable_tests {
         assert_eq!(universal_cable(BaseTier::Elite), Some(1_024_000));
         assert_eq!(cable_share(100, 20), 40);
         assert_eq!(cable_share(20, 100), 0);
+        assert_eq!(pressurized_tube(BaseTier::Advanced), Some(2_000));
     }
 }
