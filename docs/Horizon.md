@@ -396,3 +396,24 @@ The steps from uranium to fissile fuel all run now (`mekanism-core`'s `nuclear`)
 Simplified: no screens of their own (the dissolution chamber uses the furnace menu, with its progress on
 the arrow); no upgrades; the ore slurry recipes of the chamber wait for the washer and crystallizer. The
 fission reactor that burns the fuel comes next.
+
+## Fission Reactor (milestone 25)
+
+`mekanism-core`'s `fission`, simplified from Mekanism's reactor:
+
+- Build a box, 3 to 18 blocks on each side, of Fission Reactor Casing and Reactor Glass with at least one
+  Fission Reactor Port in its walls, and Fission Fuel Assemblies (and Control Rod Assemblies, or air)
+  inside. Ports check the structure once a second, and the first port runs the reactor.
+- It holds 8,000 mB of fissile fuel and of waste per assembly, 100 buckets of water and 1,000 buckets of
+  steam per block of its volume. Fissile fuel comes in from the tubes and chemical tanks beside its ports,
+  and water from the pipes and fluid tanks beside them. Steam and nuclear waste go out of every port into
+  tubes and chemical tanks.
+- A right click with an empty hand on a port steps the burn rate (0.1, 0.5, 1, 2, 5, 10, 20 mB a tick, up
+  to 1 mB a tick per assembly), and sneak + right click switches it on or off. The action bar shows its
+  state, rate and tanks.
+- Each mB of fuel boils 20,000 mB of water into steam: `energyPerFissionFuel` (1 MJ) over water's 50 J a
+  mB as coolant. This is the reactor's steady state, without its heat model.
+- Simplified: no temperature, damage, meltdown or radiation. Without enough water, or with nowhere for
+  the steam or waste, the reactor stops (SCRAM) and says so. There are no port modes, logic adapter or
+  screen, and the tanks are lost if the first port is broken. Steam drives the Industrial Turbine, which
+  comes next.
