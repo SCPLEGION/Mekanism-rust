@@ -1148,15 +1148,8 @@ fn is_transporter(name: &str) -> bool {
     name.strip_prefix("mekanism:").is_some_and(|n| n.ends_with("_logistical_transporter"))
 }
 
-/// The output slots of a Mekanism block's container, as `block_entity_container` lays them out.
-fn output_slots(block: &str) -> Vec<usize> {
-    let mut container = None;
-    block_entity_container(block, &mut container);
-    container.map_or(Vec::new(), |c| c.outputs)
-}
-
-/// A logistical transporter, simplified: twice a second it pulls up to its tier's count from the first
-/// filled output slot of a Mekanism machine beside it (when that machine's face gives out), and sends it
+/// A logistical transporter, simplified: twice a second it pulls up to its tier's count from a container
+/// beside it (a chest, a furnace's output, a machine's output when its face gives out), and sends it
 /// at once along the connected transporters into the nearest container that takes it: a chest, a
 /// furnace, a hopper or another machine's input, through the side it faces. What fits nowhere goes back.
 /// Mekanism moves items visibly along the pipe at the tier's speed and sorts by colour and filters.
@@ -1169,31 +1162,23 @@ fn tick_transporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     for (_, d) in DIRECTIONS {
         let source = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
         let back = [-d[0], -d[1], -d[2]];
-        let taken = game.native_with_mod_block_entity(source, |m| {
-            if kind(&m.id).is_none() || !sides_of(&m.nbt).get(face_index(back)).gives_out() {
-                return None;
-            }
-            for slot in output_slots(&m.id) {
-                if let Some(Some(stack)) = m.items.get(slot).cloned() {
-                    let n = stack.count.min(pull);
-                    m.items[slot] = (stack.count > n).then(|| ItemStack { count: stack.count - n, ..stack.clone() });
-                    return Some((slot, ItemStack { count: n, ..stack }));
-                }
-            }
-            None
-        });
-        let Some(Some((slot, stack))) = taken else {
+        // A Mekanism block's face must give out (side configuration); any container then gives what a
+        // hopper there could take (API 24 `native_extract_item`).
+        let closed = game
+            .native_with_mod_block_entity(source, |m| !sides_of(&m.nbt).get(face_index(back)).gives_out())
+            .unwrap_or(false);
+        if closed || is_transporter(block_name(game, source)) {
+            continue;
+        }
+        let face = horizon_core::geometry::Direction::ALL[face_index(back)];
+        let Some(stack) = game.native_extract_item(source, face, pull) else {
             continue;
         };
-        let left = route_items(game, pos, source, stack);
-        if let Some(left) = left {
-            game.native_with_mod_block_entity(source, |m| {
-                let slot_stack = m.items.get(slot).cloned().flatten();
-                m.items[slot] = Some(match slot_stack {
-                    Some(s) if s.item == left.item => ItemStack { count: s.count + left.count, ..s },
-                    _ => left,
-                });
-            });
+        if let Some(left) = route_items(game, pos, source, stack) {
+            // What fits nowhere goes back where it came from.
+            if let Some(lost) = game.native_insert_item(source, face, left) {
+                game.native_insert_item(source, horizon_core::geometry::Direction::Up, lost);
+            }
         }
         return;
     }
