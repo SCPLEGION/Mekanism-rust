@@ -5,12 +5,14 @@
 // and these. Everything here is plain data and functions, so `cargo test` runs it without a game.
 
 pub mod energy;
+pub mod factory;
 pub mod generator;
 pub mod heat;
 pub mod machine;
 pub mod recipe_table;
 pub mod recipes;
 pub mod tier;
+pub mod upgrades;
 
 /// The four modules of Mekanism and their namespaces, as the Java build registers them.
 pub const NAMESPACES: [&str; 4] = [

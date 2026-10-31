@@ -243,6 +243,12 @@ def build_module(ns, out):
         for path in folder.glob("salt*.json") if folder.is_dir() else []:
             path.unlink()
 
+    # Items told apart by a Mekanism data component (upgrades, modules): Horizon has no mod components, so
+    # the type goes in vanilla's custom_data, the model is chosen by custom_model_data, and the name is
+    # spelled out with item_name.
+    report["component_items"] = component_items(ns, out)
+    report["component_recipes"] = component_recipes(out / "data" / ns / "recipe")
+
     # Declarations: every blockstate is a block; every item definition without a block is an item.
     declared = out / "data" / ns / "horizon"
     blocks = set()
@@ -280,6 +286,70 @@ def build_module(ns, out):
         "",
     ]))
     return report, skipped
+
+
+# Mekanism's item components that only tell items of one id apart, by the lang key of their values'
+# names ("upgrade.mekanism.speed"), to custom_data in carried recipes.
+COMPONENT_NAMES = {"mekanism:upgrade_type": "upgrade", "mekanism:module_type": "module"}
+
+
+def component_items(ns, out):
+    """`mekanism:component_item` models become vanilla selects on custom_model_data's first string."""
+    count = 0
+    for path in sorted((out / "assets" / ns / "items").glob("*.json")):
+        definition = json.loads(path.read_text())
+        model = definition.get("model", {})
+        if model.get("type") != "mekanism:component_item":
+            continue
+        component = model["mek_data"].split(":", 1)[1]
+        textures = out / "assets" / ns / "textures/item" / component
+        cases = []
+        for texture in sorted(textures.glob("*.png")) if textures.is_dir() else []:
+            name = f"{ns}:item/{component}/{texture.stem}"
+            write_json(out / "assets" / ns / "models/item" / component / f"{texture.stem}.json",
+                       {"parent": "minecraft:item/generated", "textures": {"layer0": name}})
+            cases.append({"when": f"{ns}:{texture.stem}", "model": {"type": "minecraft:model", "model": name}})
+        if not cases:
+            continue
+        definition["model"] = {"type": "minecraft:select", "property": "minecraft:custom_model_data",
+                               "index": 0, "cases": cases, "fallback": cases[0]["model"]}
+        path.write_text(json.dumps(definition, indent=2) + "\n")
+        count += 1
+    return count
+
+
+def carried_result(result):
+    """A recipe result with Mekanism's components, in vanilla components; None when it has none."""
+    components = result.get("components", {})
+    mek = {k: v for k, v in components.items() if k in COMPONENT_NAMES}
+    if not mek:
+        return None
+    rest = {k: v for k, v in components.items() if k not in mek}
+    rest["minecraft:custom_data"] = mek
+    (key, value), = mek.items()
+    rest["minecraft:custom_model_data"] = {"strings": [value]}
+    ns, path = value.split(":", 1)
+    kind = COMPONENT_NAMES[key]
+    if kind == "upgrade":
+        rest["minecraft:item_name"] = [{"translate": f"upgrade.{ns}.{path}"}, " ",
+                                       {"translate": f"item.{ns}.upgrade"}]
+    else:
+        rest["minecraft:item_name"] = {"translate": f"module.{ns}.{path}"}
+    return {**result, "components": rest}
+
+
+def component_recipes(recipes):
+    count = 0
+    for path in sorted(recipes.rglob("*.json")) if recipes.is_dir() else []:
+        recipe = json.loads(path.read_text())
+        result = recipe.get("result")
+        carried = carried_result(result) if isinstance(result, dict) else None
+        if carried is None:
+            continue
+        recipe["result"] = carried
+        path.write_text(json.dumps(recipe, indent=2) + "\n")
+        count += 1
+    return count
 
 
 def write_json(path, value):

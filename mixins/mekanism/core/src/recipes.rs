@@ -43,6 +43,53 @@ pub fn find<'a>(
         .find(|r| count >= r.input_count && r.input.matches(item, in_tag))
 }
 
+/// A Precision Sawmill recipe (`SawmillRecipe`): a main output, a secondary one with a chance, or both.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SawingRecipe {
+    pub id: &'static str,
+    pub input: Ingredient,
+    pub input_count: u32,
+    pub main: Option<(&'static str, u32)>,
+    pub secondary: Option<(&'static str, u32)>,
+    pub secondary_chance: f64,
+}
+
+/// A Combiner recipe (`CombinerRecipe`): a main input and an extra input make one output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CombiningRecipe {
+    pub id: &'static str,
+    pub main: Ingredient,
+    pub main_count: u32,
+    pub extra: Ingredient,
+    pub extra_count: u32,
+    pub output: &'static str,
+    pub output_count: u32,
+}
+
+pub fn find_sawing(
+    item: &str,
+    count: u32,
+    in_tag: &dyn Fn(&str, &str) -> bool,
+) -> Option<&'static SawingRecipe> {
+    crate::recipe_table::SAWING
+        .iter()
+        .find(|r| count >= r.input_count && r.input.matches(item, in_tag))
+}
+
+/// The first combining recipe for this main input and extra input (each with enough of it).
+pub fn find_combining(
+    main: (&str, u32),
+    extra: (&str, u32),
+    in_tag: &dyn Fn(&str, &str) -> bool,
+) -> Option<&'static CombiningRecipe> {
+    crate::recipe_table::COMBINING.iter().find(|r| {
+        main.1 >= r.main_count
+            && extra.1 >= r.extra_count
+            && r.main.matches(main.0, in_tag)
+            && r.extra.matches(extra.0, in_tag)
+    })
+}
+
 /// The recipe types this port runs, with their tables.
 pub fn table(kind: &str) -> &'static [ItemRecipe] {
     match kind {

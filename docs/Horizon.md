@@ -103,3 +103,27 @@ furnace's; the middle slot takes no energy items (item energy needs custom item 
 or side configuration; the Heat Generator ignores neighbouring lava and the biome's temperature; energy
 cubes face only the four horizontal directions (the furnace template's `facing`); machines are not shown
 running on clients (block entity sync), only their `lit` state.
+
+## More machines and upgrades (milestone 3)
+
+- **Precision Sawmill** (`sawing`, 157 recipes) and **Combiner** (`combining`, 106 recipes) run like the
+  other machines, at 5 FE a tick. The Combiner takes its extra input from the middle slot. The sawmill
+  has one output slot here, so a secondary output (sawdust and the like, rolled with the recipe's
+  chance) waits inside the machine until the output slot takes it, and the machine stops until then,
+  the way a full secondary slot stops it in Mekanism.
+- **Speed and energy upgrades.** Right click a machine holding an upgrade to install one, or all that
+  fit when sneaking (up to 8 of each). The formulas are `UpgradeUtils`' (ticks, energy per tick, storage),
+  and a progress machine stores one operation of energy (`MachineEnergyContainer.updateMaxEnergy`).
+- **Upgrade items.** Mekanism tells upgrades apart by its own `mekanism:upgrade_type` item component,
+  which Horizon does not have. `carry_content.py` moves it into vanilla `minecraft:custom_data` in the
+  carried recipes, sets `minecraft:custom_model_data` so the item model (a vanilla `select`) draws the
+  right texture, and spells the name out with `minecraft:item_name`. Modules get the same treatment.
+- The furnace menu's flame now shows stored energy as thousandths of capacity, since data slots are
+  16 bits.
+- **Factories** (basic 3, advanced 5, elite 7, ultimate 9 processes) for enriching, crushing and smelting.
+  They show a two-row chest menu: the inputs are on the top row and each process's output is below its
+  input. All processes share one energy store sized for one operation of each, and each process uses the
+  machine's energy per tick. Upgrades work as they do on machines. Input sorting is not ported yet.
+- **Energy cubes keep their energy** when broken outside creative. The cube drops itself with the energy
+  in `minecraft:custom_data` (`mekanism:energy`), and placing it puts the energy back. The tooltip shows
+  "Stored Energy" with SI prefixes, as Mekanism does.

@@ -70,3 +70,51 @@ bindings = [
   { name = "pos", ty = "[i32; 3]", value = "pos" },
   { name = "entity", ty = "&mut horizon_client::containers::ModBlockEntity", value = "&mut *entity" },
 ]
+
+[[injection]]
+id = "right-click-block"
+hook = "right_click_block"
+hook_version = 1
+kind = "HEAD"
+helper = "right_click_block.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "destroy-block"
+hook = "destroy_block"
+hook_version = 1
+kind = "HEAD"
+helper = "destroy_block.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "place-block"
+hook = "place_block"
+hook_version = 1
+kind = "HEAD"
+helper = "place_block.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+]
+
+[[injection]]
+id = "tooltip"
+hook = "tooltip"
+hook_version = 1
+kind = "HEAD"
+helper = "tooltip.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+  { name = "lines", ty = "&mut Vec<(horizon_client::text::Text, u32)>", value = "&mut *lines" },
+]

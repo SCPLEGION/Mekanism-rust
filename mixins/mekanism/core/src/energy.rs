@@ -124,3 +124,34 @@ mod tests {
         assert_eq!((a.stored, b.stored), (70, 30));
     }
 }
+
+/// An amount of FE with an SI prefix, as Mekanism shows energy (`UnitDisplayUtils`): "500 FE",
+/// "12.5 kFE", "4 MFE", up to two decimals.
+pub fn format_fe(fe: u64) -> String {
+    const PREFIXES: [&str; 7] = ["", "k", "M", "G", "T", "P", "E"];
+    let mut value = fe as f64;
+    let mut i = 0;
+    while value >= 1000.0 && i + 1 < PREFIXES.len() {
+        value /= 1000.0;
+        i += 1;
+    }
+    let mut text = format!("{value:.2}");
+    while text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    format!("{text} {}FE", PREFIXES[i])
+}
+
+#[cfg(test)]
+mod format_tests {
+    #[test]
+    fn energy_reads_with_si_prefixes() {
+        assert_eq!(super::format_fe(500), "500 FE");
+        assert_eq!(super::format_fe(12_500), "12.5 kFE");
+        assert_eq!(super::format_fe(4_000_000), "4 MFE");
+        assert_eq!(super::format_fe(0), "0 FE");
+    }
+}
