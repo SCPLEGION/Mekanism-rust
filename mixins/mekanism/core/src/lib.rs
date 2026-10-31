@@ -9,6 +9,7 @@ pub mod energy;
 pub mod evaporation;
 pub mod factory;
 pub mod fission;
+pub mod fusion;
 pub mod gear;
 pub mod generator;
 pub mod heat;

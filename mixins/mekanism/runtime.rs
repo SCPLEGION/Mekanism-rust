@@ -13,6 +13,7 @@ use mekanism_core::evaporation as evap;
 use mekanism_core::gear;
 use mekanism_core::nuclear;
 use mekanism_core::fission;
+use mekanism_core::fusion;
 use mekanism_core::turbine;
 use mekanism_core::sides::{Sides, Transmission};
 use mekanism_core::factory::{self, Factory};
@@ -69,6 +70,8 @@ enum Kind {
     FissionPort,
     /// An Industrial Turbine's valve; the first valve runs it.
     TurbineValve,
+    /// A Fusion Reactor's port; the first port of a formed reactor runs it.
+    FusionPort,
     /// The Chemical Washer: dirty slurry and water into clean slurry.
     Washer,
     /// The Chemical Crystallizer: a chemical into an item.
@@ -109,6 +112,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:isotopic_centrifuge" => return Some(Kind::Centrifuge),
         "mekanismgenerators:fission_reactor_port" => return Some(Kind::FissionPort),
         TURBINE_VALVE => return Some(Kind::TurbineValve),
+        fusion::PORT => return Some(Kind::FusionPort),
         "mekanism:chemical_washer" => return Some(Kind::Washer),
         "mekanism:chemical_crystallizer" => return Some(Kind::Crystallizer),
         _ => {}
@@ -248,6 +252,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             None
         }
         Kind::TurbineValve => tick_turbine_valve(game, pos, entity),
+        Kind::FusionPort => {
+            tick_fusion_port(game, pos, entity);
+            None
+        }
         Kind::Washer => tick_washer(game, pos, entity),
         Kind::Crystallizer => tick_crystallizer(entity),
         Kind::Advanced(m) => tick_advanced(game, entity, m),
@@ -1561,6 +1569,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::HeatGenerator
                 | Kind::FissionPort
                 | Kind::TurbineValve
+                | Kind::FusionPort
                 | Kind::Washer
         ),
         "tube" => matches!(
@@ -1576,6 +1585,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Centrifuge
                 | Kind::FissionPort
                 | Kind::TurbineValve
+                | Kind::FusionPort
                 | Kind::Washer
                 | Kind::Crystallizer
         ),
@@ -2941,6 +2951,197 @@ pub(super) fn use_fission_port(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
             })
             .unwrap_or_else(|| "Fission Reactor: not formed".to_owned()),
     };
+    if let Some(player) = game.native_acting_player() {
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
+    true
+}
+
+// --- Fusion Reactor ----------------------------------------------------------------------------------
+
+/// `FusionReactorValidator`, simplified: the reactor blocks joined to `start` span a 5×5×5 box whose
+/// faces follow `ALLOWED_GRID`, with the controller in the middle of the top and air inside. The box's
+/// low corner and its ports.
+fn find_fusion(game: &Game<'_>, start: [i32; 3]) -> Option<([i32; 3], Vec<[i32; 3]>)> {
+    let (lo, _, seen) = find_box(game, start, fusion::is_part, fusion::SIZE, fusion::SIZE)?;
+    let mut ports = Vec::new();
+    for x in 0..fusion::SIZE {
+        for y in 0..fusion::SIZE {
+            for z in 0..fusion::SIZE {
+                let at = [lo[0] + x, lo[1] + y, lo[2] + z];
+                let name = block_name(game, at);
+                let controller_spot = [x, y, z] == [2, fusion::SIZE - 1, 2];
+                if controller_spot != (name == fusion::CONTROLLER) {
+                    return None;
+                }
+                match fusion::requirement([x, y, z]) {
+                    None if !matches!(name, "minecraft:air" | "minecraft:cave_air") => return None,
+                    Some(1) if name != fusion::FRAME || !seen.contains(&at) => return None,
+                    Some(2) if !seen.contains(&at) => return None,
+                    _ => {}
+                }
+                if name == fusion::PORT {
+                    ports.push(at);
+                }
+            }
+        }
+    }
+    (!ports.is_empty()).then_some((lo, ports))
+}
+
+/// The tanks a master port keeps, as `fusion::Tanks`.
+fn fusion_tanks(nbt: &Compound, injection: u64) -> [ChemicalTank; 5] {
+    [
+        get_tank(nbt, "deuterium", fusion::FUEL_CAPACITY),
+        get_tank(nbt, "tritium", fusion::FUEL_CAPACITY),
+        get_tank(nbt, "fuel", fusion::FUEL_CAPACITY),
+        get_tank(nbt, "water", fusion::water_capacity(injection)),
+        get_tank(nbt, "steam", fusion::steam_capacity(injection)),
+    ]
+}
+
+fn fusion_plasma(nbt: &Compound) -> fusion::Plasma {
+    fusion::Plasma {
+        plasma: get_double(nbt, "plasma").unwrap_or(fusion::AMBIENT),
+        case: get_double(nbt, "case").unwrap_or(fusion::AMBIENT),
+        burning: get_long(nbt, "burning") == 1,
+    }
+}
+
+fn put_fusion_plasma(nbt: &mut Compound, p: &fusion::Plasma) {
+    nbt.insert("plasma".into(), Tag::Double(p.plasma.to_bits()));
+    nbt.insert("case".into(), Tag::Double(p.case.to_bits()));
+    put_long(nbt, "burning", u64::from(p.burning));
+}
+
+fn fusion_injection(nbt: &Compound) -> u64 {
+    match get_long(nbt, "injection") {
+        0 => fusion::DEFAULT_INJECTION,
+        n => n.min(fusion::MAX_INJECTION),
+    }
+}
+
+/// A Fusion Reactor port. Once a second each port checks its reactor; the first port runs it: it takes
+/// deuterium and tritium from the tubes and chemical tanks beside the ports and water from the pipes and
+/// fluid tanks beside them, runs the plasma for a tick, and gives energy and steam out of every port.
+fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
+    if ticker == 0 {
+        match find_fusion(game, pos) {
+            Some((_, ports)) => {
+                entity.nbt.insert("master".into(), Tag::IntArray(ports[0].to_vec()));
+                entity.nbt.insert("ports".into(), Tag::IntArray(ports.concat()));
+            }
+            None => {
+                entity.nbt.remove(&JavaString::from("master"));
+            }
+        }
+    }
+    if get_pos(&entity.nbt, "master") != Some(pos) {
+        return;
+    }
+    let ports: Vec<[i32; 3]> = match entity.nbt.get(&JavaString::from("ports")) {
+        Some(Tag::IntArray(v)) => v.chunks(3).filter(|c| c.len() == 3).map(|c| [c[0], c[1], c[2]]).collect(),
+        _ => vec![pos],
+    };
+    let injection = fusion_injection(&entity.nbt);
+    let [mut deuterium, mut tritium, mut fuel, mut water, mut steam] = fusion_tanks(&entity.nbt, injection);
+    for &p in &ports {
+        pull_from_carriers(game, p, &mut deuterium, fusion::DEUTERIUM);
+        pull_from_carriers(game, p, &mut tritium, fusion::TRITIUM);
+        pull_from_carriers(game, p, &mut water, "minecraft:water");
+    }
+    let mut plasma = fusion_plasma(&entity.nbt);
+    let mut t = fusion::Tanks {
+        deuterium: deuterium.amount,
+        tritium: tritium.amount,
+        fuel: fuel.amount,
+        water: if water.accepts("minecraft:water") { water.amount } else { 0 },
+        steam: if steam.accepts("mekanism:steam") { steam.amount } else { steam.capacity },
+    };
+    let before = t;
+    let out = fusion::tick(&mut plasma, &mut t, injection, steam.capacity);
+    deuterium.extract(before.deuterium - t.deuterium);
+    tritium.extract(before.tritium - t.tritium);
+    if t.fuel > before.fuel {
+        fuel.insert("mekanismgenerators:fusion_fuel", t.fuel - before.fuel);
+    } else {
+        fuel.extract(before.fuel - t.fuel);
+    }
+    water.extract(before.water - t.water);
+    if t.steam > before.steam {
+        steam.insert("mekanism:steam", t.steam - before.steam);
+    }
+    let mut energy = EnergyContainer::new(fusion::ENERGY_CAPACITY, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(energy.capacity);
+    energy.insert(out.energy, Action::Execute);
+    for &p in &ports {
+        push_energy(game, p, &mut energy, None, false);
+        if steam.amount > 0 {
+            push_chemical(game, p, &mut steam, None, u64::MAX, false);
+        }
+    }
+    put_fusion_plasma(&mut entity.nbt, &plasma);
+    for (key, tank) in [
+        ("deuterium", &deuterium),
+        ("tritium", &tritium),
+        ("fuel", &fuel),
+        ("water", &water),
+        ("steam", &steam),
+    ] {
+        put_tank(&mut entity.nbt, key, tank);
+    }
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_long(&mut entity.nbt, "production", out.energy);
+}
+
+/// A right click with an empty hand on a Fusion Reactor's controller or port: sneaking ignites the
+/// reactor (what its lasers and a hohlraum do), else it steps the injection rate. Either way the action
+/// bar shows the reactor's state.
+pub(super) fn use_fusion(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || game.inventory.get(game.selected).cloned().flatten().is_some() {
+        return false;
+    }
+    let master = if block_name(game, pos) == fusion::CONTROLLER {
+        find_fusion(game, pos).map(|(_, ports)| ports[0])
+    } else {
+        match game.native_with_mod_block_entity(pos, |m| {
+            (kind(&m.id) == Some(Kind::FusionPort)).then(|| get_pos(&m.nbt, "master"))
+        }) {
+            Some(Some(master)) => master,
+            _ => return false,
+        }
+    };
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let line = master
+        .and_then(|master| {
+            game.native_with_mod_block_entity(master, |m| {
+                let mut injection = fusion_injection(&m.nbt);
+                let mut plasma = fusion_plasma(&m.nbt);
+                if sneaking {
+                    fusion::ignite(&mut plasma, injection);
+                    put_fusion_plasma(&mut m.nbt, &plasma);
+                } else {
+                    injection = fusion::next_injection(injection);
+                    put_long(&mut m.nbt, "injection", injection);
+                }
+                let [d, t, _, water, steam] = fusion_tanks(&m.nbt, injection);
+                format!(
+                    "Fusion Reactor: {}, injection {injection}, plasma {:.1} MK, case {:.1} MK, {} J/t, \
+                     D {}, T {}, water {}, steam {}",
+                    if plasma.burning { "burning" } else { "not burning" },
+                    plasma.plasma / 1e6,
+                    plasma.case / 1e6,
+                    get_long(&m.nbt, "production"),
+                    d.amount,
+                    t.amount,
+                    water.amount,
+                    steam.amount,
+                )
+            })
+        })
+        .unwrap_or_else(|| "Fusion Reactor: not formed".to_owned());
     if let Some(player) = game.native_acting_player() {
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
