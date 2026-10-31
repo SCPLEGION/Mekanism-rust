@@ -122,7 +122,20 @@ pub const SEPARATING: &[(&str, u64, Amount, Amount)] = &[
         ("mekanism:sodium", 1),
         ("mekanism:chlorine", 1),
     ),
+    (
+        HEAVY_WATER,
+        2,
+        ("mekanismgenerators:deuterium", 2),
+        ("mekanism:oxygen", 1),
+    ),
 ];
+
+pub const HEAVY_WATER: &str = "mekanism:heavy_water";
+
+/// A separating recipe's `energy_multiplier`: heavy water takes twice the energy.
+pub fn separating_multiplier(fluid: &str) -> u64 {
+    if fluid == HEAVY_WATER { 2 } else { 1 }
+}
 
 pub fn separates(fluid: &str) -> bool {
     SEPARATING.iter().any(|r| r.0 == fluid)
@@ -141,12 +154,9 @@ pub fn separate(
     else {
         return false;
     };
+    let usage = SEPARATOR_USAGE * separating_multiplier(fluid.chemical.as_deref().unwrap_or(""));
     let fits = |t: &ChemicalTank, c: &str, n: u64| t.accepts(c) && t.amount + n <= t.capacity;
-    if fluid.amount < need
-        || !fits(left, l, ln)
-        || !fits(right, r, rn)
-        || !energy.consume(SEPARATOR_USAGE)
-    {
+    if fluid.amount < need || !fits(left, l, ln) || !fits(right, r, rn) || !energy.consume(usage) {
         return false;
     }
     fluid.extract(need);

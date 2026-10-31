@@ -477,3 +477,24 @@ temperatures, `burnFuel`, `injectFuel`, `transferHeat`) and Mekanism's default c
   temperature it needs at that rate). There is no screen, no damage to things inside, no biome
   temperature, and the tanks are lost if the first port is broken. Deuterium and tritium have no source
   yet: that comes next.
+
+## Fusion fuel (milestone 29)
+
+`mekanism-core`'s `isotopes` and the new separating and evaporating recipes give the fusion reactor its
+deuterium and tritium:
+
+- **Electric Pump**: every 19 ticks (fewer with speed upgrades) at 2 FE a tick, it takes the water source
+  below it, as a bucket of water or, with a **Filter Upgrade** (right click the pump with it), 10 mB of
+  heavy water. With `waterSourceConversion` on (the default), water is an infinite source and the block
+  stays, as in Mekanism. The fluid goes up into the pipe or tank above. Filter upgrades go only into
+  the pump.
+- **Electrolytic Separator**: 2 mB of heavy water → 2 mB deuterium + 1 mB oxygen, at twice the energy
+  (`separator/heavy_water.json`).
+- **Thermal Evaporation Plant**: a tower fed brine (by bucket, or through its valves while it is not
+  making brine itself) makes 1 mB of lithium per 10 mB, as `evaporating/lithium.json` says.
+- **Solar Neutron Activator**: while it sees the sun, lithium piped in becomes tritium 1:1, up to 64 mB a
+  tick at noon (`maxSolarNeutronActivatorRate` × the sun's brightness), pushed to the tubes beside it.
+
+Simplified: the pump only pumps the block right below it, and only water; liquid lithium goes straight
+from the tower into tubes as a chemical, with no rotary condensentrator step; the activator ignores the
+biome's temperature and rain.

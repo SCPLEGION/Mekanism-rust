@@ -14,6 +14,7 @@ use mekanism_core::gear;
 use mekanism_core::nuclear;
 use mekanism_core::fission;
 use mekanism_core::fusion;
+use mekanism_core::isotopes;
 use mekanism_core::turbine;
 use mekanism_core::sides::{Sides, Transmission};
 use mekanism_core::factory::{self, Factory};
@@ -72,6 +73,10 @@ enum Kind {
     TurbineValve,
     /// A Fusion Reactor's port; the first port of a formed reactor runs it.
     FusionPort,
+    /// The Electric Pump: water (or heavy water) from below.
+    Pump,
+    /// The Solar Neutron Activator: lithium into tritium in the sun.
+    Activator,
     /// The Chemical Washer: dirty slurry and water into clean slurry.
     Washer,
     /// The Chemical Crystallizer: a chemical into an item.
@@ -113,6 +118,8 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanismgenerators:fission_reactor_port" => return Some(Kind::FissionPort),
         TURBINE_VALVE => return Some(Kind::TurbineValve),
         fusion::PORT => return Some(Kind::FusionPort),
+        "mekanism:electric_pump" => return Some(Kind::Pump),
+        "mekanism:solar_neutron_activator" => return Some(Kind::Activator),
         "mekanism:chemical_washer" => return Some(Kind::Washer),
         "mekanism:chemical_crystallizer" => return Some(Kind::Crystallizer),
         _ => {}
@@ -256,6 +263,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             tick_fusion_port(game, pos, entity);
             None
         }
+        Kind::Pump => tick_pump(game, pos, entity),
+        Kind::Activator => tick_activator(game, pos, entity),
         Kind::Washer => tick_washer(game, pos, entity),
         Kind::Crystallizer => tick_crystallizer(entity),
         Kind::Advanced(m) => tick_advanced(game, entity, m),
@@ -488,7 +497,10 @@ pub(super) fn install_upgrade(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
     let want = if sneaking { held.count } else { 1 };
     let installed = game.native_with_mod_block_entity(pos, |m| {
-        if !matches!(self::kind(&m.id), Some(Kind::Machine(..) | Kind::Factory(..) | Kind::DigitalMiner)) {
+        let target = self::kind(&m.id);
+        if !matches!(target, Some(Kind::Machine(..) | Kind::Factory(..) | Kind::DigitalMiner | Kind::Pump))
+            || (kind == Upgrade::Filter && target != Some(Kind::Pump))
+        {
             return None;
         }
         let mut u = upgrades(&m.nbt);
@@ -815,6 +827,7 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
         Kind::Centrifuge if nuclear::centrifuging(chemical).is_some() => Some(("input", nuclear::CENTRIFUGE_TANK)),
         Kind::Washer if nuclear::find_washing(chemical).is_some() => Some(("input", nuclear::WASHER_TANK)),
         Kind::Crystallizer if nuclear::find_crystallizing(chemical).is_some() => Some(("input", nuclear::CRYSTALLIZER_TANK)),
+        Kind::Activator if isotopes::activating(chemical).is_some() => Some(("input", isotopes::ACTIVATOR_TANK)),
         _ => None,
     }
 }
@@ -901,7 +914,7 @@ fn set_custom_string(stack: &mut ItemStack, key: &str, value: &str) {
     }
 }
 
-const FLUIDS: [&str; 3] = ["minecraft:water", "minecraft:lava", "mekanism:brine"];
+const FLUIDS: [&str; 4] = ["minecraft:water", "minecraft:lava", "mekanism:brine", chem::HEAVY_WATER];
 
 /// Pushes up to `rate` of `from`'s chemical into the tanks and generators beside `pos` (or only the one
 /// at `only`) that accept it.
@@ -1571,6 +1584,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::TurbineValve
                 | Kind::FusionPort
                 | Kind::Washer
+                | Kind::Pump
         ),
         "tube" => matches!(
             kind,
@@ -1588,6 +1602,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::FusionPort
                 | Kind::Washer
                 | Kind::Crystallizer
+                | Kind::Activator
         ),
         // The blocks with item slots (`block_entity_container`).
         "transporter" => matches!(
@@ -1941,12 +1956,18 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     };
     let mut water = get_tank(&entity.nbt, "water", evap::input_capacity(tower.height));
     let mut brine = get_tank(&entity.nbt, "brine", evap::OUTPUT_TANK);
+    let bucket_fluid = |item: &str| match item {
+        "minecraft:water_bucket" => Some("minecraft:water"),
+        "mekanism:brine_bucket" => Some("mekanism:brine"),
+        _ => None,
+    };
     if let Some(Some(bucket)) = entity.items.first().cloned()
-        && &*bucket.item == "minecraft:water_bucket"
+        && let Some(f) = bucket_fluid(&bucket.item)
+        && water.accepts(f)
         && water.amount + 1_000 <= water.capacity
         && give_back_bucket(entity)
     {
-        water.insert("minecraft:water", 1_000);
+        water.insert(f, 1_000);
         entity.items[0] = None;
     }
     // The top corners: an Advanced Solar Generator that sees the sun heats the tower.
@@ -1962,17 +1983,25 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     temperature = evap::step_temperature(temperature, solars, evap::AMBIENT_TEMP);
     let mut progress = get_int(&entity.nbt, "progress");
     let ops = evap::operations(evap::temp_multiplier(temperature, tower.height), &mut progress);
-    let ops = ops
-        .min(water.amount / evap::WATER_PER_BRINE)
-        .min((brine.capacity - brine.amount) * u64::from(brine.accepts("mekanism:brine")));
-    if ops > 0 {
+    // Water evaporates into brine, and brine into lithium.
+    let made = water.chemical.as_deref().and_then(evap::evaporating);
+    let ops = match made {
+        Some(out) => ops
+            .min(water.amount / evap::WATER_PER_BRINE)
+            .min((brine.capacity - brine.amount) * u64::from(brine.accepts(out))),
+        None => 0,
+    };
+    if let Some(out) = made
+        && ops > 0
+    {
         water.extract(ops * evap::WATER_PER_BRINE);
-        brine.insert("mekanism:brine", ops);
+        brine.insert(out, ops);
     }
     // FluidInventorySlot.drain: an empty bucket in the middle slot fills with a bucket of brine.
     if let Some(Some(bucket)) = entity.items.get(1).cloned()
         && &*bucket.item == "minecraft:bucket"
         && bucket.count == 1
+        && brine.chemical.as_deref() == Some("mekanism:brine")
         && brine.amount >= 1_000
     {
         brine.extract(1_000);
@@ -1982,8 +2011,14 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     // and separators beside them.
     let valves: Vec<[i32; 3]> =
         (y0..top).flat_map(|y| tower.perimeter(y).collect::<Vec<_>>()).filter(|&at| block_name(game, at) == EVAPORATION_VALVE).collect();
+    // A tower that is not making brine may take brine in, to make lithium.
+    let takes_brine = water.chemical.as_deref() == Some("mekanism:brine")
+        || (water.amount == 0 && brine.chemical.as_deref() != Some("mekanism:brine"));
     for valve in valves {
         pull_fluid(game, valve, &mut water, "minecraft:water");
+        if takes_brine {
+            pull_fluid(game, valve, &mut water, "mekanism:brine");
+        }
         if brine.amount > 0 {
             push_chemical(game, valve, &mut brine, None, u64::MAX, false);
         }
@@ -2284,6 +2319,11 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Advanced(m) => Some((m.usage * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
         Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE, u64::MAX)),
         Kind::Rotary => Some((machine::STORAGE_MULTIPLIER * chem::ROTARY_USAGE, u64::MAX)),
+        Kind::Pump => {
+            let u = upgrades(nbt);
+            let usage = u.energy_per_tick(isotopes::PUMP_USAGE);
+            Some((u.max_energy(machine::STORAGE_MULTIPLIER * isotopes::PUMP_USAGE).max(usage), u64::MAX))
+        }
         // The matrix's first port holds its energy; the others take a tick's worth and pass it on.
         Kind::InductionPort if get_long(nbt, "rate") > 0 => {
             let rate = get_long(nbt, "rate");
@@ -2955,6 +2995,77 @@ pub(super) fn use_fission_port(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
     true
+}
+
+/// The Electric Pump: every 19 ticks (fewer with speed upgrades) it takes the water source below it,
+/// as a bucket of water or, with a filter upgrade, 10 mB of heavy water. Water left by the
+/// `waterSourceConversion` rule is an infinite source, so the block stays, as in Mekanism. The fluid
+/// goes up into the pipe or tank above.
+fn tick_pump(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let u = upgrades(&entity.nbt);
+    let usage = u.energy_per_tick(isotopes::PUMP_USAGE);
+    let capacity = u.max_energy(machine::STORAGE_MULTIPLIER * isotopes::PUMP_USAGE).max(usage);
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut tank = get_tank(&entity.nbt, "fluid", isotopes::PUMP_TANK);
+    let below = [pos[0], pos[1] - 1, pos[2]];
+    let source = (game.native_block_property(below, "level").as_deref() == Some("0"))
+        .then(|| isotopes::pumped(block_name(game, below), u.filter > 0))
+        .flatten();
+    let mut progress = get_int(&entity.nbt, "progress");
+    let mut active = false;
+    match source {
+        Some((fluid, amount)) if tank.accepts(fluid) && tank.amount + amount <= tank.capacity => {
+            if energy.consume(usage) {
+                active = true;
+                progress += 1;
+                if progress >= u.ticks(isotopes::PUMP_TICKS) {
+                    progress = 0;
+                    tank.insert(fluid, amount);
+                }
+            }
+        }
+        _ => progress = 0,
+    }
+    if tank.amount > 0 {
+        push_chemical(game, pos, &mut tank, Some([0, 1, 0]), u64::MAX, false);
+    }
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "progress", progress);
+    put_tank(&mut entity.nbt, "fluid", &tank);
+    Some(active)
+}
+
+/// The Solar Neutron Activator: while it sees the sun, lithium piped in becomes tritium, up to 64 mB a
+/// tick at noon, pushed to the tubes and tanks beside it.
+fn tick_activator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let mut input = get_tank(&entity.nbt, "input", isotopes::ACTIVATOR_TANK);
+    let mut output = get_tank(&entity.nbt, "output", isotopes::ACTIVATOR_TANK);
+    let sees_sun = overworld(game) && game.sky_darken() < 4 && can_see_sky(game, pos);
+    let brightness = if sees_sun {
+        let mut sky = game.res.environment().sample(game.world.day_time, None, None);
+        let (rain, thunder) = game.world.weather.levels(1.0);
+        horizon_client::environment::apply_weather(&mut sky, rain, thunder);
+        f64::from(sky.sky_light_factor)
+    } else {
+        0.0
+    };
+    let mut made = 0;
+    if let Some(out) = input.chemical.as_deref().and_then(isotopes::activating)
+        && output.accepts(out)
+    {
+        made = isotopes::activator_rate(sees_sun, brightness)
+            .min(input.amount)
+            .min(output.capacity - output.amount);
+        input.extract(made);
+        output.insert(out, made);
+    }
+    if output.amount > 0 {
+        push_chemical(game, pos, &mut output, None, u64::MAX, false);
+    }
+    put_tank(&mut entity.nbt, "input", &input);
+    put_tank(&mut entity.nbt, "output", &output);
+    Some(made > 0)
 }
 
 // --- Fusion Reactor ----------------------------------------------------------------------------------

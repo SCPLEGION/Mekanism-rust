@@ -159,6 +159,7 @@ mod tests {
             Upgrades {
                 speed: 8,
                 energy: 0,
+                filter: 0,
             },
         );
         assert_eq!(
@@ -174,6 +175,7 @@ mod tests {
             Upgrades {
                 speed: 8,
                 energy: 0,
+                filter: 0,
             },
         );
         let mut dust = Slot {

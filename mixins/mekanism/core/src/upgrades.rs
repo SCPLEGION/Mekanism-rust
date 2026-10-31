@@ -9,16 +9,19 @@ pub const MAX_UPGRADE_MULTIPLIER: f64 = 10.0;
 pub enum Upgrade {
     Speed,
     Energy,
+    /// The Electric Pump's: water pumps as heavy water.
+    Filter,
 }
 
 impl Upgrade {
-    pub const ALL: [Upgrade; 2] = [Upgrade::Speed, Upgrade::Energy];
+    pub const ALL: [Upgrade; 3] = [Upgrade::Speed, Upgrade::Energy, Upgrade::Filter];
 
     /// The `mekanism:upgrade_type` value of the upgrade item.
     pub fn id(self) -> &'static str {
         match self {
             Upgrade::Speed => "mekanism:speed",
             Upgrade::Energy => "mekanism:energy",
+            Upgrade::Filter => "mekanism:filter",
         }
     }
 
@@ -27,7 +30,10 @@ impl Upgrade {
     }
 
     pub fn max(self) -> u32 {
-        8
+        match self {
+            Upgrade::Filter => 1,
+            _ => 8,
+        }
     }
 
     pub fn from_id(id: &str) -> Option<Upgrade> {
@@ -40,6 +46,7 @@ impl Upgrade {
 pub struct Upgrades {
     pub speed: u32,
     pub energy: u32,
+    pub filter: u32,
 }
 
 impl Upgrades {
@@ -47,6 +54,7 @@ impl Upgrades {
         match u {
             Upgrade::Speed => self.speed,
             Upgrade::Energy => self.energy,
+            Upgrade::Filter => self.filter,
         }
     }
 
@@ -57,6 +65,7 @@ impl Upgrades {
         match u {
             Upgrade::Speed => self.speed += n,
             Upgrade::Energy => self.energy += n,
+            Upgrade::Filter => self.filter += n,
         }
         n
     }
@@ -115,6 +124,7 @@ mod tests {
         let u = Upgrades {
             speed: 8,
             energy: 0,
+            filter: 0,
         };
         assert_eq!(u.ticks(200), 20);
         assert_eq!(u.energy_per_tick(50), 5000);
@@ -122,6 +132,7 @@ mod tests {
         let half = Upgrades {
             speed: 4,
             energy: 0,
+            filter: 0,
         };
         assert_eq!((half.ticks(200), half.energy_per_tick(50)), (63, 500));
     }
@@ -131,11 +142,13 @@ mod tests {
         let u = Upgrades {
             speed: 0,
             energy: 8,
+            filter: 0,
         };
         assert_eq!((u.energy_per_tick(50), u.max_energy(200)), (5, 2000));
         let both = Upgrades {
             speed: 8,
             energy: 8,
+            filter: 0,
         };
         assert_eq!(both.energy_per_tick(50), 500);
     }

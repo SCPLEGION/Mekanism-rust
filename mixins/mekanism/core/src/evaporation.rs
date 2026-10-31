@@ -14,8 +14,18 @@ pub const SOLAR_MULTIPLIER: f64 = 0.2;
 pub const TEMP_MULTIPLIER: f64 = 0.4;
 pub const FLUID_PER_TANK: u64 = 64_000;
 pub const OUTPUT_TANK: u64 = 10_000;
-/// `recipe/evaporating/brine.json`: 10 mB of water make 1 mB of brine.
+/// `recipe/evaporating/`: 10 mB of water make 1 mB of brine (`brine.json`), and 10 mB of brine 1 mB
+/// of lithium (`lithium.json`).
 pub const WATER_PER_BRINE: u64 = 10;
+
+/// What the tower makes of `fluid`.
+pub fn evaporating(fluid: &str) -> Option<&'static str> {
+    match fluid {
+        "minecraft:water" => Some("mekanism:brine"),
+        "mekanism:brine" => Some("mekanism:lithium"),
+        _ => None,
+    }
+}
 
 /// The water tank grows with the tower: a quarter of its volume, times 64 buckets.
 pub fn input_capacity(height: u32) -> u64 {
