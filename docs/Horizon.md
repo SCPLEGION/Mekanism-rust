@@ -77,3 +77,29 @@ Ores are placed by Mekanism's NeoForge biome modifiers (`data/mekanism/neoforge/
 the Horizon fork reads from content mods since its `milestone/m1-content` branch. Known gaps: the salt disk and the retrogen features use Mekanism's own feature types and are left out; models with
 NeoForge loaders (OBJ, transmitters) show as missing; machine recipe types (crushing, enriching...) load
 only once the native mod reads them; Tools' items keep the iron templates' damage and durability.
+
+## Machines (milestone 2: ore doubling)
+
+Hooks: `block_entity`, `block_entity_ticks`, `block_entity_container`, `block_entity_tick` (API 15 to 18,
+plus the API 20 block-property helpers). Logic in `mekanism-core` (`machine`, `generator`, `heat`,
+`recipes`, `energy`); glue in `runtime.rs`.
+
+| Block | What it does | Slots (furnace menu) | Bars |
+|---|---|---|---|
+| Enrichment Chamber | `enriching` recipes (osmium ore → 2 osmium dust), 5 FE/t, 200 ticks | input, (energy), output | flame = energy, arrow = progress |
+| Crusher | `crushing` recipes, 8 FE/t, 200 ticks | input, (energy), output | same |
+| Energized Smelter | vanilla smelting recipes, 5 FE/t, 200 ticks | input, (energy), output | same |
+| Heat Generator | furnace fuel → lava (1000 mB per lava bucket's burn time), lava → heat → FE | (unused), fuel, (unused) | flame = lava, arrow = heat |
+| Energy Cubes (basic to ultimate) | store 4M to 256M FE, output 4k to 256k FE/t out of the front | none | none |
+
+Energy moves only between touching Mekanism blocks: generators push to every side, cubes out of their
+front and take from the other sides, machines take from every side. Cables come with milestone 4.
+
+`tools/gen_recipe_table.py` writes `core/src/recipe_table.rs` (223 enriching, 255 crushing recipes) from
+the generated data; recipes that need another mod are left out.
+
+Not like Mekanism yet, each waiting for a later milestone or Horizon hook: the screens are the vanilla
+furnace's; the middle slot takes no energy items (item energy needs custom item components); no upgrades
+or side configuration; the Heat Generator ignores neighbouring lava and the biome's temperature; energy
+cubes face only the four horizontal directions (the furnace template's `facing`); machines are not shown
+running on clients (block entity sync), only their `lit` state.
