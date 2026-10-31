@@ -215,7 +215,11 @@ pub const JETPACK_THRUST: f64 = 0.15;
 /// `IJetpackItem.handleJetpackMotion` in its normal mode: the velocity a tick of thrust adds, from the
 /// player's velocity.
 pub fn jetpack_normal(motion: [f64; 3], thrust: f64) -> [f64; 3] {
-    [0.08 * motion[0], thrust * (-motion[1]).exp().min(1.0), 0.08 * motion[2]]
+    [
+        0.08 * motion[0],
+        thrust * (-motion[1]).exp().min(1.0),
+        0.08 * motion[2],
+    ]
 }
 
 #[cfg(test)]

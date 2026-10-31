@@ -70,12 +70,14 @@ impl Turbine {
 
     /// `getEnergyMultiplier`: energy per `STEAM_DIVISOR` mB of steam.
     pub fn energy_multiplier(&self) -> f64 {
-        JOULES_PER_STEAM / MAX_BLADES as f64 * self.blades().min(self.coils * BLADES_PER_COIL) as f64
+        JOULES_PER_STEAM / MAX_BLADES as f64
+            * self.blades().min(self.coils * BLADES_PER_COIL) as f64
     }
 
     /// `getMaxFlowRateDouble`.
     pub fn max_flow(&self) -> f64 {
-        (self.lower_volume as f64 * (self.dispersers as f64 * DISPERSER_FLOW)).min(self.vents as f64 * VENT_FLOW)
+        (self.lower_volume as f64 * (self.dispersers as f64 * DISPERSER_FLOW))
+            .min(self.vents as f64 * VENT_FLOW)
     }
 
     /// One tick: (steam used, energy made, water condensed) from `stored` steam with room for `needed`
@@ -86,7 +88,10 @@ impl Turbine {
             return (0, 0, 0);
         }
         let proportion = stored as f64 / self.steam_capacity() as f64;
-        let rate = (stored as f64).min(self.max_flow()).min(needed as f64 / multiplier * STEAM_DIVISOR) * proportion;
+        let rate = (stored as f64)
+            .min(self.max_flow())
+            .min(needed as f64 / multiplier * STEAM_DIVISOR)
+            * proportion;
         let energy = (multiplier * (rate / STEAM_DIVISOR)) as u64;
         if rate <= 1e-5 || energy == 0 {
             return (0, 0, 0);
@@ -102,7 +107,15 @@ mod tests {
 
     #[test]
     fn a_full_turbine_turns_steam_into_energy() {
-        let t = Turbine { rotors: 2, dispersers: 8, coils: 1, condensers: 1, vents: 4, volume: 125, lower_volume: 50 };
+        let t = Turbine {
+            rotors: 2,
+            dispersers: 8,
+            coils: 1,
+            condensers: 1,
+            vents: 4,
+            volume: 125,
+            lower_volume: 50,
+        };
         assert_eq!(t.blades(), 4);
         assert!((t.energy_multiplier() - 5.0 / 28.0 * 4.0).abs() < 1e-12);
         assert_eq!(t.max_flow(), 128_000.0);
