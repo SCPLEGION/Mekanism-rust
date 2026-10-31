@@ -12,6 +12,7 @@ use mekanism_core::energy::{Action, EnergyContainer};
 use mekanism_core::evaporation as evap;
 use mekanism_core::gear;
 use mekanism_core::nuclear;
+use mekanism_core::fission;
 use mekanism_core::sides::{Sides, Transmission};
 use mekanism_core::factory::{self, Factory};
 use mekanism_core::generator::HeatGenerator;
@@ -63,6 +64,8 @@ enum Kind {
     Dissolution,
     /// The Isotopic Centrifuge: a chemical into another.
     Centrifuge,
+    /// A Fission Reactor's port; the first port of a formed reactor runs it.
+    FissionPort,
     /// A mechanical pipe and the mB of fluid it carries in a tick.
     Pipe(u64),
 }
@@ -97,6 +100,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:electrolytic_separator" => return Some(Kind::Separator),
         "mekanism:chemical_dissolution_chamber" => return Some(Kind::Dissolution),
         "mekanism:isotopic_centrifuge" => return Some(Kind::Centrifuge),
+        "mekanismgenerators:fission_reactor_port" => return Some(Kind::FissionPort),
         _ => {}
     }
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_universal_cable")) {
@@ -227,6 +231,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         Kind::Oxidizer => tick_oxidizer(game, pos, entity),
         Kind::Dissolution => tick_dissolution(game, pos, entity),
         Kind::Centrifuge => tick_centrifuge(game, pos, entity),
+        Kind::FissionPort => {
+            tick_fission_port(game, pos, entity);
+            None
+        }
         Kind::Advanced(m) => tick_advanced(game, entity, m),
         Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
         Kind::Evaporation => tick_evaporation(game, pos, entity),
@@ -1452,8 +1460,12 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Evaporation
                 | Kind::FluidTank(_)
                 | Kind::Pipe(_)
+                | Kind::FissionPort
         ),
-        "pipe" => matches!(kind, Kind::FluidTank(_) | Kind::Separator | Kind::Rotary | Kind::HeatGenerator),
+        "pipe" => matches!(
+            kind,
+            Kind::FluidTank(_) | Kind::Separator | Kind::Rotary | Kind::HeatGenerator | Kind::FissionPort
+        ),
         "tube" => matches!(
             kind,
             Kind::Oxidizer
@@ -1465,6 +1477,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::ChemicalTank(_)
                 | Kind::Dissolution
                 | Kind::Centrifuge
+                | Kind::FissionPort
         ),
         // The blocks with item slots (`block_entity_container`).
         "transporter" => matches!(
@@ -1965,6 +1978,13 @@ const EVAPORATION_VALVE: &str = "mekanism:thermal_evaporation_valve";
 /// Fills `into` with `fluid` from the mechanical pipes and fluid tanks beside `pos`, as Mekanism's pipes
 /// push into a block that takes the fluid.
 fn pull_fluid(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTank, fluid: &str) {
+    pull_from_carriers(game, pos, into, fluid);
+}
+
+/// Fills `into` with `id` from the carriers and tanks of its kind beside `pos`: pipes and fluid tanks
+/// for a fluid, tubes and chemical tanks for a chemical.
+fn pull_from_carriers(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTank, fluid: &str) {
+    let is_fluid = FLUIDS.contains(&fluid);
     for (_, d) in DIRECTIONS {
         let room = into.capacity - into.amount;
         if room == 0 || !into.accepts(fluid) {
@@ -1972,17 +1992,19 @@ fn pull_fluid(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTank, fluid
         }
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
         let taken = game.native_with_mod_block_entity(at, |m| {
-            let capacity = match kind(&m.id)? {
-                Kind::Pipe(rate) => rate,
-                Kind::FluidTank(t) => tier::fluid_tank(t).0,
+            let (key, capacity) = match kind(&m.id)? {
+                Kind::Pipe(rate) if is_fluid => ("fluid", rate),
+                Kind::FluidTank(t) if is_fluid => ("fluid", tier::fluid_tank(t).0),
+                Kind::Tube(rate) if !is_fluid => ("chemical", rate),
+                Kind::ChemicalTank(t) if !is_fluid => ("chemical", chem::chemical_tank(t).0),
                 _ => return None,
             };
-            let mut theirs = get_tank(&m.nbt, "fluid", capacity);
+            let mut theirs = get_tank(&m.nbt, key, capacity);
             if theirs.chemical.as_deref() != Some(fluid) {
                 return None;
             }
             let n = theirs.extract(room);
-            put_tank(&mut m.nbt, "fluid", &theirs);
+            put_tank(&mut m.nbt, key, &theirs);
             Some(n)
         });
         if let Some(Some(n)) = taken {
@@ -2610,6 +2632,200 @@ pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     game.inventory[selected] = Some(held);
     if let Some(player) = game.native_acting_player() {
         let line = format!("Jetpack: {} / {} mB hydrogen", fuel + n, gear::JETPACK_CAPACITY);
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
+    true
+}
+
+// --- Fission Reactor ---------------------------------------------------------------------------------
+
+/// `FissionReactorValidator`, simplified: the frame blocks joined to `start` must be exactly the shell
+/// of a box 3 to 18 on each side, with fuel assemblies, control rods or air inside. The reactor and its
+/// ports.
+fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, Vec<[i32; 3]>)> {
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut todo = vec![start];
+    let (mut lo, mut hi) = (start, start);
+    while let Some(at) = todo.pop() {
+        for k in 0..3 {
+            lo[k] = lo[k].min(at[k]);
+            hi[k] = hi[k].max(at[k]);
+            if hi[k] - lo[k] >= fission::MAX_SIZE {
+                return None;
+            }
+        }
+        for (_, d) in DIRECTIONS {
+            let next = [at[0] + d[0], at[1] + d[1], at[2] + d[2]];
+            if !seen.contains(&next) && fission::is_frame(block_name(game, next)) {
+                seen.insert(next);
+                todo.push(next);
+            }
+        }
+    }
+    if (0..3).any(|k| hi[k] - lo[k] + 1 < fission::MIN_SIZE) {
+        return None;
+    }
+    let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
+    let mut reactor = fission::Reactor { volume: size(0) * size(1) * size(2), ..Default::default() };
+    let mut ports = Vec::new();
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                let at = [x, y, z];
+                let shell = x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2];
+                let name = block_name(game, at);
+                if shell {
+                    if !seen.contains(&at) {
+                        return None;
+                    }
+                    if name == FISSION_PORT {
+                        ports.push(at);
+                    }
+                } else if !reactor.add_inside(name) {
+                    return None;
+                }
+            }
+        }
+    }
+    (reactor.assemblies > 0).then_some((reactor, ports))
+}
+
+const FISSION_PORT: &str = "mekanismgenerators:fission_reactor_port";
+const FISSILE_FUEL: &str = "mekanism:fissile_fuel";
+
+fn get_pos(nbt: &Compound, key: &str) -> Option<[i32; 3]> {
+    match nbt.get(&JavaString::from(key)) {
+        Some(Tag::IntArray(v)) if v.len() == 3 => Some([v[0], v[1], v[2]]),
+        _ => None,
+    }
+}
+
+/// A Fission Reactor port. Once a second each port checks its reactor; the first port runs it, holding
+/// its tanks: it takes fissile fuel from the tubes and chemical tanks beside the ports and water from the
+/// pipes and fluid tanks beside them, burns the fuel at the set rate while switched on (water boils to
+/// steam), and gives steam and nuclear waste out of every port.
+fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
+    if ticker == 0 {
+        match find_reactor(game, pos) {
+            Some((r, ports)) => {
+                put_long(&mut entity.nbt, "assemblies", r.assemblies);
+                put_long(&mut entity.nbt, "volume", r.volume);
+                let master = ports.first().copied().unwrap_or(pos);
+                entity.nbt.insert("master".into(), Tag::IntArray(master.to_vec()));
+                entity.nbt.insert("ports".into(), Tag::IntArray(ports.concat()));
+            }
+            None => {
+                put_long(&mut entity.nbt, "assemblies", 0);
+                entity.nbt.remove(&JavaString::from("master"));
+            }
+        }
+    }
+    let r = fission::Reactor { assemblies: get_long(&entity.nbt, "assemblies"), volume: get_long(&entity.nbt, "volume") };
+    if r.assemblies == 0 || get_pos(&entity.nbt, "master") != Some(pos) {
+        return;
+    }
+    let ports: Vec<[i32; 3]> = match entity.nbt.get(&JavaString::from("ports")) {
+        Some(Tag::IntArray(v)) => v.chunks(3).filter(|c| c.len() == 3).map(|c| [c[0], c[1], c[2]]).collect(),
+        _ => vec![pos],
+    };
+    let mut fuel = get_tank(&entity.nbt, "fuel", r.fuel_capacity());
+    let mut water = get_tank(&entity.nbt, "water", r.water_capacity());
+    let mut steam = get_tank(&entity.nbt, "steam", r.steam_capacity());
+    let mut waste = get_tank(&entity.nbt, "waste", r.fuel_capacity());
+    for &p in &ports {
+        pull_from_carriers(game, p, &mut fuel, FISSILE_FUEL);
+        pull_from_carriers(game, p, &mut water, "minecraft:water");
+    }
+    if get_long(&entity.nbt, "active") == 1 {
+        let rate = get_long(&entity.nbt, "burn").clamp(1, r.max_burn_tenths());
+        let mut partial = get_long(&entity.nbt, "partial");
+        let burned = fission::burn(
+            rate,
+            &mut partial,
+            fuel.amount,
+            if water.accepts("minecraft:water") { water.amount } else { 0 },
+            (steam.capacity - steam.amount) * u64::from(steam.accepts("mekanism:steam")),
+            (waste.capacity - waste.amount) * u64::from(waste.accepts("mekanism:nuclear_waste")),
+        );
+        match burned {
+            Some(b) => {
+                fuel.extract(b.fuel);
+                water.extract(b.steam);
+                steam.insert("mekanism:steam", b.steam);
+                waste.insert("mekanism:nuclear_waste", b.waste);
+                put_long(&mut entity.nbt, "partial", partial);
+            }
+            // SCRAM: too little water to take the heat, or nowhere for the steam or waste.
+            None => {
+                put_long(&mut entity.nbt, "active", 0);
+                put_long(&mut entity.nbt, "scram", 1);
+            }
+        }
+    }
+    for &p in &ports {
+        push_chemical(game, p, &mut steam, None, u64::MAX, false);
+        push_chemical(game, p, &mut waste, None, u64::MAX, false);
+    }
+    put_tank(&mut entity.nbt, "fuel", &fuel);
+    put_tank(&mut entity.nbt, "water", &water);
+    put_tank(&mut entity.nbt, "steam", &steam);
+    put_tank(&mut entity.nbt, "waste", &waste);
+}
+
+/// A right click with an empty hand on a fission port: sneaking switches the reactor on or off, else it
+/// steps the burn rate. Either way the action bar shows the reactor's state.
+pub(super) fn use_fission_port(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || game.inventory.get(game.selected).cloned().flatten().is_some() {
+        return false;
+    }
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let master = game.native_with_mod_block_entity(pos, |m| {
+        (kind(&m.id) == Some(Kind::FissionPort)).then(|| get_pos(&m.nbt, "master"))
+    });
+    let Some(Some(master)) = master else {
+        return false;
+    };
+    let line = match master {
+        None => "Fission Reactor: not formed".to_owned(),
+        Some(master) => game
+            .native_with_mod_block_entity(master, |m| {
+                let r = fission::Reactor { assemblies: get_long(&m.nbt, "assemblies"), volume: get_long(&m.nbt, "volume") };
+                let mut burn = get_long(&m.nbt, "burn").clamp(1, r.max_burn_tenths().max(1));
+                if sneaking {
+                    let on = get_long(&m.nbt, "active") == 0;
+                    put_long(&mut m.nbt, "active", u64::from(on));
+                    put_long(&mut m.nbt, "scram", 0);
+                } else {
+                    burn = fission::next_burn(burn, r.max_burn_tenths());
+                }
+                put_long(&mut m.nbt, "burn", burn);
+                let amount = |key: &str| {
+                    let mut c = Compound::new();
+                    if let Some(t) = m.nbt.get(&JavaString::from(key)) {
+                        c.insert("t".into(), t.clone());
+                    }
+                    get_tank(&c, "t", u64::MAX).amount
+                };
+                let state = match (get_long(&m.nbt, "active"), get_long(&m.nbt, "scram")) {
+                    (1, _) => "on",
+                    (_, 1) => "SCRAM (no coolant or full)",
+                    _ => "off",
+                };
+                format!(
+                    "Fission Reactor: {state}, burn {}.{} mB/t, fuel {}, water {}, steam {}, waste {}",
+                    burn / 10,
+                    burn % 10,
+                    amount("fuel"),
+                    amount("water"),
+                    amount("steam"),
+                    amount("waste"),
+                )
+            })
+            .unwrap_or_else(|| "Fission Reactor: not formed".to_owned()),
+    };
+    if let Some(player) = game.native_acting_player() {
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
     true
