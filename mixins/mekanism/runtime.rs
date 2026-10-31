@@ -562,3 +562,83 @@ fn set_slot(entity: &mut ModBlockEntity, index: usize, slot: &Slot) {
         (Some(item), _) => Some(stack_of(item, slot.count)),
     };
 }
+
+// --- Energy kept in items ---------------------------------------------------------------------------
+
+/// The key in an item's `minecraft:custom_data` that holds its energy (FE), as Mekanism's
+/// `mekanism:energy` component does.
+const ENERGY_KEY: &str = "mekanism:energy";
+
+fn custom_data(stack: &ItemStack) -> Option<&Compound> {
+    let (_, data) = stack.extra.as_ref()?.other.iter().find(|(k, _)| k == "minecraft:custom_data")?;
+    match data {
+        Tag::Compound(c) => Some(c),
+        _ => None,
+    }
+}
+
+fn stored_energy(stack: &ItemStack) -> u64 {
+    custom_data(stack).map_or(0, |c| get_long(c, ENERGY_KEY))
+}
+
+fn with_energy(item: &str, energy: u64) -> ItemStack {
+    let mut c = Compound::new();
+    put_long(&mut c, ENERGY_KEY, energy);
+    let data = horizon_client::item_data::StackData {
+        other: vec![("minecraft:custom_data".to_owned(), Tag::Compound(c))],
+        ..Default::default()
+    };
+    ItemStack { extra: Some(Box::new(data)), ..stack_of(item, 1) }
+}
+
+/// Breaking an energy cube that holds energy outside creative: the block goes as `Level.destroyBlock`
+/// takes it (particles, sound, no loot) and drops the cube with its energy, as Mekanism's loot copies
+/// the energy component. True when it did, so the game's own break is canceled.
+pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || game.creative {
+        return false;
+    }
+    let held = game.native_with_mod_block_entity(pos, |m| match kind(&m.id) {
+        Some(Kind::EnergyCube(_)) => Some((m.id.clone(), get_long(&m.nbt, "energy"))),
+        _ => None,
+    });
+    let Some(Some((id, energy))) = held else {
+        return false;
+    };
+    if energy == 0 {
+        return false;
+    }
+    let at = horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]);
+    let cube = with_energy(&id, energy);
+    game.with_level(|b, level, ticks| {
+        b.destroy_block(level, ticks, at, false);
+        level.drop_lost_contents(at, vec![Some(cube)]);
+    });
+    true
+}
+
+/// A placed energy cube takes the energy its item held.
+pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
+    let energy = stored_energy(stack);
+    if energy == 0 || !game.native_on(MOD_ID) {
+        return;
+    }
+    game.native_with_mod_block_entity(pos, |m| {
+        if let Some(Kind::EnergyCube(t)) = kind(&m.id) {
+            put_long(&mut m.nbt, "energy", energy.min(tier::energy_cube(t).0));
+        }
+    });
+}
+
+/// "Stored Energy: 1.2 MFE" under a Mekanism item that holds energy.
+pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    if !game.native_on(MOD_ID) || !stack.item.starts_with("mekanism") {
+        return;
+    }
+    let energy = stored_energy(stack);
+    if energy == 0 {
+        return;
+    }
+    let line = format!("Stored Energy: {}", mekanism_core::energy::format_fe(energy));
+    lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0x55, 0xFF, 0xFF, 0xFF)));
+}

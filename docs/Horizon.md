@@ -124,3 +124,6 @@ running on clients (block entity sync), only their `lit` state.
   They show a two-row chest menu: the inputs are on the top row and each process's output is below its
   input. All processes share one energy store sized for one operation of each, and each process uses the
   machine's energy per tick. Upgrades work as they do on machines. Input sorting is not ported yet.
+- **Energy cubes keep their energy** when broken outside creative. The cube drops itself with the energy
+  in `minecraft:custom_data` (`mekanism:energy`), and placing it puts the energy back. The tooltip shows
+  "Stored Energy" with SI prefixes, as Mekanism does.
