@@ -38,7 +38,9 @@ enum Kind {
     /// A pressurized tube and the mB it carries in a tick.
     Tube(u64),
     Oxidizer,
-    Purifier,
+    /// A purification chamber or osmium compressor: an item and a chemical each tick.
+    Advanced(&'static chem::AdvancedMachine),
+    ChemicalInfuser,
     Infuser,
     Separator,
     GasGenerator,
@@ -64,7 +66,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanismgenerators:wind_generator" => return Some(Kind::Wind),
         "mekanismgenerators:gas_burning_generator" => return Some(Kind::GasGenerator),
         "mekanism:chemical_oxidizer" => return Some(Kind::Oxidizer),
-        "mekanism:purification_chamber" => return Some(Kind::Purifier),
+        "mekanism:chemical_infuser" => return Some(Kind::ChemicalInfuser),
         "mekanism:metallurgic_infuser" => return Some(Kind::Infuser),
         "mekanism:electrolytic_separator" => return Some(Kind::Separator),
         _ => {}
@@ -72,6 +74,9 @@ fn kind(id: &str) -> Option<Kind> {
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_universal_cable")) {
         let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
         return tier::universal_cable(tier).map(Kind::Cable);
+    }
+    if let Some(m) = chem::ADVANCED_MACHINES.iter().find(|m| m.block == id) {
+        return Some(Kind::Advanced(m));
     }
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_pressurized_tube")) {
         let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
@@ -131,7 +136,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         // the empty buckets back in the last.
         Some(Kind::Oxidizer) => (vec![0], vec![]),
         Some(Kind::Separator) => (vec![0], vec![2]),
-        Some(Kind::Purifier) => (vec![0], vec![2]),
+        // An advanced machine's middle slot takes items that turn into its chemical (flint → oxygen).
+        Some(Kind::Advanced(_)) => (vec![0, 1], vec![2]),
         // The item to infuse in the first slot, the infuse item (coal, redstone...) in the middle one.
         Some(Kind::Infuser) => (vec![0, 1], vec![2]),
         _ => return,
@@ -167,7 +173,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             None
         }
         Kind::Oxidizer => tick_oxidizer(game, pos, entity),
-        Kind::Purifier => tick_purifier(game, pos, entity),
+        Kind::Advanced(m) => tick_advanced(game, entity, m),
+        Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
         Kind::Infuser => tick_infuser(game, entity),
         Kind::Separator => tick_separator(game, pos, entity),
         Kind::GasGenerator => tick_gas_generator(game, pos, entity),
@@ -645,11 +652,25 @@ fn put_tank(nbt: &mut Compound, key: &str, t: &ChemicalTank) {
 /// Where a neighbour keeps chemicals it accepts: its NBT key and capacity, for `chemical`. Tubes take
 /// from machines and tanks but not from other tubes, which share by gradient instead (`tick_tube`).
 /// `d` is the receiver's offset from the giver: a tank takes nothing into its bottom, its output side.
-fn chemical_receiver(id: &str, chemical: &str, from_tube: bool, d: [i32; 3]) -> Option<(&'static str, u64)> {
+fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, d: [i32; 3]) -> Option<(&'static str, u64)> {
     match kind(id)? {
         Kind::Tube(rate) if !from_tube => Some(("chemical", rate)),
         Kind::ChemicalTank(t) if d != [0, 1, 0] => Some(("chemical", chem::chemical_tank(t).0)),
-        Kind::Purifier if chemical == "mekanism:oxygen" => Some(("chemical", chem::PURIFIER_TANK)),
+        Kind::Advanced(m) if chemical == m.chemical => Some(("chemical", chem::ADVANCED_TANK)),
+        // The chemical infuser fills whichever input tank holds this chemical, else an empty one.
+        Kind::ChemicalInfuser if mekanism_core::recipes::infusing_input(chemical) => {
+            let cap = chem::CHEMICAL_INFUSER_TANK;
+            let (left, right) = (get_tank(nbt, "left", cap), get_tank(nbt, "right", cap));
+            let holds = |t: &ChemicalTank| t.chemical.as_deref() == Some(chemical);
+            let key = if holds(&left) || (!holds(&right) && left.amount == 0) {
+                "left"
+            } else if holds(&right) || right.amount == 0 {
+                "right"
+            } else {
+                return None;
+            };
+            Some((key, cap))
+        }
         Kind::GasGenerator if chem::fuel(chemical).is_some() => Some(("fuel", chem::GAS_GENERATOR_TANK)),
         _ => None,
     }
@@ -679,7 +700,7 @@ fn push_chemical(
         }
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
         let taken = game.native_with_mod_block_entity(at, |m| {
-            let Some((key, capacity)) = chemical_receiver(&m.id, &chemical, from_tube, d) else {
+            let Some((key, capacity)) = chemical_receiver(&m.id, &m.nbt, &chemical, from_tube, d) else {
                 return 0;
             };
             let mut to = get_tank(&m.nbt, key, capacity);
@@ -736,35 +757,48 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     Some(active)
 }
 
-/// The Purification Chamber: an item and 1 mB of oxygen a tick for 200 ticks at 10 FE a tick
-/// (`purifying`: ore → 3 clumps). Oxygen comes in from the separator, tanks or tubes beside it.
-fn tick_purifier(game: &mut Game<'_>, _pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = chem::PURIFIER_USAGE * u64::from(chem::PURIFIER_TICKS);
+/// An advanced electric machine: the Purification Chamber (ore + 1 mB oxygen a tick → 3 clumps) or the
+/// Osmium Compressor (refined obsidian or glowstone dust + osmium → ingot), 200 ticks. Its chemical comes
+/// from the blocks beside it, or from items in the middle slot (`chemical_conversion`: flint → oxygen,
+/// osmium ingot → osmium).
+fn tick_advanced(game: &mut Game<'_>, entity: &mut ModBlockEntity, m: &'static chem::AdvancedMachine) -> Option<bool> {
+    let ticks = chem::ADVANCED_TICKS;
+    let capacity = m.usage * u64::from(ticks);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
-    let mut tank = get_tank(&entity.nbt, "chemical", chem::PURIFIER_TANK);
+    let mut tank = get_tank(&entity.nbt, "chemical", chem::ADVANCED_TANK);
     let mut progress = get_int(&entity.nbt, "progress");
     let mut active = false;
+    let items = world_items!(game);
+    let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
+    if let Some(Some(extra)) = entity.items.get(1).cloned()
+        && let Some(c) = mekanism_core::recipes::find_conversion(&extra.item, &in_tag)
+        && c.output == m.chemical
+        && tank.amount + c.amount <= tank.capacity
+    {
+        tank.insert(c.output, c.amount);
+        entity.items[1] = (extra.count > 1).then(|| ItemStack { count: extra.count - 1, ..extra });
+    }
     let recipe = entity.items.first().cloned().flatten().and_then(|stack| {
-        let items = world_items!(game);
-        let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
-        mekanism_core::recipes::find_purifying(&stack.item, stack.count, &in_tag).map(|r| (stack, *r))
+        mekanism_core::recipes::find_item_chemical(m.table, &stack.item, stack.count, &in_tag).map(|r| (stack, *r))
     });
     let out = entity.items.get(2).cloned().flatten();
-    let fits = |r: &mekanism_core::recipes::ItemChemicalRecipe| match &out {
-        None => true,
-        Some(o) => &*o.item == r.output && o.count + r.output_count <= max_stack(game, r.output),
-    };
     match recipe {
-        Some((stack, r)) if fits(&r) => {
-            if tank.chemical.as_deref() == Some(r.chemical)
+        Some((stack, r)) => {
+            let max = items.get(r.output).map_or(64, |i| i.max_stack);
+            let fits = match &out {
+                None => true,
+                Some(o) => &*o.item == r.output && o.count + r.output_count <= max,
+            };
+            if fits
+                && tank.chemical.as_deref() == Some(r.chemical)
                 && tank.amount >= r.chemical_amount
-                && energy.consume(chem::PURIFIER_USAGE)
+                && energy.consume(m.usage)
             {
                 active = true;
                 tank.extract(r.chemical_amount);
                 progress += 1;
-                if progress >= chem::PURIFIER_TICKS {
+                if progress >= ticks {
                     progress = 0;
                     let left = stack.count - r.input_count;
                     entity.items[0] = (left > 0).then(|| ItemStack { count: left, ..stack });
@@ -775,7 +809,7 @@ fn tick_purifier(game: &mut Game<'_>, _pos: [i32; 3], entity: &mut ModBlockEntit
                 }
             }
         }
-        _ => progress = 0,
+        None => progress = 0,
     }
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
@@ -784,8 +818,44 @@ fn tick_purifier(game: &mut Game<'_>, _pos: [i32; 3], entity: &mut ModBlockEntit
         (energy.stored * 1000 / capacity) as i32,
         1000,
         progress as i32,
-        chem::PURIFIER_TICKS as i32,
+        ticks as i32,
     ];
+    Some(active)
+}
+
+/// The Chemical Infuser: one operation a tick of two chemicals into a third (oxygen + sulfur dioxide →
+/// sulfur trioxide), 15 FE a tick, pushed out to the blocks beside it. Each input tank takes one of the
+/// two chemicals (`chemical_receiver`).
+fn tick_chemical_infuser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let cap = chem::CHEMICAL_INFUSER_TANK;
+    let capacity = machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE;
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut left = get_tank(&entity.nbt, "left", cap);
+    let mut right = get_tank(&entity.nbt, "right", cap);
+    let mut out = get_tank(&entity.nbt, "output", cap);
+    let mut active = false;
+    if let (Some(a), Some(b)) = (left.chemical.clone(), right.chemical.clone())
+        && let Some((r, swapped)) = mekanism_core::recipes::find_chemical_infusing(&a, &b)
+    {
+        let (need_a, need_b) = if swapped { (r.right_amount, r.left_amount) } else { (r.left_amount, r.right_amount) };
+        if left.amount >= need_a
+            && right.amount >= need_b
+            && out.accepts(r.output)
+            && out.amount + r.amount <= out.capacity
+            && energy.consume(chem::CHEMICAL_INFUSER_USAGE)
+        {
+            left.extract(need_a);
+            right.extract(need_b);
+            out.insert(r.output, r.amount);
+            active = true;
+        }
+    }
+    push_chemical(game, pos, &mut out, None, u64::MAX, false);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_tank(&mut entity.nbt, "left", &left);
+    put_tank(&mut entity.nbt, "right", &right);
+    put_tank(&mut entity.nbt, "output", &out);
     Some(active)
 }
 
@@ -1026,7 +1096,8 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Cable(rate) if !from_cable => Some((rate, rate)),
         Kind::Oxidizer => Some((chem::OXIDIZER_USAGE * u64::from(chem::OXIDIZER_TICKS), u64::MAX)),
         Kind::Separator => Some((machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE, u64::MAX)),
-        Kind::Purifier => Some((chem::PURIFIER_USAGE * u64::from(chem::PURIFIER_TICKS), u64::MAX)),
+        Kind::Advanced(m) => Some((m.usage * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
+        Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE, u64::MAX)),
         Kind::Infuser => Some((chem::INFUSER_USAGE * u64::from(chem::INFUSER_TICKS), u64::MAX)),
         _ => None,
     }

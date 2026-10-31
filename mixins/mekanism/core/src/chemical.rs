@@ -128,11 +128,37 @@ pub const OXIDIZER_USAGE: u64 = 15;
 pub const OXIDIZER_TICKS: u32 = 100;
 pub const OXIDIZER_TANK: u64 = 10_000;
 
-/// `TileEntityPurificationChamber` (an advanced electric machine): 10 FE a tick (`UsageConfig`), 200
-/// ticks, and a 210 mB tank for the chemical it uses each tick (`TileEntityAdvancedElectricMachine.MAX_GAS`).
-pub const PURIFIER_USAGE: u64 = 10;
-pub const PURIFIER_TICKS: u32 = 200;
-pub const PURIFIER_TANK: u64 = 210;
+/// An advanced electric machine (`TileEntityAdvancedElectricMachine`): an item and a chemical used each
+/// tick, 200 ticks, a 210 mB tank (`MAX_GAS`); its energy per tick is `UsageConfig`'s.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AdvancedMachine {
+    pub block: &'static str,
+    pub usage: u64,
+    pub chemical: &'static str,
+    pub table: &'static [crate::recipes::ItemChemicalRecipe],
+}
+
+pub const ADVANCED_TICKS: u32 = 200;
+pub const ADVANCED_TANK: u64 = 210;
+
+pub static ADVANCED_MACHINES: &[AdvancedMachine] = &[
+    AdvancedMachine {
+        block: "mekanism:purification_chamber",
+        usage: 10,
+        chemical: "mekanism:oxygen",
+        table: crate::recipe_table::PURIFYING,
+    },
+    AdvancedMachine {
+        block: "mekanism:osmium_compressor",
+        usage: 15,
+        chemical: "mekanism:osmium",
+        table: crate::recipe_table::COMPRESSING,
+    },
+];
+
+/// `TileEntityChemicalInfuser`: 15 FE a tick, three 10,000 mB tanks.
+pub const CHEMICAL_INFUSER_USAGE: u64 = 15;
+pub const CHEMICAL_INFUSER_TANK: u64 = 10_000;
 
 /// `TileEntityMetallurgicInfuser`: 5 FE a tick, 200 ticks, a 1,000 mB infuse tank.
 pub const INFUSER_USAGE: u64 = 5;

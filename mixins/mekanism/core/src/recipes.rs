@@ -111,7 +111,7 @@ pub fn find_oxidizing(
 }
 
 /// An item and a chemical used a little each tick (`per_tick_usage`) make an item: purifying.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ItemChemicalRecipe {
     pub id: &'static str,
     pub input: Ingredient,
@@ -128,9 +128,50 @@ pub fn find_purifying(
     count: u32,
     in_tag: &dyn Fn(&str, &str) -> bool,
 ) -> Option<&'static ItemChemicalRecipe> {
-    crate::recipe_table::PURIFYING
+    find_item_chemical(crate::recipe_table::PURIFYING, item, count, in_tag)
+}
+
+pub fn find_item_chemical(
+    table: &'static [ItemChemicalRecipe],
+    item: &str,
+    count: u32,
+    in_tag: &dyn Fn(&str, &str) -> bool,
+) -> Option<&'static ItemChemicalRecipe> {
+    table
         .iter()
         .find(|r| count >= r.input_count && r.input.matches(item, in_tag))
+}
+
+/// `chemical_infusing`: two chemicals become a third, one operation a tick.
+#[derive(Clone, Copy, Debug)]
+pub struct InfusingRecipe {
+    pub id: &'static str,
+    pub left: &'static str,
+    pub left_amount: u64,
+    pub right: &'static str,
+    pub right_amount: u64,
+    pub output: &'static str,
+    pub amount: u64,
+}
+
+/// The recipe for two chemicals, in either order, and whether they are swapped.
+pub fn find_chemical_infusing(a: &str, b: &str) -> Option<(&'static InfusingRecipe, bool)> {
+    crate::recipe_table::CHEMICAL_INFUSING.iter().find_map(|r| {
+        if r.left == a && r.right == b {
+            Some((r, false))
+        } else if r.left == b && r.right == a {
+            Some((r, true))
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether `chemical` is either input of some `chemical_infusing` recipe.
+pub fn infusing_input(chemical: &str) -> bool {
+    crate::recipe_table::CHEMICAL_INFUSING
+        .iter()
+        .any(|r| r.left == chemical || r.right == chemical)
 }
 
 /// `metallurgic_infusing`: an item and the infuse chemical in the tank (used at the end of the
@@ -227,5 +268,16 @@ mod tests {
         assert_eq!(dirt("mekanism:fungi"), Some("minecraft:mycelium"));
         assert_eq!(dirt("mekanism:bio"), Some("minecraft:podzol"));
         assert_eq!(dirt("mekanism:carbon"), None);
+    }
+
+    #[test]
+    fn sulfur_dioxide_and_oxygen_infuse_in_either_order() {
+        let (r, swapped) =
+            find_chemical_infusing("mekanism:oxygen", "mekanism:sulfur_dioxide").expect("a recipe");
+        assert_eq!(r.output, "mekanism:sulfur_trioxide");
+        let (_, swapped_back) =
+            find_chemical_infusing("mekanism:sulfur_dioxide", "mekanism:oxygen").unwrap();
+        assert_ne!(swapped, swapped_back);
+        assert!(infusing_input("mekanism:oxygen"));
     }
 }

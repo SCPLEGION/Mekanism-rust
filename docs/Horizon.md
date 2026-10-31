@@ -172,7 +172,7 @@ tank contents in a screen.
   tank or a pressurized tube beside it. Slots: input, (unused), output.
 - The rest of the chain already runs: the Crusher turns clumps into dirty dust and the Enrichment Chamber
   turns dirty dust into dust, so one ore gives three ingots.
-- Not yet: the middle slot does not take oxygen items, and upgrades do not apply to the chamber.
+- Upgrades do not apply to the chamber yet.
 
 ## Metallurgic infusing (milestone 7)
 
@@ -184,3 +184,15 @@ tank contents in a screen.
 - Mekanism names infuse chemicals in recipes by tag (`#mekanism:carbon`), and each such tag holds the one
   chemical of the same name, so `gen_recipe_table.py` writes the chemical itself.
 - This makes Mekanism's crafting chain playable: alloys and control circuits come from the infuser.
+
+## Compressing and chemical infusing (milestone 8)
+
+- **Osmium Compressor**: `compressing` recipes (refined obsidian and glowstone dust → ingots), 15 FE/t
+  over 200 ticks with 1 mB of osmium a tick. It and the Purification Chamber are one advanced-machine
+  kind now (`chemical::ADVANCED_MACHINES`), and both take their chemical from items in the middle slot
+  (`chemical_conversion`: osmium ingot → 200 mB osmium, flint → oxygen) as well as from the blocks beside
+  them.
+- **Chemical Infuser**: `chemical_infusing` recipes (5), one operation a tick at 15 FE, three 10,000 mB
+  tanks. Each input tank takes one of the two chemicals, in either order. With an oxidizer making sulfur
+  dioxide and a separator making oxygen beside it, it makes sulfur trioxide. Hydrogen chloride waits for
+  chlorine (brine and the Thermal Evaporation Plant).
