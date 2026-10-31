@@ -220,3 +220,12 @@ tank contents in a screen.
   a Chemical Infuser (hydrogen + chlorine) beside it, or from salt in its middle slot.
 - With the Purification Chamber (shard → clump), Crusher and Enrichment Chamber, one ore gives four dusts.
   Water vapour has no source yet (Rotary Condensentrator).
+
+## Rotary Condensentrator (milestone 11)
+
+- Decondensentrating only: a fluid from buckets in the first slot (the empty bucket comes out of the last)
+  turns into its chemical, 1 mB a tick at 2 FE, from a 10,000 mB tank into another (`rotary` recipes, 20;
+  water → water vapour). The chemical goes to the blocks beside it, so a condensentrator beside a
+  Chemical Injection Chamber runs its water-vapour recipes.
+- Not yet: the condensentrating mode (chemical → fluid), its mode button, and speed upgrades
+  (`2^upgrades` operations a tick in Mekanism).

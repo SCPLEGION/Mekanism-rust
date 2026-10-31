@@ -44,6 +44,8 @@ enum Kind {
     ChemicalInfuser,
     /// A Thermal Evaporation Plant's controller; the tower's other blocks have no block entity.
     Evaporation,
+    /// A Rotary Condensentrator, decondensentrating: a fluid into its chemical.
+    Rotary,
     Infuser,
     Separator,
     GasGenerator,
@@ -71,6 +73,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:chemical_oxidizer" => return Some(Kind::Oxidizer),
         "mekanism:chemical_infuser" => return Some(Kind::ChemicalInfuser),
         "mekanism:thermal_evaporation_controller" => return Some(Kind::Evaporation),
+        "mekanism:rotary_condensentrator" => return Some(Kind::Rotary),
         "mekanism:metallurgic_infuser" => return Some(Kind::Infuser),
         "mekanism:electrolytic_separator" => return Some(Kind::Separator),
         _ => {}
@@ -145,6 +148,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         // Water buckets in the first slot (empty buckets out of the last), and an empty bucket in the
         // middle one fills with brine.
         Some(Kind::Evaporation) => (vec![0, 1], vec![2]),
+        Some(Kind::Rotary) => (vec![0], vec![2]),
         // The item to infuse in the first slot, the infuse item (coal, redstone...) in the middle one.
         Some(Kind::Infuser) => (vec![0, 1], vec![2]),
         _ => return,
@@ -183,6 +187,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         Kind::Advanced(m) => tick_advanced(game, entity, m),
         Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
         Kind::Evaporation => tick_evaporation(game, pos, entity),
+        Kind::Rotary => tick_rotary(game, pos, entity),
         Kind::Infuser => tick_infuser(game, entity),
         Kind::Separator => tick_separator(game, pos, entity),
         Kind::GasGenerator => tick_gas_generator(game, pos, entity),
@@ -997,6 +1002,59 @@ fn tick_separator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     Some(active)
 }
 
+/// The fluid in a bucket item: vanilla's water bucket, or a Mekanism `<fluid>_bucket`.
+fn bucket_fluid(item: &str) -> Option<String> {
+    if item == "minecraft:water_bucket" {
+        return Some("minecraft:water".into());
+    }
+    let fluid = item.strip_suffix("_bucket")?;
+    fluid.starts_with("mekanism:").then(|| fluid.to_owned())
+}
+
+/// The Rotary Condensentrator turning fluid into chemical (`rotary` recipes: water → water vapour),
+/// 1 mB a tick at 2 FE, from buckets in its first slot (the empty bucket comes out of the last). The
+/// chemical goes out to the blocks beside it. Condensentrating (chemical → fluid) needs a mode switch
+/// and fluid outputs, which come later.
+fn tick_rotary(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = machine::STORAGE_MULTIPLIER * chem::ROTARY_USAGE;
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut fluid = get_tank(&entity.nbt, "fluid", chem::ROTARY_TANK);
+    let mut gas = get_tank(&entity.nbt, "chemical", chem::ROTARY_TANK);
+    if let Some(Some(bucket)) = entity.items.first().cloned()
+        && let Some(f) = bucket_fluid(&bucket.item)
+        && chem::rotary_chemical(&f).is_some()
+        && fluid.accepts(&f)
+        && fluid.amount + 1_000 <= fluid.capacity
+        && give_back_bucket(entity)
+    {
+        fluid.insert(&f, 1_000);
+        entity.items[0] = None;
+    }
+    let mut active = false;
+    if let Some(output) = fluid.chemical.as_deref().and_then(chem::rotary_chemical)
+        && fluid.amount > 0
+        && gas.accepts(output)
+        && gas.amount < gas.capacity
+        && energy.consume(chem::ROTARY_USAGE)
+    {
+        fluid.extract(1);
+        gas.insert(output, 1);
+        active = true;
+    }
+    push_chemical(game, pos, &mut gas, None, u64::MAX, false);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_tank(&mut entity.nbt, "fluid", &fluid);
+    put_tank(&mut entity.nbt, "chemical", &gas);
+    entity.data = vec![
+        (fluid.amount * 1000 / chem::ROTARY_TANK) as i32,
+        1000,
+        (gas.amount * 1000 / chem::ROTARY_TANK) as i32,
+        1000,
+    ];
+    Some(active)
+}
+
 /// Puts an empty bucket into the last slot, if it has room for one.
 fn give_back_bucket(entity: &mut ModBlockEntity) -> bool {
     let out = entity.items.get(2).cloned().flatten();
@@ -1295,6 +1353,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Separator => Some((machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE, u64::MAX)),
         Kind::Advanced(m) => Some((m.usage * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
         Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE, u64::MAX)),
+        Kind::Rotary => Some((machine::STORAGE_MULTIPLIER * chem::ROTARY_USAGE, u64::MAX)),
         Kind::Infuser => Some((chem::INFUSER_USAGE * u64::from(chem::INFUSER_TICKS), u64::MAX)),
         _ => None,
     }
