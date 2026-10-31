@@ -9,6 +9,7 @@ use horizon_client::items::ItemStack;
 use horizon_world::nbt::{Compound, JavaString, Tag};
 use mekanism_core::chemical::{self as chem, ChemicalTank};
 use mekanism_core::energy::{Action, EnergyContainer};
+use mekanism_core::evaporation as evap;
 use mekanism_core::factory::{self, Factory};
 use mekanism_core::generator::HeatGenerator;
 use mekanism_core::machine::{self, ElectricMachine, Operation, Slot};
@@ -41,6 +42,8 @@ enum Kind {
     /// A purification chamber or osmium compressor: an item and a chemical each tick.
     Advanced(&'static chem::AdvancedMachine),
     ChemicalInfuser,
+    /// A Thermal Evaporation Plant's controller; the tower's other blocks have no block entity.
+    Evaporation,
     Infuser,
     Separator,
     GasGenerator,
@@ -67,6 +70,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanismgenerators:gas_burning_generator" => return Some(Kind::GasGenerator),
         "mekanism:chemical_oxidizer" => return Some(Kind::Oxidizer),
         "mekanism:chemical_infuser" => return Some(Kind::ChemicalInfuser),
+        "mekanism:thermal_evaporation_controller" => return Some(Kind::Evaporation),
         "mekanism:metallurgic_infuser" => return Some(Kind::Infuser),
         "mekanism:electrolytic_separator" => return Some(Kind::Separator),
         _ => {}
@@ -138,6 +142,9 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::Separator) => (vec![0], vec![2]),
         // An advanced machine's middle slot takes items that turn into its chemical (flint → oxygen).
         Some(Kind::Advanced(_)) => (vec![0, 1], vec![2]),
+        // Water buckets in the first slot (empty buckets out of the last), and an empty bucket in the
+        // middle one fills with brine.
+        Some(Kind::Evaporation) => (vec![0, 1], vec![2]),
         // The item to infuse in the first slot, the infuse item (coal, redstone...) in the middle one.
         Some(Kind::Infuser) => (vec![0, 1], vec![2]),
         _ => return,
@@ -175,6 +182,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         Kind::Oxidizer => tick_oxidizer(game, pos, entity),
         Kind::Advanced(m) => tick_advanced(game, entity, m),
         Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
+        Kind::Evaporation => tick_evaporation(game, pos, entity),
         Kind::Infuser => tick_infuser(game, entity),
         Kind::Separator => tick_separator(game, pos, entity),
         Kind::GasGenerator => tick_gas_generator(game, pos, entity),
@@ -653,7 +661,16 @@ fn put_tank(nbt: &mut Compound, key: &str, t: &ChemicalTank) {
 /// from machines and tanks but not from other tubes, which share by gradient instead (`tick_tube`).
 /// `d` is the receiver's offset from the giver: a tank takes nothing into its bottom, its output side.
 fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, d: [i32; 3]) -> Option<(&'static str, u64)> {
-    match kind(id)? {
+    let kind = kind(id)?;
+    // Fluids (water, brine) share the chemical code here but go only into the separator, since there
+    // are no fluid pipes or fluid tanks yet.
+    if FLUIDS.contains(&chemical) {
+        return match kind {
+            Kind::Separator if chem::separates(chemical) => Some(("fluid", chem::SEPARATOR_FLUID)),
+            _ => None,
+        };
+    }
+    match kind {
         Kind::Tube(rate) if !from_tube => Some(("chemical", rate)),
         Kind::ChemicalTank(t) if d != [0, 1, 0] => Some(("chemical", chem::chemical_tank(t).0)),
         Kind::Advanced(m) if chemical == m.chemical => Some(("chemical", chem::ADVANCED_TANK)),
@@ -675,6 +692,8 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
         _ => None,
     }
 }
+
+const FLUIDS: [&str; 2] = ["minecraft:water", "mekanism:brine"];
 
 /// Pushes up to `rate` of `from`'s chemical into the tanks and generators beside `pos` (or only the one
 /// at `only`) that accept it.
@@ -925,50 +944,218 @@ fn tick_infuser(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool
     Some(active)
 }
 
-/// The Electrolytic Separator on water: water buckets fill its 24,000 mB tank, each tick splits 2 mB
-/// into hydrogen and oxygen at 4 FE, and the gases go out to the tanks and generators beside it.
+/// The Electrolytic Separator: water or brine buckets (or brine from a Thermal Evaporation Plant) fill
+/// its 24,000 mB tank, and each tick runs one `separating` operation at 4 FE: 2 mB water → 2 hydrogen +
+/// 1 oxygen, or 10 mB brine → 1 sodium + 1 chlorine. The chemicals go out to the blocks beside it.
 fn tick_separator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
     let capacity = machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE;
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
-    let mut water = get_long(&entity.nbt, "water").min(chem::SEPARATOR_FLUID);
-    // FluidInventorySlot.fill: a water bucket empties into the tank when it fits and the bucket has
+    let mut fluid = get_tank(&entity.nbt, "fluid", chem::SEPARATOR_FLUID);
+    // FluidInventorySlot.fill: a bucket empties into the tank when it fits and the bucket has
     // somewhere to go.
+    let bucket_fluid = |item: &str| match item {
+        "minecraft:water_bucket" => Some("minecraft:water"),
+        "mekanism:brine_bucket" => Some("mekanism:brine"),
+        _ => None,
+    };
     if let Some(Some(bucket)) = entity.items.first().cloned()
-        && &*bucket.item == "minecraft:water_bucket"
-        && water + 1_000 <= chem::SEPARATOR_FLUID
+        && let Some(f) = bucket_fluid(&bucket.item)
+        && fluid.accepts(f)
+        && fluid.amount + 1_000 <= fluid.capacity
+        && give_back_bucket(entity)
     {
-        let out = entity.items.get(2).cloned().flatten();
-        let room = match &out {
-            None => true,
-            Some(s) => &*s.item == "minecraft:bucket" && s.count < 16,
-        };
-        if room {
-            water += 1_000;
-            entity.items[0] = None;
-            entity.items[2] = Some(match out {
-                Some(s) => ItemStack { count: s.count + 1, ..s },
-                None => stack_of("minecraft:bucket", 1),
-            });
-        }
+        fluid.insert(f, 1_000);
+        entity.items[0] = None;
     }
-    let mut hydrogen = get_tank(&entity.nbt, "left", chem::SEPARATOR_GAS);
-    let mut oxygen = get_tank(&entity.nbt, "right", chem::SEPARATOR_GAS);
-    let active = chem::separate_water(&mut water, &mut hydrogen, &mut oxygen, &mut energy);
-    push_chemical(game, pos, &mut hydrogen, None, u64::MAX, false);
-    push_chemical(game, pos, &mut oxygen, None, u64::MAX, false);
+    let mut left = get_tank(&entity.nbt, "left", chem::SEPARATOR_GAS);
+    let mut right = get_tank(&entity.nbt, "right", chem::SEPARATOR_GAS);
+    let active = chem::separate(&mut fluid, &mut left, &mut right, &mut energy);
+    push_chemical(game, pos, &mut left, None, u64::MAX, false);
+    push_chemical(game, pos, &mut right, None, u64::MAX, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
-    put_long(&mut entity.nbt, "water", water);
-    put_tank(&mut entity.nbt, "left", &hydrogen);
-    put_tank(&mut entity.nbt, "right", &oxygen);
-    // The flame shows the water, the arrow the hydrogen tank.
+    put_tank(&mut entity.nbt, "fluid", &fluid);
+    put_tank(&mut entity.nbt, "left", &left);
+    put_tank(&mut entity.nbt, "right", &right);
+    // The flame shows the fluid, the arrow the left gas tank.
     entity.data = vec![
-        (water * 1000 / chem::SEPARATOR_FLUID) as i32,
+        (fluid.amount * 1000 / chem::SEPARATOR_FLUID) as i32,
         1000,
-        (hydrogen.amount * 1000 / chem::SEPARATOR_GAS) as i32,
+        (left.amount * 1000 / chem::SEPARATOR_GAS) as i32,
         1000,
     ];
     Some(active)
+}
+
+/// Puts an empty bucket into the last slot, if it has room for one.
+fn give_back_bucket(entity: &mut ModBlockEntity) -> bool {
+    let out = entity.items.get(2).cloned().flatten();
+    match out {
+        None => entity.items[2] = Some(stack_of("minecraft:bucket", 1)),
+        Some(s) if &*s.item == "minecraft:bucket" && s.count < 16 => {
+            entity.items[2] = Some(ItemStack { count: s.count + 1, ..s })
+        }
+        Some(_) => return false,
+    }
+    true
+}
+
+// --- Thermal Evaporation Plant -----------------------------------------------------------------------
+
+const EVAPORATION_PARTS: [&str; 3] = [
+    "mekanism:thermal_evaporation_block",
+    "mekanism:thermal_evaporation_valve",
+    "mekanism:thermal_evaporation_controller",
+];
+
+fn block_name<'a>(game: &'a Game<'_>, at: [i32; 3]) -> &'a str {
+    let state = game.world.block(at[0], at[1], at[2]);
+    game.pack.assets.registry.state(state).map_or("", |s| s.name.as_str())
+}
+
+/// A formed tower: its north-west bottom corner and height.
+#[derive(Clone, Copy)]
+struct Tower {
+    origin: [i32; 3],
+    height: u32,
+}
+
+impl Tower {
+    fn perimeter(self, y: i32) -> impl Iterator<Item = [i32; 3]> {
+        let [x0, _, z0] = self.origin;
+        (0..4).flat_map(move |dx| (0..4).map(move |dz| (dx, dz)))
+            .filter(|&(dx, dz)| dx == 0 || dx == 3 || dz == 0 || dz == 3)
+            .map(move |(dx, dz)| [x0 + dx, y, z0 + dz])
+    }
+}
+
+/// `EvaporationValidator`, simplified: a 4x4 floor of tower blocks, then 4x4 rings of them with air
+/// inside, 3 to 18 blocks high in all, with the controller in a ring.
+fn find_tower(game: &Game<'_>, c: [i32; 3]) -> Option<Tower> {
+    let part = |at: [i32; 3]| EVAPORATION_PARTS.contains(&block_name(game, at));
+    let mut bottom = c[1];
+    while part([c[0], bottom - 1, c[2]]) && c[1] - bottom < evap::MAX_HEIGHT as i32 {
+        bottom -= 1;
+    }
+    for x0 in c[0] - 3..=c[0] {
+        for z0 in c[2] - 3..=c[2] {
+            let on_ring = c[0] == x0 || c[0] == x0 + 3 || c[2] == z0 || c[2] == z0 + 3;
+            if !on_ring {
+                continue;
+            }
+            let floor = (0..4).all(|dx| (0..4).all(|dz| part([x0 + dx, bottom, z0 + dz])));
+            if !floor {
+                continue;
+            }
+            let mut tower = Tower { origin: [x0, bottom, z0], height: 1 };
+            while tower.height < evap::MAX_HEIGHT {
+                let y = bottom + tower.height as i32;
+                let ring = tower.perimeter(y).all(part);
+                let hollow = (1..3).all(|dx| (1..3).all(|dz| block_name(game, [x0 + dx, y, z0 + dz]) == "minecraft:air"));
+                if !(ring && hollow) {
+                    break;
+                }
+                tower.height += 1;
+            }
+            if tower.height >= evap::MIN_HEIGHT && c[1] > bottom && c[1] < bottom + tower.height as i32 {
+                return Some(tower);
+            }
+        }
+    }
+    None
+}
+
+/// The Thermal Evaporation Plant's controller runs the tower: water from buckets, heat from the
+/// Advanced Solar Generators on its top corners, brine into buckets or out of its valves into the
+/// separators beside them. The tower is checked again once a second.
+fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
+    let tower = if ticker == 0 || get_int(&entity.nbt, "height") == 0 {
+        let t = find_tower(game, pos);
+        put_int(&mut entity.nbt, "height", t.map_or(0, |t| t.height));
+        if let Some(t) = t {
+            for (key, v) in ["x0", "y0", "z0"].into_iter().zip(t.origin) {
+                entity.nbt.insert(key.into(), Tag::Int(v));
+            }
+        }
+        t
+    } else {
+        Some(Tower {
+            origin: ["x0", "y0", "z0"].map(|key| match entity.nbt.get(&JavaString::from(key)) {
+                Some(Tag::Int(v)) => *v,
+                _ => 0,
+            }),
+            height: get_int(&entity.nbt, "height"),
+        })
+    };
+    let Some(tower) = tower else {
+        entity.data = vec![0, 1000, 0, 1000];
+        return Some(false);
+    };
+    let mut water = get_tank(&entity.nbt, "water", evap::input_capacity(tower.height));
+    let mut brine = get_tank(&entity.nbt, "brine", evap::OUTPUT_TANK);
+    if let Some(Some(bucket)) = entity.items.first().cloned()
+        && &*bucket.item == "minecraft:water_bucket"
+        && water.amount + 1_000 <= water.capacity
+        && give_back_bucket(entity)
+    {
+        water.insert("minecraft:water", 1_000);
+        entity.items[0] = None;
+    }
+    // The top corners: an Advanced Solar Generator that sees the sun heats the tower.
+    let [x0, y0, z0] = tower.origin;
+    let top = y0 + tower.height as i32;
+    let sun = overworld(game) && game.sky_darken() < 4;
+    let solars = [[0, 0], [3, 0], [0, 3], [3, 3]]
+        .into_iter()
+        .map(|[dx, dz]| [x0 + dx, top, z0 + dz])
+        .filter(|&at| sun && block_name(game, at) == "mekanismgenerators:advanced_solar_generator" && can_see_sky(game, at))
+        .count() as u32;
+    let mut temperature = get_double(&entity.nbt, "temperature").unwrap_or(evap::AMBIENT_TEMP);
+    temperature = evap::step_temperature(temperature, solars, evap::AMBIENT_TEMP);
+    let mut progress = get_int(&entity.nbt, "progress");
+    let ops = evap::operations(evap::temp_multiplier(temperature, tower.height), &mut progress);
+    let ops = ops
+        .min(water.amount / evap::WATER_PER_BRINE)
+        .min((brine.capacity - brine.amount) * u64::from(brine.accepts("mekanism:brine")));
+    if ops > 0 {
+        water.extract(ops * evap::WATER_PER_BRINE);
+        brine.insert("mekanism:brine", ops);
+    }
+    // FluidInventorySlot.drain: an empty bucket in the middle slot fills with a bucket of brine.
+    if let Some(Some(bucket)) = entity.items.get(1).cloned()
+        && &*bucket.item == "minecraft:bucket"
+        && bucket.count == 1
+        && brine.amount >= 1_000
+    {
+        brine.extract(1_000);
+        entity.items[1] = Some(stack_of("mekanism:brine_bucket", 1));
+    }
+    // Valves give brine to the separators beside them.
+    for y in y0..top {
+        if brine.amount == 0 {
+            break;
+        }
+        let valves: Vec<[i32; 3]> =
+            tower.perimeter(y).filter(|&at| block_name(game, at) == "mekanism:thermal_evaporation_valve").collect();
+        for valve in valves {
+            push_chemical(game, valve, &mut brine, None, u64::MAX, false);
+        }
+    }
+    put_tank(&mut entity.nbt, "water", &water);
+    put_tank(&mut entity.nbt, "brine", &brine);
+    put_int(&mut entity.nbt, "progress", progress);
+    entity.nbt.insert("temperature".into(), Tag::Double(temperature.to_bits()));
+    // The flame shows the temperature up to 3,000 K, the arrow the brine tank.
+    let heat = (temperature - evap::AMBIENT_TEMP) / (evap::MAX_MULTIPLIER_TEMP - evap::AMBIENT_TEMP);
+    entity.data = vec![
+        (heat.clamp(0.0, 1.0) * 1000.0) as i32,
+        1000,
+        (brine.amount * 1000 / evap::OUTPUT_TANK) as i32,
+        1000,
+    ];
+    Some(ops > 0)
 }
 
 fn tick_gas_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
