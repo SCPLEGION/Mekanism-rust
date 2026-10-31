@@ -252,3 +252,15 @@ tank contents in a screen.
 - The energy lives in the matrix's first port (the lowest by x, then y, then z). Other ports buffer one tick
   and hand it on. Breaking that port loses the stored energy, unlike Mekanism, which keeps it in the
   multiblock's saved data. There is no matrix screen yet.
+
+## Logistical transporters (milestone 14)
+
+- **Logistical transporters**, four tiers (1, 16, 32 or 64 items at a time, `TransporterTier`), on the
+  iron bars template like cables. Twice a second a transporter beside a Mekanism machine pulls from the
+  machine's first filled output slot, when that face gives out (side configuration), and sends the items
+  along the joined transporters to the nearest container that takes them: a chest, barrel, furnace,
+  hopper or another machine's input, through the side the transporter touches, as a hopper would
+  (`native_insert_item`). Whatever fits nowhere goes back into the machine.
+- Simplified: items arrive at once instead of travelling along the pipe; there is no colour sorting, no
+  diversion or restrictive transporters, no Logistical Sorter, and transporters do not pull from vanilla
+  containers, because Horizon offers mods no way to take items out of them yet.
