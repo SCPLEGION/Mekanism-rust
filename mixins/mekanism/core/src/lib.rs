@@ -4,6 +4,7 @@
 // (`[[crate]]` in horizon-mixin.toml) and the bundle's helpers translate between the game's types
 // and these. Everything here is plain data and functions, so `cargo test` runs it without a game.
 
+pub mod chemical;
 pub mod energy;
 pub mod factory;
 pub mod generator;

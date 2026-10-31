@@ -7,6 +7,7 @@ use super::Game;
 use horizon_client::containers::{ModBlockEntity, ModContainer};
 use horizon_client::items::ItemStack;
 use horizon_world::nbt::{Compound, JavaString, Tag};
+use mekanism_core::chemical::{self as chem, ChemicalTank};
 use mekanism_core::energy::{Action, EnergyContainer};
 use mekanism_core::factory::{self, Factory};
 use mekanism_core::generator::HeatGenerator;
@@ -34,6 +35,10 @@ enum Kind {
     EnergyCube(BaseTier),
     /// A universal cable and what it carries in a tick.
     Cable(u64),
+    Oxidizer,
+    Separator,
+    GasGenerator,
+    ChemicalTank(BaseTier),
 }
 
 fn kind(id: &str) -> Option<Kind> {
@@ -53,11 +58,17 @@ fn kind(id: &str) -> Option<Kind> {
             return Some(Kind::Solar(g::ADVANCED_SOLAR_GENERATION, g::ADVANCED_SOLAR_STORAGE));
         }
         "mekanismgenerators:wind_generator" => return Some(Kind::Wind),
+        "mekanismgenerators:gas_burning_generator" => return Some(Kind::GasGenerator),
+        "mekanism:chemical_oxidizer" => return Some(Kind::Oxidizer),
+        "mekanism:electrolytic_separator" => return Some(Kind::Separator),
         _ => {}
     }
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_universal_cable")) {
         let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
         return tier::universal_cable(tier).map(Kind::Cable);
+    }
+    if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_chemical_tank")) {
+        return BaseTier::ALL.into_iter().find(|t| t.name() == tier).map(Kind::ChemicalTank);
     }
     let tier = id.strip_prefix("mekanism:")?.strip_suffix("_energy_cube")?;
     BaseTier::ALL
@@ -106,6 +117,10 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
     let (inputs, outputs) = match kind(block) {
         Some(Kind::Machine(..)) => (vec![0, 1], vec![2]),
         Some(Kind::HeatGenerator) => (vec![1], vec![]),
+        // The oxidizer's item goes in the first slot; the separator takes water buckets there and gives
+        // the empty buckets back in the last.
+        Some(Kind::Oxidizer) => (vec![0], vec![]),
+        Some(Kind::Separator) => (vec![0], vec![2]),
         _ => return,
     };
     *container = Some(ModContainer {
@@ -136,6 +151,13 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         }
         Kind::Cable(rate) => {
             tick_cable(game, pos, entity, rate);
+            None
+        }
+        Kind::Oxidizer => tick_oxidizer(game, pos, entity),
+        Kind::Separator => tick_separator(game, pos, entity),
+        Kind::GasGenerator => tick_gas_generator(game, pos, entity),
+        Kind::ChemicalTank(t) => {
+            tick_chemical_tank(game, pos, entity, t);
             None
         }
     };
@@ -574,6 +596,184 @@ fn tick_cable(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, r
     put_long(&mut entity.nbt, "energy", energy.stored);
 }
 
+// --- Chemicals --------------------------------------------------------------------------------------
+
+fn get_tank(nbt: &Compound, key: &str, capacity: u64) -> ChemicalTank {
+    let mut t = ChemicalTank::new(capacity);
+    if let Some(Tag::Compound(c)) = nbt.get(&JavaString::from(key))
+        && let Some(Tag::String(id)) = c.get(&JavaString::from("id"))
+        && let Ok(id) = id.to_string()
+    {
+        t.insert(&id, get_long(c, "amount"));
+    }
+    t
+}
+
+fn put_tank(nbt: &mut Compound, key: &str, t: &ChemicalTank) {
+    match &t.chemical {
+        Some(id) if t.amount > 0 => {
+            let mut c = Compound::new();
+            c.insert("id".into(), Tag::String(id.as_str().into()));
+            put_long(&mut c, "amount", t.amount);
+            nbt.insert(key.into(), Tag::Compound(c));
+        }
+        _ => {
+            nbt.remove(&JavaString::from(key));
+        }
+    }
+}
+
+/// Where a neighbour keeps chemicals it accepts: its NBT key and capacity, for `chemical`.
+fn chemical_receiver(id: &str, chemical: &str) -> Option<(&'static str, u64)> {
+    match kind(id)? {
+        Kind::ChemicalTank(t) => Some(("chemical", chem::chemical_tank(t).0)),
+        Kind::GasGenerator if chem::fuel(chemical).is_some() => Some(("fuel", chem::GAS_GENERATOR_TANK)),
+        _ => None,
+    }
+}
+
+/// Pushes up to `rate` of `from`'s chemical into the tanks and generators beside `pos` (or only the one
+/// at `only`) that accept it.
+fn push_chemical(game: &mut Game<'_>, pos: [i32; 3], from: &mut ChemicalTank, only: Option<[i32; 3]>, rate: u64) {
+    let mut budget = rate;
+    for (_, d) in DIRECTIONS {
+        if only.is_some_and(|o| o != d) {
+            continue;
+        }
+        let Some(chemical) = from.chemical.clone() else {
+            return;
+        };
+        let offer = from.amount.min(budget);
+        if offer == 0 {
+            return;
+        }
+        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        let taken = game.native_with_mod_block_entity(at, |m| {
+            let Some((key, capacity)) = chemical_receiver(&m.id, &chemical) else {
+                return 0;
+            };
+            let mut to = get_tank(&m.nbt, key, capacity);
+            let n = to.insert(&chemical, offer);
+            put_tank(&mut m.nbt, key, &to);
+            n
+        });
+        if let Some(n) = taken {
+            from.extract(n);
+            budget -= n;
+        }
+    }
+}
+
+/// The Chemical Oxidizer: an item becomes a chemical over 100 ticks at 15 FE a tick, pushed out to the
+/// tanks beside it.
+fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = chem::OXIDIZER_USAGE * u64::from(chem::OXIDIZER_TICKS);
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut tank = get_tank(&entity.nbt, "output", chem::OXIDIZER_TANK);
+    let mut progress = get_int(&entity.nbt, "progress");
+    let mut active = false;
+    let recipe = entity.items.first().cloned().flatten().and_then(|stack| {
+        let items = world_items!(game);
+        let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
+        mekanism_core::recipes::find_oxidizing(&stack.item, stack.count, &in_tag).map(|r| (stack, *r))
+    });
+    match recipe {
+        Some((stack, r)) if tank.accepts(r.output) && tank.amount + r.amount <= tank.capacity => {
+            if energy.consume(chem::OXIDIZER_USAGE) {
+                active = true;
+                progress += 1;
+                if progress >= chem::OXIDIZER_TICKS {
+                    progress = 0;
+                    tank.insert(r.output, r.amount);
+                    let left = stack.count - r.input_count;
+                    entity.items[0] = (left > 0).then(|| ItemStack { count: left, ..stack });
+                }
+            }
+        }
+        _ => progress = 0,
+    }
+    push_chemical(game, pos, &mut tank, None, u64::MAX);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "progress", progress);
+    put_tank(&mut entity.nbt, "output", &tank);
+    entity.data = vec![
+        (energy.stored * 1000 / capacity) as i32,
+        1000,
+        progress as i32,
+        chem::OXIDIZER_TICKS as i32,
+    ];
+    Some(active)
+}
+
+/// The Electrolytic Separator on water: water buckets fill its 24,000 mB tank, each tick splits 2 mB
+/// into hydrogen and oxygen at 4 FE, and the gases go out to the tanks and generators beside it.
+fn tick_separator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE;
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut water = get_long(&entity.nbt, "water").min(chem::SEPARATOR_FLUID);
+    // FluidInventorySlot.fill: a water bucket empties into the tank when it fits and the bucket has
+    // somewhere to go.
+    if let Some(Some(bucket)) = entity.items.first().cloned()
+        && &*bucket.item == "minecraft:water_bucket"
+        && water + 1_000 <= chem::SEPARATOR_FLUID
+    {
+        let out = entity.items.get(2).cloned().flatten();
+        let room = match &out {
+            None => true,
+            Some(s) => &*s.item == "minecraft:bucket" && s.count < 16,
+        };
+        if room {
+            water += 1_000;
+            entity.items[0] = None;
+            entity.items[2] = Some(match out {
+                Some(s) => ItemStack { count: s.count + 1, ..s },
+                None => stack_of("minecraft:bucket", 1),
+            });
+        }
+    }
+    let mut hydrogen = get_tank(&entity.nbt, "left", chem::SEPARATOR_GAS);
+    let mut oxygen = get_tank(&entity.nbt, "right", chem::SEPARATOR_GAS);
+    let active = chem::separate_water(&mut water, &mut hydrogen, &mut oxygen, &mut energy);
+    push_chemical(game, pos, &mut hydrogen, None, u64::MAX);
+    push_chemical(game, pos, &mut oxygen, None, u64::MAX);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_long(&mut entity.nbt, "water", water);
+    put_tank(&mut entity.nbt, "left", &hydrogen);
+    put_tank(&mut entity.nbt, "right", &oxygen);
+    // The flame shows the water, the arrow the hydrogen tank.
+    entity.data = vec![
+        (water * 1000 / chem::SEPARATOR_FLUID) as i32,
+        1000,
+        (hydrogen.amount * 1000 / chem::SEPARATOR_GAS) as i32,
+        1000,
+    ];
+    Some(active)
+}
+
+fn tick_gas_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let mut energy = EnergyContainer::new(chem::GAS_GENERATOR_STORAGE, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(chem::GAS_GENERATOR_STORAGE);
+    let mut fuel = get_tank(&entity.nbt, "fuel", chem::GAS_GENERATOR_TANK);
+    let (made, _) = chem::burn_fuel(&mut fuel, energy.capacity - energy.stored);
+    energy.insert(made, Action::Execute);
+    push_energy(game, pos, &mut energy, None, false);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_tank(&mut entity.nbt, "fuel", &fuel);
+    Some(made > 0)
+}
+
+/// A chemical tank takes from every side and gives out of its bottom at its tier's rate.
+fn tick_chemical_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, tier: BaseTier) {
+    let (capacity, rate) = chem::chemical_tank(tier);
+    let mut tank = get_tank(&entity.nbt, "chemical", capacity);
+    if tank.amount > 0 {
+        push_chemical(game, pos, &mut tank, Some([0, -1, 0]), rate);
+        put_tank(&mut entity.nbt, "chemical", &tank);
+    }
+}
+
 // --- Energy between blocks --------------------------------------------------------------------------
 
 const DIRECTIONS: [(&str, [i32; 3]); 6] = [
@@ -641,6 +841,8 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Factory(n, _, usage) => Some((Factory::new(n, usage, upgrades(nbt)).machine.energy.capacity, u64::MAX)),
         Kind::EnergyCube(t) if facing_away => Some(tier::energy_cube(t)),
         Kind::Cable(rate) if !from_cable => Some((rate, rate)),
+        Kind::Oxidizer => Some((chem::OXIDIZER_USAGE * u64::from(chem::OXIDIZER_TICKS), u64::MAX)),
+        Kind::Separator => Some((machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE, u64::MAX)),
         _ => None,
     }
 }
