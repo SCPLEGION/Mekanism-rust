@@ -260,3 +260,26 @@ mod tests {
         assert_eq!((water, h.amount, o.amount, e.stored), (1, 2, 1, 96));
     }
 }
+
+/// `TileEntityRotaryCondensentrator`: 2 FE a tick, 10,000 mB tanks, one 1 mB operation a tick.
+pub const ROTARY_USAGE: u64 = 2;
+pub const ROTARY_TANK: u64 = 10_000;
+
+/// The chemical a fluid decondensentrates into.
+pub fn rotary_chemical(fluid: &str) -> Option<&'static str> {
+    crate::recipe_table::ROTARY
+        .iter()
+        .find(|r| r.0 == fluid)
+        .map(|r| r.1)
+}
+
+#[cfg(test)]
+mod rotary_tests {
+    #[test]
+    fn water_turns_into_water_vapor() {
+        assert_eq!(
+            super::rotary_chemical("minecraft:water"),
+            Some("mekanism:water_vapor")
+        );
+    }
+}

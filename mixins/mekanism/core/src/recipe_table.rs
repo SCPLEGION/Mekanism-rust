@@ -7606,3 +7606,36 @@ pub static INJECTING: &[ItemChemicalRecipe] = &[
         output_count: 8,
     },
 ];
+
+/// `rotary`: a fluid and the chemical it turns into, 1 mB for 1 mB.
+pub static ROTARY: &[(&str, &str)] = &[
+    ("mekanism:brine", "mekanism:brine"),
+    ("mekanism:chlorine", "mekanism:chlorine"),
+    ("mekanism:ethene", "mekanism:ethene"),
+    ("mekanism:hydrofluoric_acid", "mekanism:hydrofluoric_acid"),
+    ("mekanism:hydrogen", "mekanism:hydrogen"),
+    ("mekanism:hydrogen_chloride", "mekanism:hydrogen_chloride"),
+    ("mekanism:lithium", "mekanism:lithium"),
+    ("mekanism:oxygen", "mekanism:oxygen"),
+    ("mekanism:sodium", "mekanism:sodium"),
+    ("mekanism:steam", "mekanism:steam"),
+    ("mekanism:sulfur_dioxide", "mekanism:sulfur_dioxide"),
+    ("mekanism:sulfur_trioxide", "mekanism:sulfur_trioxide"),
+    ("mekanism:sulfuric_acid", "mekanism:sulfuric_acid"),
+    ("mekanism:superheated_sodium", "mekanism:superheated_sodium"),
+    (
+        "mekanism:uranium_hexafluoride",
+        "mekanism:uranium_hexafluoride",
+    ),
+    ("mekanism:uranium_oxide", "mekanism:uranium_oxide"),
+    ("minecraft:water", "mekanism:water_vapor"),
+    (
+        "mekanismgenerators:deuterium",
+        "mekanismgenerators:deuterium",
+    ),
+    (
+        "mekanismgenerators:fusion_fuel",
+        "mekanismgenerators:fusion_fuel",
+    ),
+    ("mekanismgenerators:tritium", "mekanismgenerators:tritium"),
+];
