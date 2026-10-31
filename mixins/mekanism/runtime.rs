@@ -673,7 +673,7 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
     match kind {
         Kind::Tube(rate) if !from_tube => Some(("chemical", rate)),
         Kind::ChemicalTank(t) if d != [0, 1, 0] => Some(("chemical", chem::chemical_tank(t).0)),
-        Kind::Advanced(m) if chemical == m.chemical => Some(("chemical", chem::ADVANCED_TANK)),
+        Kind::Advanced(m) if m.chemicals.contains(&chemical) && get_tank(nbt, "chemical", chem::ADVANCED_TANK).accepts(chemical) => Some(("chemical", chem::ADVANCED_TANK)),
         // The chemical infuser fills whichever input tank holds this chemical, else an empty one.
         Kind::ChemicalInfuser if mekanism_core::recipes::infusing_input(chemical) => {
             let cap = chem::CHEMICAL_INFUSER_TANK;
@@ -792,14 +792,24 @@ fn tick_advanced(game: &mut Game<'_>, entity: &mut ModBlockEntity, m: &'static c
     let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
     if let Some(Some(extra)) = entity.items.get(1).cloned()
         && let Some(c) = mekanism_core::recipes::find_conversion(&extra.item, &in_tag)
-        && c.output == m.chemical
+        && m.chemicals.contains(&c.output)
+        && tank.accepts(c.output)
         && tank.amount + c.amount <= tank.capacity
     {
         tank.insert(c.output, c.amount);
         entity.items[1] = (extra.count > 1).then(|| ItemStack { count: extra.count - 1, ..extra });
     }
     let recipe = entity.items.first().cloned().flatten().and_then(|stack| {
-        mekanism_core::recipes::find_item_chemical(m.table, &stack.item, stack.count, &in_tag).map(|r| (stack, *r))
+        // With a chemical in the tank, only its recipes (the injection chamber takes two chemicals).
+        let held = tank.chemical.as_deref();
+        m.table
+            .iter()
+            .find(|r| {
+                held.is_none_or(|c| c == r.chemical)
+                    && stack.count >= r.input_count
+                    && r.input.matches(&stack.item, &in_tag)
+            })
+            .map(|r| (stack, *r))
     });
     let out = entity.items.get(2).cloned().flatten();
     match recipe {

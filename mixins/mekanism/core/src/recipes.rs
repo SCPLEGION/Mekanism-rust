@@ -280,4 +280,17 @@ mod tests {
         assert_ne!(swapped, swapped_back);
         assert!(infusing_input("mekanism:oxygen"));
     }
+
+    #[test]
+    fn osmium_ore_injects_into_four_shards() {
+        let r = find_item_chemical(
+            crate::recipe_table::INJECTING,
+            "mekanism:osmium_ore",
+            1,
+            &tags,
+        )
+        .expect("a recipe");
+        assert_eq!((r.output, r.output_count), ("mekanism:shard_osmium", 4));
+        assert_eq!(r.chemical, "mekanism:hydrogen_chloride");
+    }
 }

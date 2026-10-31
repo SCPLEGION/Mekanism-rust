@@ -178,7 +178,8 @@ pub const OXIDIZER_TANK: u64 = 10_000;
 pub struct AdvancedMachine {
     pub block: &'static str,
     pub usage: u64,
-    pub chemical: &'static str,
+    /// The chemicals its tank takes.
+    pub chemicals: &'static [&'static str],
     pub table: &'static [crate::recipes::ItemChemicalRecipe],
 }
 
@@ -189,14 +190,20 @@ pub static ADVANCED_MACHINES: &[AdvancedMachine] = &[
     AdvancedMachine {
         block: "mekanism:purification_chamber",
         usage: 10,
-        chemical: "mekanism:oxygen",
+        chemicals: &["mekanism:oxygen"],
         table: crate::recipe_table::PURIFYING,
     },
     AdvancedMachine {
         block: "mekanism:osmium_compressor",
         usage: 15,
-        chemical: "mekanism:osmium",
+        chemicals: &["mekanism:osmium"],
         table: crate::recipe_table::COMPRESSING,
+    },
+    AdvancedMachine {
+        block: "mekanism:chemical_injection_chamber",
+        usage: 15,
+        chemicals: &["mekanism:hydrogen_chloride", "mekanism:water_vapor"],
+        table: crate::recipe_table::INJECTING,
     },
 ];
 
