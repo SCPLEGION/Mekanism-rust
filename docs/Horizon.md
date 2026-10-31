@@ -285,7 +285,7 @@ tank contents in a screen.
   to that commit.
 - The disassembler gets Mekanism's tool rules as a `minecraft:tool` component: every mineable block drops
   its loot, except those in `#mekanism:incorrect_for_disassembler`.
-- Simplified: one mode only (no slow, fast or vein mining, no mode key); no attack damage from energy;
+- Simplified: no attack damage from energy (modes came in milestone 18);
   generators and advanced machines have no energy slot.
 
 ## Six-way transmitters (milestone 17)
@@ -305,3 +305,15 @@ tank contents in a screen.
   content-mod block declarations, so the bundle is pinned to that commit.
 - Simplified: the arms are not part of the outline or collision; a transmitter still conducts redstone as
   the stem does; side configuration does not cut arms off.
+
+## Disassembler modes and generator energy slots (milestone 18)
+
+- **Atomic Disassembler modes**: sneak + right click cycles Normal (20), Slow (8), Fast (128) and Off (0),
+  as Mekanism's mode key does with `GearConfig` defaults (vein mining off). The mode is kept in
+  `custom_data` under `mekanism:disassembler_mode`, named on the action bar when it changes and in the
+  tooltip. A block costs 10 FE per point of the mode's efficiency, half for blocks that break at once; short
+  of that, it mines as normal mode would with what it has (`getDestroySpeed`).
+- **Generators charge items**: the Heat, Advanced Solar, Wind and Gas-Burning Generators charge an energy
+  tablet, cube or tool in their first slot from what they make. The plain Solar Generator (an iron block with
+  no menu) has no slot.
+- Simplified: no radial menu or mode key (sneak + right click instead); no vein mining.

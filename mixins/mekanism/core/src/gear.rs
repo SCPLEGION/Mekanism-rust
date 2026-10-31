@@ -54,15 +54,65 @@ pub fn discharge(item: ItemEnergy, stored: u64, target: &mut EnergyContainer) ->
     stored - (offered - left)
 }
 
-/// `DisassemblerMode.NORMAL`'s efficiency, the only mode this port has (Mekanism switches modes with
-/// the mode key).
-pub const DISASSEMBLER_EFFICIENCY: f32 = 20.0;
+/// `ItemAtomicDisassembler.DisassemblerMode` with `GearConfig`'s defaults: vein mining is off, so the
+/// mode key cycles normal, slow, fast and off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DisassemblerMode {
+    #[default]
+    Normal,
+    Slow,
+    Fast,
+    Off,
+}
+
+impl DisassemblerMode {
+    pub const ALL: [DisassemblerMode; 4] = [Self::Normal, Self::Slow, Self::Fast, Self::Off];
+
+    pub fn efficiency(self) -> u64 {
+        match self {
+            Self::Normal => 20,
+            Self::Slow => 8,
+            Self::Fast => 128,
+            Self::Off => 0,
+        }
+    }
+
+    /// The serialized name (`StringRepresentable`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Slow => "slow",
+            Self::Fast => "fast",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Slow => "Slow",
+            Self::Fast => "Fast",
+            Self::Off => "Off",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.name() == name)
+    }
+
+    /// `adjust(1)`: the next enabled mode, wrapping around.
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+}
+
 /// `GearConfig.disassemblerEnergyUsage`, FE per point of efficiency a block costs.
 pub const DISASSEMBLER_ENERGY_USAGE: u64 = 10;
 
 /// The energy breaking a block costs (`getDestroyEnergy`): half for a block that breaks instantly.
-pub fn destroy_energy(hardness: f32) -> u64 {
-    let base = DISASSEMBLER_ENERGY_USAGE * DISASSEMBLER_EFFICIENCY as u64;
+pub fn destroy_energy(mode: DisassemblerMode, hardness: f32) -> u64 {
+    let base = DISASSEMBLER_ENERGY_USAGE * mode.efficiency();
     if hardness == 0.0 {
         (base / 2).max(1)
     } else {
@@ -71,13 +121,14 @@ pub fn destroy_energy(hardness: f32) -> u64 {
 }
 
 /// `ItemAtomicDisassembler.getDestroySpeed`: the mode's efficiency while the energy for the block is
-/// there, scaled down by how much of it is.
-pub fn destroy_speed(stored: u64, hardness: f32) -> f32 {
-    let required = destroy_energy(hardness);
+/// there; short of it, normal mode's efficiency scaled down by how much of it is.
+pub fn destroy_speed(mode: DisassemblerMode, stored: u64, hardness: f32) -> f32 {
+    let required = destroy_energy(mode, hardness);
     if stored < required {
-        return DISASSEMBLER_EFFICIENCY * (stored as f32 / required as f32);
+        let normal = DisassemblerMode::Normal.efficiency() as f32;
+        return normal * (stored as f32 / required as f32);
     }
-    DISASSEMBLER_EFFICIENCY
+    mode.efficiency() as f32
 }
 
 #[cfg(test)]
@@ -127,10 +178,31 @@ mod tests {
 
     #[test]
     fn the_disassembler_slows_down_as_it_runs_out() {
-        assert_eq!(destroy_energy(1.5), 200);
-        assert_eq!(destroy_energy(0.0), 100);
-        assert_eq!(destroy_speed(1_000, 50.0), 20.0);
-        assert_eq!(destroy_speed(50, 3.0), 5.0);
-        assert_eq!(destroy_speed(0, 3.0), 0.0);
+        use DisassemblerMode::*;
+        assert_eq!(destroy_energy(Normal, 1.5), 200);
+        assert_eq!(destroy_energy(Normal, 0.0), 100);
+        assert_eq!(destroy_speed(Normal, 1_000, 50.0), 20.0);
+        assert_eq!(destroy_speed(Normal, 50, 3.0), 5.0);
+        assert_eq!(destroy_speed(Normal, 0, 3.0), 0.0);
+    }
+
+    #[test]
+    fn modes_cycle_and_cost_by_efficiency() {
+        use DisassemblerMode::*;
+        assert_eq!(
+            [Normal.next(), Slow.next(), Fast.next(), Off.next()],
+            [Slow, Fast, Off, Normal]
+        );
+        assert_eq!(destroy_energy(Fast, 2.0), 1_280);
+        assert_eq!(destroy_speed(Fast, 2_000, 2.0), 128.0);
+        // Short of fast mode's cost, it mines as normal mode would with what it has.
+        assert_eq!(destroy_speed(Fast, 640, 2.0), 10.0);
+        // Off costs nothing and mines at 0; an instant block still costs 1 FE.
+        assert_eq!(
+            (destroy_energy(Off, 2.0), destroy_speed(Off, 0, 2.0)),
+            (0, 0.0)
+        );
+        assert_eq!(destroy_energy(Off, 0.0), 1);
+        assert_eq!(DisassemblerMode::from_name("slow"), Some(Slow));
     }
 }

@@ -132,3 +132,15 @@ bindings = [
   { name = "hardness", ty = "f32", value = "hardness" },
   { name = "speed", ty = "&mut f32", value = "&mut *speed" },
 ]
+
+[[injection]]
+id = "use-item"
+hook = "use_item"
+hook_version = 1
+kind = "HEAD"
+helper = "use_item.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+  { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
+]
