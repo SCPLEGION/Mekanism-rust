@@ -378,3 +378,21 @@ Needs the Horizon fork's `milestone/h6-payload-as-player` (API 26: a mod packet 
 - Simplified: normal mode only (no hover or vector modes, no mode key), no flame particles or sound,
   and a worn jetpack does not show on the player. A dedicated server with
   `allow-flight=false` can kick a long flight for floating, as vanilla does.
+
+## Nuclear fuel chain (milestone 24)
+
+The steps from uranium to fissile fuel all run now (`mekanism-core`'s `nuclear`):
+
+1. The Enrichment Chamber turns a uranium ingot into 2 yellow cake uranium (milestone 2's table).
+2. The Chemical Oxidizer turns yellow cake into 250 mB of uranium oxide.
+3. The new **Chemical Dissolution Chamber** takes a fluorite gem (or a fluorite block) in its slot and
+   sulfuric acid piped in, 1 mB a tick (9 for a block) for 100 ticks at 16 FE a tick. It makes 1,000 mB
+   (9,000) of hydrofluoric acid and pushes it to the tanks and tubes beside it.
+4. The Chemical Infuser turns hydrofluoric acid and uranium oxide into 2 mB of uranium hexafluoride per mB.
+5. The new **Isotopic Centrifuge** turns 1 mB of uranium hexafluoride into 1 mB of fissile fuel each tick
+   at 8 FE a tick (and 10 mB of nuclear waste into 1 mB of plutonium). Pipe it in, and it pushes the
+   output to its neighbours.
+
+Simplified: no screens of their own (the dissolution chamber uses the furnace menu, with its progress on
+the arrow); no upgrades; the ore slurry recipes of the chamber wait for the washer and crystallizer. The
+fission reactor that burns the fuel comes next.
