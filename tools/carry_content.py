@@ -67,6 +67,17 @@ TOOL_TEMPLATES = [("_paxel", "minecraft:iron_pickaxe"), ("_pickaxe", "minecraft:
                   ("_leggings", "minecraft:iron_leggings"), ("_boots", "minecraft:iron_boots"),
                   ("_shield", "minecraft:shield"), ("_bucket", "minecraft:water_bucket")]
 
+# Items that hold energy in custom_data (mekanism:energy) stack to one, as Mekanism's do.
+SINGLE_ITEMS = {"energy_tablet", "atomic_disassembler", "electric_bow"}
+# ItemAtomicDisassembler's Tool: no drops from #mekanism:incorrect_for_disassembler, drops from every other
+# block (vanilla's tool rules take tags, so "every block" is the four mineable tags). Its speed comes from
+# the bundle (native_destroy_speed), from the energy it holds.
+DISASSEMBLER_TOOL = {
+    "rules": [{"blocks": "#mekanism:incorrect_for_disassembler", "correct_for_drops": False}]
+    + [{"blocks": f"#minecraft:mineable/{t}", "correct_for_drops": True} for t in ("pickaxe", "axe", "shovel", "hoe")],
+    "default_mining_speed": 1.0,
+}
+
 
 def block_template(name, blockstate):
     """The vanilla block a Mekanism block copies, from what it is."""
@@ -268,7 +279,12 @@ def build_module(ns, out):
     for path in sorted((out / "assets" / ns / "items").glob("*.json")):
         if path.stem in blocks:
             continue
-        write_json(declared / "item" / f"{path.stem}.json", {"template": item_template(path.stem)})
+        item = {"template": item_template(path.stem)}
+        if path.stem in SINGLE_ITEMS:
+            item["max_stack_size"] = 1
+        if path.stem == "atomic_disassembler":
+            item["components"] = {"minecraft:tool": DISASSEMBLER_TOOL}
+        write_json(declared / "item" / f"{path.stem}.json", item)
         items += 1
     report["blocks"] = len(blocks)
     report["items"] = items

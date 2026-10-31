@@ -266,3 +266,24 @@ tank contents in a screen.
 - Since milestone 15 (Horizon API 24, `native_extract_item`), transporters pull from any container beside
   them as a hopper would: chests, barrels, a furnace's output, a machine's outputs. The bundle is pinned to
   the Horizon fork's `milestone/h3-extract-item` commit from then on.
+
+## Gear and item energy (milestone 16)
+
+- **Items hold energy** in `minecraft:custom_data` under `mekanism:energy`, as before for energy cubes: the
+  Energy Tablet and Atomic Disassembler hold 1 MFE and charge at 5 kFE/t, the Electric Bow 120 kFE at
+  600 FE/t (`GearConfig` defaults), an energy cube item what its tier holds. The three gear items stack to
+  one. Their tooltip shows the stored energy.
+- **Energy cubes** now open a furnace-style menu: the top slot charges the item in it from the cube, the
+  bottom slot empties its item into the cube (`EnergyInventorySlot`). The flame shows the cube's fill.
+- **Machines' energy slot**: the middle slot of the single machines (enrichment chamber, crusher, smelter,
+  sawmill; not the combiner, whose middle slot is its extra input) runs the machine off an energy tablet or
+  an energy cube item in it. Tools only spend their energy, so a disassembler there gives nothing.
+- **Atomic Disassembler** mines at efficiency 20 (`DisassemblerMode.NORMAL`) while it holds the 200 FE a
+  block costs (100 FE for blocks that break at once), slower as it runs out and not at all when empty, and
+  each block it breaks outside creative spends that energy. This uses Horizon API 25
+  (`native_destroy_speed`, added on the fork's `milestone/h4-destroy-speed` branch), so the bundle is pinned
+  to that commit.
+- The disassembler gets Mekanism's tool rules as a `minecraft:tool` component: every mineable block drops
+  its loot, except those in `#mekanism:incorrect_for_disassembler`.
+- Simplified: one mode only (no slow, fast or vein mining, no mode key); no attack damage from energy;
+  generators and advanced machines have no energy slot.

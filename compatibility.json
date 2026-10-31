@@ -1,8 +1,8 @@
 {
-  "horizon_revision": "75c68b395c845952bc2cd57ae0ac4510cf6a3ca0",
+  "horizon_revision": "d0d5bbbc5a5249d1f625c9b2d54e6652cd14337d",
   "source_sha256": {
     "crates/horizon-client/src/game.rs": "bfe4cac9eb1e93dd03282932ac9aecb1b5a3fa70c805c34c1f78f0eff9dab1c2",
-    "crates/horizon-client/src/game/native_hooks.rs": "2eb399c8928b3fba33db0c3d5e131082ba249721c2e27c03c1a75bbf29d4ed54"
+    "crates/horizon-client/src/game/native_hooks.rs": "5c7d23720b0187e7bd2b0096babb8e71e9a8891564a4a8e9dabe245847975ffc"
   },
   "horizon_repository": "https://github.com/SCPLEGION/horizon",
   "horizon_mixins_repository": "https://github.com/horizon-rust/horizon-mixins",

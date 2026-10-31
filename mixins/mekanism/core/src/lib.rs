@@ -8,6 +8,7 @@ pub mod chemical;
 pub mod energy;
 pub mod evaporation;
 pub mod factory;
+pub mod gear;
 pub mod generator;
 pub mod heat;
 pub mod machine;
