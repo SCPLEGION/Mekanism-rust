@@ -535,3 +535,28 @@ screens (API 19/20: `native_screen`, `native_screen_draw`, `native_screen_toolti
 
 Simplified: no side-config or upgrade tabs to click yet, no redstone control, and the other blocks
 keep the furnace's screen until milestones 32 and 33.
+
+## Gauge screens (milestone 32)
+
+Milestone 31's screen code now works from one `layout` per block (slots, gauges, power bar, progress
+bar, at the positions of Mekanism's tile and `Gui*` classes), and more blocks get Mekanism's screen:
+
+- **Chemical Oxidizer**: item (26, 36), output gauge (131, 13), horizontal power bar (115, 75), large
+  progress arrow (64, 40).
+- **Chemical Dissolution Chamber**: item (28, 36), sulfuric acid gauge (7, 4), output gauge (131, 13),
+  horizontal power bar, large progress arrow.
+- **Chemical Crystallizer**: input gauge (7, 4), output slot (129, 57), vertical power bar (157, 23),
+  large progress arrow (53, 61).
+- **Electrolytic Separator**: bucket slot (26, 35) with the empty buckets below it, fluid gauge (5, 10),
+  two small gauges (58, 18) and (100, 18), vertical power bar (164, 15).
+- **Energy Cubes**: the wide energy gauge (55, 18) between the discharge slot (17, 35) and the charge
+  slot (143, 35).
+
+Gauges are Mekanism's frame (`gauge/normal`) and overlay sprites, filled from the bottom in the
+chemical's colour. Their tooltip names the chemical with its amount and capacity. Each gauge's tank
+goes into the menu's data after the energy (`screen_data`): amount and capacity in 15-bit pieces, and
+the chemical's index in `CHEMICALS`.
+
+Simplified: the fill is a flat colour, not the chemical's animated texture. There are no gas dump
+buttons on the separator and no item slots for chemical items. Generators, tanks and multiblocks come
+next.
