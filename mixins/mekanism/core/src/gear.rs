@@ -21,6 +21,11 @@ pub fn item_energy(id: &str) -> Option<ItemEnergy> {
         "mekanism:energy_tablet" => (1_000_000, 5_000, true),
         "mekanism:atomic_disassembler" => (1_000_000, 5_000, false),
         "mekanism:electric_bow" => (120_000, 600, false),
+        crate::teleporter::PORTABLE => (
+            crate::teleporter::PORTABLE_CAPACITY,
+            crate::teleporter::PORTABLE_CHARGE_RATE,
+            false,
+        ),
         "mekanism:free_runners" | "mekanism:free_runners_armored" => {
             (FREE_RUNNER_CAPACITY, FREE_RUNNER_CHARGE_RATE, false)
         }

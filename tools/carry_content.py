@@ -127,7 +127,7 @@ def pipe_models(ns, out, name, blockstate):
 
 
 # Items that hold energy in custom_data (mekanism:energy) stack to one, as Mekanism's do.
-SINGLE_ITEMS = {"energy_tablet", "atomic_disassembler", "electric_bow"}
+SINGLE_ITEMS = {"energy_tablet", "atomic_disassembler", "electric_bow", "portable_teleporter", "free_runners", "free_runners_armored"}
 # ItemAtomicDisassembler's Tool: no drops from #mekanism:incorrect_for_disassembler, drops from every other
 # block (vanilla's tool rules take tags, so "every block" is the four mineable tags). Its speed comes from
 # the bundle (native_destroy_speed), from the energy it holds.

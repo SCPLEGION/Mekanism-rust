@@ -665,3 +665,30 @@ duration.
 - **Energy.** It uses 15 FE a tick (`UsageConfig`) and spends the recipe's antimatter once, when the
   operation finishes (`per_tick_usage` false).
 - **Screen.** It uses the advanced machines' layout, with the antimatter gauge on the left.
+
+## M39: teleporters
+
+**Teleporter** (`TileEntityTeleporter`)
+- **Frame.** The teleporter block needs a frame of teleporter frames around the two blocks in front
+  of it (`getFrameDirection`). Usually that is a 3-wide, 4-tall ring standing on the teleporter, and
+  the frame may face any way. Once a second the teleporter checks its frame and puts itself on its
+  frequency.
+- **Frequency.** Right-click the teleporter with a name tag renamed in an anvil, and the name becomes
+  its frequency. The name tag is kept.
+- **Travel.** Right-click the teleporter or its frame with an empty hand. The player goes to the
+  closest other formed teleporter on the same frequency in this dimension and arrives in front of it.
+- **Energy.** A trip costs 100 FE plus 2 FE a block (`UsageConfig`), paid by the sending teleporter.
+  The teleporter holds 1,000 FE (`StorageConfig`) and takes energy from cables.
+
+**Portable Teleporter**
+- It holds 1 MFE and charges at 5 kFE/t in any charge slot.
+- Right-click a teleporter with it to tune it to that teleporter's frequency.
+- Right-click in the air to travel to the closest teleporter on that frequency, paid from the
+  portable teleporter's own energy.
+
+**Not ported**
+- Walking into the frame doesn't teleport you, because the native API has no list of the players
+  near a block. Teleporting takes a click instead.
+- Frequencies are all public, and there is no travel between dimensions or teleporter screen.
+
+The portable teleporter and both free runners now stack to 1.
