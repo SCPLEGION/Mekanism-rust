@@ -615,3 +615,24 @@ The SPS turns polonium into antimatter (`SPSMultiblockData`, `SPSValidator`, Mek
   pellet.
 
 Left out: the SPS's damage to entities inside it, and its laser effects.
+
+## M36: free runners
+
+The free runners and the armored free runners are worn on the feet. The armored pair keeps the iron
+boots' armour; the plain pair gives none. They hold 64 kFE and charge at 320 FE/t in any charge slot
+(`GearConfig` defaults).
+
+- **Modes.** A sneaking right click with the runners in hand cycles them, and the tooltip shows the
+  current one (`FreeRunnerMode`):
+  - Regular: no fall damage and step assist.
+  - Safety: no fall damage.
+  - Disabled.
+- **Step assist.** In Regular mode the runners add 0.5 to the player's step height while they are not
+  sneaking (`CommonPlayerTickHandler.getStepBoost`), so they walk up full blocks.
+- **Fall protection.** While a player falls in runners that guard falls and hold energy, their client
+  tells the server once a tick. The server then pays for the fall so far from the runners, at 50 FE a
+  block (`fallEnergyCost`), and resets the fall distance. When the energy runs out, the fall counts
+  again.
+
+Mekanism instead charges once, on landing, for the blocks past the safe distance. Charging every tick
+here costs a little more, and the last tick before a very fast landing can still count.

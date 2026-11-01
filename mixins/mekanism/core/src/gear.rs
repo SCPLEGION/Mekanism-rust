@@ -21,6 +21,9 @@ pub fn item_energy(id: &str) -> Option<ItemEnergy> {
         "mekanism:energy_tablet" => (1_000_000, 5_000, true),
         "mekanism:atomic_disassembler" => (1_000_000, 5_000, false),
         "mekanism:electric_bow" => (120_000, 600, false),
+        "mekanism:free_runners" | "mekanism:free_runners_armored" => {
+            (FREE_RUNNER_CAPACITY, FREE_RUNNER_CHARGE_RATE, false)
+        }
         _ => {
             let name = id.strip_prefix("mekanism:")?.strip_suffix("_energy_cube")?;
             let tier = BaseTier::ALL.into_iter().find(|t| t.name() == name)?;
@@ -235,5 +238,100 @@ mod jetpack_tests {
         assert!((rising[0] - 0.08).abs() < 1e-12);
         // Falling, the thrust is full.
         assert_eq!(jetpack_normal([0.0, -2.0, 0.0], JETPACK_THRUST)[1], 0.15);
+    }
+}
+
+/// The free runners (`ItemFreeRunners`, `GearConfig`'s free runners): `maxEnergy`, `chargeRate`,
+/// `fallEnergyCost` (FE per point of fall damage absorbed), and the step height their normal mode adds
+/// (`CommonPlayerTickHandler.getStepBoost`).
+pub const FREE_RUNNER_CAPACITY: u64 = 64_000;
+pub const FREE_RUNNER_CHARGE_RATE: u64 = 320;
+pub const FREE_RUNNER_FALL_COST: u64 = 50;
+pub const FREE_RUNNER_STEP: f64 = 0.5;
+
+/// `IFreeRunnerItem.FreeRunnerMode`: normal (no fall damage, step assist), safety (no fall damage),
+/// disabled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FreeRunnerMode {
+    #[default]
+    Normal,
+    Safety,
+    Disabled,
+}
+
+impl FreeRunnerMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Safety => "safety",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Regular",
+            Self::Safety => "Safety",
+            Self::Disabled => "Disabled",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Normal, Self::Safety, Self::Disabled]
+            .into_iter()
+            .find(|m| m.name() == name)
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Normal => Self::Safety,
+            Self::Safety => Self::Disabled,
+            Self::Disabled => Self::Normal,
+        }
+    }
+
+    pub fn prevents_fall_damage(self) -> bool {
+        self != Self::Disabled
+    }
+
+    pub fn step_boost(self) -> bool {
+        self == Self::Normal
+    }
+}
+
+/// `CommonPlayerTickHandler.livingFall` for the free runners, taken a tick at a time: the fall so far
+/// (blocks past the safe distance count as damage points) costs `fallEnergyCost` FE a point. Returns
+/// the energy it takes, or None when the runners cannot pay for all of it.
+pub fn fall_cost(fallen: f64, stored: u64) -> Option<u64> {
+    let cost = (fallen.max(0.0) * FREE_RUNNER_FALL_COST as f64).ceil() as u64;
+    (cost <= stored).then_some(cost)
+}
+
+#[cfg(test)]
+mod free_runner_tests {
+    use super::*;
+
+    #[test]
+    fn modes_cycle_and_guard_falls() {
+        let m = FreeRunnerMode::default();
+        assert_eq!(m.next(), FreeRunnerMode::Safety);
+        assert_eq!(m.next().next().next(), m);
+        assert!(m.step_boost() && !m.next().step_boost());
+        assert!(!FreeRunnerMode::Disabled.prevents_fall_damage());
+        assert_eq!(
+            FreeRunnerMode::from_name("safety"),
+            Some(FreeRunnerMode::Safety)
+        );
+    }
+
+    #[test]
+    fn falls_cost_fifty_fe_a_block() {
+        assert_eq!(fall_cost(2.5, 1_000), Some(125));
+        assert_eq!(fall_cost(0.0, 0), Some(0));
+        assert_eq!(fall_cost(10.0, 499), None);
+        assert_eq!(
+            item_energy("mekanism:free_runners").map(|e| e.capacity),
+            Some(FREE_RUNNER_CAPACITY)
+        );
     }
 }

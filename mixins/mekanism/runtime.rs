@@ -2560,6 +2560,10 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
         configurator_use(game, claimed);
         return;
     }
+    if !*claimed && FREE_RUNNERS.contains(&&*stack.item) {
+        free_runners_use(game, claimed);
+        return;
+    }
     if *claimed || &*stack.item != DISASSEMBLER || !game.native_on(MOD_ID) {
         return;
     }
@@ -2716,6 +2720,10 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
         let line = format!("Configuring: {}", configurator_mode(stack).name());
         lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
     }
+    if FREE_RUNNERS.contains(&&*stack.item) {
+        let line = format!("Mode: {}", free_runner_mode(stack).label());
+        lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+    }
     if &*stack.item == DISASSEMBLER {
         let mode = disassembler_mode(stack);
         let line = format!("Mode: {} (efficiency {})", mode.label(), mode.efficiency());
@@ -2768,6 +2776,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     if !game.native_window() || !game.native_on(MOD_ID) || !game.native_playing() {
         return;
     }
+    free_runners_tick(game);
     let Some(chest) = game.armor[1].as_ref().filter(|s| JETPACKS.contains(&&*s.item)) else {
         return;
     };
@@ -2788,6 +2797,10 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
 /// A client's packet, with its player swapped in (API 26): a jetpack thrust spends one mB of the
 /// hydrogen in the jetpack they wear and stops their fall here too.
 pub(super) fn server_payload(game: &mut Game<'_>, channel: &str) {
+    if channel == FREE_RUNNERS_CHANNEL && game.native_on(MOD_ID) {
+        free_runners_fall(game);
+        return;
+    }
     if channel != JETPACK_CHANNEL || !game.native_on(MOD_ID) {
         return;
     }
@@ -2839,6 +2852,85 @@ pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
     true
+}
+
+// --- Free Runners -----------------------------------------------------------------------------------
+
+const FREE_RUNNERS: [&str; 2] = ["mekanism:free_runners", "mekanism:free_runners_armored"];
+/// The window tells the server that its player falls in free runners.
+const FREE_RUNNERS_CHANNEL: &str = "mekanism:free_runners";
+const FREE_RUNNER_MODE_KEY: &str = "mekanism:free_runner_mode";
+const STEP_ASSIST_ID: &str = "mekanism:step_assist";
+
+fn free_runner_mode(stack: &ItemStack) -> gear::FreeRunnerMode {
+    let name = custom_data(stack).and_then(|c| match c.get(&JavaString::from(FREE_RUNNER_MODE_KEY)) {
+        Some(Tag::String(s)) => s.to_string().ok(),
+        _ => None,
+    });
+    name.as_deref().and_then(gear::FreeRunnerMode::from_name).unwrap_or_default()
+}
+
+/// The free runners on the feet, when worn.
+fn worn_free_runners<'g>(game: &'g Game<'_>) -> Option<&'g ItemStack> {
+    game.armor[3].as_ref().filter(|s| FREE_RUNNERS.contains(&&*s.item))
+}
+
+/// On the window each tick: the step assist of the normal mode (`PlayerState.updateStepAssist`, 0.5
+/// more step height while not sneaking), and while falling in runners that guard falls, a note to
+/// the server, which takes the fall's energy.
+fn free_runners_tick(game: &mut Game<'_>) {
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let runners = worn_free_runners(game).map(|s| (free_runner_mode(s), stored_energy(s)));
+    let step = runners.is_some_and(|(mode, _)| mode.step_boost()) && !sneaking;
+    let Some(p) = game.player.as_mut() else {
+        return;
+    };
+    let _ = p.set_modifier("minecraft:step_height", STEP_ASSIST_ID, gear::FREE_RUNNER_STEP, "add_value", step);
+    let falling = p.fall_distance > 0.0 && !p.flying && !p.spectator;
+    if falling && runners.is_some_and(|(mode, energy)| mode.prevents_fall_damage() && energy > 0) {
+        game.native_send_to_server(FREE_RUNNERS_CHANNEL, &[1]);
+    }
+}
+
+/// On the server, for the player who sent the note: the fall so far is paid for from the runners'
+/// energy and forgotten, so the landing does not hurt (`CommonPlayerTickHandler.livingFall`).
+fn free_runners_fall(game: &mut Game<'_>) {
+    let Some(fallen) = game.player.as_ref().map(|p| f64::from(p.fall_distance)) else {
+        return;
+    };
+    let Some(feet) = game.armor[3].as_mut().filter(|s| FREE_RUNNERS.contains(&&*s.item)) else {
+        return;
+    };
+    if fallen <= 0.0 || !free_runner_mode(feet).prevents_fall_damage() {
+        return;
+    }
+    let stored = stored_energy(feet);
+    let Some(cost) = gear::fall_cost(fallen, stored) else {
+        return;
+    };
+    set_energy(feet, stored - cost);
+    if let Some(p) = game.player.as_mut() {
+        p.fall_distance = 0.0;
+    }
+}
+
+/// Sneak + right click with free runners in hand cycles their mode, as Mekanism's mode key does.
+fn free_runners_use(game: &mut Game<'_>, claimed: &mut bool) {
+    if !game.native_on(MOD_ID) || !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+        return;
+    }
+    let Some(held) = game.held_mut().as_mut().filter(|s| FREE_RUNNERS.contains(&&*s.item)) else {
+        return;
+    };
+    let mode = free_runner_mode(held).next();
+    let stored = stored_energy(held);
+    set_energy(held, stored);
+    set_custom_string(held, FREE_RUNNER_MODE_KEY, mode.name());
+    *claimed = true;
+    if let Some(player) = game.native_acting_player() {
+        let line = format!("Free runners mode: {}", mode.label());
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
 }
 
 // --- Fission Reactor ---------------------------------------------------------------------------------
