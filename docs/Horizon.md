@@ -636,3 +636,18 @@ boots' armour; the plain pair gives none. They hold 64 kFE and charge at 320 FE/
 
 Mekanism instead charges once, on landing, for the blocks past the safe distance. Charging every tick
 here costs a little more, and the last tick before a very fast landing can still count.
+
+## M37: the Dynamic Tank
+
+The Dynamic Tank (`TankValidator`, `TankMultiblockData`) is a box of dynamic tank casing, dynamic
+valves and structural glass, 3 to 18 blocks on each side, with air inside. Its edges must be casing.
+
+- **Capacity.** The tank holds one fluid or one chemical, 16,000 buckets for each block of the whole
+  box (`mBPerTank`). A 3×3×3 tank holds 432,000 buckets.
+- **Valves.** Pipes and tubes fill a valve in input mode. Each valve keeps up to 256 buckets a tick,
+  and the first valve takes that into the tank. A sneaking right click with an empty hand switches a
+  valve to output, and it then gives out to the pipes and tubes beside it.
+- **Screen.** A plain right click opens the tank's screen, which shows the gauge and the volume.
+
+Mekanism's valves don't push anything out themselves. Here the output mode stands in for the pumps
+and pipes that pull from them in Mekanism, because Horizon's pipes only push.

@@ -6,6 +6,7 @@
 
 pub mod boiler;
 pub mod chemical;
+pub mod dynamic_tank;
 pub mod energy;
 pub mod evaporation;
 pub mod factory;

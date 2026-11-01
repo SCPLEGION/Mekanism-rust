@@ -13,6 +13,7 @@ fn on_right_click_block(game: &mut crate::game::Game<'_>, pos: [i32; 3], face: [
         || crate::game::mekanism::use_fusion(game, pos)
         || crate::game::mekanism::use_boiler(game, pos)
         || crate::game::mekanism::use_sps_port(game, pos)
+        || crate::game::mekanism::use_dynamic_valve(game, pos)
     {
         *canceled = true;
     }
