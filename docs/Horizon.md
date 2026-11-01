@@ -575,3 +575,23 @@ The screens from M31 and M32 now cover the generators and the remaining machines
 
 Every screen's power bar now reads the stored energy and capacity in FE, sent as 15-bit pieces, so
 generators show their real charge. Blocks with no power hide the energy tab.
+
+## M34: tank and multiblock screens
+
+Chemical and fluid tanks, and the ports of the multiblocks, now open a screen on a plain right click
+with an empty hand:
+
+- Tanks: one gauge with the chemical or fluid and its amount.
+- Fission Reactor port: fuel, water, steam and waste gauges, the status (off, active, SCRAM) and burn
+  rate, and two buttons: On/Off and Burn+.
+- Fusion Reactor port: deuterium, tritium, water and steam gauges, burning or not, injection, plasma
+  temperature, production and stored energy, and two buttons: Ignite and Inject+.
+- Thermoelectric Boiler valve: water and steam gauges, the temperature, the boil rate and the
+  superheaters.
+- Industrial Turbine valve: the steam gauge, the power bar, the production and stored energy.
+- Induction Matrix port: the energy gauge and the matrix's maximum input/output.
+
+Every port shows its multiblock's master. A sneaking right click with an empty hand keeps the old
+controls: it switches the fission reactor on or off, ignites the fusion reactor, and shows the
+turbine's and the boiler's state in the action bar. Clicking the fusion controller still steps the
+injection rate.
