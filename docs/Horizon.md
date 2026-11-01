@@ -595,3 +595,23 @@ Every port shows its multiblock's master. A sneaking right click with an empty h
 controls: it switches the fission reactor on or off, ignites the fusion reactor, and shows the
 turbine's and the boiler's state in the action bar. Clicking the fusion controller still steps the
 injection rate.
+
+## M35: the Supercritical Phase Shifter
+
+The SPS turns polonium into antimatter (`SPSMultiblockData`, `SPSValidator`, Mekanism's default config):
+
+- **Structure.** A 7×7×7 box of SPS casing and SPS ports, its faces following `ALLOWED_GRID`, so the
+  corners are cut. Inside it holds air and Supercharged Coils, and every coil sits against a port.
+- **Ports.** A port takes polonium from tubes and energy from cables in input mode, and gives
+  antimatter in output mode. Switch the mode with a sneaking right click while your hand is empty.
+- **Process.** A port with a coil behind it hands the coils all the energy it holds, up to an int's
+  worth a tick. Each 1,000,000 FE processes 1 mB of polonium, and 1,000 mB make 1 mB of antimatter.
+  The input tank holds 2,000 mB and the output tank 1,000 mB.
+- **Screen.** It shows the polonium and antimatter gauges, the coils, the progress, the polonium
+  processed a tick and the energy the coils took.
+- **Polonium.** The Solar Neutron Activator now makes polonium from nuclear waste, 10 mB into 1 mB
+  (`processing/lategame/polonium.json`).
+- **Antimatter pellets.** The chemical crystallizer already turns 1,000 mB of antimatter into a
+  pellet.
+
+Left out: the SPS's damage to entities inside it, and its laser effects.
