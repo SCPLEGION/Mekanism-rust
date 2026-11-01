@@ -203,3 +203,28 @@ bindings = [
   { name = "at", ty = "[f32; 2]", value = "at" },
   { name = "lines", ty = "&mut Vec<String>", value = "&mut *lines" },
 ]
+
+[[injection]]
+id = "screen-click"
+hook = "screen_click"
+hook_version = 1
+kind = "HEAD"
+helper = "screen_click.rs"
+bindings = [
+  { name = "block", ty = "&str", value = "block" },
+  { name = "at", ty = "[f32; 2]", value = "at" },
+  { name = "button", ty = "&mut Option<i32>", value = "&mut *button" },
+]
+
+[[injection]]
+id = "menu-button"
+hook = "menu_button"
+hook_version = 1
+kind = "HEAD"
+helper = "menu_button.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "entity", ty = "&mut horizon_client::containers::ModBlockEntity", value = "&mut *entity" },
+  { name = "id", ty = "i32", value = "id" },
+]

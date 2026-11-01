@@ -225,6 +225,25 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::EnergyCube(_)) => (vec![0, 1], vec![]),
         // The miner's energy slot; what it mines goes into the container above it.
         Some(Kind::DigitalMiner) => (vec![1], vec![]),
+        // Tanks and the multiblocks' ports open a screen with no slots of their own.
+        Some(
+            Kind::ChemicalTank(_)
+            | Kind::FluidTank(_)
+            | Kind::FissionPort
+            | Kind::TurbineValve
+            | Kind::FusionPort
+            | Kind::BoilerValve
+            | Kind::InductionPort,
+        ) => {
+            *container = Some(ModContainer {
+                slots: 3,
+                faces: Default::default(),
+                inputs: vec![],
+                outputs: vec![],
+                menu: Some("minecraft:furnace".into()),
+            });
+            return;
+        }
         _ => return,
     };
     *container = Some(ModContainer {
@@ -310,6 +329,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         }
     };
     screen_data(entity);
+    multiblock_data(game, pos, entity);
     if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Pipe(_)) {
         show_connections(game, pos, entity);
     }
@@ -2965,7 +2985,11 @@ pub(super) fn use_fission_port(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     if !game.native_on(MOD_ID) || game.inventory.get(game.selected).cloned().flatten().is_some() {
         return false;
     }
+    // A plain click opens the reactor's screen.
     let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    if !sneaking {
+        return false;
+    }
     let master = game.native_with_mod_block_entity(pos, |m| {
         (kind(&m.id) == Some(Kind::FissionPort)).then(|| get_pos(&m.nbt, "master"))
     });
@@ -3244,6 +3268,10 @@ pub(super) fn use_fusion(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         }
     };
     let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    // A plain click on a port opens the reactor's screen; the controller has none.
+    if !sneaking && block_name(game, pos) != fusion::CONTROLLER {
+        return false;
+    }
     let line = master
         .and_then(|master| {
             game.native_with_mod_block_entity(master, |m| {
@@ -3505,6 +3533,61 @@ fn layout(block: &str) -> Option<Layout> {
             power: None,
             progress: None,
         },
+        // A tank's one big gauge.
+        Kind::ChemicalTank(t) => Layout {
+            slots: [None; 3],
+            gauges: vec![gauge("chemical", chem::chemical_tank(t).0, 79.0, 13.0, STANDARD)],
+            power: None,
+            progress: None,
+        },
+        Kind::FluidTank(t) => Layout {
+            slots: [None; 3],
+            gauges: vec![gauge("fluid", tier::fluid_tank(t).0, 79.0, 13.0, STANDARD)],
+            power: None,
+            progress: None,
+        },
+        // The multiblocks show their master's tanks (capacities from its size, in screen_data), their
+        // state as text and, for the reactors, two buttons.
+        Kind::FissionPort => Layout {
+            slots: [None; 3],
+            gauges: vec![
+                gauge("fuel", 0, 7.0, 13.0, STANDARD),
+                gauge("water", 0, 27.0, 13.0, STANDARD),
+                gauge("steam", 0, 131.0, 13.0, STANDARD),
+                gauge("waste", 0, 151.0, 13.0, STANDARD),
+            ],
+            power: None,
+            progress: None,
+        },
+        Kind::FusionPort => Layout {
+            slots: [None; 3],
+            gauges: vec![
+                gauge("deuterium", fusion::FUEL_CAPACITY, 7.0, 13.0, STANDARD),
+                gauge("tritium", fusion::FUEL_CAPACITY, 27.0, 13.0, STANDARD),
+                gauge("water", 0, 131.0, 13.0, STANDARD),
+                gauge("steam", 0, 151.0, 13.0, STANDARD),
+            ],
+            power: None,
+            progress: None,
+        },
+        Kind::BoilerValve => Layout {
+            slots: [None; 3],
+            gauges: vec![gauge("water", 0, 7.0, 13.0, STANDARD), gauge("steam", 0, 151.0, 13.0, STANDARD)],
+            power: None,
+            progress: None,
+        },
+        Kind::TurbineValve => Layout {
+            slots: [None; 3],
+            gauges: vec![gauge("steam", 0, 7.0, 13.0, STANDARD)],
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
+            progress: None,
+        },
+        Kind::InductionPort => Layout {
+            slots: [None; 3],
+            gauges: vec![],
+            power: Some(PowerBar::Gauge([55.0, 18.0])),
+            progress: None,
+        },
         // TileEntityDigitalMiner and its screen: the energy slot (152, 20) and the power bar.
         Kind::DigitalMiner => Layout {
             slots: [None, Some(([152.0, 20.0], "slot/power")), None],
@@ -3523,6 +3606,10 @@ fn energy_capacity(entity: &ModBlockEntity) -> u64 {
         Some(Kind::Wind) => mekanism_core::generator::WIND_STORAGE,
         Some(Kind::GasGenerator) => chem::GAS_GENERATOR_STORAGE,
         Some(Kind::Solar(_, storage)) => storage,
+        Some(Kind::FusionPort) => fusion::ENERGY_CAPACITY,
+        Some(Kind::TurbineValve) => turbine_of(&entity.nbt).energy_capacity(),
+        Some(Kind::InductionPort) => get_long(&entity.nbt, "capacity"),
+        Some(Kind::FissionPort | Kind::BoilerValve) => 0,
         _ => receiver(&entity.id, &entity.nbt, true, false).map_or(0, |r| r.0),
     }
 }
@@ -3551,9 +3638,186 @@ fn screen_data(entity: &mut ModBlockEntity) {
         if g.key == "water" && kind(&entity.id) == Some(Kind::Evaporation) {
             tank.capacity = evap::input_capacity(get_int(&entity.nbt, "height"));
         }
+        if g.capacity == 0 {
+            tank.capacity = multiblock_capacity(entity, g.key);
+        }
         entity.data.extend(wide(tank.amount));
         entity.data.extend(wide(tank.capacity));
         entity.data.push(chemical_index(tank.chemical.as_deref()));
+    }
+}
+
+/// The capacity of a multiblock's tank, from the size its master saved.
+fn multiblock_capacity(entity: &ModBlockEntity, key: &str) -> u64 {
+    let nbt = &entity.nbt;
+    match kind(&entity.id) {
+        Some(Kind::FissionPort) => {
+            let r = fission::Reactor { assemblies: get_long(nbt, "assemblies"), volume: get_long(nbt, "volume") };
+            match key {
+                "water" => r.water_capacity(),
+                "steam" => r.steam_capacity(),
+                _ => r.fuel_capacity(),
+            }
+        }
+        Some(Kind::FusionPort) => {
+            let injection = fusion_injection(nbt);
+            if key == "water" { fusion::water_capacity(injection) } else { fusion::steam_capacity(injection) }
+        }
+        Some(Kind::BoilerValve) => {
+            let b = boiler_of(nbt);
+            if key == "water" { b.water_capacity() } else { b.steam_capacity() }
+        }
+        Some(Kind::TurbineValve) => turbine_of(nbt).steam_capacity(),
+        _ => 0,
+    }
+}
+
+/// Where a multiblock port's master is, if the block is one: the port whose data its screen shows.
+fn multiblock_master(entity: &ModBlockEntity, pos: [i32; 3]) -> Option<Option<[i32; 3]>> {
+    Some(match kind(&entity.id)? {
+        Kind::FissionPort | Kind::FusionPort | Kind::BoilerValve | Kind::TurbineValve => get_pos(&entity.nbt, "master"),
+        Kind::InductionPort => (get_long(&entity.nbt, "rate") > 0).then(|| {
+            ["mx", "my", "mz"].map(|key| match entity.nbt.get(&JavaString::from(key)) {
+                Some(Tag::Int(v)) => *v,
+                _ => pos[0],
+            })
+        }),
+        _ => return None,
+    })
+}
+
+/// A multiblock's screen: the master writes its state into the first four data slots (formed, then
+/// two or three numbers) and what it makes or boils a tick into the usage slots; the other ports show
+/// the master's data.
+fn multiblock_data(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let Some(master) = multiblock_master(entity, pos) else {
+        return;
+    };
+    let Some(master) = master else {
+        entity.data[..4].fill(0);
+        return;
+    };
+    if master != pos {
+        if let Some(data) = game.native_with_mod_block_entity(master, |m| m.data.clone())
+            && !data.is_empty()
+        {
+            entity.data = data;
+        }
+        return;
+    }
+    let nbt = &entity.nbt;
+    let small = |v: u64| v.min(i16::MAX as u64) as i32;
+    let (state, usage) = match kind(&entity.id) {
+        Some(Kind::FissionPort) => {
+            let r = fission::Reactor { assemblies: get_long(nbt, "assemblies"), volume: get_long(nbt, "volume") };
+            let on = match (get_long(nbt, "active"), get_long(nbt, "scram")) {
+                (1, _) => 1,
+                (_, 1) => 2,
+                _ => 0,
+            };
+            let burn = get_long(nbt, "burn").clamp(1, r.max_burn_tenths().max(1));
+            ([1, on, small(burn), small(r.max_burn_tenths())], 0)
+        }
+        Some(Kind::FusionPort) => {
+            let plasma = fusion_plasma(nbt);
+            let mk = |k: f64| small((k / 1e6).max(0.0) as u64);
+            ([1, i32::from(plasma.burning), small(fusion_injection(nbt)), mk(plasma.plasma)], get_long(nbt, "production"))
+        }
+        Some(Kind::BoilerValve) => {
+            let b = boiler_of(nbt);
+            let heat = get_double(nbt, "heat").unwrap_or(b.heat_capacity() * boiler::BOIL_TEMP);
+            ([1, small((heat / b.heat_capacity().max(1.0)) as u64), small(b.elements), 0], get_long(nbt, "boil_rate"))
+        }
+        Some(Kind::TurbineValve) => ([1, 0, 0, 0], get_long(nbt, "production")),
+        _ => ([1, 0, 0, 0], get_long(nbt, "rate")),
+    };
+    entity.data[..4].copy_from_slice(&state);
+    entity.data.splice(DATA_USAGE..DATA_USAGE + 4, wide(usage));
+}
+
+/// The text a multiblock's screen shows between its gauges.
+fn multiblock_lines(block: &str, data: &[i32]) -> Vec<String> {
+    let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0) as u64;
+    if get(0) == 0 {
+        return vec!["Not formed".to_owned()];
+    }
+    let usage = read_wide(data, DATA_USAGE);
+    let fe = mekanism_core::energy::format_fe;
+    match kind(block) {
+        Some(Kind::FissionPort) => vec![
+            format!("Status: {}", ["Off", "Active", "SCRAM"][get(1).min(2) as usize]),
+            format!("Burn: {:.1}/{:.1} mB/t", get(2) as f64 / 10.0, get(3) as f64 / 10.0),
+        ],
+        Some(Kind::FusionPort) => vec![
+            if get(1) == 1 { "Burning".to_owned() } else { "Not burning".to_owned() },
+            format!("Injection: {}", get(2)),
+            format!("Plasma: {} MK", get(3)),
+            format!("{}/t", fe(usage)),
+            format!("Stored: {}", fe(read_wide(data, DATA_STORED))),
+        ],
+        Some(Kind::BoilerValve) => vec![
+            format!("Temp: {} K", get(1)),
+            format!("Boiling: {usage} mB/t"),
+            format!("Superheaters: {}", get(2)),
+        ],
+        Some(Kind::TurbineValve) => vec![format!("Producing: {}/t", fe(usage)), format!("Stored: {}", fe(read_wide(data, DATA_STORED)))],
+        Some(Kind::InductionPort) => vec![format!("Max I/O: {}/t", fe(usage))],
+        _ => vec![],
+    }
+}
+
+/// The reactors' buttons: [x, y, w, h] on the screen, label, and the menu button id.
+fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
+    match kind(block) {
+        Some(Kind::FissionPort) => &[([50.0, 56.0, 38.0, 16.0], "On/Off"), ([90.0, 56.0, 38.0, 16.0], "Burn+")],
+        Some(Kind::FusionPort) => &[([50.0, 56.0, 38.0, 16.0], "Ignite"), ([90.0, 56.0, 38.0, 16.0], "Inject+")],
+        _ => &[],
+    }
+}
+
+/// A press on a reactor's button (hook point `native_screen_click`, API 20).
+pub(super) fn screen_click(block: &str, at: [f32; 2], button: &mut Option<i32>) {
+    if let Some(i) = buttons(block).iter().position(|(r, _)| inside(at, *r)) {
+        *button = Some(i as i32);
+    }
+}
+
+/// A reactor's button pressed, on the server (hook point `native_menu_button`, API 20): the fission
+/// reactor switches on or off (0) or steps its burn rate (1); the fusion reactor ignites (0) or steps
+/// its injection rate (1). The press goes to the reactor's master port.
+pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id: i32) {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    let Some(Some(master)) = multiblock_master(entity, pos) else {
+        return;
+    };
+    let press = |m: &mut ModBlockEntity| match (kind(&m.id), id) {
+        (Some(Kind::FissionPort), 0) => {
+            let on = get_long(&m.nbt, "active") == 0;
+            put_long(&mut m.nbt, "active", u64::from(on));
+            put_long(&mut m.nbt, "scram", 0);
+        }
+        (Some(Kind::FissionPort), 1) => {
+            let r = fission::Reactor { assemblies: get_long(&m.nbt, "assemblies"), volume: get_long(&m.nbt, "volume") };
+            let burn = get_long(&m.nbt, "burn").clamp(1, r.max_burn_tenths().max(1));
+            put_long(&mut m.nbt, "burn", fission::next_burn(burn, r.max_burn_tenths()));
+        }
+        (Some(Kind::FusionPort), 0) => {
+            let mut plasma = fusion_plasma(&m.nbt);
+            fusion::ignite(&mut plasma, fusion_injection(&m.nbt));
+            put_fusion_plasma(&mut m.nbt, &plasma);
+        }
+        (Some(Kind::FusionPort), 1) => {
+            let next = fusion::next_injection(fusion_injection(&m.nbt));
+            put_long(&mut m.nbt, "injection", next);
+        }
+        _ => {}
+    };
+    if master == pos {
+        press(entity);
+    } else {
+        game.native_with_mod_block_entity(master, press);
     }
 }
 
@@ -3678,6 +3942,16 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
     }
     if l.power.is_some() {
     sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
+    }
+    let text_x = if l.gauges.len() > 2 { 50.0 } else { 30.0 };
+    for (i, line) in multiblock_lines(block, data).iter().enumerate() {
+        game.native_text(batch, line, [ox + text_x, oy + 16.0 + 10.0 * i as f32], 0x40_4040, false);
+    }
+    for ([x, y, w, h], label) in buttons(block) {
+        game.native_fill(batch, [ox + x, oy + y, *w, *h], 0xFF00_0000);
+        game.native_fill(batch, [ox + x + 1.0, oy + y + 1.0, w - 2.0, h - 2.0], 0xFF6F_6F6F);
+        let tw = game.native_text_width(label);
+        game.native_text(batch, label, [ox + x + (w - tw) / 2.0, oy + y + (h - 8.0) / 2.0], 0xFF_FFFF, true);
     }
 }
 
@@ -3907,13 +4181,15 @@ pub(super) fn use_boiler(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     if !game.native_on(MOD_ID) || game.inventory.get(game.selected).cloned().flatten().is_some() {
         return false;
     }
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
     let line = game.native_with_mod_block_entity(pos, |m| match kind(&m.id) {
         Some(Kind::Heater) => {
             let usage = boiler::next_heater_usage(heater_usage(&m.nbt));
             put_long(&mut m.nbt, "usage", usage);
             Some(Ok(format!("Resistive Heater: {usage} FE/t")))
         }
-        Some(Kind::BoilerValve) => Some(Err(get_pos(&m.nbt, "master"))),
+        // A plain click on a valve opens the boiler's screen.
+        Some(Kind::BoilerValve) if sneaking => Some(Err(get_pos(&m.nbt, "master"))),
         _ => None,
     });
     let line = match line.flatten() {
@@ -3987,6 +4263,19 @@ fn find_turbine(game: &Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, V
 /// An Industrial Turbine valve. Once a second each valve checks its turbine; the first valve runs it: it
 /// takes steam from the tubes and chemical tanks beside the valves, turns it into energy given out of
 /// every valve, and gives condensed water to the pipes and fluid tanks beside them.
+fn turbine_of(nbt: &Compound) -> turbine::Turbine {
+    let g = |key: &str| get_long(nbt, key);
+    turbine::Turbine {
+        rotors: g("rotors"),
+        dispersers: g("dispersers"),
+        coils: g("coils"),
+        condensers: g("condensers"),
+        vents: g("vents"),
+        volume: g("volume"),
+        lower_volume: g("lower_volume"),
+    }
+}
+
 fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
     let ticker = get_int(&entity.nbt, "ticker");
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
@@ -4013,16 +4302,7 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
             }
         }
     }
-    let g = |key: &str| get_long(&entity.nbt, key);
-    let t = turbine::Turbine {
-        rotors: g("rotors"),
-        dispersers: g("dispersers"),
-        coils: g("coils"),
-        condensers: g("condensers"),
-        vents: g("vents"),
-        volume: g("volume"),
-        lower_volume: g("lower_volume"),
-    };
+    let t = turbine_of(&entity.nbt);
     if t.rotors == 0 || get_pos(&entity.nbt, "master") != Some(pos) {
         return None;
     }
@@ -4059,6 +4339,10 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
 /// A right click with an empty hand on a turbine valve shows the turbine's steam, production and energy.
 pub(super) fn show_turbine(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     if !game.native_on(MOD_ID) || game.inventory.get(game.selected).cloned().flatten().is_some() {
+        return false;
+    }
+    // A plain click opens the turbine's screen; a sneaking one shows its state.
+    if !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
         return false;
     }
     let master = game.native_with_mod_block_entity(pos, |m| {
