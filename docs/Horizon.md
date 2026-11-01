@@ -560,3 +560,18 @@ the chemical's index in `CHEMICALS`.
 Simplified: the fill is a flat colour, not the chemical's animated texture. There are no gas dump
 buttons on the separator and no item slots for chemical items. Generators, tanks and multiblocks come
 next.
+
+## M33: more machine screens
+
+The screens from M31 and M32 now cover the generators and the remaining machines:
+
+- Heat generator: the lava gauge, the fuel and charge slots and the power bar.
+- Gas-burning generator: the fuel gauge. Wind and advanced solar generators: the charge slot and the power bar.
+- Metallurgic infuser: the infusion bar, its three slots and the progress arrow.
+- Purification chamber and osmium compressor: the chemical bar beside the input.
+- Rotary condensentrator: the chemical and fluid gauges and the bucket slots.
+- Thermal evaporation controller: the water gauge (its capacity follows the tower's height) and the brine gauge.
+- Digital miner: the energy slot and the power bar.
+
+Every screen's power bar now reads the stored energy and capacity in FE, sent as 15-bit pieces, so
+generators show their real charge. Blocks with no power hide the energy tab.
