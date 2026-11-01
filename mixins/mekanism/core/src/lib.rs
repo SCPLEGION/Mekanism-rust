@@ -25,6 +25,7 @@ pub mod recipes;
 pub mod sides;
 pub mod slurry_table;
 pub mod sps;
+pub mod teleporter;
 pub mod tier;
 pub mod turbine;
 pub mod upgrades;

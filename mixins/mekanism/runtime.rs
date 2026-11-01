@@ -20,6 +20,7 @@ use mekanism_core::turbine;
 use mekanism_core::dynamic_tank;
 use mekanism_core::sides::{Sides, Transmission};
 use mekanism_core::sps;
+use mekanism_core::teleporter;
 use mekanism_core::factory::{self, Factory};
 use mekanism_core::generator::HeatGenerator;
 use mekanism_core::machine::{self, ElectricMachine, Operation, Slot};
@@ -80,6 +81,8 @@ enum Kind {
     DynamicValve,
     /// The Antiprotonic Nucleosynthesizer: an item and antimatter into an item.
     Nucleosynthesizer,
+    /// A Teleporter: sends players to another teleporter on its frequency.
+    Teleporter,
     /// A Fusion Reactor's port; the first port of a formed reactor runs it.
     FusionPort,
     /// The Electric Pump: water (or heavy water) from below.
@@ -122,6 +125,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:chemical_oxidizer" => return Some(Kind::Oxidizer),
         "mekanism:chemical_infuser" => return Some(Kind::ChemicalInfuser),
         "mekanism:antiprotonic_nucleosynthesizer" => return Some(Kind::Nucleosynthesizer),
+        teleporter::TELEPORTER => return Some(Kind::Teleporter),
         "mekanism:thermal_evaporation_controller" => return Some(Kind::Evaporation),
         "mekanism:rotary_condensentrator" => return Some(Kind::Rotary),
         "mekanism:induction_port" => return Some(Kind::InductionPort),
@@ -320,6 +324,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         Kind::Crystallizer => tick_crystallizer(entity),
         Kind::Advanced(m) => tick_advanced(game, entity, m),
         Kind::Nucleosynthesizer => tick_nucleosynthesizer(game, entity),
+        Kind::Teleporter => {
+            tick_teleporter(game, pos, entity);
+            None
+        }
         Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
         Kind::Evaporation => tick_evaporation(game, pos, entity),
         Kind::Rotary => tick_rotary(game, pos, entity),
@@ -2454,6 +2462,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Separator => Some((machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE, u64::MAX)),
         Kind::Advanced(m) => Some((m.usage * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
         Kind::Nucleosynthesizer => Some((machine::STORAGE_MULTIPLIER * chem::NUCLEOSYNTHESIZER_USAGE, u64::MAX)),
+        Kind::Teleporter => Some((teleporter::STORAGE, u64::MAX)),
         Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE, u64::MAX)),
         Kind::Rotary => Some((machine::STORAGE_MULTIPLIER * chem::ROTARY_USAGE, u64::MAX)),
         Kind::Heater => Some((machine::STORAGE_MULTIPLIER * heater_usage(nbt), u64::MAX)),
@@ -2651,6 +2660,10 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
     }
     if !*claimed && FREE_RUNNERS.contains(&&*stack.item) {
         free_runners_use(game, claimed);
+        return;
+    }
+    if !*claimed && &*stack.item == teleporter::PORTABLE {
+        portable_teleporter_use(game, claimed);
         return;
     }
     if *claimed || &*stack.item != DISASSEMBLER || !game.native_on(MOD_ID) {
@@ -4235,6 +4248,215 @@ pub(super) fn screen_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mu
             lines.push(format!("§7Energy upgrades: {}/8", get(DATA_ENERGY_UPGRADES)));
         }
     }
+}
+
+// --- Teleporters ------------------------------------------------------------------------------------
+
+const FREQUENCY_KEY: &str = "mekanism:frequency";
+
+/// The teleporters this server has seen, by frequency: their dimension and position. A teleporter
+/// adds itself once a second; an entry is checked against the world before anyone travels to it.
+static TELEPORTERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Vec<(super::Dim, [i32; 3])>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn get_string(nbt: &Compound, key: &str) -> Option<String> {
+    match nbt.get(&JavaString::from(key)) {
+        Some(Tag::String(s)) => s.to_string().ok().filter(|s| !s.is_empty()),
+        _ => None,
+    }
+}
+
+/// A teleporter: once a second it looks for its frame (`getFrameDirection`) and puts itself on its
+/// frequency.
+fn tick_teleporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
+    if ticker != 0 {
+        return;
+    }
+    let dir = teleporter::frame_direction(|o| block_name(game, [pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]]) == teleporter::FRAME);
+    match dir {
+        Some(d) => {
+            entity.nbt.insert("dir".into(), Tag::IntArray(d.to_vec()));
+        }
+        None => {
+            entity.nbt.remove(&JavaString::from("dir"));
+        }
+    }
+    let dim = game.dim;
+    if let Ok(mut all) = TELEPORTERS.lock() {
+        for list in all.values_mut() {
+            list.retain(|&(d, p)| (d, p) != (dim, pos));
+        }
+        if let Some(f) = get_string(&entity.nbt, "frequency") {
+            all.entry(f).or_default().push((dim, pos));
+        }
+    }
+}
+
+/// The closest other formed teleporter on `frequency` in this dimension, and where a player arrives:
+/// the block in front of it, toward its frame.
+fn teleport_target(game: &mut Game<'_>, frequency: &str, from: [f64; 3], not: Option<[i32; 3]>) -> Option<([i32; 3], [f64; 3])> {
+    let dim = game.dim;
+    let mut list: Vec<[i32; 3]> = TELEPORTERS
+        .lock()
+        .ok()?
+        .get(frequency)?
+        .iter()
+        .filter(|&&(d, p)| d == dim && Some(p) != not)
+        .map(|&(_, p)| p)
+        .collect();
+    let dist = |p: &[i32; 3]| (0..3).map(|k| (from[k] - f64::from(p[k])).powi(2)).sum::<f64>();
+    list.sort_by(|a, b| dist(a).total_cmp(&dist(b)));
+    list.into_iter().find_map(|p| {
+        let dir = game.native_with_mod_block_entity(p, |m| {
+            (kind(&m.id) == Some(Kind::Teleporter) && get_string(&m.nbt, "frequency").as_deref() == Some(frequency))
+                .then(|| get_pos(&m.nbt, "dir"))
+                .flatten()
+        })??;
+        let feet = [p[0] + dir[0], p[1] + dir[1], p[2] + dir[2]];
+        Some((p, [f64::from(feet[0]) + 0.5, f64::from(feet[1]), f64::from(feet[2]) + 0.5]))
+    })
+}
+
+fn place_player(game: &mut Game<'_>, at: [f64; 3]) {
+    if let Some(p) = game.player.as_mut() {
+        p.position = horizon_core::geometry::Vec3::new(at[0], at[1], at[2]);
+        p.velocity = horizon_core::geometry::Vec3::new(0.0, 0.0, 0.0);
+        p.fall_distance = 0.0;
+    }
+    game.previous_position = horizon_core::geometry::Vec3::new(at[0], at[1], at[2]);
+}
+
+fn tell(game: &mut Game<'_>, line: String) {
+    if let Some(player) = game.native_acting_player() {
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
+}
+
+/// A right click on a teleporter or its frame:
+/// - with a named name tag on the teleporter, sets its frequency to the name;
+/// - with a portable teleporter on the teleporter, tunes the portable one to its frequency;
+/// - with an empty hand, sends the player to the closest other teleporter on the frequency, paid from
+///   this teleporter's energy (`TileEntityTeleporter.teleport`).
+pub(super) fn use_teleporter(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) {
+        return false;
+    }
+    let name = block_name(game, pos);
+    if name != teleporter::TELEPORTER && name != teleporter::FRAME {
+        return false;
+    }
+    let held = game.inventory.get(game.selected).cloned().flatten();
+    if name == teleporter::TELEPORTER {
+        if let Some(tag) = held.as_ref().filter(|s| &*s.item == "minecraft:name_tag").and_then(|s| s.custom_name()) {
+            game.native_with_mod_block_entity(pos, |m| m.nbt.insert("frequency".into(), Tag::String(tag.as_str().into())));
+            tell(game, format!("Teleporter frequency: {tag}"));
+            return true;
+        }
+        if held.as_ref().is_some_and(|s| &*s.item == teleporter::PORTABLE) {
+            let f = game.native_with_mod_block_entity(pos, |m| get_string(&m.nbt, "frequency")).flatten();
+            let Some(f) = f else {
+                tell(game, "Teleporter: no frequency (name it with a name tag)".to_owned());
+                return true;
+            };
+            let selected = game.selected;
+            if let Some(stack) = game.inventory[selected].as_mut() {
+                let stored = stored_energy(stack);
+                set_energy(stack, stored);
+                set_custom_string(stack, FREQUENCY_KEY, &f);
+            }
+            tell(game, format!("Portable Teleporter: {f}"));
+            return true;
+        }
+    }
+    if held.is_some() {
+        return false;
+    }
+    // The teleporter this block belongs to: itself, or one whose frame or opening holds it.
+    let source = if name == teleporter::TELEPORTER {
+        Some(pos)
+    } else {
+        let mut found = None;
+        'search: for dx in -3..=3 {
+            for dy in -3..=3 {
+                for dz in -3..=3 {
+                    let t = [pos[0] + dx, pos[1] + dy, pos[2] + dz];
+                    if block_name(game, t) != teleporter::TELEPORTER {
+                        continue;
+                    }
+                    let dir = game.native_with_mod_block_entity(t, |m| get_pos(&m.nbt, "dir")).flatten();
+                    if let Some(d) = dir
+                        && [false, true].into_iter().any(|r| teleporter::frame_offsets(d, r).contains(&[-dx, -dy, -dz]))
+                    {
+                        found = Some(t);
+                        break 'search;
+                    }
+                }
+            }
+        }
+        found
+    };
+    let Some(source) = source else {
+        return false;
+    };
+    let (frequency, formed, stored) = game
+        .native_with_mod_block_entity(source, |m| (get_string(&m.nbt, "frequency"), get_pos(&m.nbt, "dir").is_some(), get_long(&m.nbt, "energy")))
+        .unwrap_or((None, false, 0));
+    if !formed {
+        tell(game, "Teleporter: no frame".to_owned());
+        return true;
+    }
+    let Some(frequency) = frequency else {
+        tell(game, "Teleporter: no frequency (name it with a name tag)".to_owned());
+        return true;
+    };
+    let Some(from) = game.player.as_ref().map(|p| [p.position.x, p.position.y, p.position.z]) else {
+        return false;
+    };
+    let Some((target, at)) = teleport_target(game, &frequency, from, Some(source)) else {
+        tell(game, "Teleporter: no link found".to_owned());
+        return true;
+    };
+    let cost = teleporter::energy_cost(from, target, true);
+    if stored < cost {
+        tell(game, format!("Teleporter: needs {cost} FE"));
+        return true;
+    }
+    game.native_with_mod_block_entity(source, |m| put_long(&mut m.nbt, "energy", stored - cost));
+    place_player(game, at);
+    true
+}
+
+/// A right click with the Portable Teleporter: to the closest teleporter on its frequency, paid from
+/// its own energy (`ItemPortableTeleporter`).
+fn portable_teleporter_use(game: &mut Game<'_>, claimed: &mut bool) {
+    let Some(held) = game.held_mut().clone().filter(|s| &*s.item == teleporter::PORTABLE) else {
+        return;
+    };
+    *claimed = true;
+    let frequency = custom_data(&held).and_then(|c| get_string(c, FREQUENCY_KEY));
+    let Some(frequency) = frequency else {
+        tell(game, "Portable Teleporter: no frequency (right click a teleporter with it)".to_owned());
+        return;
+    };
+    let Some(from) = game.player.as_ref().map(|p| [p.position.x, p.position.y, p.position.z]) else {
+        return;
+    };
+    let Some((target, at)) = teleport_target(game, &frequency, from, None) else {
+        tell(game, "Portable Teleporter: no link found".to_owned());
+        return;
+    };
+    let cost = teleporter::energy_cost(from, target, true);
+    let stored = stored_energy(&held);
+    if stored < cost {
+        tell(game, format!("Portable Teleporter: needs {cost} FE"));
+        return;
+    }
+    if let Some(stack) = game.held_mut().as_mut() {
+        set_energy(stack, stored - cost);
+    }
+    place_player(game, at);
 }
 
 // --- Dynamic Tank -----------------------------------------------------------------------------------
