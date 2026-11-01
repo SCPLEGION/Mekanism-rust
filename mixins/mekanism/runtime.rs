@@ -17,6 +17,7 @@ use mekanism_core::fusion;
 use mekanism_core::boiler;
 use mekanism_core::isotopes;
 use mekanism_core::turbine;
+use mekanism_core::dynamic_tank;
 use mekanism_core::sides::{Sides, Transmission};
 use mekanism_core::sps;
 use mekanism_core::factory::{self, Factory};
@@ -75,6 +76,8 @@ enum Kind {
     TurbineValve,
     /// A Supercritical Phase Shifter's port; the first port runs it.
     SpsPort,
+    /// A Dynamic Tank's valve; the first valve holds the tank.
+    DynamicValve,
     /// A Fusion Reactor's port; the first port of a formed reactor runs it.
     FusionPort,
     /// The Electric Pump: water (or heavy water) from below.
@@ -127,6 +130,7 @@ fn kind(id: &str) -> Option<Kind> {
         TURBINE_VALVE => return Some(Kind::TurbineValve),
         fusion::PORT => return Some(Kind::FusionPort),
         sps::PORT => return Some(Kind::SpsPort),
+        dynamic_tank::VALVE => return Some(Kind::DynamicValve),
         "mekanism:electric_pump" => return Some(Kind::Pump),
         "mekanism:solar_neutron_activator" => return Some(Kind::Activator),
         boiler::VALVE => return Some(Kind::BoilerValve),
@@ -238,6 +242,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::FusionPort
             | Kind::BoilerValve
             | Kind::SpsPort
+            | Kind::DynamicValve
             | Kind::InductionPort,
         ) => {
             *container = Some(ModContainer {
@@ -296,6 +301,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         }
         Kind::SpsPort => {
             tick_sps_port(game, pos, entity);
+            None
+        }
+        Kind::DynamicValve => {
+            tick_dynamic_valve(game, pos, entity);
             None
         }
         Kind::Pump => tick_pump(game, pos, entity),
@@ -844,6 +853,7 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
             Kind::Separator if chem::separates(chemical) => Some(("fluid", chem::SEPARATOR_FLUID)),
             Kind::Rotary if chem::rotary_chemical(chemical).is_some() => Some(("fluid", chem::ROTARY_TANK)),
             Kind::Washer if chemical == "minecraft:water" => Some(("fluid", nuclear::WASHER_TANK)),
+            Kind::DynamicValve if valve_takes(nbt, chemical) => Some(("buffer", dynamic_tank::VALVE_BUFFER)),
             // Brine crystallizes into salt.
             Kind::Crystallizer if nuclear::find_crystallizing(chemical).is_some() => Some(("input", nuclear::CRYSTALLIZER_TANK)),
             _ => None,
@@ -873,6 +883,7 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
         Kind::Washer if nuclear::find_washing(chemical).is_some() => Some(("input", nuclear::WASHER_TANK)),
         Kind::Crystallizer if nuclear::find_crystallizing(chemical).is_some() => Some(("input", nuclear::CRYSTALLIZER_TANK)),
         Kind::Activator if isotopes::activating(chemical).is_some() => Some(("input", isotopes::ACTIVATOR_TANK)),
+        Kind::DynamicValve if valve_takes(nbt, chemical) => Some(("buffer", dynamic_tank::VALVE_BUFFER)),
         _ => None,
     }
 }
@@ -1631,6 +1642,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Washer
                 | Kind::Pump
                 | Kind::BoilerValve
+                | Kind::DynamicValve
         ),
         "tube" => matches!(
             kind,
@@ -1651,6 +1663,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Activator
                 | Kind::BoilerValve
                 | Kind::SpsPort
+                | Kind::DynamicValve
         ),
         // The blocks with item slots (`block_entity_container`).
         "transporter" => matches!(
@@ -3686,6 +3699,13 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
         },
+        // GuiDynamicTank: one gauge for the fluid or chemical.
+        Kind::DynamicValve => Layout {
+            slots: [None; 3],
+            gauges: vec![gauge("fluid", 0, 79.0, 13.0, STANDARD)],
+            power: None,
+            progress: None,
+        },
         // GuiSPS: the polonium gauge on the left, the antimatter gauge on the right.
         Kind::SpsPort => Layout {
             slots: [None; 3],
@@ -3723,7 +3743,7 @@ fn energy_capacity(entity: &ModBlockEntity) -> u64 {
         Some(Kind::FusionPort) => fusion::ENERGY_CAPACITY,
         Some(Kind::TurbineValve) => turbine_of(&entity.nbt).energy_capacity(),
         Some(Kind::InductionPort) => get_long(&entity.nbt, "capacity"),
-        Some(Kind::FissionPort | Kind::BoilerValve | Kind::SpsPort) => 0,
+        Some(Kind::FissionPort | Kind::BoilerValve | Kind::SpsPort | Kind::DynamicValve) => 0,
         _ => receiver(&entity.id, &entity.nbt, true, false).map_or(0, |r| r.0),
     }
 }
@@ -3782,6 +3802,7 @@ fn multiblock_capacity(entity: &ModBlockEntity, key: &str) -> u64 {
             if key == "water" { b.water_capacity() } else { b.steam_capacity() }
         }
         Some(Kind::TurbineValve) => turbine_of(nbt).steam_capacity(),
+        Some(Kind::DynamicValve) => dynamic_tank::capacity(get_long(nbt, "volume")),
         _ => 0,
     }
 }
@@ -3789,7 +3810,7 @@ fn multiblock_capacity(entity: &ModBlockEntity, key: &str) -> u64 {
 /// Where a multiblock port's master is, if the block is one: the port whose data its screen shows.
 fn multiblock_master(entity: &ModBlockEntity, pos: [i32; 3]) -> Option<Option<[i32; 3]>> {
     Some(match kind(&entity.id)? {
-        Kind::FissionPort | Kind::FusionPort | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort => {
+        Kind::FissionPort | Kind::FusionPort | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::DynamicValve => {
             get_pos(&entity.nbt, "master")
         }
         Kind::InductionPort => (get_long(&entity.nbt, "rate") > 0).then(|| {
@@ -3845,6 +3866,7 @@ fn multiblock_data(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
             ([1, small((heat / b.heat_capacity().max(1.0)) as u64), small(b.elements), 0], get_long(nbt, "boil_rate"))
         }
         Some(Kind::TurbineValve) => ([1, 0, 0, 0], get_long(nbt, "production")),
+        Some(Kind::DynamicValve) => ([1, small(get_long(nbt, "volume")), 0, 0], 0),
         Some(Kind::SpsPort) => {
             let progress = (sps_of(nbt).scaled_progress() * 1_000.0) as u64;
             let processed = get_double(nbt, "processed").unwrap_or(0.0).max(0.0) as u64;
@@ -3883,6 +3905,7 @@ fn multiblock_lines(block: &str, data: &[i32]) -> Vec<String> {
         ],
         Some(Kind::TurbineValve) => vec![format!("Producing: {}/t", fe(usage)), format!("Stored: {}", fe(read_wide(data, DATA_STORED)))],
         Some(Kind::InductionPort) => vec![format!("Max I/O: {}/t", fe(usage))],
+        Some(Kind::DynamicValve) => vec![format!("Volume: {} blocks", get(1))],
         Some(Kind::SpsPort) => vec![
             format!("Coils: {}", get(1)),
             format!("Progress: {:.1}%", get(2) as f64 / 10.0),
@@ -4124,6 +4147,124 @@ pub(super) fn screen_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mu
             lines.push(format!("§7Energy upgrades: {}/8", get(DATA_ENERGY_UPGRADES)));
         }
     }
+}
+
+// --- Dynamic Tank -----------------------------------------------------------------------------------
+
+/// `TankValidator`: the casing, valves and glass joined to `start` make the shell of a box 3 to 18 on
+/// each side, its edges casing, with air inside. The box's volume and its valves.
+fn find_dynamic_tank(game: &Game<'_>, start: [i32; 3]) -> Option<(u64, Vec<[i32; 3]>)> {
+    let (lo, hi, seen) = find_box(game, start, dynamic_tank::is_frame, dynamic_tank::MIN_SIZE, dynamic_tank::MAX_SIZE)?;
+    let size = [0, 1, 2].map(|k| hi[k] - lo[k] + 1);
+    let mut valves = Vec::new();
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                let at = [x, y, z];
+                let rel = [x - lo[0], y - lo[1], z - lo[2]];
+                let shell = (0..3).any(|k| rel[k] == 0 || rel[k] == size[k] - 1);
+                let name = block_name(game, at);
+                if shell {
+                    if !seen.contains(&at) || (dynamic_tank::on_edge(rel, size) && name != dynamic_tank::CASING) {
+                        return None;
+                    }
+                    if name == dynamic_tank::VALVE {
+                        valves.push(at);
+                    }
+                } else if !matches!(name, "minecraft:air" | "minecraft:cave_air") {
+                    return None;
+                }
+            }
+        }
+    }
+    let volume = size.iter().map(|&s| s as u64).product();
+    (!valves.is_empty()).then_some((volume, valves))
+}
+
+/// Whether a valve's buffer takes `chemical` from a pipe or tube: input mode, and the buffer empty or
+/// holding it.
+fn valve_takes(nbt: &Compound, chemical: &str) -> bool {
+    get_long(nbt, "output") == 0 && get_tank(nbt, "buffer", dynamic_tank::VALVE_BUFFER).accepts(chemical)
+}
+
+/// A Dynamic Tank's valve. Once a second each valve checks the tank; the first valve holds it, takes in
+/// what the other valves' buffers caught, and gives out through valves in output mode.
+fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
+    if ticker == 0 {
+        match find_dynamic_tank(game, pos) {
+            Some((volume, valves)) => {
+                put_long(&mut entity.nbt, "volume", volume);
+                entity.nbt.insert("master".into(), Tag::IntArray(valves[0].to_vec()));
+                entity.nbt.insert("valves".into(), Tag::IntArray(valves.concat()));
+            }
+            None => {
+                put_long(&mut entity.nbt, "volume", 0);
+                entity.nbt.remove(&JavaString::from("master"));
+            }
+        }
+    }
+    if get_pos(&entity.nbt, "master") != Some(pos) {
+        return;
+    }
+    let mut tank = get_tank(&entity.nbt, "fluid", dynamic_tank::capacity(get_long(&entity.nbt, "volume")));
+    // Each valve's buffer into the tank.
+    let drain = |nbt: &mut Compound, tank: &mut ChemicalTank| {
+        let mut buffer = get_tank(nbt, "buffer", dynamic_tank::VALVE_BUFFER);
+        if let Some(id) = buffer.chemical.clone()
+            && tank.accepts(&id)
+        {
+            let n = buffer.amount.min(tank.capacity - tank.amount);
+            buffer.extract(n);
+            tank.insert(&id, n);
+            put_tank(nbt, "buffer", &buffer);
+        }
+        get_long(nbt, "output") == 1
+    };
+    let mut outputs = Vec::new();
+    for p in positions(&entity.nbt, "valves") {
+        let out = if p == pos {
+            drain(&mut entity.nbt, &mut tank)
+        } else {
+            game.native_with_mod_block_entity(p, |m| drain(&mut m.nbt, &mut tank)).unwrap_or(false)
+        };
+        if out {
+            outputs.push(p);
+        }
+    }
+    for p in outputs {
+        if tank.amount > 0 {
+            push_chemical(game, p, &mut tank, None, u64::MAX, false);
+        }
+    }
+    put_tank(&mut entity.nbt, "fluid", &tank);
+}
+
+/// A sneaking right click with an empty hand on a dynamic valve switches it between filling the tank
+/// and emptying it into the pipes and tubes beside it; a plain one opens the tank's screen.
+pub(super) fn use_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID)
+        || game.inventory.get(game.selected).cloned().flatten().is_some()
+        || !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft)
+    {
+        return false;
+    }
+    let output = game.native_with_mod_block_entity(pos, |m| {
+        (kind(&m.id) == Some(Kind::DynamicValve)).then(|| {
+            let output = get_long(&m.nbt, "output") == 0;
+            put_long(&mut m.nbt, "output", u64::from(output));
+            output
+        })
+    });
+    let Some(Some(output)) = output else {
+        return false;
+    };
+    let line = format!("Dynamic Valve: {}", if output { "output" } else { "input" });
+    if let Some(player) = game.native_acting_player() {
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
+    true
 }
 
 // --- Supercritical Phase Shifter ---------------------------------------------------------------------
