@@ -217,6 +217,12 @@ pub static ADVANCED_MACHINES: &[AdvancedMachine] = &[
     },
 ];
 
+/// `TileEntityAntiprotonicNucleosynthesizer`: 15 FE a tick (`UsageConfig`), a 10,000 mB antimatter
+/// tank (`MAX_GAS`), each recipe its own duration.
+pub const NUCLEOSYNTHESIZER_USAGE: u64 = 15;
+pub const NUCLEOSYNTHESIZER_TANK: u64 = 10_000;
+pub const ANTIMATTER: &str = "mekanism:antimatter";
+
 /// `TileEntityChemicalInfuser`: 15 FE a tick, three 10,000 mB tanks.
 pub const CHEMICAL_INFUSER_USAGE: u64 = 15;
 pub const CHEMICAL_INFUSER_TANK: u64 = 10_000;

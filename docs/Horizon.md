@@ -651,3 +651,17 @@ valves and structural glass, 3 to 18 blocks on each side, with air inside. Its e
 
 Mekanism's valves don't push anything out themselves. Here the output mode stands in for the pumps
 and pipes that pull from them in Mekanism, because Horizon's pipes only push.
+
+## M38: the Antiprotonic Nucleosynthesizer
+
+The Antiprotonic Nucleosynthesizer (`TileEntityAntiprotonicNucleosynthesizer`) runs Mekanism's 23
+`nucleosynthesizing` recipes, for example coal and 4 mB of antimatter into a diamond over 1,000 ticks.
+`tools/gen_recipe_table.py` now writes them to the `NUCLEOSYNTHESIZING` table, each with its own
+duration.
+
+- **Slots and antimatter.** The item goes in the first slot. Antimatter pellets in the middle slot
+  fill the 10,000 mB antimatter tank (`chemical_conversion`), and tubes can fill it with antimatter
+  too.
+- **Energy.** It uses 15 FE a tick (`UsageConfig`) and spends the recipe's antimatter once, when the
+  operation finishes (`per_tick_usage` false).
+- **Screen.** It uses the advanced machines' layout, with the antimatter gauge on the left.
