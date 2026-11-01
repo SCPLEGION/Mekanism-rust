@@ -123,6 +123,14 @@ pub struct ItemChemicalRecipe {
     pub output_count: u32,
 }
 
+/// `nucleosynthesizing`: an item and antimatter into an item, the antimatter used once over the
+/// recipe's own `duration` (`per_tick_usage` false).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NucleosynthesizingRecipe {
+    pub recipe: ItemChemicalRecipe,
+    pub duration: u32,
+}
+
 pub fn find_purifying(
     item: &str,
     count: u32,
@@ -209,6 +217,19 @@ pub fn table(kind: &str) -> &'static [ItemRecipe] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coal_and_four_mb_of_antimatter_make_a_diamond() {
+        let r = crate::recipe_table::NUCLEOSYNTHESIZING
+            .iter()
+            .find(|r| r.recipe.output == "minecraft:diamond")
+            .unwrap();
+        assert_eq!(
+            (r.recipe.chemical, r.recipe.chemical_amount, r.duration),
+            ("mekanism:antimatter", 4, 1_000)
+        );
+        assert!(r.recipe.input.matches("minecraft:coal", &|_, _| false));
+    }
+
     use super::*;
 
     fn tags(tag: &str, item: &str) -> bool {
