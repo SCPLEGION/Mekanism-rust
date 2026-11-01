@@ -18,6 +18,7 @@ use mekanism_core::boiler;
 use mekanism_core::isotopes;
 use mekanism_core::turbine;
 use mekanism_core::sides::{Sides, Transmission};
+use mekanism_core::sps;
 use mekanism_core::factory::{self, Factory};
 use mekanism_core::generator::HeatGenerator;
 use mekanism_core::machine::{self, ElectricMachine, Operation, Slot};
@@ -72,6 +73,8 @@ enum Kind {
     FissionPort,
     /// An Industrial Turbine's valve; the first valve runs it.
     TurbineValve,
+    /// A Supercritical Phase Shifter's port; the first port runs it.
+    SpsPort,
     /// A Fusion Reactor's port; the first port of a formed reactor runs it.
     FusionPort,
     /// The Electric Pump: water (or heavy water) from below.
@@ -123,6 +126,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanismgenerators:fission_reactor_port" => return Some(Kind::FissionPort),
         TURBINE_VALVE => return Some(Kind::TurbineValve),
         fusion::PORT => return Some(Kind::FusionPort),
+        sps::PORT => return Some(Kind::SpsPort),
         "mekanism:electric_pump" => return Some(Kind::Pump),
         "mekanism:solar_neutron_activator" => return Some(Kind::Activator),
         boiler::VALVE => return Some(Kind::BoilerValve),
@@ -233,6 +237,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::TurbineValve
             | Kind::FusionPort
             | Kind::BoilerValve
+            | Kind::SpsPort
             | Kind::InductionPort,
         ) => {
             *container = Some(ModContainer {
@@ -287,6 +292,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         Kind::TurbineValve => tick_turbine_valve(game, pos, entity),
         Kind::FusionPort => {
             tick_fusion_port(game, pos, entity);
+            None
+        }
+        Kind::SpsPort => {
+            tick_sps_port(game, pos, entity);
             None
         }
         Kind::Pump => tick_pump(game, pos, entity),
@@ -1641,6 +1650,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Crystallizer
                 | Kind::Activator
                 | Kind::BoilerValve
+                | Kind::SpsPort
         ),
         // The blocks with item slots (`block_entity_container`).
         "transporter" => matches!(
@@ -2369,6 +2379,8 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
             Some(if get_long(nbt, "master") == 1 { (get_long(nbt, "capacity"), rate) } else { (rate, rate) })
         }
         Kind::Infuser => Some((chem::INFUSER_USAGE * u64::from(chem::INFUSER_TICKS), u64::MAX)),
+        // An SPS port takes energy in input mode (`TileEntitySPSPort`).
+        Kind::SpsPort if get_long(nbt, "output") == 0 => Some((sps::PORT_STORAGE, u64::MAX)),
         Kind::DigitalMiner => {
             let usage = upgrades(nbt).energy_per_tick(mekanism_core::miner::ENERGY_USAGE);
             Some((mekanism_core::miner::STORAGE.max(usage), u64::MAX))
@@ -3094,13 +3106,13 @@ fn tick_activator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
         0.0
     };
     let mut made = 0;
-    if let Some(out) = input.chemical.as_deref().and_then(isotopes::activating)
+    if let Some((per, out)) = input.chemical.as_deref().and_then(isotopes::activating)
         && output.accepts(out)
     {
         made = isotopes::activator_rate(sees_sun, brightness)
-            .min(input.amount)
+            .min(input.amount / per)
             .min(output.capacity - output.amount);
-        input.extract(made);
+        input.extract(made * per);
         output.insert(out, made);
     }
     if output.amount > 0 {
@@ -3582,6 +3594,16 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
         },
+        // GuiSPS: the polonium gauge on the left, the antimatter gauge on the right.
+        Kind::SpsPort => Layout {
+            slots: [None; 3],
+            gauges: vec![
+                gauge("input", sps::INPUT_CAPACITY, 7.0, 13.0, STANDARD),
+                gauge("output", sps::OUTPUT_CAPACITY, 151.0, 13.0, STANDARD),
+            ],
+            power: None,
+            progress: None,
+        },
         Kind::InductionPort => Layout {
             slots: [None; 3],
             gauges: vec![],
@@ -3609,7 +3631,7 @@ fn energy_capacity(entity: &ModBlockEntity) -> u64 {
         Some(Kind::FusionPort) => fusion::ENERGY_CAPACITY,
         Some(Kind::TurbineValve) => turbine_of(&entity.nbt).energy_capacity(),
         Some(Kind::InductionPort) => get_long(&entity.nbt, "capacity"),
-        Some(Kind::FissionPort | Kind::BoilerValve) => 0,
+        Some(Kind::FissionPort | Kind::BoilerValve | Kind::SpsPort) => 0,
         _ => receiver(&entity.id, &entity.nbt, true, false).map_or(0, |r| r.0),
     }
 }
@@ -3675,7 +3697,9 @@ fn multiblock_capacity(entity: &ModBlockEntity, key: &str) -> u64 {
 /// Where a multiblock port's master is, if the block is one: the port whose data its screen shows.
 fn multiblock_master(entity: &ModBlockEntity, pos: [i32; 3]) -> Option<Option<[i32; 3]>> {
     Some(match kind(&entity.id)? {
-        Kind::FissionPort | Kind::FusionPort | Kind::BoilerValve | Kind::TurbineValve => get_pos(&entity.nbt, "master"),
+        Kind::FissionPort | Kind::FusionPort | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort => {
+            get_pos(&entity.nbt, "master")
+        }
         Kind::InductionPort => (get_long(&entity.nbt, "rate") > 0).then(|| {
             ["mx", "my", "mz"].map(|key| match entity.nbt.get(&JavaString::from(key)) {
                 Some(Tag::Int(v)) => *v,
@@ -3729,6 +3753,11 @@ fn multiblock_data(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
             ([1, small((heat / b.heat_capacity().max(1.0)) as u64), small(b.elements), 0], get_long(nbt, "boil_rate"))
         }
         Some(Kind::TurbineValve) => ([1, 0, 0, 0], get_long(nbt, "production")),
+        Some(Kind::SpsPort) => {
+            let progress = (sps_of(nbt).scaled_progress() * 1_000.0) as u64;
+            let processed = get_double(nbt, "processed").unwrap_or(0.0).max(0.0) as u64;
+            ([1, small(get_long(nbt, "coils")), small(progress), small(processed)], get_long(nbt, "received"))
+        }
         _ => ([1, 0, 0, 0], get_long(nbt, "rate")),
     };
     entity.data[..4].copy_from_slice(&state);
@@ -3762,6 +3791,12 @@ fn multiblock_lines(block: &str, data: &[i32]) -> Vec<String> {
         ],
         Some(Kind::TurbineValve) => vec![format!("Producing: {}/t", fe(usage)), format!("Stored: {}", fe(read_wide(data, DATA_STORED)))],
         Some(Kind::InductionPort) => vec![format!("Max I/O: {}/t", fe(usage))],
+        Some(Kind::SpsPort) => vec![
+            format!("Coils: {}", get(1)),
+            format!("Progress: {:.1}%", get(2) as f64 / 10.0),
+            format!("Polonium: {} mB/t", get(3)),
+            format!("Energy: {}/t", fe(usage)),
+        ],
         _ => vec![],
     }
 }
@@ -3997,6 +4032,155 @@ pub(super) fn screen_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mu
             lines.push(format!("§7Energy upgrades: {}/8", get(DATA_ENERGY_UPGRADES)));
         }
     }
+}
+
+// --- Supercritical Phase Shifter ---------------------------------------------------------------------
+
+/// `SPSValidator`: the box of casing and ports joined to `start`, 7 on each side, with air and coils
+/// inside, every coil against a port. Its low corner, its ports, and the ports with a coil behind them.
+#[allow(clippy::type_complexity)]
+fn find_sps(game: &Game<'_>, start: [i32; 3]) -> Option<(Vec<[i32; 3]>, Vec<[i32; 3]>)> {
+    let (lo, _, seen) = find_box(game, start, sps::is_frame, sps::SIZE, sps::SIZE)?;
+    let mut ports = Vec::new();
+    let mut coils = 0;
+    for x in 0..sps::SIZE {
+        for y in 0..sps::SIZE {
+            for z in 0..sps::SIZE {
+                let at = [lo[0] + x, lo[1] + y, lo[2] + z];
+                let name = block_name(game, at);
+                match sps::requirement([x, y, z]) {
+                    None if name == sps::COIL => coils += 1,
+                    None if !matches!(name, "minecraft:air" | "minecraft:cave_air") => return None,
+                    Some(1) if name != sps::CASING || !seen.contains(&at) => return None,
+                    Some(2) if !seen.contains(&at) => return None,
+                    _ => {}
+                }
+                if name == sps::PORT && seen.contains(&at) {
+                    ports.push(at);
+                }
+            }
+        }
+    }
+    let inside = |p: [i32; 3]| (0..3).all(|k| p[k] > lo[k] && p[k] < lo[k] + sps::SIZE - 1);
+    let coiled: Vec<[i32; 3]> = ports
+        .iter()
+        .copied()
+        .filter(|p| {
+            DIRECTIONS.iter().any(|(_, d)| {
+                let at = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
+                inside(at) && block_name(game, at) == sps::COIL
+            })
+        })
+        .collect();
+    // A coil not against a port fails the structure.
+    (!ports.is_empty() && coiled.len() == coils).then_some((ports, coiled))
+}
+
+fn sps_of(nbt: &Compound) -> sps::Sps {
+    sps::Sps {
+        input: get_tank(nbt, "input", sps::INPUT_CAPACITY).amount,
+        output: get_tank(nbt, "output", sps::OUTPUT_CAPACITY).amount,
+        progress: get_double(nbt, "progress").unwrap_or(0.0),
+        input_processed: get_long(nbt, "input_processed"),
+    }
+}
+
+/// An SPS port. Once a second each port checks its structure; the first port runs it: polonium in
+/// through the input-mode ports, the energy the coiled ports hold into the coils, antimatter out of the
+/// output-mode ports.
+fn tick_sps_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
+    if ticker == 0 {
+        match find_sps(game, pos) {
+            Some((ports, coiled)) => {
+                entity.nbt.insert("master".into(), Tag::IntArray(ports[0].to_vec()));
+                entity.nbt.insert("ports".into(), Tag::IntArray(ports.concat()));
+                entity.nbt.insert("coiled".into(), Tag::IntArray(coiled.concat()));
+                put_long(&mut entity.nbt, "coils", coiled.len() as u64);
+            }
+            None => {
+                entity.nbt.remove(&JavaString::from("master"));
+            }
+        }
+    }
+    if get_pos(&entity.nbt, "master") != Some(pos) {
+        return;
+    }
+    let ports = positions(&entity.nbt, "ports");
+    let coiled = positions(&entity.nbt, "coiled");
+    let mut input = get_tank(&entity.nbt, "input", sps::INPUT_CAPACITY);
+    let mut output = get_tank(&entity.nbt, "output", sps::OUTPUT_CAPACITY);
+    let output_mode = |game: &mut Game<'_>, entity: &ModBlockEntity, p: [i32; 3]| {
+        if p == pos {
+            get_long(&entity.nbt, "output") == 1
+        } else {
+            game.native_with_mod_block_entity(p, |m| get_long(&m.nbt, "output") == 1).unwrap_or(false)
+        }
+    };
+    for &p in &ports {
+        if !output_mode(game, entity, p) {
+            pull_from_carriers(game, p, &mut input, sps::POLONIUM);
+        }
+    }
+    let mut s = sps_of(&entity.nbt);
+    s.input = input.amount;
+    // Each coiled port hands the coils what it holds, at most an int's worth (`getAmountAsInt`).
+    let mut received = 0u64;
+    if s.can_operate() {
+        for &p in &coiled {
+            let take = |nbt: &mut Compound| {
+                let stored = get_long(nbt, "energy");
+                let n = stored.min(i32::MAX as u64);
+                put_long(nbt, "energy", stored - n);
+                n
+            };
+            let n = if p == pos { take(&mut entity.nbt) } else { game.native_with_mod_block_entity(p, |m| take(&mut m.nbt)).unwrap_or(0) };
+            received = received.saturating_add(n).min(i32::MAX as u64);
+        }
+    }
+    let processed = s.tick(received);
+    input.extract(input.amount - s.input);
+    if s.output > output.amount {
+        output.insert(sps::ANTIMATTER, s.output - output.amount);
+    }
+    for &p in &ports {
+        if output.amount > 0 && output_mode(game, entity, p) {
+            push_chemical(game, p, &mut output, None, u64::MAX, false);
+        }
+    }
+    put_tank(&mut entity.nbt, "input", &input);
+    put_tank(&mut entity.nbt, "output", &output);
+    entity.nbt.insert("progress".into(), Tag::Double(s.progress.to_bits()));
+    entity.nbt.insert("processed".into(), Tag::Double(processed.to_bits()));
+    put_long(&mut entity.nbt, "input_processed", s.input_processed);
+    put_long(&mut entity.nbt, "received", received);
+}
+
+/// A sneaking right click with an empty hand on an SPS port switches it between input and output
+/// (`TileEntitySPSPort.onSneakRightClick`); a plain one opens the SPS's screen.
+pub(super) fn use_sps_port(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID)
+        || game.inventory.get(game.selected).cloned().flatten().is_some()
+        || !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft)
+    {
+        return false;
+    }
+    let output = game.native_with_mod_block_entity(pos, |m| {
+        (kind(&m.id) == Some(Kind::SpsPort)).then(|| {
+            let output = get_long(&m.nbt, "output") == 0;
+            put_long(&mut m.nbt, "output", u64::from(output));
+            output
+        })
+    });
+    let Some(Some(output)) = output else {
+        return false;
+    };
+    let line = format!("SPS Port: {} mode", if output { "output" } else { "input" });
+    if let Some(player) = game.native_acting_player() {
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
+    true
 }
 
 // --- Thermoelectric Boiler ---------------------------------------------------------------------------

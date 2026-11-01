@@ -23,6 +23,7 @@ pub mod recipe_table;
 pub mod recipes;
 pub mod sides;
 pub mod slurry_table;
+pub mod sps;
 pub mod tier;
 pub mod turbine;
 pub mod upgrades;

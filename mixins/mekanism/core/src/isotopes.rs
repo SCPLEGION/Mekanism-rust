@@ -24,9 +24,15 @@ pub const ACTIVATOR_TANK: u64 = 10_000;
 /// `general.maxSolarNeutronActivatorRate`: mB a tick at full sun.
 pub const ACTIVATOR_PEAK: f64 = 64.0;
 
-/// `recipe/activating/tritium.json`: lithium into tritium, 1:1.
-pub fn activating(chemical: &str) -> Option<&'static str> {
-    (chemical == "mekanism:lithium").then_some("mekanismgenerators:tritium")
+/// The activating recipes (`recipe/activating/tritium.json`, `processing/lategame/polonium.json`): the
+/// mB of input an operation takes and the chemical it makes, 1 mB each: lithium into tritium 1:1,
+/// nuclear waste into polonium 10:1.
+pub fn activating(chemical: &str) -> Option<(u64, &'static str)> {
+    match chemical {
+        "mekanism:lithium" => Some((1, "mekanismgenerators:tritium")),
+        "mekanism:nuclear_waste" => Some((10, "mekanism:polonium")),
+        _ => None,
+    }
 }
 
 /// The activator's operations this tick: `peakProductionRate × brightness`, rounded down, while it
@@ -63,7 +69,11 @@ mod tests {
         assert_eq!(activator_rate(false, 1.0), 0);
         assert_eq!(
             activating("mekanism:lithium"),
-            Some("mekanismgenerators:tritium")
+            Some((1, "mekanismgenerators:tritium"))
+        );
+        assert_eq!(
+            activating("mekanism:nuclear_waste"),
+            Some((10, "mekanism:polonium"))
         );
     }
 }
