@@ -356,6 +356,13 @@ def build_module(ns, out):
             item["components"] = {"minecraft:equippable": {"slot": "chest"}}
             if path.stem == "jetpack":
                 item["components"]["minecraft:attribute_modifiers"] = []
+        # Free runners are worn on the feet; the plain pair gives no armour, the armored pair keeps the
+        # iron boots'.
+        if path.stem in ("free_runners", "free_runners_armored"):
+            item["template"] = "minecraft:iron_boots"
+            item["components"] = {"minecraft:equippable": {"slot": "feet"}}
+            if path.stem == "free_runners":
+                item["components"]["minecraft:attribute_modifiers"] = []
         write_json(declared / "item" / f"{path.stem}.json", item)
         items += 1
     report["blocks"] = len(blocks)
