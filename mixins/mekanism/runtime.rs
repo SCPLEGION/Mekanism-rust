@@ -3433,8 +3433,98 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Gauge([55.0, 18.0])),
             progress: None,
         },
+        // TileEntityHeatGenerator and its screen: fuel (17, 35), charge slot (143, 35), the lava gauge.
+        Kind::HeatGenerator => Layout {
+            slots: [Some(([143.0, 35.0], "slot/power")), Some(([17.0, 35.0], "slot/normal")), None],
+            gauges: vec![gauge("lava", u64::from(mekanism_core::generator::TANK_CAPACITY), 55.0, 18.0, WIDE)],
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
+            progress: None,
+        },
+        // The gas-burning generator's fuel gauge (GuiGasGenerator).
+        Kind::GasGenerator => Layout {
+            slots: [Some(([143.0, 35.0], "slot/power")), None, None],
+            gauges: vec![gauge("fuel", chem::GAS_GENERATOR_TANK, 55.0, 18.0, WIDE)],
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
+            progress: None,
+        },
+        // The wind and advanced solar generators: a charge slot and the power bar.
+        Kind::Wind | Kind::Solar(..) => Layout {
+            slots: [Some(([143.0, 35.0], "slot/power")), None, None],
+            gauges: vec![],
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
+            progress: None,
+        },
+        // TileEntityMetallurgicInfuser and its screen: the infuse item (17, 35), input (51, 43), output
+        // (109, 43), the infusion bar (7, 15).
+        Kind::Infuser => Layout {
+            slots: [
+                Some(([51.0, 43.0], "slot/normal")),
+                Some(([17.0, 35.0], "slot/normal")),
+                Some(([109.0, 43.0], "slot/output")),
+            ],
+            gauges: vec![gauge("infuse", chem::INFUSER_TANK, 7.0, 15.0, [6.0, 54.0])],
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
+            progress: Some(([72.0, 47.0], "progress/right", [32.0, 8.0])),
+        },
+        // TileEntityAdvancedElectricMachine and its screen: the chemical bar (68, 36) between the input
+        // and the chemical item.
+        Kind::Advanced(_) => Layout {
+            slots: [
+                Some(([64.0, 17.0], "slot/normal")),
+                Some(([64.0, 53.0], "slot/normal")),
+                Some(([116.0, 35.0], "slot/output")),
+            ],
+            gauges: vec![gauge("chemical", chem::ADVANCED_TANK, 68.0, 36.0, [8.0, 14.0])],
+            power: Some(PowerBar::Vertical([164.0, 16.0])),
+            progress: Some(([86.0, 38.0], "progress/bar", [25.0, 9.0])),
+        },
+        // TileEntityRotaryCondensentrator and its screen: buckets on the fluid side (155, 25) and
+        // (155, 56), the chemical gauge (25, 13) and the fluid gauge (133, 13).
+        Kind::Rotary => Layout {
+            slots: [Some(([155.0, 25.0], "slot/normal")), None, Some(([155.0, 56.0], "slot/output"))],
+            gauges: vec![
+                gauge("chemical", chem::ROTARY_TANK, 25.0, 13.0, STANDARD),
+                gauge("fluid", chem::ROTARY_TANK, 133.0, 13.0, STANDARD),
+            ],
+            power: Some(PowerBar::Horizontal([115.0, 75.0])),
+            progress: None,
+        },
+        // TileEntityThermalEvaporationController and its screen: water buckets in at (28, 20), an empty
+        // bucket for brine at (152, 20) and the buckets out at (152, 51); the input and output gauges.
+        // The water gauge's capacity follows the tower's height (screen_data).
+        Kind::Evaporation => Layout {
+            slots: [
+                Some(([28.0, 20.0], "slot/normal")),
+                Some(([152.0, 20.0], "slot/normal")),
+                Some(([152.0, 51.0], "slot/output")),
+            ],
+            gauges: vec![
+                gauge("water", evap::input_capacity(0), 6.0, 13.0, STANDARD),
+                gauge("brine", evap::OUTPUT_TANK, 172.0 - 18.0, 13.0, STANDARD),
+            ],
+            power: None,
+            progress: None,
+        },
+        // TileEntityDigitalMiner and its screen: the energy slot (152, 20) and the power bar.
+        Kind::DigitalMiner => Layout {
+            slots: [None, Some(([152.0, 20.0], "slot/power")), None],
+            gauges: vec![],
+            power: Some(PowerBar::Vertical([157.0, 39.0])),
+            progress: None,
+        },
         _ => return None,
     })
+}
+
+/// The energy a block's screen shows the capacity of.
+fn energy_capacity(entity: &ModBlockEntity) -> u64 {
+    match kind(&entity.id) {
+        Some(Kind::HeatGenerator) => HeatGenerator::new().energy.capacity,
+        Some(Kind::Wind) => mekanism_core::generator::WIND_STORAGE,
+        Some(Kind::GasGenerator) => chem::GAS_GENERATOR_STORAGE,
+        Some(Kind::Solar(_, storage)) => storage,
+        _ => receiver(&entity.id, &entity.nbt, true, false).map_or(0, |r| r.0),
+    }
 }
 
 /// The data a screen reads past the furnace's four slots, for the blocks that do not send it
@@ -3445,14 +3535,22 @@ fn screen_data(entity: &mut ModBlockEntity) {
     };
     if !matches!(kind(&entity.id), Some(Kind::Machine(..))) {
         entity.data.resize(4, 0);
-        let capacity = receiver(&entity.id, &entity.nbt, true, false).map_or(0, |r| r.0);
+        let capacity = energy_capacity(entity);
         entity.data.extend(wide(get_long(&entity.nbt, "energy").min(capacity)));
         entity.data.extend(wide(capacity));
         entity.data.extend([0, 0]);
         entity.data.extend(wide(0));
     }
     for g in &l.gauges {
-        let tank = get_tank(&entity.nbt, g.key, g.capacity);
+        let mut tank = get_tank(&entity.nbt, g.key, g.capacity);
+        // The heat generator keeps its lava as a plain amount.
+        if g.key == "lava" {
+            tank = ChemicalTank::new(g.capacity);
+            tank.insert("minecraft:lava", u64::from(get_int(&entity.nbt, "lava")));
+        }
+        if g.key == "water" && kind(&entity.id) == Some(Kind::Evaporation) {
+            tank.capacity = evap::input_capacity(get_int(&entity.nbt, "height"));
+        }
         entity.data.extend(wide(tank.amount));
         entity.data.extend(wide(tank.capacity));
         entity.data.push(chemical_index(tank.chemical.as_deref()));
@@ -3544,7 +3642,13 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
         let rgb = chemical.map_or(0x8A8A8A, |c| c.2);
         gauge(batch, g.at, g.size, amount as f32 / capacity as f32, 0xFF00_0000 | rgb);
     }
-    let energy = (get(0) / get(1).max(1.0)).clamp(0.0, 1.0);
+    // The stored energy and capacity, else the furnace's first two slots.
+    let capacity = read_wide(data, DATA_CAPACITY);
+    let energy = if capacity > 0 {
+        read_wide(data, DATA_STORED) as f32 / capacity as f32
+    } else {
+        (get(0) / get(1).max(1.0)).clamp(0.0, 1.0)
+    };
     match l.power {
         Some(p @ PowerBar::Vertical(_)) => {
             let [x, y, w, h] = power_rect(p);
@@ -3572,7 +3676,9 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
             sprite(game, batch, &format!("{name}/full"), [0.0, 0.0, done, h], [ox + at[0], oy + at[1], done, h]);
         }
     }
+    if l.power.is_some() {
     sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
+    }
 }
 
 fn inside(at: [f32; 2], rect: [f32; 4]) -> bool {
@@ -3606,7 +3712,7 @@ pub(super) fn screen_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mu
         && inside(at, [p[0], p[1], w, h])
     {
         lines.push(format!("{}%", get(2) * 100 / get(3).max(1)));
-    } else if inside(at, [-26.0, 137.0, 26.0, 26.0]) {
+    } else if l.power.is_some() && inside(at, [-26.0, 137.0, 26.0, 26.0]) {
         let usage = read_wide(data, DATA_USAGE);
         if usage > 0 {
             lines.push(format!("Using: {usage} FE/t"));
