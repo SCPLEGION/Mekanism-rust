@@ -377,6 +377,12 @@ fn tick_machine(game: &mut Game<'_>, entity: &mut ModBlockEntity, recipe: &str, 
         m.progress as i32,
         m.ticks_required as i32,
     ];
+    // Mekanism's screen reads the rest (`screen_tooltip`).
+    let u = upgrades(&entity.nbt);
+    entity.data.extend(wide(m.energy.stored));
+    entity.data.extend(wide(m.energy.capacity));
+    entity.data.extend([u.speed as i32, u.energy as i32]);
+    entity.data.extend(wide(m.usage));
     Some(m.active)
 }
 
@@ -3269,6 +3275,137 @@ pub(super) fn use_fusion(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
     true
+}
+
+// --- Screens -----------------------------------------------------------------------------------------
+//
+// Mekanism's own screens for its machines (Horizon API 19/20), drawn with its GUI sprites
+// (`assets/mekanism/textures/gui/sprites`). The menu's data slots are 16-bit, so a machine sends its
+// energy as thousandths of its capacity for the bar, then the stored energy and capacity in 15-bit
+// pieces for the tooltip, then its upgrades.
+
+const SPRITES: &str = "mekanism:gui/sprites/";
+/// Where the data slots after the furnace's four begin: stored energy, capacity (4 pieces each), the
+/// speed and energy upgrades, and the energy used a tick (4 pieces).
+const DATA_STORED: usize = 4;
+const DATA_CAPACITY: usize = 8;
+const DATA_SPEED: usize = 12;
+const DATA_ENERGY_UPGRADES: usize = 13;
+const DATA_USAGE: usize = 14;
+
+/// A 64-bit value as four 15-bit data slots, low first.
+fn wide(v: u64) -> [i32; 4] {
+    let v = v.min((1 << 60) - 1);
+    [0, 1, 2, 3].map(|k| ((v >> (15 * k)) & 0x7FFF) as i32)
+}
+
+fn read_wide(data: &[i32], at: usize) -> u64 {
+    (0..4).fold(0, |acc, k| acc | ((data.get(at + k).copied().unwrap_or(0) as u64 & 0x7FFF) << (15 * k)))
+}
+
+/// The screen of a block, if it has Mekanism's: (its slots' positions as Mekanism places them).
+fn screen_slots(block: &str) -> Option<[[f32; 2]; 3]> {
+    match kind(block)? {
+        // TileEntityElectricMachine: input (64, 17), energy (64, 53), output (116, 35).
+        Kind::Machine(..) => Some([[64.0, 17.0], [64.0, 53.0], [116.0, 35.0]]),
+        _ => None,
+    }
+}
+
+pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::NativeScreen>) {
+    if screen.is_some() {
+        return;
+    }
+    let Some(slots) = screen_slots(block) else {
+        return;
+    };
+    *screen = Some(super::native_hooks::NativeScreen {
+        width: 176.0,
+        height: 166.0,
+        slots: slots.into_iter().map(Some).collect(),
+        inventory_y: 84.0,
+        inventory_x: 8.0,
+        own_labels: false,
+    });
+}
+
+/// A nine-slice sprite (`gui.scaling.type = nine_slice`) of `size` px with a `border` px frame, drawn
+/// over `dst`.
+fn nine_slice(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, name: &str, size: f32, border: f32, dst: [f32; 4]) {
+    let [x, y, w, h] = dst;
+    let (b, inner) = (border, size - 2.0 * border);
+    let cols = [(0.0, b, x, b), (b, inner, x + b, w - 2.0 * b), (size - b, b, x + w - b, b)];
+    let rows = [(0.0, b, y, b), (b, inner, y + b, h - 2.0 * b), (size - b, b, y + h - b, b)];
+    for (su, sw, dx, dw) in cols {
+        for (sv, sh, dy, dh) in rows {
+            if dw > 0.0 && dh > 0.0 {
+                game.native_sprite(batch, name, [su, sv, sw, sh], [dx, dy, dw, dh]);
+            }
+        }
+    }
+}
+
+fn sprite(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, name: &str, src: [f32; 4], dst: [f32; 4]) {
+    game.native_sprite(batch, &format!("{SPRITES}{name}"), src, dst);
+}
+
+/// Mekanism's machine screen: the base panel, its slots and the player's, the vertical power bar at
+/// (164, 16), the progress bar at (86, 38) and the energy tab on the left.
+pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let Some(slots) = screen_slots(block) else {
+        return;
+    };
+    let [ox, oy] = origin;
+    let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0) as f32;
+    nine_slice(game, batch, &format!("{SPRITES}base"), 16.0, 4.0, [ox, oy, 176.0, 166.0]);
+    // The machine's slots: input, energy, output.
+    // The combiner's middle slot holds its extra input, not energy.
+    let middle = if matches!(kind(block), Some(Kind::Machine("combining", _))) { "slot/normal" } else { "slot/power" };
+    for (at, name) in slots.iter().zip(["slot/normal", middle, "slot/output"]) {
+        sprite(game, batch, name, [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
+    }
+    // The player's inventory and hotbar.
+    for row in 0..4 {
+        let y = if row < 3 { 84.0 + 18.0 * row as f32 } else { 142.0 };
+        for col in 0..9 {
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + 18.0 * col as f32, oy + y - 1.0, 18.0, 18.0]);
+        }
+    }
+    // The power bar: a 6×54 frame, filled from the bottom.
+    nine_slice(game, batch, &format!("{SPRITES}bar/base"), 5.0, 1.0, [ox + 164.0, oy + 16.0, 6.0, 54.0]);
+    let filled = (get(0) / get(1).max(1.0)).clamp(0.0, 1.0) * 52.0;
+    if filled > 0.0 {
+        sprite(game, batch, "bar/vertical_power", [0.0, 0.0, 2.0, 2.0], [ox + 165.0, oy + 17.0 + 52.0 - filled, 4.0, filled]);
+    }
+    // The progress bar: 25×9, filled from the left.
+    sprite(game, batch, "progress/bar/empty", [0.0, 0.0, 25.0, 9.0], [ox + 86.0, oy + 38.0, 25.0, 9.0]);
+    let done = (get(2) / get(3).max(1.0)).clamp(0.0, 1.0) * 25.0;
+    if done > 0.0 {
+        sprite(game, batch, "progress/bar/full", [0.0, 0.0, done, 9.0], [ox + 86.0, oy + 38.0, done, 9.0]);
+    }
+    sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
+}
+
+fn inside(at: [f32; 2], rect: [f32; 4]) -> bool {
+    at[0] >= rect[0] && at[0] < rect[0] + rect[2] && at[1] >= rect[1] && at[1] < rect[1] + rect[3]
+}
+
+/// The power bar's tooltip (stored / capacity), the progress bar's and the energy tab's (usage and
+/// upgrades).
+pub(super) fn screen_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
+    if screen_slots(block).is_none() {
+        return;
+    }
+    let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0);
+    if inside(at, [164.0, 16.0, 6.0, 54.0]) {
+        lines.push(format!("{} / {} FE", read_wide(data, DATA_STORED), read_wide(data, DATA_CAPACITY)));
+    } else if inside(at, [86.0, 38.0, 25.0, 9.0]) {
+        lines.push(format!("{}%", get(2) * 100 / get(3).max(1)));
+    } else if inside(at, [-26.0, 137.0, 26.0, 26.0]) {
+        lines.push(format!("Using: {} FE/t", read_wide(data, DATA_USAGE)));
+        lines.push(format!("§7Speed upgrades: {}/8", get(DATA_SPEED)));
+        lines.push(format!("§7Energy upgrades: {}/8", get(DATA_ENERGY_UPGRADES)));
+    }
 }
 
 // --- Thermoelectric Boiler ---------------------------------------------------------------------------
