@@ -516,3 +516,22 @@ biome's temperature and rain.
 - A right click with an empty hand on a valve shows the temperature, boil rate, superheaters and tanks.
 - Simplified: no heated coolant (sodium) from a fission reactor, no valve modes or screen, and the tanks
   are lost if the first valve is broken.
+
+## Machine screens (milestone 31)
+
+The electric machines (Enrichment Chamber, Crusher, Energized Smelter, Precision Sawmill, Combiner and
+the rest of `Kind::Machine`) open Mekanism's own screen instead of the furnace's, through Horizon's mod
+screens (API 19/20: `native_screen`, `native_screen_draw`, `native_screen_tooltip`):
+
+- Mekanism's panel, drawn with its GUI sprites from the content mod (`mekanism:gui/sprites/base`,
+  nine-sliced as its `.mcmeta` says), and its slots where `TileEntityElectricMachine` puts them: input
+  (64, 17), energy (64, 53, the power slot), output (116, 35).
+- The vertical power bar at (164, 16) and the progress bar at (86, 38), as `GuiElectricMachine` places
+  them, and the energy tab on the left.
+- Tooltips: the power bar shows stored and maximum energy, the progress bar its percent, and the energy
+  tab the energy used a tick and the installed speed and energy upgrades.
+- The machine's menu data grows past the furnace's four slots: stored energy and capacity (in 15-bit
+  pieces, as data slots are 16-bit), the upgrades and the usage.
+
+Simplified: no side-config or upgrade tabs to click yet, no redstone control, and the other blocks
+keep the furnace's screen until milestones 32 and 33.
