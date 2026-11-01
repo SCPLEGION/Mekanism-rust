@@ -309,6 +309,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             None
         }
     };
+    screen_data(entity);
     if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Pipe(_)) {
         show_connections(game, pos, entity);
     }
@@ -3303,12 +3304,158 @@ fn read_wide(data: &[i32], at: usize) -> u64 {
     (0..4).fold(0, |acc, k| acc | ((data.get(at + k).copied().unwrap_or(0) as u64 & 0x7FFF) << (15 * k)))
 }
 
-/// The screen of a block, if it has Mekanism's: (its slots' positions as Mekanism places them).
-fn screen_slots(block: &str) -> Option<[[f32; 2]; 3]> {
-    match kind(block)? {
-        // TileEntityElectricMachine: input (64, 17), energy (64, 53), output (116, 35).
-        Kind::Machine(..) => Some([[64.0, 17.0], [64.0, 53.0], [116.0, 35.0]]),
-        _ => None,
+/// Where the gauges' data slots begin; each gauge takes its amount and capacity (4 pieces each) and
+/// the index of its chemical in `CHEMICALS`.
+const DATA_GAUGES: usize = 18;
+const GAUGE_SLOTS: usize = 9;
+
+/// The chemicals and fluids a gauge can show, with Mekanism's colours (`MekanismChemicals`'s tints,
+/// the fluids' own); anything else shows grey.
+const CHEMICALS: &[(&str, &str, u32)] = &[
+    ("minecraft:water", "Water", 0x3F76E4),
+    ("minecraft:lava", "Lava", 0xFF6A00),
+    ("mekanism:brine", "Brine", 0xFEEF9C),
+    ("mekanism:heavy_water", "Heavy Water", 0x2B4F84),
+    ("mekanism:hydrogen", "Hydrogen", 0xFFFFFF),
+    ("mekanism:oxygen", "Oxygen", 0x6CE2FF),
+    ("mekanism:steam", "Steam", 0xC4C4C4),
+    ("mekanism:chlorine", "Chlorine", 0xCFE800),
+    ("mekanism:sodium", "Sodium", 0xE9FEF4),
+    ("mekanism:hydrogen_chloride", "Hydrogen Chloride", 0xA8F1E9),
+    ("mekanism:sulfur_dioxide", "Sulfur Dioxide", 0xA99D90),
+    ("mekanism:sulfur_trioxide", "Sulfur Trioxide", 0xCE6C6C),
+    ("mekanism:sulfuric_acid", "Sulfuric Acid", 0x82802B),
+    ("mekanism:ethene", "Ethylene", 0xEACCF9),
+    ("mekanism:lithium", "Lithium", 0xEBA400),
+    ("mekanism:uranium_oxide", "Uranium Oxide", 0xE1F573),
+    ("mekanism:uranium_hexafluoride", "Uranium Hexafluoride", 0x809960),
+    ("mekanism:fissile_fuel", "Fissile Fuel", 0x2E332F),
+    ("mekanism:nuclear_waste", "Nuclear Waste", 0x4F412A),
+    ("mekanism:plutonium", "Plutonium", 0x1F919C),
+    ("mekanism:polonium", "Polonium", 0x1B9E7B),
+    ("mekanism:antimatter", "Antimatter", 0xA464B3),
+    ("mekanismgenerators:deuterium", "Deuterium", 0xFF3232),
+    ("mekanismgenerators:tritium", "Tritium", 0x64FF70),
+    ("mekanismgenerators:fusion_fuel", "D-T Fuel", 0x7E007D),
+];
+
+fn chemical_index(id: Option<&str>) -> i32 {
+    id.and_then(|id| CHEMICALS.iter().position(|c| c.0 == id)).map_or(-1, |i| i as i32)
+}
+
+/// A gauge on a screen: its tank's key in the block entity, the tank's capacity, where it is and how
+/// tall (`GaugeType.STANDARD` 18×60, `SMALL` 18×30, `WIDE` 66×50).
+#[derive(Clone, Copy)]
+struct Gauge {
+    key: &'static str,
+    capacity: u64,
+    at: [f32; 2],
+    size: [f32; 2],
+}
+
+const STANDARD: [f32; 2] = [18.0, 60.0];
+const SMALL: [f32; 2] = [18.0, 30.0];
+const WIDE: [f32; 2] = [66.0, 50.0];
+
+/// The power bar a screen has: vertical (6×54) or horizontal (54×6), at its Gui class's position.
+#[derive(Clone, Copy)]
+enum PowerBar {
+    Vertical([f32; 2]),
+    Horizontal([f32; 2]),
+    /// The energy cube's wide energy gauge.
+    Gauge([f32; 2]),
+}
+
+/// Everything a Mekanism screen draws for a block: its slots (None hides one the block does not use),
+/// slot sprites, gauges, power bar and progress bar (`LARGE_RIGHT`, 48×8, or the machine's `BAR`).
+struct Layout {
+    slots: [Option<([f32; 2], &'static str)>; 3],
+    gauges: Vec<Gauge>,
+    power: Option<PowerBar>,
+    progress: Option<([f32; 2], &'static str, [f32; 2])>,
+}
+
+fn layout(block: &str) -> Option<Layout> {
+    let gauge = |key, capacity, x, y, size| Gauge { key, capacity, at: [x, y], size };
+    let large_right = |x, y| Some(([x, y], "progress/large_right", [48.0, 8.0]));
+    Some(match kind(block)? {
+        // TileEntityElectricMachine and GuiElectricMachine.
+        Kind::Machine(recipe, _) => Layout {
+            slots: [
+                Some(([64.0, 17.0], "slot/normal")),
+                Some(([64.0, 53.0], if recipe == "combining" { "slot/normal" } else { "slot/power" })),
+                Some(([116.0, 35.0], "slot/output")),
+            ],
+            gauges: vec![],
+            power: Some(PowerBar::Vertical([164.0, 16.0])),
+            progress: Some(([86.0, 38.0], "progress/bar", [25.0, 9.0])),
+        },
+        // TileEntityChemicalOxidizer and GuiChemicalOxidizer.
+        Kind::Oxidizer => Layout {
+            slots: [Some(([26.0, 36.0], "slot/normal")), None, None],
+            gauges: vec![gauge("output", chem::OXIDIZER_TANK, 131.0, 13.0, STANDARD)],
+            power: Some(PowerBar::Horizontal([115.0, 75.0])),
+            progress: large_right(64.0, 40.0),
+        },
+        // TileEntityChemicalDissolutionChamber and its screen.
+        Kind::Dissolution => Layout {
+            slots: [Some(([28.0, 36.0], "slot/normal")), None, None],
+            gauges: vec![
+                gauge("input", nuclear::DISSOLUTION_TANK, 7.0, 4.0, STANDARD),
+                gauge("output", nuclear::DISSOLUTION_TANK, 131.0, 13.0, STANDARD),
+            ],
+            power: Some(PowerBar::Horizontal([115.0, 75.0])),
+            progress: large_right(64.0, 40.0),
+        },
+        // TileEntityChemicalCrystallizer and its screen.
+        Kind::Crystallizer => Layout {
+            slots: [None, None, Some(([129.0, 57.0], "slot/output"))],
+            gauges: vec![gauge("input", nuclear::CRYSTALLIZER_TANK, 7.0, 4.0, STANDARD)],
+            power: Some(PowerBar::Vertical([157.0, 23.0])),
+            progress: large_right(53.0, 61.0),
+        },
+        // TileEntityElectrolyticSeparator and its screen; the empty buckets come out below the full one.
+        Kind::Separator => Layout {
+            slots: [Some(([26.0, 35.0], "slot/normal")), None, Some(([26.0, 56.0], "slot/output"))],
+            gauges: vec![
+                gauge("fluid", chem::SEPARATOR_FLUID, 5.0, 10.0, STANDARD),
+                gauge("left", chem::SEPARATOR_GAS, 58.0, 18.0, SMALL),
+                gauge("right", chem::SEPARATOR_GAS, 100.0, 18.0, SMALL),
+            ],
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
+            progress: None,
+        },
+        // TileEntityEnergyCube: an item there charges from the cube on the right (our slot 0) and
+        // gives the cube its energy on the left (our slot 1).
+        Kind::EnergyCube(_) => Layout {
+            slots: [Some(([143.0, 35.0], "slot/power")), Some(([17.0, 35.0], "slot/power")), None],
+            gauges: vec![],
+            power: Some(PowerBar::Gauge([55.0, 18.0])),
+            progress: None,
+        },
+        _ => return None,
+    })
+}
+
+/// The data a screen reads past the furnace's four slots, for the blocks that do not send it
+/// themselves (the electric machines do, in `tick_machine`): energy, then each gauge's tank.
+fn screen_data(entity: &mut ModBlockEntity) {
+    let Some(l) = layout(&entity.id) else {
+        return;
+    };
+    if !matches!(kind(&entity.id), Some(Kind::Machine(..))) {
+        entity.data.resize(4, 0);
+        let capacity = receiver(&entity.id, &entity.nbt, true, false).map_or(0, |r| r.0);
+        entity.data.extend(wide(get_long(&entity.nbt, "energy").min(capacity)));
+        entity.data.extend(wide(capacity));
+        entity.data.extend([0, 0]);
+        entity.data.extend(wide(0));
+    }
+    for g in &l.gauges {
+        let tank = get_tank(&entity.nbt, g.key, g.capacity);
+        entity.data.extend(wide(tank.amount));
+        entity.data.extend(wide(tank.capacity));
+        entity.data.push(chemical_index(tank.chemical.as_deref()));
     }
 }
 
@@ -3316,13 +3463,13 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
     if screen.is_some() {
         return;
     }
-    let Some(slots) = screen_slots(block) else {
+    let Some(l) = layout(block) else {
         return;
     };
     *screen = Some(super::native_hooks::NativeScreen {
         width: 176.0,
         height: 166.0,
-        slots: slots.into_iter().map(Some).collect(),
+        slots: l.slots.iter().map(|s| s.map(|(at, _)| at)).collect(),
         inventory_y: 84.0,
         inventory_x: 8.0,
         own_labels: false,
@@ -3339,7 +3486,7 @@ fn nine_slice(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, name: 
     for (su, sw, dx, dw) in cols {
         for (sv, sh, dy, dh) in rows {
             if dw > 0.0 && dh > 0.0 {
-                game.native_sprite(batch, name, [su, sv, sw, sh], [dx, dy, dw, dh]);
+                game.native_sprite(batch, &format!("{SPRITES}{name}"), [su, sv, sw, sh], [dx, dy, dw, dh]);
             }
         }
     }
@@ -3349,39 +3496,81 @@ fn sprite(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, name: &str
     game.native_sprite(batch, &format!("{SPRITES}{name}"), src, dst);
 }
 
-/// Mekanism's machine screen: the base panel, its slots and the player's, the vertical power bar at
-/// (164, 16), the progress bar at (86, 38) and the energy tab on the left.
+/// The rectangle a power bar covers.
+fn power_rect(p: PowerBar) -> [f32; 4] {
+    match p {
+        PowerBar::Vertical([x, y]) => [x, y, 6.0, 54.0],
+        PowerBar::Horizontal([x, y]) => [x, y, 54.0, 6.0],
+        PowerBar::Gauge([x, y]) => [x, y, WIDE[0], WIDE[1]],
+    }
+}
+
+/// Mekanism's screen for a block: the base panel, its slots and the player's, its gauges, its power
+/// bar or energy gauge, its progress bar, and the energy tab on the left.
 pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
-    let Some(slots) = screen_slots(block) else {
+    let Some(l) = layout(block) else {
         return;
     };
     let [ox, oy] = origin;
     let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0) as f32;
-    nine_slice(game, batch, &format!("{SPRITES}base"), 16.0, 4.0, [ox, oy, 176.0, 166.0]);
-    // The machine's slots: input, energy, output.
-    // The combiner's middle slot holds its extra input, not energy.
-    let middle = if matches!(kind(block), Some(Kind::Machine("combining", _))) { "slot/normal" } else { "slot/power" };
-    for (at, name) in slots.iter().zip(["slot/normal", middle, "slot/output"]) {
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 176.0, 166.0]);
+    for (at, name) in l.slots.iter().flatten() {
         sprite(game, batch, name, [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
     }
-    // The player's inventory and hotbar.
     for row in 0..4 {
         let y = if row < 3 { 84.0 + 18.0 * row as f32 } else { 142.0 };
         for col in 0..9 {
             sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + 18.0 * col as f32, oy + y - 1.0, 18.0, 18.0]);
         }
     }
-    // The power bar: a 6×54 frame, filled from the bottom.
-    nine_slice(game, batch, &format!("{SPRITES}bar/base"), 5.0, 1.0, [ox + 164.0, oy + 16.0, 6.0, 54.0]);
-    let filled = (get(0) / get(1).max(1.0)).clamp(0.0, 1.0) * 52.0;
-    if filled > 0.0 {
-        sprite(game, batch, "bar/vertical_power", [0.0, 0.0, 2.0, 2.0], [ox + 165.0, oy + 17.0 + 52.0 - filled, 4.0, filled]);
+    let gauge = |batch: &mut horizon_client::hud::HudBatch, at: [f32; 2], size: [f32; 2], fill: f32, argb: u32| {
+        let [x, y] = [ox + at[0], oy + at[1]];
+        nine_slice(game, batch, "gauge/normal", 5.0, 2.0, [x, y, size[0], size[1]]);
+        let h = (size[1] - 2.0) * fill.clamp(0.0, 1.0);
+        if h > 0.0 {
+            game.native_fill(batch, [x + 1.0, y + size[1] - 1.0 - h, size[0] - 2.0, h], argb);
+        }
+        let overlay = match size {
+            SMALL => "small",
+            WIDE => "wide",
+            _ => "standard",
+        };
+        sprite(game, batch, &format!("gauge/overlay/{overlay}"), [0.0, 0.0, size[0] - 2.0, size[1] - 2.0], [x + 1.0, y + 1.0, size[0] - 2.0, size[1] - 2.0]);
+    };
+    for (i, g) in l.gauges.iter().enumerate() {
+        let at = DATA_GAUGES + i * GAUGE_SLOTS;
+        let (amount, capacity) = (read_wide(data, at), read_wide(data, at + 4).max(1));
+        let chemical = usize::try_from(data.get(at + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c));
+        let rgb = chemical.map_or(0x8A8A8A, |c| c.2);
+        gauge(batch, g.at, g.size, amount as f32 / capacity as f32, 0xFF00_0000 | rgb);
     }
-    // The progress bar: 25×9, filled from the left.
-    sprite(game, batch, "progress/bar/empty", [0.0, 0.0, 25.0, 9.0], [ox + 86.0, oy + 38.0, 25.0, 9.0]);
-    let done = (get(2) / get(3).max(1.0)).clamp(0.0, 1.0) * 25.0;
-    if done > 0.0 {
-        sprite(game, batch, "progress/bar/full", [0.0, 0.0, done, 9.0], [ox + 86.0, oy + 38.0, done, 9.0]);
+    let energy = (get(0) / get(1).max(1.0)).clamp(0.0, 1.0);
+    match l.power {
+        Some(p @ PowerBar::Vertical(_)) => {
+            let [x, y, w, h] = power_rect(p);
+            nine_slice(game, batch, "bar/base", 5.0, 1.0, [ox + x, oy + y, w, h]);
+            let filled = energy * (h - 2.0);
+            if filled > 0.0 {
+                sprite(game, batch, "bar/vertical_power", [0.0, 0.0, 2.0, 2.0], [ox + x + 1.0, oy + y + h - 1.0 - filled, w - 2.0, filled]);
+            }
+        }
+        Some(p @ PowerBar::Horizontal(_)) => {
+            let [x, y, w, h] = power_rect(p);
+            nine_slice(game, batch, "bar/base", 5.0, 1.0, [ox + x, oy + y, w, h]);
+            let filled = energy * (w - 2.0);
+            if filled > 0.0 {
+                sprite(game, batch, "bar/horizontal_power", [0.0, 0.0, 2.0, 2.0], [ox + x + 1.0, oy + y + 1.0, filled, h - 2.0]);
+            }
+        }
+        Some(PowerBar::Gauge(at)) => gauge(batch, at, WIDE, energy, 0xFFC4_1E1E),
+        None => {}
+    }
+    if let Some((at, name, [w, h])) = l.progress {
+        sprite(game, batch, &format!("{name}/empty"), [0.0, 0.0, w, h], [ox + at[0], oy + at[1], w, h]);
+        let done = (get(2) / get(3).max(1.0)).clamp(0.0, 1.0) * w;
+        if done > 0.0 {
+            sprite(game, batch, &format!("{name}/full"), [0.0, 0.0, done, h], [ox + at[0], oy + at[1], done, h]);
+        }
     }
     sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
 }
@@ -3390,21 +3579,43 @@ fn inside(at: [f32; 2], rect: [f32; 4]) -> bool {
     at[0] >= rect[0] && at[0] < rect[0] + rect[2] && at[1] >= rect[1] && at[1] < rect[1] + rect[3]
 }
 
-/// The power bar's tooltip (stored / capacity), the progress bar's and the energy tab's (usage and
-/// upgrades).
+/// The tooltips: a gauge's chemical and amount, the power bar's stored and maximum energy, the
+/// progress bar's percent, and the energy tab's usage and upgrades.
 pub(super) fn screen_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
-    if screen_slots(block).is_none() {
+    let Some(l) = layout(block) else {
         return;
-    }
+    };
     let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0);
-    if inside(at, [164.0, 16.0, 6.0, 54.0]) {
+    for (i, g) in l.gauges.iter().enumerate() {
+        if inside(at, [g.at[0], g.at[1], g.size[0], g.size[1]]) {
+            let d = DATA_GAUGES + i * GAUGE_SLOTS;
+            let amount = read_wide(data, d);
+            let name = usize::try_from(data.get(d + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c)).map(|c| c.1);
+            lines.push(match (amount, name) {
+                (0, _) => "Empty".to_owned(),
+                (_, Some(name)) => format!("{name}: {amount} mB"),
+                (_, None) => format!("{amount} mB"),
+            });
+            lines.push(format!("§7Capacity: {} mB", read_wide(data, d + 4)));
+            return;
+        }
+    }
+    if l.power.is_some_and(|p| inside(at, power_rect(p))) {
         lines.push(format!("{} / {} FE", read_wide(data, DATA_STORED), read_wide(data, DATA_CAPACITY)));
-    } else if inside(at, [86.0, 38.0, 25.0, 9.0]) {
+    } else if let Some((p, _, [w, h])) = l.progress
+        && inside(at, [p[0], p[1], w, h])
+    {
         lines.push(format!("{}%", get(2) * 100 / get(3).max(1)));
     } else if inside(at, [-26.0, 137.0, 26.0, 26.0]) {
-        lines.push(format!("Using: {} FE/t", read_wide(data, DATA_USAGE)));
-        lines.push(format!("§7Speed upgrades: {}/8", get(DATA_SPEED)));
-        lines.push(format!("§7Energy upgrades: {}/8", get(DATA_ENERGY_UPGRADES)));
+        let usage = read_wide(data, DATA_USAGE);
+        if usage > 0 {
+            lines.push(format!("Using: {usage} FE/t"));
+        }
+        lines.push(format!("Stored: {} FE", read_wide(data, DATA_STORED)));
+        if matches!(kind(block), Some(Kind::Machine(..))) {
+            lines.push(format!("§7Speed upgrades: {}/8", get(DATA_SPEED)));
+            lines.push(format!("§7Energy upgrades: {}/8", get(DATA_ENERGY_UPGRADES)));
+        }
     }
 }
 
