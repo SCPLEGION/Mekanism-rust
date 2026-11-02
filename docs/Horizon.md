@@ -1077,3 +1077,20 @@ on `milestone/h12-screen-overlay`.
   machine (Mekanism puts it in the window's output slot).
 - **Not done yet:** the slots are drawn but don't take items: installing is still a right-click
   on the machine with the upgrade. Shift-uninstall-all is also not done.
+
+## G4: Screens for six more machines
+
+These machines had no screen before. Now they open Mekanism's, at its positions:
+- **Solar Neutron Activator** (`GuiSolarNeutronActivator`): the input and output gauges, and the
+  large arrow, full while it works.
+- **Isotopic Centrifuge**: the two gauges, the horizontal power bar and the arrow.
+- **Chemical Infuser**: the left and right inputs, the output gauge in the middle 9 px higher, the
+  power bar, and the two small arrows facing each other.
+- **Chemical Washer**: the water, dirty slurry and clean slurry gauges, the power bar and the arrow.
+- **Electric Pump** and **Fluidic Plenisher**: the tank on the left, the vertical power bar, the down
+  arrow, and the inner screen with the energy, whether the plenisher has finished, and the fluid
+  ("Water: 1000 mB" or "No fluid").
+
+Each also gets its tabs (side configuration on the four chemical machines; upgrades, redstone and
+security on all). The arrows follow the block's `lit` state, as Mekanism's follow `getActive`.
+**Not done yet:** their item slots (buckets, energy, chemical items), which the port does not have.

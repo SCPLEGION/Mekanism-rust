@@ -361,7 +361,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::EnergyCube(_)) => (vec![0, 1], vec![]),
         // The miner's energy slot; what it mines goes into the container above it.
         Some(Kind::DigitalMiner) => (vec![1], vec![]),
-        // Tanks and the multiblocks' ports open a screen with no slots of their own.
+        // Tanks, the multiblocks' ports and the machines below open a screen with no slots of their own.
         Some(
             Kind::ChemicalTank(_)
             | Kind::FluidTank(_)
@@ -377,7 +377,14 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::Vibrator
             | Kind::Sorter
             | Kind::Chargepad
-            | Kind::Entangloporter,
+            | Kind::Entangloporter
+            // Their item slots (buckets, energy) are not ported; the screen shows their tanks.
+            | Kind::Activator
+            | Kind::Centrifuge
+            | Kind::ChemicalInfuser
+            | Kind::Washer
+            | Kind::Pump
+            | Kind::Plenisher,
         ) => {
             *container = Some(ModContainer {
                 slots: 3,
@@ -4499,6 +4506,55 @@ fn layout(block: &str) -> Option<Layout> {
             progress: None,
         },
         // TileEntityDigitalMiner and its screen: the energy slot (152, 20) and the power bar.
+        // GuiSolarNeutronActivator: no energy, lit while the sun lets it work.
+        Kind::Activator => Layout {
+            slots: [None, None, None],
+            gauges: vec![gauge("input", isotopes::ACTIVATOR_TANK, 25.0, 13.0, STANDARD), gauge("output", isotopes::ACTIVATOR_TANK, 133.0, 13.0, STANDARD)],
+            power: None,
+            progress: None,
+        },
+        // GuiIsotopicCentrifuge.
+        Kind::Centrifuge => Layout {
+            slots: [None, None, None],
+            gauges: vec![gauge("input", nuclear::CENTRIFUGE_TANK, 25.0, 13.0, STANDARD), gauge("output", nuclear::CENTRIFUGE_TANK, 133.0, 13.0, STANDARD)],
+            power: Some(PowerBar::Horizontal([115.0, 75.0])),
+            progress: None,
+        },
+        // GuiChemicalInfuser: the left and right inputs, the output in the middle, 9 px higher.
+        Kind::ChemicalInfuser => Layout {
+            slots: [None, None, None],
+            gauges: vec![
+                gauge("left", chem::CHEMICAL_INFUSER_TANK, 25.0, 13.0, STANDARD),
+                gauge("output", chem::CHEMICAL_INFUSER_TANK, 79.0, 4.0, STANDARD),
+                gauge("right", chem::CHEMICAL_INFUSER_TANK, 133.0, 13.0, STANDARD),
+            ],
+            power: Some(PowerBar::Horizontal([115.0, 75.0])),
+            progress: None,
+        },
+        // GuiChemicalWasher: water, dirty slurry, clean slurry.
+        Kind::Washer => Layout {
+            slots: [None, None, None],
+            gauges: vec![
+                gauge("fluid", nuclear::WASHER_TANK, 7.0, 13.0, STANDARD),
+                gauge("input", nuclear::WASHER_TANK, 28.0, 13.0, STANDARD),
+                gauge("output", nuclear::WASHER_TANK, 131.0, 13.0, STANDARD),
+            ],
+            power: Some(PowerBar::Horizontal([115.0, 75.0])),
+            progress: None,
+        },
+        // GuiElectricPump and GuiFluidicPlenisher: the tank on the left, a screen in the middle.
+        Kind::Pump => Layout {
+            slots: [None, None, None],
+            gauges: vec![gauge("fluid", isotopes::PUMP_TANK, 6.0, 13.0, STANDARD)],
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
+            progress: None,
+        },
+        Kind::Plenisher => Layout {
+            slots: [None, None, None],
+            gauges: vec![gauge("fluid", plenisher::PLENISHER_TANK, 6.0, 13.0, STANDARD)],
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
+            progress: None,
+        },
         Kind::DigitalMiner => Layout {
             slots: [None, Some(([152.0, 20.0], "slot/power")), None],
             gauges: vec![],
@@ -4540,6 +4596,10 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
         let u = upgrades(&entity.nbt);
         entity.data.extend([u.get(Upgrade::Speed) as i32, u.get(Upgrade::Energy) as i32]);
         entity.data.extend(wide(0));
+        // The plenisher's screen says whether it has filled all it can (in the progress slot).
+        if kind(&entity.id) == Some(Kind::Plenisher) {
+            entity.data[2] = get_int(&entity.nbt, "finished") as i32;
+        }
     }
     for g in &l.gauges {
         let mut tank = get_tank(&entity.nbt, g.key, g.capacity);
@@ -4629,7 +4689,9 @@ fn tabs(block: &str) -> u8 {
             | Kind::Washer
             | Kind::Centrifuge,
         ) => all,
-        Some(Kind::HeatGenerator | Kind::BioGenerator | Kind::GasGenerator | Kind::Wind | Kind::Solar(..) | Kind::DigitalMiner) => {
+        Some(
+            Kind::HeatGenerator | Kind::BioGenerator | Kind::GasGenerator | Kind::Wind | Kind::Solar(..) | Kind::DigitalMiner | Kind::Pump | Kind::Plenisher,
+        ) => {
             TAB_UPGRADE | TAB_REDSTONE | TAB_SECURITY
         }
         Some(Kind::EnergyCube(_) | Kind::ChemicalTank(_)) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
@@ -5633,6 +5695,72 @@ fn power_rect(p: PowerBar) -> [f32; 4] {
     }
 }
 
+/// What a screen draws beyond its `Layout`: progress arrows that fill while the machine is lit
+/// (`GuiProgress` on `tile::getActive`), an inner screen with text lines, and down arrows.
+struct Extras {
+    active_progress: Vec<([f32; 2], &'static str, [f32; 2])>,
+    screen: Option<[f32; 4]>,
+    arrows: Vec<[f32; 2]>,
+}
+
+fn extras(block: &str) -> Extras {
+    let none = Extras { active_progress: vec![], screen: None, arrows: vec![] };
+    let large = |x, y| ([x, y], "progress/large_right", [48.0, 8.0]);
+    match kind(block) {
+        Some(Kind::Activator | Kind::Centrifuge | Kind::Washer) => Extras { active_progress: vec![large(64.0, 39.0)], ..none },
+        Some(Kind::ChemicalInfuser) => Extras {
+            active_progress: vec![([47.0, 39.0], "progress/small_right", [28.0, 8.0]), ([101.0, 39.0], "progress/small_left", [28.0, 8.0])],
+            ..none
+        },
+        Some(Kind::Pump | Kind::Plenisher) => Extras { screen: Some([54.0, 23.0, 80.0, 42.0]), arrows: vec![[32.0, 39.0]], ..none },
+        _ => none,
+    }
+}
+
+/// The inner screen's lines: the pump's energy and fluid; the plenisher's energy, whether it has
+/// finished, and its fluid.
+fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
+    let fe = mekanism_core::energy::format_fe;
+    let energy = format!("{}/{}", fe(read_wide(data, DATA_STORED)), fe(read_wide(data, DATA_CAPACITY)));
+    let fluid = || {
+        let amount = read_wide(data, DATA_GAUGES);
+        let name = usize::try_from(data.get(DATA_GAUGES + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c)).map(|c| c.1);
+        match (amount, name) {
+            (0, _) | (_, None) => "No fluid".to_owned(),
+            (_, Some(name)) => format!("{name}: {amount} mB"),
+        }
+    };
+    match kind(block) {
+        Some(Kind::Pump) => vec![energy, fluid()],
+        Some(Kind::Plenisher) => {
+            let finished = if data.get(2).copied().unwrap_or(0) == 1 { "Yes" } else { "No" };
+            vec![energy, format!("Finished: {finished}"), fluid()]
+        }
+        _ => vec![],
+    }
+}
+
+/// Draws the extras: an arrow full while the block is lit (its `lit` property, seen from the
+/// client's world), the screen and its text, the down arrows.
+fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, data: &[i32], origin: [f32; 2]) {
+    let e = extras(block);
+    let [ox, oy] = origin;
+    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit")).as_deref() == Some("true");
+    for (at, name, [w, h]) in &e.active_progress {
+        let state = if lit { "full" } else { "empty" };
+        sprite(game, batch, &format!("{name}/{state}"), [0.0, 0.0, *w, *h], [ox + at[0], oy + at[1], *w, *h]);
+    }
+    if let Some([x, y, w, h]) = e.screen {
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + x, oy + y, w, h], 0xFFFF_FFFF);
+        for (i, line) in screen_lines(block, data).iter().enumerate() {
+            game.native_text(batch, line, [ox + x + 3.0, oy + y + 3.0 + 10.0 * i as f32], 0x3C_FE9A, false);
+        }
+    }
+    for [x, y] in &e.arrows {
+        sprite(game, batch, "arrow/down", [0.0, 0.0, 8.0, 9.0], [ox + x, oy + y, 8.0, 9.0]);
+    }
+}
+
 /// Mekanism's screen for a block: the base panel, its slots and the player's, its gauges, its power
 /// bar or energy gauge, its progress bar, and the energy tab on the left.
 pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
@@ -5709,6 +5837,7 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
     if l.power.is_some() {
         sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
     }
+    draw_extras(game, batch, block, data, origin);
     draw_tabs(game, batch, block, &l, data, origin);
     let text_x = if l.gauges.len() > 2 { 50.0 } else { 30.0 };
     for (i, line) in multiblock_lines(block, data).iter().enumerate() {
