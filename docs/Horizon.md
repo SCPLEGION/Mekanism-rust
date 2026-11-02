@@ -1094,3 +1094,20 @@ These machines had no screen before. Now they open Mekanism's, at its positions:
 Each also gets its tabs (side configuration on the four chemical machines; upgrades, redstone and
 security on all). The arrows follow the block's `lit` state, as Mekanism's follow `getActive`.
 **Not done yet:** their item slots (buckets, energy, chemical items), which the port does not have.
+
+## G5: Gauges fill with their fluid's texture
+
+Gauges used to fill with a flat colour. They now fill the way Mekanism's `GuiTankGauge` does, with
+the contents' texture tiled 16 px at a time from the bottom up:
+- **Water** uses vanilla's `block/water_still`, tinted water's blue.
+- **Lava** uses `block/lava_still` as it is.
+- **Steam** uses Mekanism's own steam texture.
+- **Chemicals** use Mekanism's base chemical icon (`mek_liquid/liquid`), tinted with the
+  chemical's colour.
+- **The energy cube's energy gauge** uses `mek_liquid/energy`.
+
+Horizon's GUI atlas holds only a content mod's `textures/gui`. So `tools/carry_content.py` now
+copies the first frame of each `mek_liquid` texture to `textures/gui/gauge_fluid/`, with a plain
+standard-library PNG crop. If a texture is missing, the gauge falls back to the flat colour.
+**Not done yet:** slurries, pigments and infuse types keep the grey fill (their colours are not in
+the gauge table), and the textures don't animate.
