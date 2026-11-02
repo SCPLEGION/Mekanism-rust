@@ -14,6 +14,7 @@ use mekanism_core::gear;
 use mekanism_core::nuclear;
 use mekanism_core::qio;
 use mekanism_core::laser;
+use mekanism_core::seismic;
 use mekanism_core::fission;
 use mekanism_core::fusion;
 use mekanism_core::bin::{self, Bin};
@@ -117,6 +118,8 @@ enum Kind {
     Laser,
     LaserAmplifier,
     TractorBeam,
+    /// A Seismic Vibrator: lets a Seismic Reader see under its chunk while it has energy.
+    Vibrator,
 }
 
 fn kind(id: &str) -> Option<Kind> {
@@ -147,6 +150,7 @@ fn kind(id: &str) -> Option<Kind> {
         laser::LASER => return Some(Kind::Laser),
         laser::AMPLIFIER => return Some(Kind::LaserAmplifier),
         laser::TRACTOR_BEAM => return Some(Kind::TractorBeam),
+        seismic::VIBRATOR => return Some(Kind::Vibrator),
         _ => {}
     }
     use mekanism_core::generator as g;
@@ -339,7 +343,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::DynamicValve
             | Kind::InductionPort
             | Kind::Laser
-            | Kind::LaserAmplifier,
+            | Kind::LaserAmplifier
+            | Kind::Vibrator,
         ) => {
             *container = Some(ModContainer {
                 slots: 3,
@@ -472,6 +477,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             None
         }
         Kind::Laser | Kind::LaserAmplifier | Kind::TractorBeam => tick_laser(game, pos, entity),
+        Kind::Vibrator => tick_vibrator(game, pos, entity),
     };
     screen_data(entity);
     multiblock_data(game, pos, entity);
@@ -2583,6 +2589,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Teleporter => Some((teleporter::STORAGE, u64::MAX)),
         // A laser takes energy on every side but its front; amplifiers and tractor beams only from lasers.
         Kind::Laser if facing_away => Some((laser::LASER_STORAGE, u64::MAX)),
+        Kind::Vibrator => Some((seismic::VIBRATOR_STORAGE, u64::MAX)),
         Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE, u64::MAX)),
         Kind::Rotary => Some((machine::STORAGE_MULTIPLIER * chem::ROTARY_USAGE, u64::MAX)),
         Kind::Heater => Some((machine::STORAGE_MULTIPLIER * heater_usage(nbt), u64::MAX)),
@@ -2790,6 +2797,10 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
     }
     if !*claimed && &*stack.item == teleporter::PORTABLE {
         portable_teleporter_use(game, claimed);
+        return;
+    }
+    if !*claimed && &*stack.item == seismic::READER && game.native_on(MOD_ID) {
+        seismic_reader_use(game, claimed);
         return;
     }
     if !*claimed && &*stack.item == modules::MEKA_TOOL && game.native_on(MOD_ID) {
@@ -4066,7 +4077,7 @@ fn layout(block: &str) -> Option<Layout> {
             power: None,
             progress: None,
         },
-        Kind::InductionPort | Kind::Laser | Kind::LaserAmplifier => Layout {
+        Kind::InductionPort | Kind::Laser | Kind::LaserAmplifier | Kind::Vibrator => Layout {
             slots: [None; 3],
             gauges: vec![],
             power: Some(PowerBar::Gauge([55.0, 18.0])),
@@ -6448,4 +6459,72 @@ pub(super) fn use_laser(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     };
     tell(game, format!("{name}: {energy} FE stored, {progress} FE into the block it digs"));
     true
+}
+
+// --- Seismic Vibrator -------------------------------------------------------------------------------
+
+/// The vibrators running now (`Mekanism.activeVibrators`), by dimension.
+static VIBRATORS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(super::Dim, [i32; 3])>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A vibrator runs while it has its 5 FE for the tick.
+fn tick_vibrator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let mut energy = EnergyContainer::new(seismic::VIBRATOR_STORAGE, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(energy.capacity);
+    let active = energy.consume(seismic::VIBRATOR_USAGE);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    if let Ok(mut all) = VIBRATORS.lock() {
+        if active {
+            all.insert((game.dim, pos));
+        } else {
+            all.remove(&(game.dim, pos));
+        }
+    }
+    Some(active)
+}
+
+/// `ItemSeismicReader.use`: in a chunk a running vibrator shakes, for 250 FE (free in creative), it
+/// lists the ores in the column under the player, top first, and how deep the column goes.
+fn seismic_reader_use(game: &mut Game<'_>, claimed: &mut bool) {
+    *claimed = true;
+    let Some(at) = game.player.as_ref().map(|p| [p.position.x.floor() as i32, p.position.y.floor() as i32, p.position.z.floor() as i32]) else {
+        return;
+    };
+    let dim = game.dim;
+    let vibrating = VIBRATORS.lock().map(|all| all.iter().any(|&(d, v)| d == dim && seismic::same_chunk(v, [at[0], at[2]]) && block_name(game, v) == seismic::VIBRATOR)).unwrap_or(false);
+    if !vibrating {
+        tell(game, "Seismic Reader: no vibrations detected".to_owned());
+        return;
+    }
+    if !game.creative {
+        let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == seismic::READER) else {
+            return;
+        };
+        let stored = stored_energy(held);
+        if stored < seismic::READER_USAGE {
+            tell(game, "Seismic Reader: needs energy".to_owned());
+            return;
+        }
+        set_energy(held, stored - seismic::READER_USAGE);
+    }
+    let bottom = game.world.bottom_y();
+    let column: Vec<(i32, String)> = (bottom..at[1])
+        .rev()
+        .map(|y| {
+            let state = game.world.block(at[0], y, at[2]);
+            (y, game.res.facts().get(state).name.to_string())
+        })
+        .collect();
+    let ores: Vec<String> = seismic::runs(&column)
+        .into_iter()
+        .filter(|(name, ..)| world_items!(game).block_in_tag(mekanism_core::miner::ORE_TAG, name))
+        .map(|(name, top, low)| if top == low { format!("{name} at y {top}") } else { format!("{name} at y {top} to {low}") })
+        .collect();
+    tell(game, format!("Seismic Reader: {} blocks down to y {bottom} at x {}, z {}", column.len(), at[0], at[2]));
+    if ores.is_empty() {
+        tell(game, "  no ores".to_owned());
+    }
+    for line in ores {
+        tell(game, format!("  {line}"));
+    }
 }

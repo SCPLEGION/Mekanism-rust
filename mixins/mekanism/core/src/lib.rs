@@ -26,6 +26,7 @@ pub mod nuclear;
 pub mod qio;
 pub mod recipe_table;
 pub mod recipes;
+pub mod seismic;
 pub mod sides;
 pub mod slurry_table;
 pub mod sps;
