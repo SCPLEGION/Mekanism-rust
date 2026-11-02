@@ -5127,6 +5127,24 @@ pub(super) fn screen_overlay(game: &Game<'_>, block: &str, data: &[i32], batch: 
     centred(game, batch, "Slots", x, w, y + 120.0, 0x78_7878);
 }
 
+/// Mekanism's creative tabs (hook point `native_creative_tabs`, API 34): the Mekanism, Generators, Additions and
+/// Tools tabs, their items in the order of the Java registries (`tools/gen_creative_tabs.py`).
+pub(super) fn creative_tabs(tabs: &mut Vec<crate::game::native_hooks::NativeCreativeTab>) {
+    use crate::game::native_hooks::{NativeCreativeTab, NativeStack};
+    for tab in mekanism_core::creative_tabs::CREATIVE_TABS {
+        tabs.push(NativeCreativeTab {
+            id: tab.id.to_owned(),
+            title: tab.title.to_owned(),
+            icon: tab.icon.to_owned(),
+            items: tab
+                .items
+                .iter()
+                .map(|item| NativeStack { item: (*item).to_owned(), count: 1, components: String::new() })
+                .collect(),
+        });
+    }
+}
+
 /// What Mekanism's own parts cover on a screen (hook point `native_screen_covers`, API 32): its tabs
 /// beside the panel, and the open window with its type tabs.
 pub(super) fn screen_covers(block: &str, at: [f32; 2], covered: &mut bool) {

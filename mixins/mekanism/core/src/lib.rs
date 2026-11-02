@@ -8,6 +8,7 @@ pub mod bin;
 pub mod boiler;
 pub mod chargepad;
 pub mod chemical;
+pub mod creative_tabs;
 pub mod dynamic_tank;
 pub mod energy;
 pub mod entangloporter;
