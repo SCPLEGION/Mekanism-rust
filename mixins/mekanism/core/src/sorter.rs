@@ -15,6 +15,10 @@ pub struct Sorter {
     pub filters: Vec<String>,
     pub auto_eject: bool,
     pub single_item: bool,
+    /// `round_robin`: saved and shown; one front inventory leaves nothing to take turns over.
+    pub round_robin: bool,
+    /// Filters switched off in the screen (`IFilter.isEnabled`), by their text.
+    pub disabled: Vec<String>,
 }
 
 impl Sorter {
@@ -43,6 +47,54 @@ impl Sorter {
         }
     }
 
+    /// The filters that work, in order.
+    pub fn active(&self) -> impl Iterator<Item = &String> {
+        self.filters.iter().filter(|f| !self.disabled.contains(f))
+    }
+
+    /// `FilterManager`'s moves (`MOVE_FILTER_UP`, `_DOWN`, `_TO_TOP`, `_TO_BOTTOM`): false if
+    /// `index` is not a filter or it is already there.
+    pub fn move_filter(&mut self, index: usize, op: Op) -> bool {
+        let last = self.filters.len().saturating_sub(1);
+        if index > last || self.filters.is_empty() {
+            return false;
+        }
+        let to = match op {
+            Op::Up if index > 0 => index - 1,
+            Op::Down if index < last => index + 1,
+            Op::Top if index > 0 => 0,
+            Op::Bottom if index < last => last,
+            _ => return false,
+        };
+        let f = self.filters.remove(index);
+        self.filters.insert(to, f);
+        true
+    }
+
+    /// `TOGGLE_FILTER_STATE`.
+    pub fn toggle_enabled(&mut self, index: usize) -> bool {
+        let Some(f) = self.filters.get(index) else {
+            return false;
+        };
+        match self.disabled.iter().position(|d| d == f) {
+            Some(at) => {
+                self.disabled.remove(at);
+            }
+            None => self.disabled.push(f.clone()),
+        }
+        true
+    }
+
+    /// Takes filter `index` away.
+    pub fn remove(&mut self, index: usize) -> bool {
+        if index >= self.filters.len() {
+            return false;
+        }
+        let f = self.filters.remove(index);
+        self.disabled.retain(|d| *d != f);
+        true
+    }
+
     /// How many items one operation moves.
     pub fn max_move(&self) -> u32 {
         if self.single_item { 1 } else { MAX_MOVE }
@@ -54,6 +106,68 @@ impl Sorter {
             Some(tag) => in_tag(tag),
             None => filter == item,
         }
+    }
+}
+
+/// What the sorter's screen asks (`GuiInteraction`), with the filter it concerns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Op {
+    Single,
+    RoundRobin,
+    AutoEject,
+    Up,
+    Down,
+    Top,
+    Bottom,
+    Toggle,
+    Delete,
+    /// A filter for the item in the player's hand, or its first tag.
+    AddItem,
+    AddTag,
+}
+
+const OPS: [Op; 11] = [
+    Op::Single,
+    Op::RoundRobin,
+    Op::AutoEject,
+    Op::Up,
+    Op::Down,
+    Op::Top,
+    Op::Bottom,
+    Op::Toggle,
+    Op::Delete,
+    Op::AddItem,
+    Op::AddTag,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Request {
+    pub op: Op,
+    pub pos: [i32; 3],
+    pub index: u16,
+}
+
+impl Request {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![OPS.iter().position(|o| *o == self.op).unwrap_or(0) as u8];
+        for c in self.pos {
+            out.extend(c.to_be_bytes());
+        }
+        out.extend(self.index.to_be_bytes());
+        out
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Request> {
+        if data.len() != 15 {
+            return None;
+        }
+        let op = *OPS.get(usize::from(data[0]))?;
+        let int = |i: usize| i32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        Some(Request {
+            op,
+            pos: [int(1), int(5), int(9)],
+            index: u16::from_be_bytes([data[13], data[14]]),
+        })
     }
 }
 
@@ -92,5 +206,39 @@ mod tests {
             .max_move(),
             1
         );
+    }
+
+    #[test]
+    fn filters_move_toggle_and_go() {
+        let mut s = Sorter {
+            filters: vec!["a".into(), "b".into(), "c".into()],
+            ..Sorter::default()
+        };
+        assert!(!s.move_filter(0, Op::Up));
+        assert!(s.move_filter(2, Op::Top));
+        assert_eq!(s.filters, ["c", "a", "b"]);
+        assert!(s.move_filter(0, Op::Bottom));
+        assert_eq!(s.filters, ["a", "b", "c"]);
+        assert!(s.move_filter(0, Op::Down));
+        assert_eq!(s.filters, ["b", "a", "c"]);
+        assert!(s.toggle_enabled(1));
+        assert_eq!(s.active().collect::<Vec<_>>(), ["b", "c"]);
+        assert!(s.toggle_enabled(1));
+        assert!(s.toggle_enabled(2));
+        assert!(s.remove(2));
+        assert!(s.disabled.is_empty());
+        assert!(!s.remove(5));
+    }
+
+    #[test]
+    fn requests_round_trip() {
+        let r = Request {
+            op: Op::Bottom,
+            pos: [-3, 70, 9000],
+            index: 40,
+        };
+        assert_eq!(Request::decode(&r.encode()), Some(r));
+        assert_eq!(Request::decode(&[99; 15]), None);
+        assert_eq!(Request::decode(&[0; 3]), None);
     }
 }
