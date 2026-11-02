@@ -21,6 +21,7 @@ use mekanism_core::entangloporter::{self as qe, Frequency};
 use mekanism_core::sorter::{self, Sorter};
 use mekanism_core::plenisher::{self, Plenisher, Spot};
 use mekanism_core::fission;
+use mekanism_core::frequency as freq;
 use mekanism_core::fusion;
 use mekanism_core::bin::{self, Bin};
 use mekanism_core::boiler;
@@ -378,6 +379,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::Sorter
             | Kind::Chargepad
             | Kind::Entangloporter
+            | Kind::Teleporter
             // Their item slots (buckets, energy) are not ported; the screen shows their tanks.
             | Kind::Activator
             | Kind::Centrifuge
@@ -543,6 +545,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         }
     };
     screen_data(entity, facing);
+    frequency_tick(game, pos, entity);
     multiblock_data(game, pos, entity);
     if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Pipe(_)) {
         show_connections(game, pos, entity);
@@ -3343,7 +3346,11 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
 
 /// A client's packet, with its player swapped in (API 26): a jetpack thrust spends one mB of the
 /// hydrogen in the jetpack they wear and stops their fall here too.
-pub(super) fn server_payload(game: &mut Game<'_>, channel: &str) {
+pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
+    if channel == FREQUENCY_CHANNEL && game.native_on(MOD_ID) {
+        frequency_payload(game, data);
+        return;
+    }
     if channel == FREE_RUNNERS_CHANNEL && game.native_on(MOD_ID) {
         free_runners_fall(game);
         return;
@@ -3817,40 +3824,16 @@ pub(super) fn use_entangloporter(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     }
     let held = game.inventory.get(game.selected).cloned().flatten();
     if let Some(tag) = held.as_ref().filter(|s| &*s.item == "minecraft:name_tag").and_then(|s| s.custom_name()) {
-        let shared = FREQUENCIES.lock().ok().and_then(|all| all.get(tag.as_str()).cloned());
+        let entry = name_tag_frequency(game, tag.as_str());
         game.native_with_mod_block_entity(pos, |m| {
-            m.nbt.insert("frequency".into(), Tag::String(tag.as_str().into()));
-            // Its copy of the frequency is the frequency's own from now on.
-            let f = shared.unwrap_or_default();
-            put_long(&mut m.nbt, "shared_energy", f.energy);
-            put_tank(&mut m.nbt, "shared_fluid", &f.fluid);
-            put_tank(&mut m.nbt, "shared_chemical", &f.chemical);
+            put_block_frequency(&mut m.nbt, Some(&entry));
+            qe_join(&mut m.nbt, &entry.key());
         });
         tell(game, format!("Quantum Entangloporter frequency: {tag}"));
         return true;
     }
-    if held.is_some() {
-        return false;
-    }
-    let Some(line) = game.native_with_mod_block_entity(pos, |m| {
-        let Some(name) = qe_frequency(&m.nbt) else {
-            return "Quantum Entangloporter: no frequency (right-click with a named name tag)".to_owned();
-        };
-        let tank = |key, cap| {
-            let t = get_tank(&m.nbt, key, cap);
-            t.chemical.map_or("empty".to_owned(), |c| format!("{} mB {c}", t.amount))
-        };
-        format!(
-            "Quantum Entangloporter {name}: {} FE, fluid {}, chemical {}",
-            get_long(&m.nbt, "shared_energy"),
-            tank("shared_fluid", qe::FLUID_BUFFER),
-            tank("shared_chemical", qe::CHEMICAL_BUFFER)
-        )
-    }) else {
-        return false;
-    };
-    tell(game, line);
-    true
+    // An empty hand opens its screen (`GuiQuantumEntangloporter`), which shows its frequency.
+    false
 }
 
 /// The Fluidic Plenisher: with a bucket in its tank and the energy for the tick, every 20 ticks
@@ -4309,6 +4292,9 @@ fn layout(block: &str) -> Option<Layout> {
     let gauge = |key, capacity, x, y, size| Gauge { key, capacity, at: [x, y], size };
     let large_right = |x, y| Some(([x, y], "progress/large_right", [48.0, 8.0]));
     Some(match kind(block)? {
+        // The frequency screens (`draw_frequency_screen`): the teleporter's power bar.
+        Kind::Teleporter => Layout { slots: [None, None, None], gauges: vec![], power: Some(PowerBar::Vertical([158.0, 26.0])), progress: None },
+        Kind::Entangloporter => Layout { slots: [None, None, None], gauges: vec![], power: None, progress: None },
         // TileEntityElectricMachine and GuiElectricMachine.
         Kind::Machine(recipe, _) => Layout {
             slots: [
@@ -5634,7 +5620,11 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
 }
 
 /// A press on a reactor's button (hook point `native_screen_click`, API 20).
-pub(super) fn screen_click(block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
+pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
+    if is_freq_screen(block) {
+        frequency_click(game, block, at, right);
+        return;
+    }
     if window_click(block, data, at, right, button) {
         return;
     }
@@ -5705,6 +5695,19 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
 
 pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::NativeScreen>) {
     if screen.is_some() {
+        return;
+    }
+    // `GuiTeleporter` and `GuiQuantumEntangloporter`: 74 taller, the teleporter's energy slot.
+    if is_freq_screen(block) {
+        let energy = (kind(block) == Some(Kind::Teleporter)).then_some([153.0, 7.0]);
+        *screen = Some(super::native_hooks::NativeScreen {
+            width: 176.0,
+            height: 240.0,
+            slots: vec![energy, None, None],
+            inventory_y: 158.0,
+            inventory_x: 8.0,
+            own_labels: true,
+        });
         return;
     }
     let Some(l) = layout(block) else {
@@ -5834,6 +5837,10 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
 /// Mekanism's screen for a block: the base panel, its slots and the player's, its gauges, its power
 /// bar or energy gauge, its progress bar, and the energy tab on the left.
 pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    if is_freq_screen(block) {
+        draw_frequency_screen(game, batch, block, data, origin);
+        return;
+    }
     let Some(l) = layout(block) else {
         return;
     };
@@ -5932,7 +5939,14 @@ fn inside(at: [f32; 2], rect: [f32; 4]) -> bool {
 
 /// The tooltips: a gauge's chemical and amount, the power bar's stored and maximum energy, the
 /// progress bar's percent, and the energy tab's usage and upgrades.
-pub(super) fn screen_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
+pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
+    if frequency_tooltip(block, data, at, lines) {
+        return;
+    }
+    if is_freq_screen(block) {
+        frequency_tooltip_view(game, block, at, lines);
+        return;
+    }
     let Some(l) = layout(block) else {
         return;
     };
@@ -6015,6 +6029,8 @@ fn tick_teleporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
             all.entry(f).or_default().push((dim, pos));
         }
     }
+    let status = teleporter_status(game, pos, entity);
+    put_int(&mut entity.nbt, "status", status);
 }
 
 /// The closest other formed teleporter on `frequency` in this dimension, and where a player arrives:
@@ -6073,7 +6089,8 @@ pub(super) fn use_teleporter(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     let held = game.inventory.get(game.selected).cloned().flatten();
     if name == teleporter::TELEPORTER {
         if let Some(tag) = held.as_ref().filter(|s| &*s.item == "minecraft:name_tag").and_then(|s| s.custom_name()) {
-            game.native_with_mod_block_entity(pos, |m| m.nbt.insert("frequency".into(), Tag::String(tag.as_str().into())));
+            let entry = name_tag_frequency(game, tag.as_str());
+            game.native_with_mod_block_entity(pos, |m| put_block_frequency(&mut m.nbt, Some(&entry)));
             tell(game, format!("Teleporter frequency: {tag}"));
             return true;
         }
@@ -6093,13 +6110,12 @@ pub(super) fn use_teleporter(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
             return true;
         }
     }
-    if held.is_some() {
+    // An empty hand on the teleporter opens its screen (`GuiTeleporter`); on its frame, it travels.
+    if held.is_some() || name == teleporter::TELEPORTER {
         return false;
     }
     // The teleporter this block belongs to: itself, or one whose frame or opening holds it.
-    let source = if name == teleporter::TELEPORTER {
-        Some(pos)
-    } else {
+    let source = {
         let mut found = None;
         'search: for dx in -3..=3 {
             for dy in -3..=3 {
@@ -8235,4 +8251,621 @@ fn tick_reaction(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     put_tank(&mut entity.nbt, "output", &output);
     entity.data = vec![(energy.stored * 1000 / capacity.max(1)) as i32, 1000, progress as i32, ticks as i32];
     Some(active)
+}
+
+// --- Frequency selector (GuiFrequencySelector) ------------------------------------------------------
+
+/// The teleporters' and entangloporters' frequency packets (`PacketSetTileFrequency`,
+/// `PacketSetFrequencyColor`).
+const FREQUENCY_CHANNEL: &str = "mekanism:frequency";
+
+/// Which frequency list a block uses (`FrequencyTypes.TELEPORTER`, `FrequencyTypes.INVENTORY`).
+fn freq_type(block: &str) -> Option<u8> {
+    match kind(block)? {
+        Kind::Teleporter => Some(0),
+        Kind::Entangloporter => Some(1),
+        _ => None,
+    }
+}
+
+/// The frequencies this server knows, by type. A block puts its own back on the list as it ticks, so
+/// the list comes back after a restart once the blocks on it load.
+static FREQ_LISTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u8, Vec<freq::Entry>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Frequencies deleted since the server started, by type and key: a block still on one leaves it.
+static FREQ_DELETED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(u8, String)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn get_hex(nbt: &Compound, key: &str) -> u128 {
+    get_string(nbt, key).and_then(|s| u128::from_str_radix(&s, 16).ok()).unwrap_or(0)
+}
+
+/// The frequency a block is on, from its NBT. One a name tag set before the selector existed is a
+/// public frequency of that name.
+fn block_frequency(nbt: &Compound) -> Option<freq::Entry> {
+    let key = get_string(nbt, "frequency")?;
+    Some(freq::Entry {
+        name: get_string(nbt, "freq_name").unwrap_or(key),
+        security: freq::Security::from_ordinal(i64::from(get_int(nbt, "freq_security"))),
+        owner: get_hex(nbt, "freq_owner"),
+        owner_name: get_string(nbt, "freq_owner_name").unwrap_or_default(),
+        color: nbt.get(&JavaString::from("freq_color")).map_or(freq::DEFAULT_COLOR, |_| get_int(nbt, "freq_color") as u8),
+    })
+}
+
+/// Puts a block on frequency `entry` (or on none).
+fn put_block_frequency(nbt: &mut Compound, entry: Option<&freq::Entry>) {
+    let Some(e) = entry else {
+        for k in ["frequency", "freq_name", "freq_security", "freq_owner", "freq_owner_name", "freq_color"] {
+            nbt.remove(&JavaString::from(k));
+        }
+        return;
+    };
+    nbt.insert("frequency".into(), Tag::String(e.key().as_str().into()));
+    nbt.insert("freq_name".into(), Tag::String(e.name.as_str().into()));
+    put_int(nbt, "freq_security", u32::from(e.security.ordinal()));
+    nbt.insert("freq_owner".into(), Tag::String(format!("{:032x}", e.owner).as_str().into()));
+    nbt.insert("freq_owner_name".into(), Tag::String(e.owner_name.as_str().into()));
+    put_int(nbt, "freq_color", u32::from(e.color));
+}
+
+/// An entangloporter joins the frequency under `key`: its copy of what the frequency holds is the
+/// frequency's own from now on.
+fn qe_join(nbt: &mut Compound, key: &str) {
+    let f = FREQUENCIES.lock().ok().and_then(|all| all.get(key).cloned()).unwrap_or_default();
+    put_long(nbt, "shared_energy", f.energy);
+    put_tank(nbt, "shared_fluid", &f.fluid);
+    put_tank(nbt, "shared_chemical", &f.chemical);
+}
+
+fn entry_tag(e: &freq::Entry) -> Tag {
+    let mut c = Compound::new();
+    c.insert("n".into(), Tag::String(e.name.as_str().into()));
+    c.insert("s".into(), Tag::Int(i32::from(e.security.ordinal())));
+    c.insert("o".into(), Tag::String(format!("{:032x}", e.owner).as_str().into()));
+    c.insert("on".into(), Tag::String(e.owner_name.as_str().into()));
+    c.insert("c".into(), Tag::Int(i32::from(e.color)));
+    Tag::Compound(c)
+}
+
+fn entry_of(tag: &Tag) -> Option<freq::Entry> {
+    let Tag::Compound(c) = tag else {
+        return None;
+    };
+    Some(freq::Entry {
+        name: get_string(c, "n")?,
+        security: freq::Security::from_ordinal(i64::from(get_int(c, "s"))),
+        owner: get_hex(c, "o"),
+        owner_name: get_string(c, "on").unwrap_or_default(),
+        color: get_int(c, "c") as u8,
+    })
+}
+
+/// A teleporter's or entangloporter's frequency after its tick: it leaves a deleted frequency, puts
+/// its own on the list (with the list's colour), and sends players what its selector shows (its
+/// `client` compound: its frequency, the frequencies, the teleporter's status) when that changed.
+fn frequency_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let Some(t) = freq_type(&entity.id) else {
+        return;
+    };
+    let mut own = block_frequency(&entity.nbt);
+    if let Some(e) = &own
+        && FREQ_DELETED.lock().is_ok_and(|d| d.contains(&(t, e.key())))
+    {
+        put_block_frequency(&mut entity.nbt, None);
+        own = None;
+    }
+    let list = {
+        let Ok(mut lists) = FREQ_LISTS.lock() else {
+            return;
+        };
+        let list = lists.entry(t).or_default();
+        if let Some(e) = own.as_mut() {
+            match list.iter().find(|l| l.key() == e.key()) {
+                Some(known) if known.color != e.color => {
+                    e.color = known.color;
+                    put_int(&mut entity.nbt, "freq_color", u32::from(e.color));
+                }
+                Some(_) => {}
+                None => list.push(e.clone()),
+            }
+        }
+        list.clone()
+    };
+    let mut client = Compound::new();
+    if let Some(e) = &own {
+        client.insert("freq".into(), entry_tag(e));
+    }
+    client.insert("list".into(), Tag::List(list.iter().map(entry_tag).collect()));
+    put_int(&mut client, "status", get_int(&entity.nbt, "status"));
+    let same = matches!(entity.nbt.get(&JavaString::from("client")), Some(Tag::Compound(c)) if *c == client);
+    if !same {
+        entity.nbt.insert("client".into(), Tag::Compound(client));
+        game.native_sync_block_entity(pos);
+    }
+}
+
+/// A player's frequency packet, on the server: set the block's frequency (making it when it is new),
+/// delete one of theirs, or step its colour. Players act only on a block within reach, and only on
+/// frequencies they may (`Frequency.ownerMatches`).
+fn frequency_payload(game: &mut Game<'_>, data: &[u8]) {
+    let (Some(r), Some(player)) = (freq::Request::decode(data), game.native_acting_player()) else {
+        return;
+    };
+    let near = (0..3).map(|k| (player.position[k] - f64::from(r.pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    let Some(t) = freq_type(block_name(game, r.pos)).filter(|_| near) else {
+        return;
+    };
+    let owner = if r.security == freq::Security::Public && r.op != freq::Op::Set { r.owner } else { player.uuid };
+    let key = freq::key(&r.name, r.security, owner);
+    let Ok(mut lists) = FREQ_LISTS.lock() else {
+        return;
+    };
+    let list = lists.entry(t).or_default();
+    match r.op {
+        freq::Op::Set => {
+            let entry = match list.iter().find(|e| e.key() == key) {
+                Some(e) => e.clone(),
+                None => {
+                    let e = freq::Entry {
+                        name: r.name.clone(),
+                        security: r.security,
+                        owner,
+                        owner_name: player.name.clone(),
+                        color: freq::DEFAULT_COLOR,
+                    };
+                    list.push(e.clone());
+                    e
+                }
+            };
+            drop(lists);
+            if let Ok(mut d) = FREQ_DELETED.lock() {
+                d.remove(&(t, key.clone()));
+            }
+            game.native_with_mod_block_entity(r.pos, |m| {
+                put_block_frequency(&mut m.nbt, Some(&entry));
+                if t == 1 {
+                    qe_join(&mut m.nbt, &key);
+                }
+            });
+        }
+        freq::Op::Remove => {
+            let Some(at) = list.iter().position(|e| e.key() == key && e.owner == player.uuid) else {
+                return;
+            };
+            list.remove(at);
+            drop(lists);
+            if let Ok(mut d) = FREQ_DELETED.lock() {
+                d.insert((t, key.clone()));
+            }
+            if let Ok(mut all) = FREQUENCIES.lock() {
+                all.remove(&key);
+            }
+            game.native_with_mod_block_entity(r.pos, |m| {
+                if get_string(&m.nbt, "frequency").as_deref() == Some(key.as_str()) {
+                    put_block_frequency(&mut m.nbt, None);
+                }
+            });
+        }
+        freq::Op::ColorNext | freq::Op::ColorPrevious => {
+            if let Some(e) = list.iter_mut().find(|e| e.key() == key && e.owner == player.uuid) {
+                e.color = freq::step_color(e.color, r.op == freq::Op::ColorNext);
+            }
+        }
+    }
+}
+
+/// `TeleporterStatus`, as the teleporter's tick finds it: 0 ready, 1 no frame, 2 no link, 3 needs
+/// energy (`GuiTeleporterStatus` shows no frequency apart).
+fn teleporter_status(game: &mut Game<'_>, pos: [i32; 3], entity: &ModBlockEntity) -> u32 {
+    if get_pos(&entity.nbt, "dir").is_none() {
+        return 1;
+    }
+    let Some(f) = get_string(&entity.nbt, "frequency") else {
+        return 2;
+    };
+    let from = [f64::from(pos[0]) + 0.5, f64::from(pos[1]), f64::from(pos[2]) + 0.5];
+    match teleport_target(game, &f, from, Some(pos)) {
+        None => 2,
+        Some((to, _)) if get_long(&entity.nbt, "energy") < teleporter::energy_cost(from, to, true) => 3,
+        Some(_) => 0,
+    }
+}
+
+/// What the client heard of the open block's frequencies: its own, the list, the teleporter's status.
+struct FreqView {
+    own: Option<freq::Entry>,
+    list: Vec<freq::Entry>,
+    status: u32,
+}
+
+fn freq_view(game: &Game<'_>) -> Option<([i32; 3], FreqView)> {
+    let (x, y, z) = game.container?;
+    let pos = [x, y, z];
+    let (_, client) = game.native_client_block_entity(pos)?;
+    let list = match client.get(&JavaString::from("list")) {
+        Some(Tag::List(l)) => l.iter().filter_map(entry_of).collect(),
+        _ => vec![],
+    };
+    let own = client.get(&JavaString::from("freq")).and_then(entry_of);
+    Some((pos, FreqView { own, list, status: get_int(client, "status") }))
+}
+
+fn own_uuid(game: &Game<'_>) -> u128 {
+    game.remote.as_ref().map_or(0, |r| r.profile())
+}
+
+/// The selector's own state on this client (its buttons, list and text box live in the screen).
+#[derive(Default)]
+struct FreqUi {
+    pos: [i32; 3],
+    mode: freq::Security,
+    selected: Option<usize>,
+    scroll: usize,
+    text: freq::TextBox,
+    /// The mode followed the block's frequency once (`GuiFrequencySelector.tick`'s `init`).
+    init: bool,
+}
+
+thread_local! {
+    static FREQ_UI: std::cell::RefCell<FreqUi> = std::cell::RefCell::new(FreqUi::default());
+}
+
+/// The selector's state for the block at `pos`, fresh when another block's screen opened.
+fn with_freq_ui<R>(pos: [i32; 3], view: &FreqView, f: impl FnOnce(&mut FreqUi) -> R) -> R {
+    FREQ_UI.with_borrow_mut(|ui| {
+        if ui.pos != pos {
+            *ui = FreqUi { pos, ..FreqUi::default() };
+        }
+        if !ui.init {
+            ui.init = true;
+            if let Some(e) = &view.own {
+                ui.mode = e.security;
+            }
+        }
+        f(ui)
+    })
+}
+
+/// The selector's places on the screen (`GuiFrequencySelector` at 27, 14).
+const FREQ_MODES: [[f32; 4]; 3] = [[27.0, 14.0, 38.0, 20.0], [111.0, 14.0, 38.0, 20.0], [69.0, 14.0, 38.0, 20.0]];
+const FREQ_LIST: [f32; 4] = [27.0, 36.0, 122.0, 42.0];
+const FREQ_FIELD: [f32; 4] = [50.0, 113.0, 98.0, 11.0];
+const FREQ_CHECK: [f32; 4] = [137.0, 113.0, 11.0, 11.0];
+const FREQ_ROWS: usize = 4;
+const TELEPORTER_STATUS: [f32; 4] = [6.0, 6.0, 18.0, 18.0];
+const FREQ_COLOR: [f32; 4] = [132.0, 128.0, 16.0, 16.0];
+
+/// The Set and Delete buttons: 50 wide beside the teleporter's colour, 60 otherwise.
+fn freq_buttons(block: &str) -> [[f32; 4]; 2] {
+    let w = if kind(block) == Some(Kind::Teleporter) { 50.0 } else { 60.0 };
+    [[27.0, 127.0, w, 18.0], [29.0 + w, 127.0, w, 18.0]]
+}
+
+fn is_freq_screen(block: &str) -> bool {
+    freq_type(block).is_some()
+}
+
+/// The listed frequencies in the selector's mode.
+fn freq_shown<'a>(game: &Game<'_>, view: &'a FreqView, mode: freq::Security) -> Vec<&'a freq::Entry> {
+    freq::visible(&view.list, mode, own_uuid(game))
+}
+
+fn send_frequency(game: &Game<'_>, op: freq::Op, pos: [i32; 3], e: &freq::Entry) {
+    let r = freq::Request { op, pos, security: e.security, owner: e.owner, name: e.name.clone() };
+    game.native_send_to_server(FREQUENCY_CHANNEL, &r.encode());
+}
+
+/// `setFrequency(GuiTextField)`: the box's name as a new frequency in the selector's mode.
+fn submit_frequency_field(game: &Game<'_>, pos: [i32; 3], ui: &mut FreqUi) {
+    if ui.text.value.is_empty() {
+        return;
+    }
+    let e = freq::Entry { name: std::mem::take(&mut ui.text.value), security: ui.mode, owner: own_uuid(game), ..freq::Entry::default() };
+    ui.text.cursor = 0;
+    send_frequency(game, freq::Op::Set, pos, &e);
+}
+
+/// A press on the selector, on the client: the mode buttons, the list (a row selects it, the bar
+/// scrolls it), the text box and its checkmark, Set, Delete, and the teleporter's colour.
+fn frequency_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool) -> bool {
+    let Some((pos, view)) = freq_view(game).filter(|_| is_freq_screen(block)) else {
+        return false;
+    };
+    let shown: Vec<freq::Entry> = with_freq_ui(pos, &view, |ui| freq_shown(game, &view, ui.mode).into_iter().cloned().collect());
+    FREQ_UI.with_borrow_mut(|ui| {
+        ui.text.focused = inside(at, FREQ_FIELD) && !inside(at, FREQ_CHECK);
+        if right {
+            if kind(block) == Some(Kind::Teleporter) && inside(at, FREQ_COLOR) && let Some(e) = &view.own {
+                send_frequency(game, freq::Op::ColorPrevious, pos, e);
+                return true;
+            }
+            return false;
+        }
+        for (mode, r) in freq::Security::ALL.into_iter().zip(FREQ_MODES) {
+            if inside(at, r) {
+                if ui.mode != mode {
+                    ui.mode = mode;
+                    ui.selected = None;
+                    ui.scroll = 0;
+                }
+                return true;
+            }
+        }
+        let [lx, ly, lw, lh] = FREQ_LIST;
+        // The scroll bar's track: the list jumps to where it was pressed.
+        if inside(at, [lx + lw - 6.0, ly, 6.0, lh]) {
+            let hidden = shown.len().saturating_sub(FREQ_ROWS);
+            let f = ((at[1] - ly - 2.0) / (lh - 4.0)).clamp(0.0, 1.0);
+            ui.scroll = ((hidden as f32 + 0.5) * f) as usize;
+            return true;
+        }
+        if inside(at, [lx + 1.0, ly + 1.0, lw - 8.0, lh - 2.0]) {
+            let row = ui.scroll + ((at[1] - ly - 1.0) / 10.0) as usize;
+            ui.selected = (row < shown.len()).then_some(row);
+            return true;
+        }
+        if inside(at, FREQ_CHECK) {
+            if !ui.text.value.is_empty() {
+                submit_frequency_field(game, pos, ui);
+            }
+            return true;
+        }
+        if inside(at, FREQ_FIELD) {
+            return true;
+        }
+        let [set, delete] = freq_buttons(block);
+        let chosen = ui.selected.and_then(|i| shown.get(i));
+        if inside(at, set) {
+            if let Some(e) = chosen.filter(|e| view.own.as_ref() != Some(*e)) {
+                send_frequency(game, freq::Op::Set, pos, e);
+            }
+            return true;
+        }
+        if inside(at, delete) {
+            if let Some(e) = chosen.filter(|e| e.owner == own_uuid(game)) {
+                send_frequency(game, freq::Op::Remove, pos, e);
+                ui.selected = None;
+            }
+            return true;
+        }
+        if kind(block) == Some(Kind::Teleporter) && inside(at, FREQ_COLOR) {
+            if let Some(e) = &view.own {
+                send_frequency(game, freq::Op::ColorNext, pos, e);
+            }
+            return true;
+        }
+        false
+    })
+}
+
+/// Whether the selector's text box has focus (hook point `native_screen_typing`).
+pub(super) fn screen_typing(block: &str, typing: &mut bool) {
+    if is_freq_screen(block) {
+        *typing |= FREQ_UI.with_borrow(|ui| ui.text.focused);
+    }
+}
+
+/// A key on the selector's focused text box (hook point `native_screen_key`): Enter sets the name as
+/// a new frequency (`setEnterHandler`).
+pub(super) fn screen_key(game: &mut Game<'_>, block: &str, key: &str, text: Option<&str>) {
+    if !is_freq_screen(block) || !game.native_on(MOD_ID) {
+        return;
+    }
+    let Some((pos, _)) = freq_view(game) else {
+        return;
+    };
+    let game = &*game;
+    FREQ_UI.with_borrow_mut(|ui| {
+        if ui.pos != pos || !ui.text.focused {
+            return;
+        }
+        if ui.text.key(key, text, freq::valid_char, freq::MAX_FREQ_LENGTH) == freq::Typed::Enter {
+            submit_frequency_field(game, pos, ui);
+        }
+    });
+}
+
+/// A Mekanism button (`MekanismButton`): its background as active, hovered or inactive.
+fn draw_mek_button(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, r: [f32; 4], active: bool, hovered: bool) {
+    let name = if !active {
+        "button_inactive"
+    } else if hovered {
+        "button_focus"
+    } else {
+        "button"
+    };
+    nine_slice_tinted(game, batch, name, [200.0, 20.0], 2.0, r, 0xFFFF_FFFF);
+}
+
+/// The teleporter's and the entangloporter's screen (`GuiTeleporter`, `GuiQuantumEntangloporter`):
+/// 240 high, the frequency selector, and the teleporter's status, energy slot and power bar.
+fn draw_frequency_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, data: &[i32], origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let at = |r: [f32; 4]| [ox + r[0], oy + r[1], r[2], r[3]];
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 176.0, 240.0]);
+    for row in 0..4 {
+        let y = if row < 3 { 158.0 + 18.0 * row as f32 } else { 216.0 };
+        for col in 0..9 {
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + 18.0 * col as f32, oy + y - 1.0, 18.0, 18.0]);
+        }
+    }
+    let teleporter = kind(block) == Some(Kind::Teleporter);
+    let view = freq_view(game);
+    let title = game.native_screen_title().unwrap_or_default();
+    let tw = game.native_text_width(&title);
+    // `renderTitleTextWithOffset`: the teleporter's title between its status and its energy slot.
+    let (left, right) = if teleporter { (24.0, 153.0) } else { (0.0, 176.0) };
+    game.native_text(batch, &title, [ox + left + (right - left - tw) / 2.0, oy + 4.0], 0x40_4040, false);
+    game.native_text(batch, "Inventory", [ox + 8.0, oy + 147.0], 0x40_4040, false);
+    if teleporter {
+        draw_mek_button(game, batch, at(TELEPORTER_STATUS), true, false);
+        let status = match view.as_ref().map(|(_, v)| (v.own.is_some(), v.status)) {
+            Some((true, 0)) => "ready",
+            Some((true, 1)) => "no_frame",
+            Some((true, 3)) => "needs_energy",
+            Some((true, _)) => "no_link",
+            _ => "no_frequency",
+        };
+        sprite(game, batch, &format!("teleporter/{status}"), [0.0, 0.0, 18.0, 18.0], at(TELEPORTER_STATUS));
+        sprite(game, batch, "slot/power", [0.0, 0.0, 18.0, 18.0], [ox + 152.0, oy + 6.0, 18.0, 18.0]);
+        let [x, y, w, h] = power_rect(PowerBar::Vertical([158.0, 26.0]));
+        nine_slice(game, batch, "bar/base", 5.0, 1.0, [ox + x, oy + y, w, h]);
+        let capacity = read_wide(data, DATA_CAPACITY);
+        let energy = if capacity > 0 { read_wide(data, DATA_STORED) as f32 / capacity as f32 } else { 0.0 };
+        let filled = energy.clamp(0.0, 1.0) * (h - 2.0);
+        if filled > 0.0 {
+            sprite(game, batch, "bar/vertical_power", [0.0, 0.0, 2.0, 2.0], [ox + x + 1.0, oy + y + h - 1.0 - filled, w - 2.0, filled]);
+        }
+    } else {
+        // `GuiEnergyTab` and `GuiHeatTab` on the left.
+        sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
+        sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
+    }
+    let Some((pos, view)) = view else {
+        return;
+    };
+    with_freq_ui(pos, &view, |ui| {
+        let shown = freq_shown(game, &view, ui.mode);
+        if ui.selected.is_some_and(|s| s >= shown.len()) {
+            ui.selected = None;
+        }
+        let hidden = shown.len().saturating_sub(FREQ_ROWS);
+        ui.scroll = ui.scroll.min(hidden);
+        // The mode buttons: the one in use is inactive.
+        for (mode, r) in freq::Security::ALL.into_iter().zip(FREQ_MODES) {
+            let active = ui.mode != mode;
+            draw_mek_button(game, batch, at(r), active, active && inside(mouse, r));
+            let icon = format!("security/button_{}", mode.name().to_lowercase());
+            sprite(game, batch, &icon, [0.0, 0.0, 40.0, 16.0], at(r));
+        }
+        // The list (`GuiTextScrollList`): the inner screen, the scroll bar, the selection, the lines.
+        let [lx, ly, lw, lh] = FREQ_LIST;
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, at(FREQ_LIST), 0xFFFF_FFFF);
+        let (bar_x, bar_y, bar_max) = (lx + lw - 6.0, ly + 2.0, lh - 4.0);
+        nine_slice_tinted(game, batch, "scroll/list_border", [6.0, 6.0], 2.0, [ox + bar_x - 1.0, oy + bar_y - 1.0, 6.0, bar_max + 2.0], 0xFFFF_FFFF);
+        let thumb = if hidden > 0 { (ui.scroll as f32 / hidden as f32 * (bar_max - 4.0)).round() } else { 0.0 };
+        sprite(game, batch, "scroll/list_bar", [0.0, 0.0, 4.0, 4.0], [ox + bar_x, oy + bar_y + thumb, 4.0, 4.0]);
+        if let Some(sel) = ui.selected.filter(|s| (ui.scroll..ui.scroll + FREQ_ROWS).contains(s)) {
+            let y = ly + 1.0 + (sel - ui.scroll) as f32 * 10.0;
+            sprite(game, batch, "scroll/list_selection", [0.0, 0.0, 2.0, 2.0], [ox + lx + 1.0, oy + y, lw - 8.0, 10.0]);
+        }
+        for (i, e) in shown.iter().skip(ui.scroll).take(FREQ_ROWS).enumerate() {
+            let line = freq::list_line(e, ui.mode);
+            game.native_text_scaled(batch, &line, [ox + lx + 2.0, oy + ly + 2.0 + 10.0 * i as f32], 0x3C_FE9A, 0.8);
+        }
+        // The frequency in use (`renderForeground`).
+        let (name, owner, security) = match &view.own {
+            Some(e) => (format!("\u{a7}8{}", e.name), e.owner_name.clone(), e.security.name()),
+            None => ("\u{a7}4None".to_owned(), "\u{a7}4None".to_owned(), "\u{a7}4None"),
+        };
+        let label = |batch: &mut horizon_client::hud::HudBatch, text: String, y: f32| {
+            game.native_text(batch, &text, [ox + 27.0, oy + y], 0x40_4040, false);
+        };
+        label(batch, format!("Frequency: {name}"), 81.0);
+        label(batch, format!("Owner: {owner}"), 91.0);
+        label(batch, format!("Security: {security}"), 101.0);
+        let set_w = game.native_text_width("Set:");
+        game.native_text(batch, "Set:", [ox + 45.0 - set_w, oy + 115.0], 0x40_4040, false);
+        // The text box over an inner screen, with its caret, and its checkmark.
+        let [fx, fy, fw, fh] = FREQ_FIELD;
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, [ox + fx - 1.0, oy + fy - 1.0, fw + 2.0, fh + 2.0], 0xFFFF_FFFF);
+        let text_at = [ox + fx + 2.0, oy + fy + 2.0];
+        game.native_text(batch, &ui.text.value, text_at, 0xE0_E0E0, true);
+        let blink = (game.ticks / 6) % 2 == 0;
+        if ui.text.focused && blink {
+            let before: String = ui.text.value.chars().take(ui.text.cursor).collect();
+            let cx = text_at[0] + game.native_text_width(&before);
+            if ui.text.cursor >= ui.text.value.chars().count() {
+                game.native_text(batch, "_", [cx, text_at[1]], 0xE0_E0E0, true);
+            } else {
+                game.native_fill(batch, [cx, text_at[1] - 1.0, 1.0, 10.0], 0xFFD0_D0D0);
+            }
+        }
+        let typed = !ui.text.value.is_empty();
+        draw_mek_button(game, batch, at(FREQ_CHECK), typed, typed && inside(mouse, FREQ_CHECK));
+        sprite(game, batch, "button/checkmark", [0.0, 0.0, 12.0, 12.0], at(FREQ_CHECK));
+        // Set (a listed frequency other than the one in use) and Delete (one of the player's).
+        let chosen = ui.selected.and_then(|i| shown.get(i).copied());
+        let [set, delete] = freq_buttons(block);
+        let can_set = chosen.is_some_and(|e| view.own.as_ref() != Some(e));
+        let can_delete = chosen.is_some_and(|e| e.owner == own_uuid(game));
+        for (r, label, active) in [(set, "Set", can_set), (delete, "Delete", can_delete)] {
+            draw_mek_button(game, batch, at(r), active, active && inside(mouse, r));
+            let w = game.native_text_width(label);
+            let rgb = if active { 0xFF_FFFF } else { 0xA0_A0A0 };
+            game.native_text(batch, label, [ox + r[0] + (r[2] - w) / 2.0, oy + r[1] + (r[3] - 8.0) / 2.0], rgb, true);
+        }
+        // The teleporter's colour (`ColorButton` in a slot).
+        if teleporter {
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 131.0, oy + 127.0, 18.0, 18.0]);
+            if let Some(e) = &view.own {
+                let rgb = freq::COLORS.get(usize::from(e.color)).map_or(0, |c| c.1);
+                game.native_fill(batch, at(FREQ_COLOR), 0xFF00_0000 | rgb);
+            }
+        }
+    });
+}
+
+/// The selector's tooltips: the mode buttons, the teleporter's status and colour, the power bar, the
+/// entangloporter's energy tab.
+fn frequency_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    if !is_freq_screen(block) {
+        return false;
+    }
+    let modes = ["Public Mode", "Private Mode", "Trusted Mode"];
+    if let Some(i) = FREQ_MODES.iter().position(|r| inside(at, *r)) {
+        lines.push(modes[i].to_owned());
+        return true;
+    }
+    let fe = mekanism_core::energy::format_fe;
+    if kind(block) == Some(Kind::Teleporter) {
+        if inside(at, power_rect(PowerBar::Vertical([158.0, 26.0]))) {
+            lines.push(format!("{}/{}", fe(read_wide(data, DATA_STORED)), fe(read_wide(data, DATA_CAPACITY))));
+            return true;
+        }
+    } else if inside(at, [-26.0, 137.0, 26.0, 26.0]) {
+        lines.push(format!("Storing: {}", fe(read_wide(data, DATA_STORED))));
+        return true;
+    }
+    false
+}
+
+/// Tooltips that need what the client heard of the block: the teleporter's status and colour.
+pub(super) fn frequency_tooltip_view(game: &Game<'_>, block: &str, at: [f32; 2], lines: &mut Vec<String>) {
+    if kind(block) != Some(Kind::Teleporter) || !lines.is_empty() {
+        return;
+    }
+    let Some((_, view)) = freq_view(game) else {
+        return;
+    };
+    if inside(at, TELEPORTER_STATUS) {
+        let status = match (view.own.is_some(), view.status) {
+            (false, _) => "No frequency",
+            (_, 0) => "Ready",
+            (_, 1) => "No frame",
+            (_, 3) => "Needs energy",
+            _ => "No destination",
+        };
+        lines.push(status.to_owned());
+    } else if inside(at, FREQ_COLOR)
+        && let Some(e) = &view.own
+    {
+        lines.push(freq::COLORS.get(usize::from(e.color)).map_or("", |c| c.0).to_owned());
+    }
+}
+
+/// The public frequency a name tag names, its owner the player using it.
+fn name_tag_frequency(game: &Game<'_>, name: &str) -> freq::Entry {
+    let player = game.native_acting_player();
+    freq::Entry {
+        name: name.to_owned(),
+        security: freq::Security::Public,
+        owner: player.as_ref().map_or(0, |p| p.uuid),
+        owner_name: player.map(|p| p.name).unwrap_or_default(),
+        color: freq::DEFAULT_COLOR,
+    }
 }
