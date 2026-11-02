@@ -146,6 +146,48 @@ pub fn teleport_energy(distance_sq: f64) -> u64 {
     (TOOL_TELEPORT_ENERGY as f64 * (distance_sq / 10.0)).ceil() as u64
 }
 
+/// `GearConfig.mekaSuitJetpackMaxStorage`: 24 buckets of hydrogen.
+pub const SUIT_JETPACK_CAPACITY: u64 = 24_000;
+/// `GearConfig.mekaSuitEnergyUsageSprintBoost`.
+pub const SUIT_SPRINT_ENERGY: f64 = 100.0;
+
+fn units(installed: &Installed, module: &str) -> u32 {
+    installed.get(module).copied().unwrap_or(0)
+}
+
+/// `ModuleHydraulicPropulsionUnit.StepAssist`: the highest step the installed units reach (low 0.5,
+/// medium 1, high 1.5, ultra 2 blocks), 0 without the unit.
+pub fn step_assist(installed: &Installed) -> f64 {
+    [0.0, 0.5, 1.0, 1.5, 2.0]
+        [units(installed, "mekanism:hydraulic_propulsion_unit").min(4) as usize]
+}
+
+/// `ModuleLocomotiveBoostingUnit.SprintBoost`: the strongest boost the installed units reach (low
+/// 0.05, medium 0.1, high 0.25, ultra 0.5), 0 without the unit.
+pub fn sprint_boost(installed: &Installed) -> f32 {
+    [0.0, 0.05, 0.1, 0.25, 0.5]
+        [units(installed, "mekanism:locomotive_boosting_unit").min(4) as usize]
+}
+
+/// The energy a tick of sprint boost costs (`canFunction`: 100 FE for each 0.1 of boost).
+pub fn sprint_energy(boost: f32) -> u64 {
+    (SUIT_SPRINT_ENERGY * f64::from(boost) / 0.1).round() as u64
+}
+
+/// `ModuleLocomotiveBoostingUnit.tick`: `moveRelative(boost, (0, 0, 1))` toward the player's yaw, a fifth
+/// as strong in the air or in water.
+pub fn sprint_push(boost: f32, yaw_degrees: f32, on_ground: bool, in_water: bool) -> [f64; 2] {
+    let mut b = boost;
+    if !on_ground {
+        b /= 5.0;
+    }
+    if in_water {
+        b /= 5.0;
+    }
+    let yaw = f64::from(yaw_degrees).to_radians();
+    [-yaw.sin() * f64::from(b), yaw.cos() * f64::from(b)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +214,20 @@ mod tests {
         assert_eq!(tool_destroy_energy(16, 0.0), 80);
         assert_eq!(tool_destroy_speed(16, 80, 1.5), 2.0);
         assert_eq!(teleport_energy(250.0), 25_000);
+    }
+
+    #[test]
+    fn suit_modules() {
+        let mut m = Installed::new();
+        assert_eq!(step_assist(&m), 0.0);
+        install(BOOTS, &mut m, "mekanism:hydraulic_propulsion_unit", 2);
+        assert_eq!(step_assist(&m), 1.0);
+        install(PANTS, &mut m, "mekanism:locomotive_boosting_unit", 4);
+        assert_eq!(sprint_boost(&m), 0.5);
+        assert_eq!(sprint_energy(0.5), 500);
+        let [x, z] = sprint_push(0.5, 0.0, true, false);
+        assert!(x.abs() < 1e-9 && (z - 0.5).abs() < 1e-9);
+        let [_, z] = sprint_push(0.5, 0.0, false, true);
+        assert!((z - 0.02).abs() < 1e-6);
     }
 }

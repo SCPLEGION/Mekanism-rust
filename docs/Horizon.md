@@ -779,3 +779,26 @@ behind it into the drives, and it stores what hoppers put in it.
 - The modification station's screen, and choosing a module's mode. The tool always uses its fastest.
 - Attack amplification, silk touch, fortune, vein mining, blasting, farming and shearing units: they
   install, but do nothing yet.
+
+## M43: the MekaSuit
+
+**Armour.** The helmet, body armor, pants and boots copy netherite armour: its armour, toughness and
+knockback resistance (`MekanismStartupConfig`). Each piece holds 16 MFE (doubled by each energy
+unit) and takes the modules for its slot at the Modification Station (M42).
+
+**Modules**
+- **Jetpack Unit** (body armor): the body armor works as a jetpack. It holds 24 buckets of hydrogen
+  (`mekaSuitJetpackMaxStorage`) and fills from a chemical tank, as the jetpack does.
+- **Hydraulic Propulsion Unit** (boots): step assist as high as the installed units reach: 0.5, 1,
+  1.5 or 2 blocks. Sneaking turns it off.
+- **Locomotive Boosting Unit** (pants): sprinting pushes you forward by 0.05, 0.1, 0.25 or 0.5, a
+  fifth as much in the air or in water. Each tick of it costs 100 FE for every 0.1 of boost
+  (`ModuleLocomotiveBoostingUnit`).
+- **Boots.** Without any module the boots guard against fall damage as free runners do, paid from
+  their energy.
+
+**Not ported**
+- Damage absorption by energy: Horizon's native API has no damage hook.
+- The elytra and gravitational modulating units, the jump boost, and the helmet's units (breathing,
+  vision, food). The remaining body armor and boots units also do nothing yet.
+- The HUD and module modes. Every module uses its strongest mode.

@@ -372,6 +372,11 @@ def build_module(ns, out):
             item["components"] = {"minecraft:equippable": {"slot": "feet"}}
             if path.stem == "free_runners":
                 item["components"]["minecraft:attribute_modifiers"] = []
+        # The MekaSuit's armour, toughness and knockback resistance are netherite's (`MekanismStartupConfig`).
+        suit = {"mekasuit_helmet": "helmet", "mekasuit_bodyarmor": "chestplate", "mekasuit_pants": "leggings",
+                "mekasuit_boots": "boots"}
+        if path.stem in suit:
+            item["template"] = f"minecraft:netherite_{suit[path.stem]}"
         write_json(declared / "item" / f"{path.stem}.json", item)
         items += 1
     report["blocks"] = len(blocks)

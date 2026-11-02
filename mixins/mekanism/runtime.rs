@@ -3031,14 +3031,23 @@ const JETPACKS: [&str; 2] = ["mekanism:jetpack", "mekanism:jetpack_armored"];
 /// The client's word, each tick it thrusts, that its wearer spends a mB of hydrogen.
 const JETPACK_CHANNEL: &str = "mekanism:jetpack";
 
+/// A jetpack, or MekaSuit body armor with a Jetpack Unit (`ModuleJetpackUnit`).
+fn is_jetpack(stack: &ItemStack) -> bool {
+    JETPACKS.contains(&&*stack.item) || (&*stack.item == modules::BODYARMOR && modules_of(stack).contains_key("mekanism:jetpack_unit"))
+}
+
+fn jetpack_capacity(stack: &ItemStack) -> u64 {
+    if &*stack.item == modules::BODYARMOR { modules::SUIT_JETPACK_CAPACITY } else { gear::JETPACK_CAPACITY }
+}
+
 fn jetpack_fuel(stack: &ItemStack) -> u64 {
-    item_tank(stack, CHEMICAL_KEY, gear::JETPACK_CAPACITY)
+    item_tank(stack, CHEMICAL_KEY, jetpack_capacity(stack))
         .filter(|t| t.chemical.as_deref() == Some("mekanism:hydrogen"))
         .map_or(0, |t| t.amount)
 }
 
 fn set_jetpack_fuel(stack: &mut ItemStack, amount: u64) {
-    let mut tank = ChemicalTank::new(gear::JETPACK_CAPACITY);
+    let mut tank = ChemicalTank::new(jetpack_capacity(stack));
     tank.insert("mekanism:hydrogen", amount);
     let mut c = Compound::new();
     put_tank(&mut c, "t", &tank);
@@ -3057,7 +3066,8 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
         return;
     }
     free_runners_tick(game);
-    let Some(chest) = game.armor[1].as_ref().filter(|s| JETPACKS.contains(&&*s.item)) else {
+    mekasuit_sprint(game);
+    let Some(chest) = game.armor[1].as_ref().filter(|s| is_jetpack(s)) else {
         return;
     };
     if jetpack_fuel(chest) == 0 || !game.keys.contains(&winit::keyboard::KeyCode::Space) {
@@ -3081,10 +3091,14 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str) {
         free_runners_fall(game);
         return;
     }
+    if channel == MEKASUIT_CHANNEL && game.native_on(MOD_ID) {
+        mekasuit_sprint_paid(game);
+        return;
+    }
     if channel != JETPACK_CHANNEL || !game.native_on(MOD_ID) {
         return;
     }
-    let Some(chest) = game.armor[1].as_mut().filter(|s| JETPACKS.contains(&&*s.item)) else {
+    let Some(chest) = game.armor[1].as_mut().filter(|s| is_jetpack(s)) else {
         return;
     };
     let fuel = jetpack_fuel(chest);
@@ -3104,11 +3118,12 @@ pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         return false;
     }
     let selected = game.selected;
-    let Some(held) = game.inventory.get(selected).cloned().flatten().filter(|s| JETPACKS.contains(&&*s.item)) else {
+    let Some(held) = game.inventory.get(selected).cloned().flatten().filter(is_jetpack) else {
         return false;
     };
     let fuel = jetpack_fuel(&held);
-    let room = gear::JETPACK_CAPACITY - fuel;
+    let capacity = jetpack_capacity(&held);
+    let room = capacity - fuel;
     let taken = game.native_with_mod_block_entity(pos, |m| {
         let Some(Kind::ChemicalTank(t)) = kind(&m.id) else {
             return None;
@@ -3128,7 +3143,7 @@ pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     set_jetpack_fuel(&mut held, fuel + n);
     game.inventory[selected] = Some(held);
     if let Some(player) = game.native_acting_player() {
-        let line = format!("Jetpack: {} / {} mB hydrogen", fuel + n, gear::JETPACK_CAPACITY);
+        let line = format!("Jetpack: {} / {} mB hydrogen", fuel + n, capacity);
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
     true
@@ -3152,7 +3167,7 @@ fn free_runner_mode(stack: &ItemStack) -> gear::FreeRunnerMode {
 
 /// The free runners on the feet, when worn.
 fn worn_free_runners<'g>(game: &'g Game<'_>) -> Option<&'g ItemStack> {
-    game.armor[3].as_ref().filter(|s| FREE_RUNNERS.contains(&&*s.item))
+    game.armor[3].as_ref().filter(|s| FREE_RUNNERS.contains(&&*s.item) || &*s.item == modules::BOOTS)
 }
 
 /// On the window each tick: the step assist of the normal mode (`PlayerState.updateStepAssist`, 0.5
@@ -3161,11 +3176,17 @@ fn worn_free_runners<'g>(game: &'g Game<'_>) -> Option<&'g ItemStack> {
 fn free_runners_tick(game: &mut Game<'_>) {
     let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
     let runners = worn_free_runners(game).map(|s| (free_runner_mode(s), stored_energy(s)));
-    let step = runners.is_some_and(|(mode, _)| mode.step_boost()) && !sneaking;
+    // MekaSuit boots step as high as their Hydraulic Propulsion Unit reaches.
+    let height = match worn_free_runners(game) {
+        Some(s) if &*s.item == modules::BOOTS => modules::step_assist(&modules_of(s)),
+        Some(s) if free_runner_mode(s).step_boost() => gear::FREE_RUNNER_STEP,
+        _ => 0.0,
+    };
+    let step = height > 0.0 && runners.is_some_and(|(_, energy)| energy > 0) && !sneaking;
     let Some(p) = game.player.as_mut() else {
         return;
     };
-    let _ = p.set_modifier("minecraft:step_height", STEP_ASSIST_ID, gear::FREE_RUNNER_STEP, "add_value", step);
+    let _ = p.set_modifier("minecraft:step_height", STEP_ASSIST_ID, height, "add_value", step);
     let falling = p.fall_distance > 0.0 && !p.flying && !p.spectator;
     if falling && runners.is_some_and(|(mode, energy)| mode.prevents_fall_damage() && energy > 0) {
         game.native_send_to_server(FREE_RUNNERS_CHANNEL, &[1]);
@@ -3178,7 +3199,7 @@ fn free_runners_fall(game: &mut Game<'_>) {
     let Some(fallen) = game.player.as_ref().map(|p| f64::from(p.fall_distance)) else {
         return;
     };
-    let Some(feet) = game.armor[3].as_mut().filter(|s| FREE_RUNNERS.contains(&&*s.item)) else {
+    let Some(feet) = game.armor[3].as_mut().filter(|s| FREE_RUNNERS.contains(&&*s.item) || &*s.item == modules::BOOTS) else {
         return;
     };
     if fallen <= 0.0 || !free_runner_mode(feet).prevents_fall_damage() {
@@ -5855,4 +5876,38 @@ fn meka_tool_use(game: &mut Game<'_>, claimed: &mut bool) {
     }
     *claimed = true;
     place_player(game, [f64::from(p[0]) + 0.5, f64::from(p[1]) + 1.0, f64::from(p[2]) + 0.5]);
+}
+
+// --- MekaSuit ---------------------------------------------------------------------------------------
+
+/// The window tells the server that its player's Locomotive Boosting Unit pushed them this tick.
+const MEKASUIT_CHANNEL: &str = "mekanism:mekasuit";
+
+/// The window's tick: sprinting in MekaSuit pants with a Locomotive Boosting Unit and the energy for it
+/// pushes the player forward (`ModuleLocomotiveBoostingUnit.tickClient`); the server pays for it.
+fn mekasuit_sprint(game: &mut Game<'_>) {
+    let Some(pants) = game.armor[2].as_ref().filter(|s| &*s.item == modules::PANTS) else {
+        return;
+    };
+    let boost = modules::sprint_boost(&modules_of(pants));
+    if boost <= 0.0 || stored_energy(pants) < modules::sprint_energy(boost) {
+        return;
+    }
+    let Some(p) = game.player.as_mut().filter(|p| p.sprinting && !p.fall_flying && !p.flying) else {
+        return;
+    };
+    let [x, z] = modules::sprint_push(boost, p.yaw, p.ground.on_ground, p.swimming);
+    p.velocity.x += x;
+    p.velocity.z += z;
+    game.native_send_to_server(MEKASUIT_CHANNEL, &[1]);
+}
+
+/// On the server: the boost's energy comes out of the pants (`canFunction`).
+fn mekasuit_sprint_paid(game: &mut Game<'_>) {
+    let Some(pants) = game.armor[2].as_mut().filter(|s| &*s.item == modules::PANTS) else {
+        return;
+    };
+    let cost = modules::sprint_energy(modules::sprint_boost(&modules_of(pants)));
+    let stored = stored_energy(pants);
+    set_energy(pants, stored.saturating_sub(cost));
 }
