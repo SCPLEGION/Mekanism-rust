@@ -384,7 +384,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::ChemicalInfuser
             | Kind::Washer
             | Kind::Pump
-            | Kind::Plenisher,
+            | Kind::Plenisher
+            | Kind::Heater,
         ) => {
             *container = Some(ModContainer {
                 slots: 3,
@@ -4591,6 +4592,10 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
         },
+        // GuiResistiveHeater: the screen with its temperature and usage, the power bar on the right.
+        Kind::Heater => Layout { slots: [None, None, None], gauges: vec![], power: Some(PowerBar::Vertical([164.0, 15.0])), progress: None },
+        // GuiFuelwoodHeater: its fuel slot, the screen, the flame.
+        Kind::FuelwoodHeater => Layout { slots: [Some(([15.0, 29.0], "slot/normal")), None, None], gauges: vec![], power: None, progress: None },
         Kind::DigitalMiner => Layout {
             slots: [None, Some(([152.0, 20.0], "slot/power")), None],
             gauges: vec![],
@@ -4635,6 +4640,19 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
         // The plenisher's screen says whether it has filled all it can (in the progress slot).
         if kind(&entity.id) == Some(Kind::Plenisher) {
             entity.data[2] = get_int(&entity.nbt, "finished") as i32;
+        }
+        // A heater's temperature in tenths of a kelvin: the ambient 300 K and its held heat over its
+        // heat capacity (`HEAT_CAPACITY`, 100); then the fuelwood heater's burn time, or the
+        // resistive heater's usage a tick.
+        if let Some(k @ (Kind::Heater | Kind::FuelwoodHeater)) = kind(&entity.id) {
+            let temp = 300.0 + get_double(&entity.nbt, "heat_out").unwrap_or(0.0) / 100.0;
+            entity.data[2] = (temp * 10.0).clamp(0.0, 32_767.0) as i32;
+            if k == Kind::FuelwoodHeater {
+                entity.data[3] = get_int(&entity.nbt, "burn_time").min(32_767) as i32;
+            } else {
+                entity.data.truncate(DATA_USAGE);
+                entity.data.extend(wide(heater_usage(&entity.nbt)));
+            }
         }
     }
     for g in &l.gauges {
@@ -4731,7 +4749,7 @@ fn tabs(block: &str) -> u8 {
             TAB_UPGRADE | TAB_REDSTONE | TAB_SECURITY
         }
         Some(Kind::EnergyCube(_) | Kind::ChemicalTank(_)) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
-        Some(Kind::Vibrator) => TAB_REDSTONE | TAB_SECURITY,
+        Some(Kind::Vibrator | Kind::Heater | Kind::FuelwoodHeater) => TAB_REDSTONE | TAB_SECURITY,
         Some(Kind::FluidTank(_)) => TAB_SECURITY,
         _ => 0,
     }
@@ -5749,6 +5767,12 @@ fn extras(block: &str) -> Extras {
             ..none
         },
         Some(Kind::Pump | Kind::Plenisher) => Extras { screen: Some([54.0, 23.0, 80.0, 42.0]), arrows: vec![[32.0, 39.0]], ..none },
+        Some(Kind::Heater) => Extras { screen: Some([48.0, 23.0, 80.0, 42.0]), ..none },
+        Some(Kind::FuelwoodHeater) => Extras {
+            screen: Some([48.0, 23.0, 80.0, 28.0]),
+            active_progress: vec![([144.0, 31.0], "progress/flame", [13.0, 13.0])],
+            ..none
+        },
         _ => none,
     }
 }
@@ -5771,6 +5795,16 @@ fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
         Some(Kind::Plenisher) => {
             let finished = if data.get(2).copied().unwrap_or(0) == 1 { "Yes" } else { "No" };
             vec![energy, format!("Finished: {finished}"), fluid()]
+        }
+        // The heaters' temperature (kelvin, sent in tenths) and the usage or the fuel left.
+        Some(Kind::Heater | Kind::FuelwoodHeater) => {
+            let temp = f64::from(data.get(2).copied().unwrap_or(3000).max(0)) / 10.0;
+            let temp = format!("Temp: {}", mekanism_core::energy::format_unit(temp, "K"));
+            if kind(block) == Some(Kind::Heater) {
+                vec![temp, format!("Usage: {}/t", fe(read_wide(data, DATA_USAGE)))]
+            } else {
+                vec![temp, format!("Fuel: {}", data.get(3).copied().unwrap_or(0).max(0))]
+            }
         }
         _ => vec![],
     }
@@ -5873,6 +5907,10 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
     }
     if l.power.is_some() {
         sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
+    }
+    // The heaters' heat tab (`GuiHeatTab`, in kelvin) above the energy tab.
+    if matches!(kind(block), Some(Kind::Heater | Kind::FuelwoodHeater)) {
+        sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
     }
     draw_extras(game, batch, block, data, origin);
     draw_tabs(game, batch, block, &l, data, origin);

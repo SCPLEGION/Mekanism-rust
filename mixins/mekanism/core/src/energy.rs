@@ -128,8 +128,13 @@ mod tests {
 /// An amount of FE with an SI prefix, as Mekanism shows energy (`UnitDisplayUtils`): "500 FE",
 /// "12.5 kFE", "4 MFE", up to two decimals.
 pub fn format_fe(fe: u64) -> String {
+    format_unit(fe as f64, "FE")
+}
+
+/// A value with an SI prefix before `unit` (`UnitDisplayUtils.getDisplayShort`): "300 K", "1.5 kK".
+pub fn format_unit(value: f64, unit: &str) -> String {
     const PREFIXES: [&str; 7] = ["", "k", "M", "G", "T", "P", "E"];
-    let mut value = fe as f64;
+    let mut value = value;
     let mut i = 0;
     while value >= 1000.0 && i + 1 < PREFIXES.len() {
         value /= 1000.0;
@@ -142,7 +147,7 @@ pub fn format_fe(fe: u64) -> String {
     if text.ends_with('.') {
         text.pop();
     }
-    format!("{text} {}FE", PREFIXES[i])
+    format!("{text} {}{unit}", PREFIXES[i])
 }
 
 #[cfg(test)]
@@ -153,5 +158,7 @@ mod format_tests {
         assert_eq!(super::format_fe(12_500), "12.5 kFE");
         assert_eq!(super::format_fe(4_000_000), "4 MFE");
         assert_eq!(super::format_fe(0), "0 FE");
+        assert_eq!(super::format_unit(300.0, "K"), "300 K");
+        assert_eq!(super::format_unit(1_534.567, "K"), "1.53 kK");
     }
 }
