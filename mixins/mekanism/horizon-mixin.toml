@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "cdf0e4f82048bf548a0055a0ab728755009df53f"
+horizon_revision = "b50492ee2beaad1b775b67047316d0ca4263f2ee"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -189,6 +189,32 @@ bindings = [
   { name = "data", ty = "&[i32]", value = "data" },
   { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
   { name = "origin", ty = "[f32; 2]", value = "origin" },
+]
+
+[[injection]]
+id = "screen-overlay"
+hook = "screen_overlay"
+hook_version = 1
+kind = "HEAD"
+helper = "screen_overlay.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "block", ty = "&str", value = "block" },
+  { name = "data", ty = "&[i32]", value = "data" },
+  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+  { name = "origin", ty = "[f32; 2]", value = "origin" },
+]
+
+[[injection]]
+id = "screen-covers"
+hook = "screen_covers"
+hook_version = 1
+kind = "HEAD"
+helper = "screen_covers.rs"
+bindings = [
+  { name = "block", ty = "&str", value = "block" },
+  { name = "at", ty = "[f32; 2]", value = "at" },
+  { name = "covered", ty = "&mut bool", value = "&mut *covered" },
 ]
 
 [[injection]]
