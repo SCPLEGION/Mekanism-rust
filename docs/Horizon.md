@@ -1126,3 +1126,14 @@ the gauge table), and the textures don't animate.
 - **Tabs.** Both get redstone control and security.
 - **Not done yet:** the resistive heater's usage text field (its usage still comes from its
   stored setting) and the heat tab's tooltip.
+
+## Creative tabs (Horizon API 34)
+
+Four tabs, one per module (Mekanism, Generators, Additions, Tools), through the `native_creative_tabs` hook. Each
+lists the module's items, then its blocks, then its fluid buckets, in the order of the Java registries
+(`MekanismCreativeTabs` and its three siblings); `python3 tools/gen_creative_tabs.py` regenerates
+`mixins/mekanism/core/src/creative_tabs.rs` from them. Icons as in Java (Metallurgic Infuser, Heat Generator, Lime
+Balloon, Diamond Paxel). Horizon pages the tab row like NeoForge: vanilla's tabs are page 1, Mekanism's page 2, with
+`<` `>` buttons. Left out for now: the stacks that need components (the Module item's per-module stacks, pre-filled
+fluid and chemical tanks, the filled canteen) and the entries Mekanism adds to vanilla tabs.
+Needs Horizon `claude/project-thread-84ao32` (SCPLEGION/horizon#15, stacked on h13).
