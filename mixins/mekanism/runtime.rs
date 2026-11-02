@@ -4301,6 +4301,13 @@ fn layout(block: &str) -> Option<Layout> {
     let gauge = |key, capacity, x, y, size| Gauge { key, capacity, at: [x, y], size };
     let large_right = |x, y| Some(([x, y], "progress/large_right", [48.0, 8.0]));
     Some(match kind(block)? {
+        // GuiFactory: its slots and arrows are drawn by `factory_slots`; the power bar sits at the right.
+        Kind::Factory(..) => Layout {
+            slots: [None, None, None],
+            gauges: vec![],
+            power: Some(PowerBar::Vertical([screen_width(block) - 12.0, 16.0])),
+            progress: None,
+        },
         // The frequency screens (`draw_frequency_screen`): the teleporter's power bar.
         Kind::Teleporter => Layout { slots: [None, None, None], gauges: vec![], power: Some(PowerBar::Vertical([158.0, 26.0])), progress: None },
         Kind::Entangloporter => Layout { slots: [None, None, None], gauges: vec![], power: None, progress: None },
@@ -4680,6 +4687,44 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
             }
             entity.data.push((get_int(&entity.nbt, "no_eject") & 7) as i32);
         }
+        // Then a factory's progress on each process, as the height of its arrow (0 to 20).
+        if let Some(Kind::Factory(n, _, usage)) = kind(&entity.id) {
+            let ticks = i64::from(Factory::new(n, usage, upgrades(&entity.nbt)).machine.ticks_required.max(1));
+            let saved = match entity.nbt.get(&JavaString::from("progress")) {
+                Some(Tag::IntArray(v)) => v.clone(),
+                _ => vec![],
+            };
+            for i in 0..n {
+                let done = i64::from(saved.get(i).copied().unwrap_or(0).max(0));
+                entity.data.push((done * 20 / ticks).clamp(0, 20) as i32);
+            }
+        }
+    }
+}
+
+/// A factory screen's width: 34 wider for the ultimate tier's nine processes.
+fn screen_width(block: &str) -> f32 {
+    if matches!(kind(block), Some(Kind::Factory(9, ..))) { 210.0 } else { 176.0 }
+}
+
+/// Each process's input and output slot (`TileEntityItemToItemFactory.addSlots`).
+fn factory_slots(n: usize) -> Vec<([f32; 2], [f32; 2])> {
+    (0..n).map(|i| factory::slot_x(n, i) as f32).map(|x| ([x, 13.0], [x, 57.0])).collect()
+}
+
+/// A factory's slot frames and the arrows between each process's two slots.
+fn draw_factory_slots(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, _block: &str, n: usize, l: &Layout, data: &[i32], origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let first = redstone_slot(l) + 5;
+    for (i, (input, output)) in factory_slots(n).into_iter().enumerate() {
+        sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + input[0] - 1.0, oy + input[1] - 1.0, 18.0, 18.0]);
+        sprite(game, batch, "slot/output", [0.0, 0.0, 18.0, 18.0], [ox + output[0] - 1.0, oy + output[1] - 1.0, 18.0, 18.0]);
+        let (x, y) = (ox + input[0] + 4.0, oy + 33.0);
+        sprite(game, batch, "progress/down/empty", [0.0, 0.0, 8.0, 20.0], [x, y, 8.0, 20.0]);
+        let h = data.get(first + i).copied().unwrap_or(0).clamp(0, 20) as f32;
+        if h > 0.0 {
+            sprite(game, batch, "progress/down/full", [0.0, 0.0, 8.0, h], [x, y, 8.0, h]);
+        }
     }
 }
 
@@ -4770,20 +4815,21 @@ enum TabKind {
 
 fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
     let t = tabs(block);
+    let right = screen_width(block);
     let mut out = vec![];
     if t & TAB_SIDES != 0 {
         out.push(Tab { at: [-26.0, 6.0], icon: "button/configuration", argb: 0xFFFF_FFFF, what: TabKind::Sides });
         out.push(Tab { at: [-26.0, 34.0], icon: "button/transporter_config", argb: 0xFFFF_FFFF, what: TabKind::Transporter });
     }
     if t & TAB_UPGRADE != 0 {
-        out.push(Tab { at: [176.0, 6.0], icon: "button/upgrade", argb: 0xFFFF_FFFF, what: TabKind::Upgrade });
+        out.push(Tab { at: [right, 6.0], icon: "button/upgrade", argb: 0xFFFF_FFFF, what: TabKind::Upgrade });
     }
     if t & TAB_SECURITY != 0 {
-        out.push(Tab { at: [176.0, 34.0], icon: "security/public", argb: 0xFFFF_A160, what: TabKind::Security });
+        out.push(Tab { at: [right, 34.0], icon: "security/public", argb: 0xFFFF_A160, what: TabKind::Security });
     }
     if t & TAB_REDSTONE != 0 {
         let icon = redstone_of(l, data).0.sprite();
-        out.push(Tab { at: [176.0, 137.0], icon, argb: 0xFFC9_071F, what: TabKind::Redstone });
+        out.push(Tab { at: [right, 137.0], icon, argb: 0xFFC9_071F, what: TabKind::Redstone });
     }
     out
 }
@@ -5738,6 +5784,16 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
     let Some(l) = layout(block) else {
         return;
     };
+    if let Some(Kind::Factory(n, ..)) = kind(block) {
+        let mut slots = vec![None; 2 * FACTORY_ROW];
+        for (i, (input, output)) in factory_slots(n).into_iter().enumerate() {
+            slots[i] = Some(input);
+            slots[FACTORY_ROW + i] = Some(output);
+        }
+        let w = screen_width(block);
+        *screen = Some(super::native_hooks::NativeScreen { width: w, height: 166.0, slots, inventory_y: 84.0, inventory_x: 8.0 + (w - 176.0) / 2.0, own_labels: false });
+        return;
+    }
     *screen = Some(super::native_hooks::NativeScreen {
         width: 176.0,
         height: 166.0,
@@ -5875,14 +5931,19 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
     };
     let [ox, oy] = origin;
     let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0) as f32;
-    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 176.0, 166.0]);
+    let width = screen_width(block);
+    let inv_dx = (width - 176.0) / 2.0;
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, width, 166.0]);
+    if let Some(Kind::Factory(n, ..)) = kind(block) {
+        draw_factory_slots(game, batch, block, n, &l, data, origin);
+    }
     for (at, name) in l.slots.iter().flatten() {
         sprite(game, batch, name, [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
     }
     for row in 0..4 {
         let y = if row < 3 { 84.0 + 18.0 * row as f32 } else { 142.0 };
         for col in 0..9 {
-            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + 18.0 * col as f32, oy + y - 1.0, 18.0, 18.0]);
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + inv_dx + 18.0 * col as f32, oy + y - 1.0, 18.0, 18.0]);
         }
     }
     let gauge = |batch: &mut horizon_client::hud::HudBatch, at: [f32; 2], size: [f32; 2], fill: f32, (texture, argb): (&str, u32)| {

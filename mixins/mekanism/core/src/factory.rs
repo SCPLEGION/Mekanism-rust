@@ -24,6 +24,18 @@ pub fn factory(block: &str) -> Option<(usize, &'static str, u64)> {
     Some((processes, recipe, *usage))
 }
 
+/// The x of process `i`'s slots and arrow column in a factory of `processes` (`baseX + i * baseXMult`
+/// in `TileEntityFactory.addSlots` and `GuiFactory`).
+pub fn slot_x(processes: usize, i: usize) -> i32 {
+    let (base, step) = match processes {
+        3 => (55, 38),
+        5 => (35, 26),
+        7 => (29, 19),
+        _ => (27, 19),
+    };
+    base + step * i as i32
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Factory {
     /// The shared energy and the ticks per operation; its own `progress` is unused.
@@ -73,6 +85,17 @@ impl Factory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slots_are_spread_across_the_screen() {
+        assert_eq!(
+            (0..3).map(|i| slot_x(3, i)).collect::<Vec<_>>(),
+            [55, 93, 131]
+        );
+        assert_eq!(slot_x(9, 8), 27 + 8 * 19);
+        // The ultimate factory's last slot fits its 210 wide screen.
+        assert!(slot_x(9, 8) + 18 < 210 - 12);
+    }
 
     #[test]
     fn factory_ids_name_their_tier_and_kind() {
