@@ -6800,6 +6800,15 @@ fn tick_laser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
         let state = game.world.block(at[0], at[1], at[2]);
         !beam_passes(&game.res.facts().get(state).name)
     });
+    // The beam reaches the face of the block it hits, or its full range.
+    let length = hit.map_or(f64::from(laser::RANGE), |at| {
+        let k = (0..3).map(|i| (at[i] - pos[i]) * d[i]).sum::<i32>();
+        f64::from(k) - 1.002
+    });
+    let firing = laser_hit_entities(game, entity, pos, d, length, firing);
+    if firing == 0 {
+        return Some(true);
+    }
     let Some(at) = hit else {
         put_long(&mut entity.nbt, "progress", 0);
         return Some(true);
@@ -6834,6 +6843,36 @@ fn tick_laser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
         laser_break(game, entity, at);
     }
     Some(true)
+}
+
+/// The mobs and dropped items in the beam, nearest first (`fireLaser`): a tractor beam takes the items
+/// into its rows; each mob takes the damage the energy left does (2,500 FE a point) and burns. The
+/// energy left after them goes on to the block.
+fn laser_hit_entities(game: &mut Game<'_>, entity: &mut ModBlockEntity, pos: [i32; 3], d: [i32; 3], length: f64, firing: u64) -> u64 {
+    let (min, max) = laser::beam_box(pos, d, length);
+    let from = pos.map(|c| f64::from(c) + 0.5);
+    let mut left = firing;
+    for hit in game.native_entities_in(min, max, from) {
+        if hit.kind == "minecraft:item" {
+            if entity.id == laser::TRACTOR_BEAM
+                && let Some(stack) = game.native_take_item_entity(hit.id)
+                && let Some(rest) = store_drop(game, &mut entity.items, stack)
+            {
+                // What has no room drops where the item was.
+                let at = hit.position.map(|c| c.floor() as i32);
+                let block = horizon_core::position::BlockPos::new(at[0], at[1], at[2]);
+                game.with_level(|_, level, _| level.drop_lost_contents(block, vec![Some(rest)]));
+            }
+            continue;
+        }
+        let (damage, fire) = laser::damage(left);
+        let lost = game.native_hurt_mob(hit.id, damage, fire);
+        left -= laser::spent(lost, left);
+        if left == 0 {
+            break;
+        }
+    }
+    left
 }
 
 /// The beam breaks the block at `at` (`withFakePlayer`, with a disassembler's drops): they fall where it

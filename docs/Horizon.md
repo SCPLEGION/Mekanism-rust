@@ -997,3 +997,17 @@ the stacks a filter turns down. The bundle now pins that revision, `8c71132e`, o
 - **Saving.** The frequencies live in memory. Each entangloporter keeps a copy of its frequency in its
   own NBT, and the first one to tick after a load brings the frequency back.
 - **Not done:** the item slot, heat, and private frequencies (all frequencies are public).
+
+## M57: Lasers hit mobs and pick up items
+
+Horizon's API 30 (SCPLEGION/horizon#11) adds entity access for mod blocks: the mobs and dropped items
+in a box, hurting a mob, and picking a dropped item up. The bundle now pins that revision, `b342dda3`,
+on the `milestone/h10-entity-access` branch.
+- **Damage.** The mobs in a beam are hit nearest first (`fireLaser`). Each takes one point of damage
+  per 2,500 FE of the beam's energy (`laser.energyPerDamage`) and burns for as many ticks, unless it
+  is fire immune. The energy its lost health took is spent. If the mobs take all of it, the beam
+  stops at them and digs nothing.
+- **Tractor beam.** A tractor beam's beam picks up the dropped items in it into its three rows. What
+  has no room drops back where the item was.
+- **Not done:** players in the beam aren't hurt (the API lists only mobs and items), and shields
+  don't block the beam.
