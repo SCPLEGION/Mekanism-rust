@@ -2111,6 +2111,10 @@ fn load_sorter(nbt: &Compound) -> Sorter {
         single_item: get_int(nbt, "single") == 1,
         round_robin: get_int(nbt, "round_robin") == 1,
         disabled: strings_of(nbt, "disabled"),
+        opts: match nbt.get(&JavaString::from("filter_opts")) {
+            Some(Tag::String(o)) => Sorter::parse_opts(&o.to_string().unwrap_or_default()),
+            _ => Default::default(),
+        },
     }
 }
 
@@ -2120,6 +2124,7 @@ fn save_sorter(nbt: &mut Compound, s: &Sorter) {
     put_int(nbt, "single", u32::from(s.single_item));
     put_int(nbt, "round_robin", u32::from(s.round_robin));
     nbt.insert("disabled".into(), string_list(&s.disabled));
+    nbt.insert("filter_opts".into(), Tag::String(s.save_opts().as_str().into()));
 }
 
 /// The Logistical Sorter, every 10 ticks: each filter in turn takes its items from the inventory behind
@@ -2143,23 +2148,31 @@ fn tick_sorter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
     let front_face = horizon_core::geometry::Direction::ALL[face_index([-d[0], -d[1], -d[2]])];
     let max = settings.max_move();
     let mut choices: Vec<Option<&str>> = settings.active().map(|f| Some(f.as_str())).collect();
+    let item_tags = world_items!(game).item_tags.clone();
+    let in_tag = |tag: &str, item: &str| item_tags.get(tag).is_some_and(|t| t.contains(item));
     if settings.auto_eject {
         choices.push(None);
     }
-    // The item tags the filters name, read once.
-    let tags: std::collections::HashMap<&str, std::collections::HashSet<String>> = {
-        let items = world_items!(game);
-        let named = settings.active().filter_map(|f| f.strip_prefix('#'));
-        named.map(|t| (t, items.item_tags.get(t).cloned().unwrap_or_default())).collect()
-    };
     for filter in choices {
-        let wanted = |s: &ItemStack| {
-            filter.is_none_or(|f| Sorter::matches(f, &s.item, &|tag: &str| tags.get(tag).is_some_and(|t| t.contains(&*s.item))))
+        // A filter in size mode moves between its min and max items (`SorterFilter.mapInventory`);
+        // auto-eject takes what no filter refuses the default for (`strictFinder`).
+        let opts = filter.map(|f| settings.opts_of(f));
+        let ranged = opts.filter(|o| o.size_mode && !settings.single_item);
+        let take = ranged.map_or(max, |o| u32::from(o.max).clamp(1, max));
+        let wanted = |s: &ItemStack| match filter {
+            Some(f) => Sorter::matches_item(f, &s.item, &in_tag),
+            None => settings.auto_eject_allows(&s.item, &in_tag),
         };
-        let stack = game.native_extract_item_where(back, back_face, max, &wanted);
+        let stack = game.native_extract_item_where(back, back_face, take, &wanted);
         let Some(stack) = stack else {
             continue;
         };
+        if let Some(o) = ranged
+            && stack.count < u32::from(o.min)
+        {
+            game.native_insert_item(back, back_face, stack);
+            continue;
+        }
         let left = if is_transporter(block_name(game, front)) {
             route_items(game, front, pos, stack)
         } else {
@@ -9185,6 +9198,7 @@ fn sorter_payload(game: &mut Game<'_>, data: &[u8]) {
     let held = game.inventory.get(game.selected).cloned().flatten();
     let filter = held.as_ref().and_then(|h| match r.op {
         sorter::Op::AddItem => Some(h.item.to_string()),
+        sorter::Op::AddMod => h.item.split_once(':').map(|(ns, _)| format!("@{ns}")),
         sorter::Op::AddTag => {
             let items = world_items!(game);
             let mut tags: Vec<&String> = items.item_tags.iter().filter(|(_, t)| t.contains(&*h.item)).map(|(k, _)| k).collect();
@@ -9209,9 +9223,32 @@ fn sorter_payload(game: &mut Game<'_>, data: &[u8]) {
             sorter::Op::Delete => {
                 s.remove(index);
             }
-            sorter::Op::AddItem | sorter::Op::AddTag => {
+            sorter::Op::AddItem | sorter::Op::AddTag | sorter::Op::AddMod => {
                 if let Some(f) = filter.filter(|f| !s.filters.contains(f)) {
                     s.filters.push(f);
+                }
+            }
+            sorter::Op::AllowDefault => {
+                s.edit(index, |o| o.allow_default = !o.allow_default);
+            }
+            sorter::Op::SizeMode => {
+                s.edit(index, |o| o.size_mode = !o.size_mode);
+            }
+            sorter::Op::ColorNext | sorter::Op::ColorPrevious => {
+                let next = r.op == sorter::Op::ColorNext;
+                s.edit(index, |o| o.color = sorter::Opts::step_color(o.color, next));
+            }
+            sorter::Op::ColorClear => {
+                s.edit(index, |o| o.color = None);
+            }
+            sorter::Op::Min | sorter::Op::Max => {
+                let (min, max) = (r.op == sorter::Op::Min, r.value);
+                let cur = s.filters.get(index).map(|f| s.opts_of(f));
+                if let Some(c) = cur {
+                    let (lo, hi) = if min { (max, c.max) } else { (c.min, max) };
+                    if sorter::Opts::valid_range(lo, hi) {
+                        s.edit(index, |o| (o.min, o.max) = (lo, hi));
+                    }
                 }
             }
         }
@@ -9220,7 +9257,11 @@ fn sorter_payload(game: &mut Game<'_>, data: &[u8]) {
 }
 
 fn send_sorter(game: &Game<'_>, op: sorter::Op, pos: [i32; 3], index: usize) {
-    let r = sorter::Request { op, pos, index: index.min(usize::from(u16::MAX)) as u16 };
+    send_sorter_value(game, op, pos, index, 0);
+}
+
+fn send_sorter_value(game: &Game<'_>, op: sorter::Op, pos: [i32; 3], index: usize, value: u16) {
+    let r = sorter::Request { op, pos, index: index.min(usize::from(u16::MAX)) as u16, value };
     game.native_send_to_server(SORTER_CHANNEL, &r.encode());
 }
 
@@ -9228,6 +9269,7 @@ fn send_sorter(game: &Game<'_>, op: sorter::Op, pos: [i32; 3], index: usize) {
 fn filter_name(f: &str) -> String {
     match f.strip_prefix('#') {
         Some(tag) => tag.to_owned(),
+        None if f.starts_with('@') => f[1..].to_owned(),
         None => {
             let path = f.split_once(':').map_or(f, |(_, p)| p);
             path.split('_').map(|w| w.chars().next().map_or(String::new(), |c| c.to_uppercase().chain(w.chars().skip(1)).collect())).collect::<Vec<_>>().join(" ")
