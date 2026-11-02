@@ -1011,3 +1011,24 @@ on the `milestone/h10-entity-access` branch.
   has no room drops back where the item was.
 - **Not done:** players in the beam aren't hurt (the API lists only mobs and items), and shields
   don't block the beam.
+
+## G1: Mekanism's tabs and redstone control
+
+The first step of the GUI work (making each screen a faithful port of Mekanism's). Horizon's API 31
+(SCPLEGION/horizon#12) adds tinted GUI sprites; the bundle now pins that revision, `cdf0e4f8`, on the
+`milestone/h11-tinted-sprites` branch.
+- **Tabs.** The screens now carry the tabs Mekanism's do (`GuiMekanismTile.addGenericTabs`,
+  `GuiConfigurableTile`), at Mekanism's positions: side configuration and transporter configuration
+  on the left (y 6 and 34), upgrades and security on the right (y 6 and 34), redstone control on the
+  right (y 137), beside the energy tab. Each is drawn as Mekanism draws it: the holder sprite tinted
+  with the tab's colour (`SpecialColors`), the button inset 4 px (lit under the cursor) and the
+  tab's icon. Machines have all of them; generators and the Digital Miner no side configuration;
+  energy cubes and chemical tanks no upgrades; fluid tanks only security; multiblocks none.
+- **Tooltips.** "Side Config", "Transporter Config", "Upgrades", the security mode, and the redstone
+  mode ("Redstone Detection: IGNORED / NORMAL / INVERTED / PULSE").
+- **Redstone control.** A left click on the redstone tab steps to the next mode, a right click to the
+  previous one (`RedstoneControl`). A machine held back by its mode does nothing that tick and goes
+  dark; pulse runs for the one tick the signal rises. While it waits, the tab shows the warning
+  stripes (tinted, close to Mekanism's multiply blend).
+- **Not done yet:** the side configuration, transporter and upgrade windows the tabs open (next GUI
+  steps), and security (every machine is public with no owner).
