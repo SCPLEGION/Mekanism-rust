@@ -1111,3 +1111,18 @@ copies the first frame of each `mek_liquid` texture to `textures/gui/gauge_fluid
 standard-library PNG crop. If a texture is missing, the gauge falls back to the flat colour.
 **Not done yet:** slurries, pigments and infuse types keep the grey fill (their colours are not in
 the gauge table), and the textures don't animate.
+
+## G6: The heaters' screens
+
+- **Resistive Heater** (`GuiResistiveHeater`): it now opens Mekanism's screen. The inner screen
+  shows "Temp: 300 K" and "Usage: 100 FE/t". There is a vertical power bar on the right, and the
+  energy and heat tabs are on the left.
+- **Fuelwood Heater** (`GuiFuelwoodHeater`): its fuel slot is at (15, 29). The inner screen shows
+  the temperature and "Fuel: n" (the burn ticks left). The flame lights while it burns. The heat
+  tab is on the left.
+- **Temperature.** It is the ambient 300 K plus the heat a heater holds over its heat capacity
+  (`HEAT_CAPACITY`, 100). It reads with SI prefixes as Mekanism's `getDisplayShort` does
+  (`format_unit`, now shared with energy).
+- **Tabs.** Both get redstone control and security.
+- **Not done yet:** the resistive heater's usage text field (its usage still comes from its
+  stored setting) and the heat tab's tooltip.
