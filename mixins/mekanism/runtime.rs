@@ -26,6 +26,7 @@ use mekanism_core::teleporter;
 use mekanism_core::factory::{self, Factory};
 use mekanism_core::generator::HeatGenerator;
 use mekanism_core::machine::{self, ElectricMachine, Operation, Slot};
+use mekanism_core::modules;
 use mekanism_core::tier::{self, BaseTier};
 use mekanism_core::upgrades::{Upgrade, Upgrades};
 use std::sync::Arc;
@@ -2667,7 +2668,7 @@ fn set_energy(stack: &mut ItemStack, energy: u64) {
 /// The item in `entity`'s slot `index` and its energy container, when it holds energy.
 fn energy_item(entity: &ModBlockEntity, index: usize) -> Option<(gear::ItemEnergy, u64)> {
     let stack = entity.items.get(index)?.as_ref()?;
-    let item = gear::item_energy(&stack.item)?;
+    let item = item_energy_of(stack)?;
     Some((item, stored_energy(stack).min(item.capacity)))
 }
 
@@ -2726,6 +2727,12 @@ fn set_disassembler_mode(stack: &mut ItemStack, mode: gear::DisassemblerMode) {
 /// `ItemAtomicDisassembler.getDestroySpeed` (hook point `native_destroy_speed`, API 25): its mode's
 /// efficiency while it holds the energy for the block, slower as it runs out, not at all when empty.
 pub(super) fn destroy_speed(game: &Game<'_>, stack: Option<&ItemStack>, hardness: f32, speed: &mut f32) {
+    if let Some(tool) = stack.filter(|s| &*s.item == modules::MEKA_TOOL)
+        && game.native_on(MOD_ID)
+    {
+        *speed = meka_tool_speed(tool, hardness);
+        return;
+    }
     let Some(stack) = stack.filter(|s| &*s.item == DISASSEMBLER) else {
         return;
     };
@@ -2747,6 +2754,10 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
     }
     if !*claimed && &*stack.item == teleporter::PORTABLE {
         portable_teleporter_use(game, claimed);
+        return;
+    }
+    if !*claimed && &*stack.item == modules::MEKA_TOOL && game.native_on(MOD_ID) {
+        meka_tool_use(game, claimed);
         return;
     }
     if *claimed || &*stack.item != DISASSEMBLER || !game.native_on(MOD_ID) {
@@ -2795,6 +2806,11 @@ pub(super) fn spend_disassembler_energy(game: &mut Game<'_>, pos: [i32; 3]) {
     if let Some(stack) = game.held_mut().as_mut().filter(|s| &*s.item == DISASSEMBLER) {
         let stored = stored_energy(stack);
         let cost = gear::destroy_energy(disassembler_mode(stack), hardness);
+        set_energy(stack, stored.saturating_sub(cost));
+    }
+    if let Some(stack) = game.held_mut().as_mut().filter(|s| &*s.item == modules::MEKA_TOOL) {
+        let stored = stored_energy(stack);
+        let cost = modules::tool_destroy_energy(modules::tool_efficiency(&modules_of(stack)), hardness);
         set_energy(stack, stored.saturating_sub(cost));
     }
 }
@@ -2985,6 +3001,11 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
     {
         let line = bin_line(t, &bin_of(c));
         lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+    }
+    let installed = modules_of(stack);
+    for (id, n) in &installed {
+        let line = format!("{} x{n}", module_name(id));
+        lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0x55, 0x55, 0xFF, 0xFF)));
     }
     if let Some(d) = drive_of(stack) {
         let line = format!("Stored: {} / {} items, {} / {} types", d.total(), d.count_limit, d.items.len(), d.type_limit);
@@ -5681,4 +5702,157 @@ pub(super) fn before_break(game: &mut Game<'_>, pos: [i32; 3]) {
     return_to_network(&mut net, &mut items);
     save_network(game, &net, &at);
     game.native_with_mod_block_entity(pos, |m| m.items = items);
+}
+
+// --- Modules and the Meka-Tool ----------------------------------------------------------------------
+
+/// The modules an item has installed (Mekanism's `module_container` component), in its custom data.
+const MODULES_KEY: &str = "mekanism:modules";
+/// One of each installed module's own item, kept so that removing a module gives back the same item.
+const MODULE_ITEMS_KEY: &str = "mekanism:module_items";
+const MODULE_TYPE_KEY: &str = "mekanism:module_type";
+
+fn modules_of(stack: &ItemStack) -> modules::Installed {
+    let mut out = modules::Installed::new();
+    if let Some(Tag::Compound(c)) = custom_data(stack).and_then(|c| c.get(&JavaString::from(MODULES_KEY))) {
+        for (k, v) in c.iter() {
+            if let (Ok(id), Tag::Int(n)) = (k.to_string(), v)
+                && *n > 0
+            {
+                out.insert(id, *n as u32);
+            }
+        }
+    }
+    out
+}
+
+fn module_type(stack: &ItemStack) -> Option<String> {
+    if &*stack.item != modules::MODULE_ITEM {
+        return None;
+    }
+    get_string(custom_data(stack)?, MODULE_TYPE_KEY)
+}
+
+/// An item's energy limits; the Meka-Tool's and the MekaSuit's grow with their energy units.
+fn item_energy_of(stack: &ItemStack) -> Option<gear::ItemEnergy> {
+    let mut e = gear::item_energy(&stack.item)?;
+    if modules::is_container(&stack.item) {
+        (e.capacity, e.rate) = modules::energy(&modules_of(stack));
+    }
+    Some(e)
+}
+
+fn module_name(id: &str) -> String {
+    let path = id.split_once(':').map_or(id, |(_, p)| p);
+    path.split('_').map(|w| w[..1].to_uppercase() + &w[1..]).collect::<Vec<_>>().join(" ")
+}
+
+/// A right click on the Modification Station holding a Meka-Tool or MekaSuit piece: every module in the
+/// inventory that it takes goes in, up to each module's limit; sneaking takes them all out again
+/// (`ModificationStationContainer`, without its screen).
+pub(super) fn use_modification_station(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || block_name(game, pos) != modules::STATION {
+        return false;
+    }
+    let selected = game.selected;
+    let Some(held) = game.inventory.get(selected).cloned().flatten().filter(|s| modules::is_container(&s.item)) else {
+        tell(game, "Modification Station: hold a Meka-Tool or a MekaSuit piece".to_owned());
+        return true;
+    };
+    let mut installed = modules_of(&held);
+    let mut kept = match custom_data(&held).and_then(|c| c.get(&JavaString::from(MODULE_ITEMS_KEY))) {
+        Some(Tag::Compound(c)) => c.clone(),
+        _ => Compound::new(),
+    };
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    if sneaking {
+        for (id, n) in std::mem::take(&mut installed) {
+            let item = kept.get(&JavaString::from(id.as_str())).and_then(horizon_items::item_nbt::item_from_nbt);
+            if let Some(item) = item {
+                game.give_or_drop(ItemStack { count: n, ..item });
+            }
+        }
+        kept = Compound::new();
+    } else {
+        for i in 0..game.inventory.len().min(36) {
+            let Some(s) = game.inventory[i].clone() else {
+                continue;
+            };
+            let Some(id) = module_type(&s) else {
+                continue;
+            };
+            let put = modules::install(&held.item, &mut installed, &id, s.count);
+            if put > 0 {
+                kept.insert(id.as_str().into(), horizon_items::item_nbt::item_to_nbt(&ItemStack { count: 1, ..s.clone() }));
+                game.inventory[i] = (s.count > put).then(|| ItemStack { count: s.count - put, ..s });
+            }
+        }
+    }
+    let mut c = Compound::new();
+    for (id, n) in &installed {
+        c.insert(id.as_str().into(), Tag::Int(*n as i32));
+    }
+    let mut stack = held;
+    let stored = stored_energy(&stack);
+    set_custom_compound(&mut stack, MODULES_KEY, c);
+    set_custom_compound(&mut stack, MODULE_ITEMS_KEY, kept);
+    // Fewer energy units hold less (`ModuleEnergyUnit.onRemoved`).
+    let capacity = item_energy_of(&stack).map_or(stored, |e| e.capacity);
+    set_energy(&mut stack, stored.min(capacity));
+    let line = if installed.is_empty() {
+        "No modules installed".to_owned()
+    } else {
+        installed.iter().map(|(id, n)| format!("{} x{n}", module_name(id))).collect::<Vec<_>>().join(", ")
+    };
+    game.inventory[selected] = Some(stack);
+    tell(game, line);
+    true
+}
+
+/// The Meka-Tool's mining speed: its efficiency while it holds the energy for the block.
+fn meka_tool_speed(stack: &ItemStack, hardness: f32) -> f32 {
+    let efficiency = modules::tool_efficiency(&modules_of(stack));
+    modules::tool_destroy_speed(efficiency, stored_energy(stack), hardness)
+}
+
+/// A right click with the Meka-Tool and its Teleportation Unit: to the top of the block looked at, up to
+/// 100 blocks away, for 1,000 FE per 10 blocks² (`ItemMekaTool.use`).
+fn meka_tool_use(game: &mut Game<'_>, claimed: &mut bool) {
+    let Some(held) = game.held_mut().clone().filter(|s| &*s.item == modules::MEKA_TOOL) else {
+        return;
+    };
+    if !modules_of(&held).contains_key("mekanism:teleportation_unit") {
+        return;
+    }
+    let Some((origin, dir)) = game.aim() else {
+        return;
+    };
+    let Some(hit) = game.clip_ray(origin, dir, modules::TOOL_TELEPORT_REACH) else {
+        return;
+    };
+    let p = hit.pos;
+    let free = |game: &Game<'_>, dy: i32| block_name(game, [p[0], p[1] + dy, p[2]]).ends_with("air");
+    if !free(game, 1) || !free(game, 2) {
+        return;
+    }
+    let Some(at) = game.player.as_ref().map(|pl| [pl.position.x, pl.position.y, pl.position.z]) else {
+        return;
+    };
+    let distance_sq: f64 = (0..3).map(|k| (at[k] - f64::from(p[k])).powi(2)).sum();
+    if distance_sq < 5.0 {
+        return;
+    }
+    let cost = modules::teleport_energy(distance_sq);
+    let creative = game.creative;
+    if let Some(stack) = game.held_mut().as_mut() {
+        let stored = stored_energy(stack);
+        if !creative {
+            if stored < cost {
+                return;
+            }
+            set_energy(stack, stored - cost);
+        }
+    }
+    *claimed = true;
+    place_player(game, [f64::from(p[0]) + 0.5, f64::from(p[1]) + 1.0, f64::from(p[2]) + 0.5]);
 }

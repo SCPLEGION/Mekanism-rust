@@ -26,6 +26,15 @@ pub fn item_energy(id: &str) -> Option<ItemEnergy> {
             crate::teleporter::PORTABLE_CHARGE_RATE,
             false,
         ),
+        crate::modules::MEKA_TOOL
+        | crate::modules::HELMET
+        | crate::modules::BODYARMOR
+        | crate::modules::PANTS
+        | crate::modules::BOOTS => (
+            crate::modules::BASE_CAPACITY,
+            crate::modules::BASE_CHARGE_RATE,
+            false,
+        ),
         "mekanism:free_runners" | "mekanism:free_runners_armored" => {
             (FREE_RUNNER_CAPACITY, FREE_RUNNER_CHARGE_RATE, false)
         }

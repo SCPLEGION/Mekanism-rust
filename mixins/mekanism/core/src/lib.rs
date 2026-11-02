@@ -20,6 +20,7 @@ pub mod isotopes;
 pub mod machine;
 pub mod matrix;
 pub mod miner;
+pub mod modules;
 pub mod nuclear;
 pub mod qio;
 pub mod recipe_table;
