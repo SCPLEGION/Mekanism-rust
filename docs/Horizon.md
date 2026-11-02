@@ -1032,3 +1032,28 @@ The first step of the GUI work (making each screen a faithful port of Mekanism's
   stripes (tinted, close to Mekanism's multiply blend).
 - **Not done yet:** the side configuration, transporter and upgrade windows the tabs open (next GUI
   steps), and security (every machine is public with no owner).
+
+## G2: The side configuration window
+
+Horizon's API 32 (SCPLEGION/horizon#13) lets a mod draw a window over its screen's slots and keep the
+slots under it from taking clicks. The bundle now pins that revision, `b50492ee`, on the
+`milestone/h12-screen-overlay` branch.
+- **Opening.** A click on the side configuration tab opens Mekanism's window
+  (`GuiSideConfiguration`, 156×135, centred 15 px down) on the block's first type. The close button
+  at its top left closes it.
+- **What it shows.** The type tabs on its left (Items, Chemicals, Energy, in their colours; the
+  shown one hidden), the title ("Items Config"), the eject screen ("Eject: On", or "Can't Eject"
+  for a machine's energy), the auto-eject and clear buttons, and the six face buttons at
+  Mekanism's places (front, left, right, back, top, bottom relative to the block's front). Each
+  button has its mode's colour, Mekanism's slightly brighter tint, and the block beside that face
+  drawn on it. The tooltips name the side and the mode.
+- **Modes.** Horizon's side modes show as Mekanism's data types: None (grey), Input (red), Output
+  (blue), and the machine's default, which takes in and gives out, as Input/Output (purple). A left
+  click on a face steps forward through them and a right click steps back. The clear button sets
+  every face to None; if every face already has the same mode, it steps them all to the next mode
+  (a right click: the previous one).
+- **Auto-eject.** The eject button turns a type's auto-eject on or off. With it off, the machine
+  pushes that type out of no face. Unlike Mekanism, it starts on, because Horizon's machines always
+  pushed their output.
+- **Not done yet:** shift-clicks (they act as plain clicks), fluids as a type of their own (they go
+  with chemicals), the transporter configuration window, and dragging or pinning the window.

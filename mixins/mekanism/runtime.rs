@@ -27,7 +27,7 @@ use mekanism_core::boiler;
 use mekanism_core::isotopes;
 use mekanism_core::turbine;
 use mekanism_core::dynamic_tank;
-use mekanism_core::sides::{Sides, Transmission};
+use mekanism_core::sides::{self as side_config, SideMode, Sides, Transmission};
 use mekanism_core::sps;
 use mekanism_core::teleporter;
 use mekanism_core::factory::{self, Factory};
@@ -406,7 +406,12 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     let Some(k) = kind(&entity.id) else {
         return;
     };
-    TICKING.set(Some((pos, [Transmission::Item, Transmission::Chemical, Transmission::Energy].map(|t| sides_of(&entity.nbt, t)))));
+    // A type whose auto-eject is off gives out through no face (the window's eject button): as if
+    // every face were Input (0b10 each), which `gives_out` reads.
+    let no_eject = get_int(&entity.nbt, "no_eject");
+    let ticking = Transmission::ALL.map(|t| if no_eject & (1 << t as u32) != 0 { Sides(0xAAA) } else { sides_of(&entity.nbt, t) });
+    TICKING.set(Some((pos, ticking)));
+    let facing = game.native_block_property(pos, "facing").and_then(|f| direction(&f)).map_or(2, face_index);
     // A machine its redstone control holds back does nothing this tick and goes dark.
     let allowed = tabs(&entity.id) & TAB_REDSTONE == 0 || redstone_allows(game, pos, entity);
     let active = if !allowed {
@@ -529,7 +534,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             Kind::Chargepad => Some((game.world.game_time.max(0) as u64).saturating_sub(get_long(&entity.nbt, "charged_at")) <= 20),
         }
     };
-    screen_data(entity);
+    screen_data(entity, facing);
     multiblock_data(game, pos, entity);
     if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Pipe(_)) {
         show_connections(game, pos, entity);
@@ -4519,7 +4524,7 @@ fn energy_capacity(entity: &ModBlockEntity) -> u64 {
 
 /// The data a screen reads past the furnace's four slots, for the blocks that do not send it
 /// themselves (the electric machines do, in `tick_machine`): energy, then each gauge's tank.
-fn screen_data(entity: &mut ModBlockEntity) {
+fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
     let Some(l) = layout(&entity.id) else {
         return;
     };
@@ -4553,6 +4558,14 @@ fn screen_data(entity: &mut ModBlockEntity) {
         entity.data.resize(DATA_GAUGES + l.gauges.len() * GAUGE_SLOTS, 0);
         let signal = get_int(&entity.nbt, "powered") & 3;
         entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2) as i32);
+        // Then, for the side configuration window, each type's faces in relative-side order and
+        // which types' auto-eject is off.
+        if tabs(&entity.id) & TAB_SIDES != 0 {
+            for t in Transmission::ALL {
+                entity.data.push(sides_of(&entity.nbt, t).relative(facing) as i32);
+            }
+            entity.data.push((get_int(&entity.nbt, "no_eject") & 7) as i32);
+        }
     }
 }
 
@@ -4729,6 +4742,344 @@ fn tab_tooltip(block: &str, l: &Layout, data: &[i32], at: [f32; 2], lines: &mut 
     true
 }
 
+// --- Windows ----------------------------------------------------------------------------------------
+//
+// Mekanism's windows over a screen (`GuiWindow`), opened from its tabs; drawn over the slots
+// (`native_screen_overlay`, API 32). Which one is open is the client's own state.
+
+/// The side configuration window (`GuiSideConfiguration`) and the transmission type it shows (an
+/// index into `transmissions`).
+#[derive(Clone, Copy, PartialEq)]
+enum Window {
+    Sides(usize),
+}
+
+thread_local! {
+    static WINDOW: std::cell::RefCell<Option<(String, Window)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The window open on `block`'s screen.
+fn window(block: &str) -> Option<Window> {
+    WINDOW.with_borrow(|w| w.as_ref().filter(|(b, _)| b == block).map(|(_, w)| *w))
+}
+
+fn set_window(block: &str, w: Option<Window>) {
+    WINDOW.with_borrow_mut(|open| *open = w.map(|w| (block.to_owned(), w)));
+}
+
+/// The types a block's side configuration has, in its config's order (`AttributeSideConfig`).
+fn transmissions(block: &str) -> &'static [Transmission] {
+    match kind(block) {
+        Some(Kind::Machine(..) | Kind::Factory(..) | Kind::EnergyCube(_)) => &[Transmission::Item, Transmission::Energy],
+        Some(Kind::ChemicalTank(_)) => &[Transmission::Item, Transmission::Chemical],
+        _ => &[Transmission::Item, Transmission::Chemical, Transmission::Energy],
+    }
+}
+
+/// `TransmissionType`'s name, icon (`transmission/*`) and tab colour (`SpecialColors.TAB_*_CONFIG`).
+fn transmission_look(t: Transmission) -> (&'static str, &'static str, u32) {
+    match t {
+        Transmission::Item => ("Items", "transmission/items", 0xFFCF_CFCF),
+        Transmission::Chemical => ("Chemicals", "transmission/chemicals", 0xFFFF_DD4F),
+        Transmission::Energy => ("Energy", "transmission/energy", 0xFF59_C15F),
+    }
+}
+
+/// Whether a type can be ejected (`ConfigInfo.canEject`): a machine's energy only comes in.
+fn can_eject(block: &str, t: Transmission) -> bool {
+    t != Transmission::Energy || matches!(kind(block), Some(Kind::EnergyCube(_)))
+}
+
+/// The side configuration window: where it opens on the screen (centred, 15 down), and its parts in
+/// its own coordinates (`GuiSideConfiguration`'s constructor).
+const SIDE_WINDOW: [f32; 4] = [10.0, 15.0, 156.0, 135.0];
+const WINDOW_CLOSE: [f32; 4] = [6.0, 6.0, 8.0, 8.0];
+const WINDOW_EJECT: [f32; 4] = [136.0, 6.0, 14.0, 14.0];
+const WINDOW_CLEAR: [f32; 4] = [136.0, 95.0, 14.0, 14.0];
+const WINDOW_SCREEN: [f32; 4] = [38.0, 25.0, 80.0, 12.0];
+/// The face buttons (22×22) by relative side: front, left, right, back, top, bottom.
+const SIDE_BUTTONS: [[f32; 2]; 6] = [[67.0, 69.0], [44.0, 69.0], [90.0, 69.0], [44.0, 92.0], [67.0, 46.0], [67.0, 92.0]];
+
+/// The menu buttons the window sends: a face (200 + 16 × type + 2 × side, + 1 for a right click),
+/// auto-eject (260 + type), and the clear button (270 + 2 × type, + 1 for a right click).
+const BUTTON_SIDE: i32 = 200;
+const BUTTON_EJECT: i32 = 260;
+const BUTTON_CLEAR: i32 = 270;
+
+/// A rectangle of the window in the screen's coordinates.
+fn in_window(r: [f32; 4]) -> [f32; 4] {
+    [SIDE_WINDOW[0] + r[0], SIDE_WINDOW[1] + r[1], r[2], r[3]]
+}
+
+/// The window's type tabs (`GuiConfigTypeTab`): on its left, 28 px apart; the one it shows is hidden.
+fn window_type_tabs(block: &str, shown: usize) -> Vec<(usize, [f32; 4])> {
+    transmissions(block)
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != shown && *i < 4)
+        .map(|(i, _)| (i, in_window([-26.0, 2.0 + 28.0 * i as f32, 26.0, 26.0])))
+        .collect()
+}
+
+/// The faces of type index `t` in relative-side order and whether its auto-eject is off, from the
+/// screen's data (after the redstone slot).
+fn window_sides(l: &Layout, data: &[i32], t: Transmission) -> (u32, bool) {
+    let at = redstone_slot(l) + 1;
+    let packed = data.get(at + t as usize).copied().unwrap_or(0).max(0) as u32;
+    let no_eject = data.get(at + 3).copied().unwrap_or(0).max(0) as u32 & (1 << t as u32) != 0;
+    (packed, no_eject)
+}
+
+/// The clear button's target (`GuiSideConfiguration.getTargetType`): when every face has the same
+/// mode, the next (or previous) one; else None.
+fn clear_target(packed: u32, forward: bool) -> SideMode {
+    let first = Sides::relative_get(packed, 0);
+    if (1..6).all(|s| Sides::relative_get(packed, s) == first) {
+        if forward { first.window_next() } else { first.window_previous() }
+    } else {
+        SideMode::Off
+    }
+}
+
+/// `BasicColorButton.getButtonBlitColor`: the colour a little less saturated and brighter.
+fn button_tint(rgb: u32) -> u32 {
+    let [_, r, g, b] = rgb.to_be_bytes().map(|c| c as f32 / 255.0);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let d = max - min;
+    let h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    } * 60.0;
+    let sat = if max == 0.0 { 0.0 } else { d / max };
+    let (sat, v) = ((sat - 0.1).max(0.0), (max + 0.1).min(1.0));
+    let c = v * sat;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let (r, g, b) = match (h / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    let to = |f: f32| ((f + m) * 255.0).round().clamp(0.0, 255.0) as u32;
+    0xFF00_0000 | to(r) << 16 | to(g) << 8 | to(b)
+}
+
+/// A Mekanism button (`MekanismButton`): `button`, `button_focus` under the cursor or
+/// `button_inactive`, tinted, with an icon of `icon_size` px over it.
+#[allow(clippy::too_many_arguments)]
+fn draw_button(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, r: [f32; 4], hovered: bool, active: bool, argb: u32, icon: Option<(&str, f32)>) {
+    let base = match (active, hovered) {
+        (false, _) => "button_inactive",
+        (true, true) => "button_focus",
+        (true, false) => "button",
+    };
+    nine_slice_tinted(game, batch, base, [200.0, 20.0], 2.0, r, argb);
+    if let Some((icon, size)) = icon {
+        sprite(game, batch, icon, [0.0, 0.0, size, size], r);
+    }
+}
+
+/// Text centred in a width.
+fn centred(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, text: &str, x: f32, width: f32, y: f32, rgb: u32) {
+    let w = game.native_text_width(text);
+    game.native_text(batch, text, [x + (width - w) / 2.0, y], rgb, false);
+}
+
+/// Draws the open window (hook point `native_screen_overlay`, API 32): the shadow and panel, the
+/// type tabs, the close button, the title, the eject screen and button, the face buttons with the
+/// block beside each face, the clear button and the "Slots" label.
+pub(super) fn screen_overlay(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let Some(Window::Sides(shown)) = window(block) else {
+        return;
+    };
+    let Some(l) = layout(block) else {
+        return;
+    };
+    let types = transmissions(block);
+    let shown = shown.min(types.len() - 1);
+    let t = types[shown];
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let at = [cursor[0] - ox, cursor[1] - oy];
+    let screen = |r: [f32; 4]| {
+        let [x, y, w, h] = in_window(r);
+        [ox + x, oy + y, w, h]
+    };
+    let [x, y, w, h] = screen([0.0, 0.0, SIDE_WINDOW[2], SIDE_WINDOW[3]]);
+    nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
+    nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
+    for (i, r) in window_type_tabs(block, shown) {
+        let (_, icon, argb) = transmission_look(types[i]);
+        let [tx, ty] = [ox + r[0], oy + r[1]];
+        nine_slice_tinted(game, batch, "holder_left", [26.0, 9.0], 4.0, [tx, ty, 26.0, 26.0], argb);
+        let hovered = inside(at, [r[0] + 4.0, r[1] + 4.0, 18.0, 18.0]);
+        draw_button(game, batch, [tx + 5.0, ty + 4.0, 18.0, 18.0], hovered, true, 0xFFFF_FFFF, Some((icon, 18.0)));
+    }
+    let hover = |r: [f32; 4]| inside(at, in_window(r));
+    draw_button(game, batch, screen(WINDOW_CLOSE), hover(WINDOW_CLOSE), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+    centred(game, batch, &format!("{} Config", transmission_look(t).0), x, w, y + 5.0, 0x40_4040);
+    let (packed, no_eject) = window_sides(&l, data, t);
+    let ejects = can_eject(block, t);
+    let s = screen(WINDOW_SCREEN);
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, s, 0xFFFF_FFFF);
+    let line = if !ejects {
+        "Can't Eject".to_owned()
+    } else {
+        format!("Eject: {}", if no_eject { "Off" } else { "On" })
+    };
+    game.native_text(batch, &line, [s[0] + 3.0, s[1] + 3.0], 0x3C_FE9A, false);
+    draw_button(game, batch, screen(WINDOW_EJECT), hover(WINDOW_EJECT), ejects, 0xFFFF_FFFF, Some(("button/auto_eject", 14.0)));
+    draw_button(game, batch, screen(WINDOW_CLEAR), hover(WINDOW_CLEAR), true, 0xFFFF_FFFF, Some(("button/clear_sides", 14.0)));
+    // The block beside each face shows on its button (`SideDataButton`).
+    let pos = game.container.map(|(x, y, z)| [x, y, z]);
+    let facing = pos.and_then(|p| game.native_block_property(p, "facing")).and_then(|f| direction(&f)).map_or(2, face_index);
+    for (side, [bx, by]) in SIDE_BUTTONS.iter().enumerate() {
+        let r = [*bx, *by, 22.0, 22.0];
+        let (_, rgb, _) = Sides::relative_get(packed, side).data_type();
+        draw_button(game, batch, screen(r), hover(r), true, button_tint(rgb), None);
+        if let Some(p) = pos {
+            let d = DIRECTIONS[side_config::relative_face(facing, side)].1;
+            let beside = game.native_block([p[0] + d[0], p[1] + d[1], p[2] + d[2]]);
+            if !beside.ends_with(":air") {
+                let [sx, sy, ..] = screen(r);
+                game.native_item(batch, &beside, [sx + 3.0, sy + 3.0], 16.0);
+            }
+        }
+    }
+    centred(game, batch, "Slots", x, w, y + 120.0, 0x78_7878);
+}
+
+/// What Mekanism's own parts cover on a screen (hook point `native_screen_covers`, API 32): its tabs
+/// beside the panel, and the open window with its type tabs.
+pub(super) fn screen_covers(block: &str, at: [f32; 2], covered: &mut bool) {
+    let Some(l) = layout(block) else {
+        return;
+    };
+    let tab = screen_tabs(block, &l, &[]).iter().any(|t| inside(at, [t.at[0], t.at[1], 26.0, 26.0]));
+    let open = match window(block) {
+        Some(Window::Sides(shown)) => inside(at, SIDE_WINDOW) || window_type_tabs(block, shown).iter().any(|(_, r)| inside(at, *r)),
+        None => false,
+    };
+    *covered |= tab || open;
+}
+
+/// A press on the open window: true when it was on the window (`button` set for the server's part).
+fn window_click(block: &str, at: [f32; 2], right: bool, button: &mut Option<i32>) -> bool {
+    let Some(Window::Sides(shown)) = window(block) else {
+        return false;
+    };
+    let types = transmissions(block);
+    let shown = shown.min(types.len() - 1);
+    if let Some((i, _)) = window_type_tabs(block, shown).into_iter().find(|(_, r)| inside(at, *r)) {
+        set_window(block, Some(Window::Sides(i)));
+        return true;
+    }
+    if !inside(at, SIDE_WINDOW) {
+        return false;
+    }
+    let t = types[shown] as i32;
+    let on = |r: [f32; 4]| inside(at, in_window(r));
+    if on(WINDOW_CLOSE) {
+        set_window(block, None);
+    } else if on(WINDOW_EJECT) && can_eject(block, types[shown]) {
+        *button = Some(BUTTON_EJECT + t);
+    } else if on(WINDOW_CLEAR) {
+        *button = Some(BUTTON_CLEAR + 2 * t + i32::from(right));
+    } else if let Some(side) = SIDE_BUTTONS.iter().position(|[x, y]| on([*x, *y, 22.0, 22.0])) {
+        *button = Some(BUTTON_SIDE + 16 * t + 2 * side as i32 + i32::from(right));
+    }
+    true
+}
+
+/// The open window's tooltip: true when the cursor is on the window.
+fn window_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    let Some(Window::Sides(shown)) = window(block) else {
+        return false;
+    };
+    let Some(l) = layout(block) else {
+        return false;
+    };
+    let types = transmissions(block);
+    let shown = shown.min(types.len() - 1);
+    if let Some((i, _)) = window_type_tabs(block, shown).into_iter().find(|(_, r)| inside(at, *r)) {
+        lines.push(transmission_look(types[i]).0.into());
+        return true;
+    }
+    if !inside(at, SIDE_WINDOW) {
+        return false;
+    }
+    let t = types[shown];
+    let (packed, _) = window_sides(&l, data, t);
+    let on = |r: [f32; 4]| inside(at, in_window(r));
+    if on(WINDOW_CLOSE) {
+        lines.push("Close".into());
+    } else if on(WINDOW_EJECT) {
+        lines.push("Auto-eject".into());
+    } else if on(WINDOW_CLEAR) {
+        if clear_target(packed, true) == SideMode::Off {
+            lines.push("Clear Side Config (sets all sides to none)".into());
+        } else {
+            lines.push("Increment Side Config (changes all sides to the next, or previous, configuration type)".into());
+        }
+    } else if on(WINDOW_SCREEN) && !can_eject(block, t) {
+        lines.push("Auto-eject is not supported, manual extraction may still be possible.".into());
+    } else if let Some(side) = SIDE_BUTTONS.iter().position(|[x, y]| on([*x, *y, 22.0, 22.0])) {
+        let (name, _, code) = Sides::relative_get(packed, side).data_type();
+        lines.push(side_config::RELATIVE[side].into());
+        lines.push(format!("§{code}{name}"));
+    }
+    true
+}
+
+/// A press on the window, on the server (hook point `native_menu_button`): a face's next or
+/// previous mode (`PacketSideData`), a type's auto-eject (`PacketEjectConfiguration`), or every face
+/// of a type at once (`PacketBatchConfiguration`). False for any other button.
+fn window_button(game: &Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id: i32) -> bool {
+    if tabs(&entity.id) & TAB_SIDES == 0 || !(BUTTON_SIDE..BUTTON_CLEAR + 6).contains(&id) {
+        return false;
+    }
+    let facing = game.native_block_property(pos, "facing").and_then(|f| direction(&f)).map_or(2, face_index);
+    let (t, rest) = match id {
+        BUTTON_EJECT.. if id < BUTTON_CLEAR => {
+            let bit = 1 << (id - BUTTON_EJECT);
+            let flags = get_int(&entity.nbt, "no_eject") ^ bit;
+            put_int(&mut entity.nbt, "no_eject", flags);
+            return true;
+        }
+        BUTTON_CLEAR.. => ((id - BUTTON_CLEAR) / 2, None),
+        _ => ((id - BUTTON_SIDE) / 16, Some(((id - BUTTON_SIDE) % 16 / 2) as usize)),
+    };
+    let Some(&t) = Transmission::ALL.get(t as usize) else {
+        return true;
+    };
+    let right = id % 2 == 1;
+    let mut sides = sides_of(&entity.nbt, t);
+    match rest {
+        Some(side) if side < 6 => {
+            let face = side_config::relative_face(facing, side);
+            let now = sides.get(face);
+            sides.set(face, if right { now.window_previous() } else { now.window_next() });
+        }
+        Some(_) => return true,
+        None => {
+            let target = clear_target(sides.relative(facing), !right);
+            for face in 0..6 {
+                sides.set(face, target);
+            }
+        }
+    }
+    put_long(&mut entity.nbt, t.key(), u64::from(sides.0));
+    true
+}
+
 /// The menu buttons the redstone tab sends: the next mode (left click), the previous (right).
 const BUTTON_REDSTONE_NEXT: i32 = 100;
 const BUTTON_REDSTONE_PREVIOUS: i32 = 101;
@@ -4879,6 +5230,9 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
 
 /// A press on a reactor's button (hook point `native_screen_click`, API 20).
 pub(super) fn screen_click(block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
+    if window_click(block, at, right, button) {
+        return;
+    }
     if let Some(i) = buttons(block).iter().position(|(r, _)| inside(at, *r)) {
         *button = Some(i as i32);
         return;
@@ -4886,8 +5240,11 @@ pub(super) fn screen_click(block: &str, data: &[i32], at: [f32; 2], right: bool,
     let Some(l) = layout(block) else {
         return;
     };
-    if screen_tabs(block, &l, data).iter().any(|t| t.what == TabKind::Redstone && inside(at, tab_button(t))) {
-        *button = Some(if right { BUTTON_REDSTONE_PREVIOUS } else { BUTTON_REDSTONE_NEXT });
+    match screen_tabs(block, &l, data).iter().find(|t| inside(at, tab_button(t))).map(|t| t.what) {
+        Some(TabKind::Redstone) => *button = Some(if right { BUTTON_REDSTONE_PREVIOUS } else { BUTTON_REDSTONE_NEXT }),
+        // The side configuration tab opens its window on the first type (`GuiWindowCreatorTab`).
+        Some(TabKind::Sides) if !right => set_window(block, Some(Window::Sides(0))),
+        _ => {}
     }
 }
 
@@ -4903,6 +5260,9 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         let now = RedstoneControl::from_ordinal(get_int(&entity.nbt, "control"));
         let next = if id == BUTTON_REDSTONE_NEXT { now.next() } else { now.previous() };
         put_int(&mut entity.nbt, "control", next.ordinal());
+        return;
+    }
+    if window_button(game, pos, entity, id) {
         return;
     }
     let Some(Some(master)) = multiblock_master(entity, pos) else {
@@ -5082,7 +5442,7 @@ pub(super) fn screen_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mu
     let Some(l) = layout(block) else {
         return;
     };
-    if tab_tooltip(block, &l, data, at, lines) {
+    if window_tooltip(block, data, at, lines) || tab_tooltip(block, &l, data, at, lines) {
         return;
     }
     let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0);
