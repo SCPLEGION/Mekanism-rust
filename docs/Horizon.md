@@ -954,3 +954,20 @@ The laser, the laser amplifier and the laser tractor beam fire along their facin
   to start the fill over.
 - **Not done:** Mekanism's own fluids, such as heavy water and brine, have no blocks here, so the
   plenisher only takes water and lava.
+
+## M54: Logistical Sorter
+
+Horizon's API 29 (SCPLEGION/horizon#10) adds `native_extract_item_where`, an item extract that skips
+the stacks a filter turns down. The bundle now pins that revision, `8c71132e`, on the
+`milestone/h9-filtered-extract` branch.
+- **Sorting.** Every 10 ticks the sorter tries its filters in order. Each filter takes the items it
+  names from the inventory behind the sorter, and the first one that moves anything ends the
+  operation. The items go into the transporter network in front, or straight into an inventory
+  there, and whatever fits nowhere goes back. With auto-eject on, items no filter names go too.
+  Single-item mode moves one item at a time instead of up to 64.
+- **Controls.** Right-click with an item to add a filter for it, or to take it away. Sneak while doing
+  it to filter by the item's first tag instead (`#c:ingots`...). Sneak-right-click with an empty
+  hand to switch auto-eject. A plain empty-hand click switches single-item mode and lists the
+  filters.
+- **Not done:** transporter colours, round robin and the min/max size modes. Without colours, every
+  filtered item takes the same nearest-first route.

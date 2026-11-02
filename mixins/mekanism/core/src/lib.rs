@@ -30,6 +30,7 @@ pub mod recipes;
 pub mod seismic;
 pub mod sides;
 pub mod slurry_table;
+pub mod sorter;
 pub mod sps;
 pub mod teleporter;
 pub mod tier;

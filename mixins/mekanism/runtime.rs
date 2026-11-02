@@ -15,6 +15,7 @@ use mekanism_core::nuclear;
 use mekanism_core::qio;
 use mekanism_core::laser;
 use mekanism_core::seismic;
+use mekanism_core::sorter::{self, Sorter};
 use mekanism_core::plenisher::{self, Plenisher, Spot};
 use mekanism_core::fission;
 use mekanism_core::fusion;
@@ -95,6 +96,8 @@ enum Kind {
     Pump,
     /// The Fluidic Plenisher: fills the space below it with fluid.
     Plenisher,
+    /// The Logistical Sorter: moves items from behind it to the front, by its filters.
+    Sorter,
     /// The Solar Neutron Activator: lithium into tritium in the sun.
     Activator,
     /// A Thermoelectric Boiler's valve; the first valve runs it.
@@ -188,6 +191,7 @@ fn kind(id: &str) -> Option<Kind> {
         dynamic_tank::VALVE => return Some(Kind::DynamicValve),
         "mekanism:electric_pump" => return Some(Kind::Pump),
         "mekanism:fluidic_plenisher" => return Some(Kind::Plenisher),
+        "mekanism:logistical_sorter" => return Some(Kind::Sorter),
         "mekanism:solar_neutron_activator" => return Some(Kind::Activator),
         boiler::VALVE => return Some(Kind::BoilerValve),
         boiler::HEATER => return Some(Kind::Heater),
@@ -361,7 +365,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::InductionPort
             | Kind::Laser
             | Kind::LaserAmplifier
-            | Kind::Vibrator,
+            | Kind::Vibrator
+            | Kind::Sorter,
         ) => {
             *container = Some(ModContainer {
                 slots: 3,
@@ -427,6 +432,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         }
         Kind::Pump => tick_pump(game, pos, entity),
         Kind::Plenisher => tick_plenisher(game, pos, entity),
+        Kind::Sorter => {
+            tick_sorter(game, pos, entity);
+            None
+        }
         Kind::Activator => tick_activator(game, pos, entity),
         Kind::BoilerValve => tick_boiler_valve(game, pos, entity),
         Kind::Heater => tick_heater(entity),
@@ -1993,6 +2002,114 @@ fn tick_transporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         }
         return;
     }
+}
+
+fn load_sorter(nbt: &Compound) -> Sorter {
+    let filters = match nbt.get(&JavaString::from("filters")) {
+        Some(Tag::String(s)) => Sorter::parse_filters(&s.to_string().unwrap_or_default()),
+        _ => Vec::new(),
+    };
+    Sorter { filters, auto_eject: get_int(nbt, "eject") == 1, single_item: get_int(nbt, "single") == 1 }
+}
+
+fn save_sorter(nbt: &mut Compound, s: &Sorter) {
+    nbt.insert("filters".into(), Tag::String(s.save_filters().as_str().into()));
+    put_int(nbt, "eject", u32::from(s.auto_eject));
+    put_int(nbt, "single", u32::from(s.single_item));
+}
+
+/// The Logistical Sorter, every 10 ticks: each filter in turn takes its items from the inventory behind
+/// the sorter, until one moves something; then, with auto-eject, any item. They go into the
+/// transporters in front (or straight into an inventory there), and what fits nowhere goes back.
+fn tick_sorter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let delay = get_int(&entity.nbt, "delay").saturating_sub(1);
+    put_int(&mut entity.nbt, "delay", delay);
+    if delay > 0 {
+        return;
+    }
+    put_int(&mut entity.nbt, "delay", sorter::DELAY);
+    let Some(d) = game.native_block_property(pos, "facing").and_then(|f| direction(&f)) else {
+        return;
+    };
+    let settings = load_sorter(&entity.nbt);
+    let back = [pos[0] - d[0], pos[1] - d[1], pos[2] - d[2]];
+    let front = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+    // The back inventory's face toward the sorter, and the front one's.
+    let back_face = horizon_core::geometry::Direction::ALL[face_index(d)];
+    let front_face = horizon_core::geometry::Direction::ALL[face_index([-d[0], -d[1], -d[2]])];
+    let max = settings.max_move();
+    let mut choices: Vec<Option<&str>> = settings.filters.iter().map(|f| Some(f.as_str())).collect();
+    if settings.auto_eject {
+        choices.push(None);
+    }
+    // The item tags the filters name, read once.
+    let tags: std::collections::HashMap<&str, std::collections::HashSet<String>> = {
+        let items = world_items!(game);
+        let named = settings.filters.iter().filter_map(|f| f.strip_prefix('#'));
+        named.map(|t| (t, items.item_tags.get(t).cloned().unwrap_or_default())).collect()
+    };
+    for filter in choices {
+        let wanted = |s: &ItemStack| {
+            filter.is_none_or(|f| Sorter::matches(f, &s.item, &|tag: &str| tags.get(tag).is_some_and(|t| t.contains(&*s.item))))
+        };
+        let stack = game.native_extract_item_where(back, back_face, max, &wanted);
+        let Some(stack) = stack else {
+            continue;
+        };
+        let left = if is_transporter(block_name(game, front)) {
+            route_items(game, front, pos, stack)
+        } else {
+            game.native_insert_item(front, front_face, stack)
+        };
+        if let Some(left) = left
+            && let Some(lost) = game.native_insert_item(back, back_face, left)
+        {
+            game.native_insert_item(back, horizon_core::geometry::Direction::Up, lost);
+        }
+        return;
+    }
+}
+
+/// A right click on a sorter: an item in hand adds a filter for it or takes it away (sneaking: for the
+/// item's first tag); sneaking with an empty hand switches auto-eject, and a plain click with an empty
+/// hand switches single-item mode and lists the filters.
+pub(super) fn use_sorter(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || kind(block_name(game, pos)) != Some(Kind::Sorter) {
+        return false;
+    }
+    let held = game.inventory.get(game.selected).cloned().flatten();
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let first_tag = held.as_ref().and_then(|h| {
+        let items = world_items!(game);
+        let mut tags: Vec<&String> = items.item_tags.iter().filter(|(_, t)| t.contains(&*h.item)).map(|(k, _)| k).collect();
+        tags.sort();
+        tags.first().map(|t| format!("#{t}"))
+    });
+    let Some(line) = game.native_with_mod_block_entity(pos, |m| {
+        let mut s = load_sorter(&m.nbt);
+        let line = match (&held, sneaking) {
+            (Some(h), _) => {
+                let filter = if sneaking { first_tag.clone().unwrap_or_else(|| h.item.to_string()) } else { h.item.to_string() };
+                let added = s.toggle(&filter);
+                format!("Logistical Sorter filter {} {filter}", if added { "added:" } else { "removed:" })
+            }
+            (None, true) => {
+                s.auto_eject = !s.auto_eject;
+                format!("Logistical Sorter auto-eject: {}", s.auto_eject)
+            }
+            (None, false) => {
+                s.single_item = !s.single_item;
+                let list = if s.filters.is_empty() { "none".to_owned() } else { s.filters.join(", ") };
+                format!("Logistical Sorter single item: {}; filters: {list}", s.single_item)
+            }
+        };
+        save_sorter(&mut m.nbt, &s);
+        line
+    }) else {
+        return false;
+    };
+    tell(game, line);
+    true
 }
 
 /// Walks the transporters joined to `start`, nearest first, offering `stack` to every container beside
