@@ -709,7 +709,7 @@ fn set_upgrades(nbt: &mut Compound, u: &Upgrades) {
 }
 
 /// The `mekanism:upgrade_type` in a stack's custom data (the carried recipes put it there).
-fn upgrade_of(stack: &ItemStack) -> Option<Upgrade> {
+fn upgrade_type_of(stack: &ItemStack) -> Option<String> {
     if &*stack.item != "mekanism:upgrade" {
         return None;
     }
@@ -718,9 +718,13 @@ fn upgrade_of(stack: &ItemStack) -> Option<Upgrade> {
         return None;
     };
     match c.get(&JavaString::from("mekanism:upgrade_type")) {
-        Some(Tag::String(id)) => Upgrade::from_id(&id.to_string().ok()?),
+        Some(Tag::String(id)) => id.to_string().ok(),
         _ => None,
     }
+}
+
+fn upgrade_of(stack: &ItemStack) -> Option<Upgrade> {
+    Upgrade::from_id(&upgrade_type_of(stack)?)
 }
 
 /// Right click on a Mekanism machine holding a speed or energy upgrade: one goes in (all that fit when
@@ -4533,7 +4537,8 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
         let capacity = energy_capacity(entity);
         entity.data.extend(wide(get_long(&entity.nbt, "energy").min(capacity)));
         entity.data.extend(wide(capacity));
-        entity.data.extend([0, 0]);
+        let u = upgrades(&entity.nbt);
+        entity.data.extend([u.get(Upgrade::Speed) as i32, u.get(Upgrade::Energy) as i32]);
         entity.data.extend(wide(0));
     }
     for g in &l.gauges {
@@ -4752,6 +4757,8 @@ fn tab_tooltip(block: &str, l: &Layout, data: &[i32], at: [f32; 2], lines: &mut 
 #[derive(Clone, Copy, PartialEq)]
 enum Window {
     Sides(usize),
+    /// The upgrade window and the registry index of the upgrade selected in its list.
+    Upgrades(Option<usize>),
 }
 
 thread_local! {
@@ -4897,8 +4904,10 @@ fn centred(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, text: &st
 /// type tabs, the close button, the title, the eject screen and button, the face buttons with the
 /// block beside each face, the clear button and the "Slots" label.
 pub(super) fn screen_overlay(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
-    let Some(Window::Sides(shown)) = window(block) else {
-        return;
+    let shown = match window(block) {
+        Some(Window::Sides(shown)) => shown,
+        Some(Window::Upgrades(selected)) => return draw_upgrade_window(game, block, data, batch, origin, selected),
+        None => return,
     };
     let Some(l) = layout(block) else {
         return;
@@ -4966,15 +4975,18 @@ pub(super) fn screen_covers(block: &str, at: [f32; 2], covered: &mut bool) {
     let tab = screen_tabs(block, &l, &[]).iter().any(|t| inside(at, [t.at[0], t.at[1], 26.0, 26.0]));
     let open = match window(block) {
         Some(Window::Sides(shown)) => inside(at, SIDE_WINDOW) || window_type_tabs(block, shown).iter().any(|(_, r)| inside(at, *r)),
+        Some(Window::Upgrades(_)) => inside(at, UPGRADE_WINDOW),
         None => false,
     };
     *covered |= tab || open;
 }
 
 /// A press on the open window: true when it was on the window (`button` set for the server's part).
-fn window_click(block: &str, at: [f32; 2], right: bool, button: &mut Option<i32>) -> bool {
-    let Some(Window::Sides(shown)) = window(block) else {
-        return false;
+fn window_click(block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) -> bool {
+    let shown = match window(block) {
+        Some(Window::Sides(shown)) => shown,
+        Some(Window::Upgrades(selected)) => return upgrade_window_click(block, data, at, selected, button),
+        None => return false,
     };
     let types = transmissions(block);
     let shown = shown.min(types.len() - 1);
@@ -5001,8 +5013,10 @@ fn window_click(block: &str, at: [f32; 2], right: bool, button: &mut Option<i32>
 
 /// The open window's tooltip: true when the cursor is on the window.
 fn window_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
-    let Some(Window::Sides(shown)) = window(block) else {
-        return false;
+    let shown = match window(block) {
+        Some(Window::Sides(shown)) => shown,
+        Some(Window::Upgrades(_)) => return upgrade_window_tooltip(block, data, at, lines),
+        None => return false,
     };
     let Some(l) = layout(block) else {
         return false;
@@ -5077,6 +5091,281 @@ fn window_button(game: &Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id
         }
     }
     put_long(&mut entity.nbt, t.key(), u64::from(sides.0));
+    true
+}
+
+// --- The upgrade window -----------------------------------------------------------------------------
+
+/// Mekanism's upgrades in their registry's order (`MekanismDatapackRegistries`): id, name, colour
+/// (`EnumColor`), description, and the port's upgrade when it installs that one.
+const UPGRADE_TYPES: [(&str, &str, u32, &str, Option<Upgrade>); 7] = [
+    ("mekanism:anchor", "Anchor", 0x59C15F, "Keeps a machine's chunk loaded.", None),
+    ("mekanism:chemical", "Chemical", 0xFFDD4F, "Increases the efficiency of chemical-using machinery.", None),
+    ("mekanism:energy", "Energy", 0x75FF89, "Increases energy efficiency and capacity of machinery.", Some(Upgrade::Energy)),
+    ("mekanism:filter", "Filter", 0x00F3D0, "A filter that separates heavy water from regular water.", Some(Upgrade::Filter)),
+    ("mekanism:muffling", "Muffling", 0x559EFF, "Reduces noise generated by machinery.", None),
+    ("mekanism:speed", "Speed", 0xFF383C, "Increases speed of machinery.", Some(Upgrade::Speed)),
+    ("mekanism:stone_generator", "Stone Generator", 0xFFA160, "Generates stone or cobblestone as needed.", None),
+];
+
+/// The upgrades the port installs in a block (`install_upgrade`).
+fn supported_upgrades(block: &str) -> &'static [Upgrade] {
+    match kind(block) {
+        Some(Kind::Machine(..) | Kind::Factory(..) | Kind::DigitalMiner | Kind::Plenisher) => &[Upgrade::Speed, Upgrade::Energy],
+        Some(Kind::Pump) => &[Upgrade::Speed, Upgrade::Energy, Upgrade::Filter],
+        _ => &[],
+    }
+}
+
+/// The installed upgrades' registry indices, from the screen's data (speed and energy counts).
+fn installed_upgrades(data: &[i32]) -> Vec<(usize, u32)> {
+    let count = |u: Upgrade| match u {
+        Upgrade::Speed => data.get(DATA_SPEED).copied().unwrap_or(0).max(0) as u32,
+        Upgrade::Energy => data.get(DATA_ENERGY_UPGRADES).copied().unwrap_or(0).max(0) as u32,
+        Upgrade::Filter => 0,
+    };
+    UPGRADE_TYPES
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| t.4.map(|u| (i, count(u))))
+        .filter(|(_, n)| *n > 0)
+        .collect()
+}
+
+thread_local! {
+    static UPGRADE_STACKS: std::cell::RefCell<std::collections::HashMap<String, Option<ItemStack>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// An upgrade's item, as its crafting recipe makes it (its name and the model its
+/// `custom_model_data` picks).
+fn upgrade_stack(game: &Game<'_>, id: &str) -> Option<ItemStack> {
+    if let Some(found) = UPGRADE_STACKS.with_borrow(|c| c.get(id).cloned()) {
+        return found;
+    }
+    let found = world_recipes!(game).crafting.iter().find_map(|(_, r)| {
+        let result = match r {
+            horizon_client::crafting::Recipe::Shaped { result, .. } | horizon_client::crafting::Recipe::Shapeless { result, .. } => result,
+            _ => return None,
+        };
+        let stack = ItemStack { item: result.item.clone()?, count: 1, damage: result.damage, extra: result.extra.clone() };
+        (upgrade_type_of(&stack).as_deref() == Some(id)).then_some(stack)
+    });
+    UPGRADE_STACKS.with_borrow_mut(|c| c.insert(id.to_owned(), found.clone()));
+    found
+}
+
+/// `GuiUpgradeWindow`: 198 wide, centred, 15 down; one row of supported upgrades makes it 94 tall.
+const UPGRADE_WINDOW: [f32; 4] = [-11.0, 15.0, 198.0, 94.0];
+const UPGRADE_LIST: [f32; 4] = [6.0, 18.0, 108.0, 50.0];
+const UPGRADE_SCREEN: [f32; 4] = [114.0, 18.0, 59.0, 50.0];
+const UPGRADE_REMOVE: [f32; 4] = [115.0, 54.0, 56.0, 12.0];
+const UPGRADE_SUPPORTED: [f32; 4] = [6.0, 68.0, 167.0, 14.0];
+/// The menu buttons: uninstall one upgrade (290 + its registry index).
+const BUTTON_UNINSTALL: i32 = 290;
+
+fn in_upgrades(r: [f32; 4]) -> [f32; 4] {
+    [UPGRADE_WINDOW[0] + r[0], UPGRADE_WINDOW[1] + r[1], r[2], r[3]]
+}
+
+/// Where "Supported:"'s icons start (`GuiSupportedUpgrades.getFirstRowStart`): the label's width in
+/// the default font (54 px) and one more.
+const SUPPORTED_START: f32 = 55.0;
+
+/// Words wrapped to `width` at `scale` (`WrappedTextRenderer`).
+fn wrap(game: &Game<'_>, text: &str, width: f32, scale: f32) -> Vec<String> {
+    let mut lines: Vec<String> = vec![];
+    for word in text.split(' ') {
+        match lines.last_mut() {
+            Some(last) if game.native_text_width(&format!("{last} {word}")) * scale <= width => {
+                last.push(' ');
+                last.push_str(word);
+            }
+            _ => lines.push(word.to_owned()),
+        }
+    }
+    lines
+}
+
+/// The upgrade's effect line (`IUpgradeTile.getUpgradeWindowInfo`): the max multiplier to the
+/// power of installed / max, to two places.
+fn upgrade_effect(u: Upgrade, installed: u32) -> Option<String> {
+    (u.max() > 1).then(|| {
+        let effect = mekanism_core::upgrades::MAX_UPGRADE_MULTIPLIER.powf(f64::from(installed) / f64::from(u.max()));
+        format!("Effect: {}x", (effect * 100.0).round() / 100.0)
+    })
+}
+
+/// Draws the upgrade window: the panel, the close button and title, the list of installed upgrades
+/// in their colours, the screen with the selected one's count and effect, the uninstall button and
+/// progress arrows, the upgrade slots, and the supported upgrades (the rest faded).
+fn draw_upgrade_window(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2], selected: Option<usize>) {
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let at = [cursor[0] - ox, cursor[1] - oy];
+    let screen = |r: [f32; 4]| {
+        let [x, y, w, h] = in_upgrades(r);
+        [ox + x, oy + y, w, h]
+    };
+    let hover = |r: [f32; 4]| inside(at, in_upgrades(r));
+    let [x, y, w, h] = screen([0.0, 0.0, UPGRADE_WINDOW[2], UPGRADE_WINDOW[3]]);
+    nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
+    nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
+    draw_button(game, batch, screen(WINDOW_CLOSE), hover(WINDOW_CLOSE), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+    centred(game, batch, "Upgrades", x, w, y + 5.0, 0x40_4040);
+    // The list (`GuiUpgradeScrollList`): its holder, its scroll bar, a row a type.
+    let list = screen(UPGRADE_LIST);
+    nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, list, 0xFFFF_FFFF);
+    nine_slice_tinted(game, batch, "scroll/list_border", [6.0, 6.0], 2.0, [list[0] + 101.0, list[1] + 1.0, 6.0, 48.0], 0xFFFF_FFFF);
+    sprite(game, batch, "scroll/list_bar", [0.0, 0.0, 4.0, 4.0], [list[0] + 102.0, list[1] + 2.0, 4.0, 4.0]);
+    let installed = installed_upgrades(data);
+    for (row, (i, _)) in installed.iter().enumerate().take(4) {
+        let (id, name, rgb, _, _) = UPGRADE_TYPES[*i];
+        let ry = list[1] + 1.0 + 12.0 * row as f32;
+        let rect = [UPGRADE_LIST[0] + 1.0, UPGRADE_LIST[1] + 1.0 + 12.0 * row as f32, 100.0, 12.0];
+        let (base, slot) = if selected == Some(*i) {
+            ("list/selected", "list/slot_selected")
+        } else if hover(rect) {
+            ("list/hovered", "list/slot_hovered")
+        } else {
+            ("list/base", "list/slot")
+        };
+        nine_slice_tinted(game, batch, base, [12.0, 12.0], 1.0, [list[0] + 1.0, ry, 100.0, 12.0], 0xFF00_0000 | rgb);
+        game.native_sprite_tinted(batch, &format!("{SPRITES}{slot}"), [0.0, 0.0, 10.0, 10.0], [list[0] + 2.0, ry + 1.0, 10.0, 10.0], 0xFF00_0000 | rgb);
+        if let Some(stack) = upgrade_stack(game, id) {
+            game.native_item_stack(batch, &stack, [list[0] + 3.0, ry + 2.0], 8.0);
+        }
+        game.native_text(batch, name, [list[0] + 13.0, ry + 2.0], 0x40_4040, false);
+    }
+    // The screen beside it: the selected upgrade, its count and effect (0.6 scale).
+    let s = screen(UPGRADE_SCREEN);
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, s, 0xFFFF_FFFF);
+    let picked = selected.and_then(|i| installed.iter().find(|(j, _)| *j == i));
+    match picked {
+        Some((i, n)) => {
+            let (_, name, _, _, upgrade) = UPGRADE_TYPES[*i];
+            let lines = wrap(game, &format!("{name} Upgrade"), 55.0, 0.6);
+            for (k, line) in lines.iter().enumerate() {
+                game.native_text_scaled(batch, line, [s[0] + 2.0, s[1] + 2.0 + 6.0 * k as f32], 0x3C_FE9A, 0.6);
+            }
+            let mut ty = s[1] + 4.0 + 6.0 * lines.len() as f32;
+            let max = upgrade.map_or(1, Upgrade::max);
+            game.native_text_scaled(batch, &format!("Amount: {n}/{max}"), [s[0] + 2.0, ty], 0x3C_FE9A, 0.6);
+            if let Some(effect) = upgrade.and_then(|u| upgrade_effect(u, *n)) {
+                ty += 6.0;
+                game.native_text_scaled(batch, &effect, [s[0] + 2.0, ty], 0x3C_FE9A, 0.6);
+            }
+        }
+        None => {
+            for (k, line) in wrap(game, "No selection.", 56.0, 0.8).iter().enumerate() {
+                game.native_text_scaled(batch, line, [s[0] + 2.0, s[1] + 2.0 + 8.0 * k as f32], 0x3C_FE9A, 0.8);
+            }
+        }
+    }
+    // Uninstall (`DigitalButton`), and the installing and uninstalling arrows.
+    let r = screen(UPGRADE_REMOVE);
+    let active = picked.is_some();
+    let base = match (active, hover(UPGRADE_REMOVE)) {
+        (false, _) => "button_digital_inactive",
+        (true, true) => "button_digital_focus",
+        (true, false) => "button_digital",
+    };
+    nine_slice_tinted(game, batch, base, [200.0, 20.0], 2.0, r, 0xFFFF_FFFF);
+    centred(game, batch, "Uninstall", r[0], r[2], r[1] + 2.0, if active { 0x3C_FE9A } else { 0x78_7878 });
+    let [px, py, ..] = screen([176.0, 37.0, 0.0, 0.0]);
+    sprite(game, batch, "progress/installing/empty", [0.0, 0.0, 10.0, 14.0], [px, py, 10.0, 14.0]);
+    sprite(game, batch, "progress/uninstalling/empty", [0.0, 0.0, 12.0, 12.0], [px, py + 21.0, 12.0, 12.0]);
+    for sy in [18.0, 72.0] {
+        let [sx, sy, ..] = screen([175.0, sy, 0.0, 0.0]);
+        sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [sx, sy, 18.0, 18.0]);
+    }
+    // The supported upgrades (`GuiSupportedUpgrades`), the others faded.
+    let sup = screen(UPGRADE_SUPPORTED);
+    nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, sup, 0xFFFF_FFFF);
+    game.native_text(batch, "Supported:", [sup[0] + 2.0, sup[1] + 3.0], 0x40_4040, false);
+    let start = SUPPORTED_START;
+    let supported = supported_upgrades(block);
+    for (i, (id, _, _, _, upgrade)) in UPGRADE_TYPES.iter().enumerate() {
+        let ix = sup[0] + 1.0 + start + 12.0 * i as f32;
+        if let Some(stack) = upgrade_stack(game, id) {
+            game.native_item_stack(batch, &stack, [ix, sup[1] + 1.0], 12.0);
+        }
+        if !upgrade.is_some_and(|u| supported.contains(&u)) {
+            game.native_fill(batch, [ix, sup[1] + 1.0, 12.0, 12.0], 0x80_8B8B8B);
+        }
+    }
+}
+
+/// A press on the upgrade window: a row selects its upgrade, Uninstall sends the selected one's
+/// button, the close button closes it.
+fn upgrade_window_click(block: &str, data: &[i32], at: [f32; 2], selected: Option<usize>, button: &mut Option<i32>) -> bool {
+    if !inside(at, UPGRADE_WINDOW) {
+        return false;
+    }
+    let on = |r: [f32; 4]| inside(at, in_upgrades(r));
+    let installed = installed_upgrades(data);
+    if on(WINDOW_CLOSE) {
+        set_window(block, None);
+    } else if let Some((i, _)) = installed.iter().take(4).enumerate().find(|(row, _)| on([7.0, 19.0 + 12.0 * *row as f32, 100.0, 12.0])).map(|(_, t)| *t) {
+        set_window(block, Some(Window::Upgrades(Some(i))));
+    } else if on(UPGRADE_REMOVE)
+        && let Some(i) = selected.filter(|i| installed.iter().any(|(j, _)| j == i))
+    {
+        *button = Some(BUTTON_UNINSTALL + i as i32);
+    }
+    true
+}
+
+fn upgrade_window_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    if !inside(at, UPGRADE_WINDOW) {
+        return false;
+    }
+    let on = |r: [f32; 4]| inside(at, in_upgrades(r));
+    let installed = installed_upgrades(data);
+    if on(WINDOW_CLOSE) {
+        lines.push("Close".into());
+    } else if let Some((i, _)) = installed.iter().take(4).enumerate().find(|(row, _)| on([7.0, 19.0 + 12.0 * *row as f32, 100.0, 12.0])).map(|(_, t)| *t) {
+        lines.push(UPGRADE_TYPES[i].3.into());
+    } else if on(UPGRADE_REMOVE) {
+        lines.push("Uninstalls a single upgrade, hold shift to uninstall all.".into());
+    } else if on(UPGRADE_SUPPORTED) {
+        // Each icon's name (`GuiSupportedUpgrades.updateTooltip`).
+        let x = at[0] - in_upgrades(UPGRADE_SUPPORTED)[0] - 1.0 - SUPPORTED_START;
+        if x >= 0.0
+            && let Some((_, name, _, _, upgrade)) = UPGRADE_TYPES.get((x / 12.0) as usize)
+        {
+            if upgrade.is_some_and(|u| supported_upgrades(block).contains(&u)) {
+                lines.push((*name).into());
+            } else {
+                lines.push(format!("{name} (Not Supported)"));
+            }
+        }
+    }
+    true
+}
+
+/// Uninstall pressed, on the server (`PacketRemoveUpgrade`): one of the upgrade comes out of the
+/// machine and drops beside it (Mekanism puts it in the window's output slot).
+fn upgrade_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id: i32) -> bool {
+    let Some(&(type_id, _, _, _, Some(upgrade))) = usize::try_from(id - BUTTON_UNINSTALL).ok().and_then(|i| UPGRADE_TYPES.get(i)) else {
+        return false;
+    };
+    if tabs(&entity.id) & TAB_UPGRADE == 0 {
+        return false;
+    }
+    let mut u = upgrades(&entity.nbt);
+    let field = match upgrade {
+        Upgrade::Speed => &mut u.speed,
+        Upgrade::Energy => &mut u.energy,
+        Upgrade::Filter => &mut u.filter,
+    };
+    if *field == 0 {
+        return true;
+    }
+    *field -= 1;
+    set_upgrades(&mut entity.nbt, &u);
+    if let Some(stack) = upgrade_stack(game, type_id) {
+        game.pop_resource([pos[0], pos[1] + 1, pos[2]], stack);
+    }
     true
 }
 
@@ -5230,7 +5519,7 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
 
 /// A press on a reactor's button (hook point `native_screen_click`, API 20).
 pub(super) fn screen_click(block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
-    if window_click(block, at, right, button) {
+    if window_click(block, data, at, right, button) {
         return;
     }
     if let Some(i) = buttons(block).iter().position(|(r, _)| inside(at, *r)) {
@@ -5244,6 +5533,7 @@ pub(super) fn screen_click(block: &str, data: &[i32], at: [f32; 2], right: bool,
         Some(TabKind::Redstone) => *button = Some(if right { BUTTON_REDSTONE_PREVIOUS } else { BUTTON_REDSTONE_NEXT }),
         // The side configuration tab opens its window on the first type (`GuiWindowCreatorTab`).
         Some(TabKind::Sides) if !right => set_window(block, Some(Window::Sides(0))),
+        Some(TabKind::Upgrade) if !right => set_window(block, Some(Window::Upgrades(None))),
         _ => {}
     }
 }
@@ -5262,7 +5552,7 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         put_int(&mut entity.nbt, "control", next.ordinal());
         return;
     }
-    if window_button(game, pos, entity, id) {
+    if window_button(game, pos, entity, id) || upgrade_button(game, pos, entity, id) {
         return;
     }
     let Some(Some(master)) = multiblock_master(entity, pos) else {

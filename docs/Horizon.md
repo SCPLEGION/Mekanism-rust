@@ -1057,3 +1057,23 @@ slots under it from taking clicks. The bundle now pins that revision, `b50492ee`
   pushed their output.
 - **Not done yet:** shift-clicks (they act as plain clicks), fluids as a type of their own (they go
   with chemicals), the transporter configuration window, and dragging or pinning the window.
+
+## G3: The upgrade window
+
+Horizon's API 32 also adds `native_item_stack` and `native_text_scaled`. The bundle pins `cf74e63e`
+on `milestone/h12-screen-overlay`.
+- **Opening.** A click on the upgrade tab opens Mekanism's upgrade window (`GuiUpgradeWindow`, 198×94,
+  centred 15 px down).
+- **What it shows.**
+  - The installed upgrades, a row each in the upgrade's colour (`list/*` sprites), with its icon
+    (the model its `custom_model_data` picks) and name. A click selects one.
+  - The screen beside them, in Mekanism's 0.6-scale text: "Speed Upgrade", "Amount: 3/8", and the
+    effect (`Effect: 2.37x`, the max multiplier to the power of installed / max).
+  - The Uninstall button (`DigitalButton`), the installing and uninstalling arrows, and the two
+    upgrade slots.
+  - The "Supported:" row with all seven upgrades in registry order; the ones this block does not
+    take are faded and their tooltip says "(Not Supported)".
+- **Uninstall.** It takes one of the selected upgrade out of the machine and drops it on top of the
+  machine (Mekanism puts it in the window's output slot).
+- **Not done yet:** the slots are drawn but don't take items: installing is still a right-click
+  on the machine with the upgrade. Shift-uninstall-all is also not done.
