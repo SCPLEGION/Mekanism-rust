@@ -6170,3 +6170,27 @@ fn mekasuit_solar(game: &mut Game<'_>) {
         set_energy(helmet, (stored + made).min(capacity.max(stored)));
     }
 }
+
+/// `ItemMekaTool.hurtEnemy` with its Attack Amplification Unit, outside creative: the unit's damage on
+/// top of the hit, scaled by the attack strength as the attribute would be, and its energy spent; with
+/// too little energy, less damage for what there is.
+pub(super) fn player_attack(game: &mut Game<'_>, strength: f32, amount: &mut f32) {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    let creative = game.creative;
+    let Some(tool) = game.held_mut().as_mut().filter(|s| &*s.item == modules::MEKA_TOOL) else {
+        return;
+    };
+    let stored = stored_energy(tool);
+    let bonus = modules::attack_bonus(&modules_of(tool));
+    let (extra, cost) = modules::attack(bonus, if creative { u64::MAX } else { stored });
+    if extra <= 0.0 {
+        return;
+    }
+    // `Player.attack` scales the attribute's damage by 0.2 + strength² * 0.8.
+    *amount += extra * (0.2 + strength * strength * 0.8);
+    if !creative {
+        set_energy(tool, stored - cost);
+    }
+}
