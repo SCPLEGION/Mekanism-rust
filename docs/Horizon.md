@@ -928,3 +928,16 @@ The laser, the laser amplifier and the laser tractor beam fire along their facin
 - **Fuelwood Heater** (`TileEntityFuelwoodHeater`). It burns furnace fuel from its slot, one item when
   the last one runs out. While burning it makes 400 heat a tick, which a Thermoelectric Boiler beside
   it takes, as it takes the Resistive Heater's.
+
+## M52: Pressurized Reaction Chamber
+
+- **Recipes.** All 14 `mekanism:reaction` recipes are generated into the recipe table
+  (`tools/gen_recipe_table.py`, `ReactionRecipe`). That covers coal and wood gasification, substrate
+  and HDPE pellets, and the plutonium and polonium pellets the fission line needs.
+- **Running it.** The item goes in the first slot. Pipes fill the water tank and tubes fill the
+  chemical tank; each tank holds 10,000 mB. While the inputs make a recipe and its products fit, the
+  chamber works for the recipe's duration at 2 FE a tick plus the recipe's own energy. The item comes
+  out of the last slot, and the chemical goes to its output tank, which it gives to the tubes beside
+  it.
+- **Not done:** the HDPE pellet recipe takes ethene as a fluid. Nothing here makes ethene as a fluid,
+  so that recipe can't run yet. Speed and energy upgrades don't change the chamber yet.
