@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "78220ffdffa414bdf6ce0c4d939472a31cbb9701"
+horizon_revision = "074750a8aa1d87acebfade688cc93e7abff9167a"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -239,4 +239,16 @@ bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "strength", ty = "f32", value = "strength" },
   { name = "amount", ty = "&mut f32", value = "&mut *amount" },
+]
+
+[[injection]]
+id = "player-damage"
+hook = "player_damage"
+hook_version = 1
+kind = "HEAD"
+helper = "player_damage.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "absorbed", ty = "f32", value = "absorbed" },
+  { name = "share", ty = "&mut f32", value = "&mut *share" },
 ]

@@ -6194,3 +6194,30 @@ pub(super) fn player_attack(game: &mut Game<'_>, strength: f32, amount: &mut f32
         set_energy(tool, stored - cost);
     }
 }
+
+/// A hit on a player (hook point `native_player_damage`, API 28): the worn MekaSuit pieces pay for the
+/// damage they took and say how much of the next hits they take (`ItemMekaSuitArmor.getDamageAbsorbed`).
+pub(super) fn player_damage(game: &mut Game<'_>, absorbed: f32, share: &mut f32) {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    let pieces = [modules::HELMET, modules::BODYARMOR, modules::PANTS, modules::BOOTS];
+    let stored = |game: &Game<'_>| -> [Option<u64>; 4] {
+        std::array::from_fn(|i| {
+            game.armor[i].as_ref().filter(|s| &*s.item == pieces[i]).map(stored_energy)
+        })
+    };
+    let creative = game.creative;
+    let costs = modules::suit_costs(absorbed, stored(game));
+    if !creative {
+        for (i, cost) in costs.into_iter().enumerate() {
+            if cost > 0
+                && let Some(piece) = game.armor[i].as_mut()
+            {
+                let e = stored_energy(piece);
+                set_energy(piece, e.saturating_sub(cost));
+            }
+        }
+    }
+    *share = modules::suit_share(stored(game));
+}
