@@ -15,6 +15,7 @@ use mekanism_core::nuclear;
 use mekanism_core::qio;
 use mekanism_core::laser;
 use mekanism_core::seismic;
+use mekanism_core::chargepad;
 use mekanism_core::sorter::{self, Sorter};
 use mekanism_core::plenisher::{self, Plenisher, Spot};
 use mekanism_core::fission;
@@ -98,6 +99,8 @@ enum Kind {
     Plenisher,
     /// The Logistical Sorter: moves items from behind it to the front, by its filters.
     Sorter,
+    /// The Chargepad: charges an item of the player standing on it.
+    Chargepad,
     /// The Solar Neutron Activator: lithium into tritium in the sun.
     Activator,
     /// A Thermoelectric Boiler's valve; the first valve runs it.
@@ -192,6 +195,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:electric_pump" => return Some(Kind::Pump),
         "mekanism:fluidic_plenisher" => return Some(Kind::Plenisher),
         "mekanism:logistical_sorter" => return Some(Kind::Sorter),
+        chargepad::CHARGEPAD => return Some(Kind::Chargepad),
         "mekanism:solar_neutron_activator" => return Some(Kind::Activator),
         boiler::VALVE => return Some(Kind::BoilerValve),
         boiler::HEATER => return Some(Kind::Heater),
@@ -366,7 +370,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::Laser
             | Kind::LaserAmplifier
             | Kind::Vibrator
-            | Kind::Sorter,
+            | Kind::Sorter
+            | Kind::Chargepad,
         ) => {
             *container = Some(ModContainer {
                 slots: 3,
@@ -508,6 +513,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         }
         Kind::Laser | Kind::LaserAmplifier | Kind::TractorBeam => tick_laser(game, pos, entity),
         Kind::Vibrator => tick_vibrator(game, pos, entity),
+        // Lit for a second after it last charged something.
+        Kind::Chargepad => Some((game.world.game_time.max(0) as u64).saturating_sub(get_long(&entity.nbt, "charged_at")) <= 20),
     };
     screen_data(entity);
     multiblock_data(game, pos, entity);
@@ -2743,6 +2750,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         // A laser takes energy on every side but its front; amplifiers and tractor beams only from lasers.
         Kind::Laser if facing_away => Some((laser::LASER_STORAGE, u64::MAX)),
         Kind::Vibrator => Some((seismic::VIBRATOR_STORAGE, u64::MAX)),
+        Kind::Chargepad => Some((chargepad::STORAGE, u64::MAX)),
         Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE, u64::MAX)),
         Kind::Rotary => Some((machine::STORAGE_MULTIPLIER * chem::ROTARY_USAGE, u64::MAX)),
         Kind::Heater => Some((machine::STORAGE_MULTIPLIER * heater_usage(nbt), u64::MAX)),
@@ -6566,6 +6574,7 @@ pub(super) fn player_damage(game: &mut Game<'_>, absorbed: f32, share: &mut f32)
     if !game.native_on(MOD_ID) {
         return;
     }
+    charge_on_pad(game);
     let pieces = [modules::HELMET, modules::BODYARMOR, modules::PANTS, modules::BOOTS];
     let stored = |game: &Game<'_>| -> [Option<u64>; 4] {
         std::array::from_fn(|i| {
@@ -6585,6 +6594,58 @@ pub(super) fn player_damage(game: &mut Game<'_>, absorbed: f32, share: &mut f32)
         }
     }
     *share = modules::suit_share(stored(game));
+}
+
+/// A player standing on a chargepad gets the first item in their inventory (then armor, then the
+/// offhand) that can take energy charged with ten ticks' worth, as `TileEntityChargepad` charges one
+/// item a tick. Runs with the player's state swapped in, every 10 ticks.
+fn charge_on_pad(game: &mut Game<'_>) {
+    if game.spectator() {
+        return;
+    }
+    let Some(p) = game.player.as_ref() else {
+        return;
+    };
+    let (x, y, z) = (p.position.x.floor() as i32, p.position.y, p.position.z.floor() as i32);
+    let pad_y = chargepad::pad_below(y);
+    let at = [x, pad_y, z];
+    if block_name(game, at) != chargepad::CHARGEPAD || !chargepad::on_pad(y, pad_y) {
+        return;
+    }
+    let Some(pad) = game.native_with_mod_block_entity(at, |m| get_long(&m.nbt, "energy")) else {
+        return;
+    };
+    if pad == 0 {
+        return;
+    }
+    let slots = (0..game.inventory.len()).map(Some).chain((0..4).map(|i| Some(100 + i))).chain([None]);
+    let mut given = 0;
+    for slot in slots {
+        let stack = match slot {
+            Some(i) if i >= 100 => game.armor.get_mut(i - 100).and_then(Option::as_mut),
+            Some(i) => game.inventory.get_mut(i).and_then(Option::as_mut),
+            None => game.offhand.as_mut(),
+        };
+        let Some(stack) = stack else {
+            continue;
+        };
+        let Some(e) = item_energy_of(stack) else {
+            continue;
+        };
+        let stored = stored_energy(stack).min(e.capacity);
+        given = chargepad::charge(pad, e.capacity, stored, e.rate);
+        if given > 0 {
+            set_energy(stack, stored + given);
+            break;
+        }
+    }
+    if given > 0 {
+        let now = game.world.game_time.max(0) as u64;
+        game.native_with_mod_block_entity(at, |m| {
+            put_long(&mut m.nbt, "energy", pad - given);
+            put_long(&mut m.nbt, "charged_at", now);
+        });
+    }
 }
 
 // --- Lasers -----------------------------------------------------------------------------------------
