@@ -918,3 +918,13 @@ The laser, the laser amplifier and the laser tractor beam fire along their facin
   down, with their heights (`ItemSeismicReader`). With no vibrator it says there are no vibrations.
 - **Not done:** the reader's screen, which shows every block of the column. Chat lists only the ores,
   so the output stays short. The vibrator's piston also doesn't move.
+
+## M51: Bio-Generator and Fuelwood Heater
+
+- **Bio-Generator** (`TileEntityBioGenerator`). Bio fuel in the middle slot becomes 64 mB of bioethanol
+  (576 mB for a block), but only when it all fits in the 200 mB tank. Pipes can bring bioethanol too.
+  Each tick, 1 mB makes 25 FE while the 600 FE store has room. It charges the item in the first slot
+  and gives energy to the cables beside it.
+- **Fuelwood Heater** (`TileEntityFuelwoodHeater`). It burns furnace fuel from its slot, one item when
+  the last one runs out. While burning it makes 400 heat a tick, which a Thermoelectric Boiler beside
+  it takes, as it takes the Resistive Heater's.
