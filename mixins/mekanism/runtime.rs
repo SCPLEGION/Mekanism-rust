@@ -44,6 +44,8 @@ const MOD_ID: &str = "mekanism";
 const HEAT_GENERATOR: &str = "mekanismgenerators:heat_generator";
 /// The slots in a row of the chest menu a factory shows.
 const FACTORY_ROW: usize = 9;
+/// A factory's energy slot (`TileEntityFactory.energySlot`), after its two rows.
+const FACTORY_ENERGY: usize = 2 * FACTORY_ROW;
 
 /// What a Mekanism block entity is, from its block (and block entity) id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,11 +275,11 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         let inputs: Vec<usize> = (0..n).collect();
         let outputs: Vec<usize> = (FACTORY_ROW..FACTORY_ROW + n).collect();
         *container = Some(ModContainer {
-            slots: 2 * FACTORY_ROW,
+            slots: FACTORY_ENERGY + 1,
             faces: [outputs.clone(), inputs.clone(), inputs.clone(), inputs.clone(), inputs.clone(), inputs.clone()],
             inputs,
             outputs,
-            menu: Some("minecraft:generic_9x2".into()),
+            menu: Some("minecraft:generic_9x3".into()),
         });
         return;
     }
@@ -628,15 +630,21 @@ fn tick_machine(game: &mut Game<'_>, entity: &mut ModBlockEntity, recipe: &str, 
 fn tick_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize, recipe: &str, usage: u64) -> Option<bool> {
     let mut f = Factory::new(n, usage, upgrades(&entity.nbt));
     f.machine.energy.stored = get_long(&entity.nbt, "energy").min(f.machine.energy.capacity);
+    discharge_slot(entity, FACTORY_ENERGY, &mut f.machine.energy);
     if let Some(Tag::IntArray(saved)) = entity.nbt.get(&JavaString::from("progress")) {
         for (p, v) in f.progress.iter_mut().zip(saved) {
             *p = (*v).max(0) as u32;
         }
     }
-    let mut inputs: Vec<Slot> = (0..n).map(|i| slot(entity.items.get(i).cloned().flatten())).collect();
     let mut outputs: Vec<Slot> = (0..n)
         .map(|i| slot(entity.items.get(FACTORY_ROW + i).cloned().flatten()))
         .collect();
+    if get_int(&entity.nbt, "sorting") & 1 != 0 && get_int(&entity.nbt, "sort_tick") % 20 == 0 {
+        sort_factory_inputs(game, entity, n, recipe);
+    }
+    let sort_tick = get_int(&entity.nbt, "sort_tick");
+    put_int(&mut entity.nbt, "sort_tick", (sort_tick + 1) % 20);
+    let mut inputs: Vec<Slot> = (0..n).map(|i| slot(entity.items.get(i).cloned().flatten())).collect();
     let operations: Vec<Option<(Operation, u32)>> = (0..n)
         .map(|i| {
             let (op, max, _) = find_operation(game, recipe, entity.items.get(i).cloned().flatten(), &Slot::default());
@@ -654,6 +662,49 @@ fn tick_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize, reci
         Tag::IntArray(f.progress.iter().map(|p| (*p).min(i32::MAX as u32) as i32).collect()),
     );
     Some(f.active)
+}
+
+/// `TileEntityFactory.sortInventory`, once a second: each kind of input item is spread evenly over the
+/// slots that hold it and the empty ones it can fill (`factory::sort_counts`; a slot needs one item at
+/// least, where Mekanism asks for the recipe's input amount).
+fn sort_factory_inputs(game: &Game<'_>, entity: &mut ModBlockEntity, n: usize, _recipe: &str) {
+    let key = |s: &ItemStack| format!("{:?}", ItemStack { count: 1, ..s.clone() });
+    let mut kinds: Vec<(String, Vec<usize>, u64)> = vec![];
+    let mut empties = vec![];
+    for i in 0..n {
+        match entity.items.get(i).cloned().flatten() {
+            None => empties.push(i),
+            Some(s) => {
+                let k = key(&s);
+                match kinds.iter_mut().find(|(o, ..)| *o == k) {
+                    Some((_, slots, total)) => {
+                        slots.push(i);
+                        *total += u64::from(s.count);
+                    }
+                    None => kinds.push((k, vec![i], u64::from(s.count))),
+                }
+            }
+        }
+    }
+    for (_, slots, total) in kinds {
+        let Some(proto) = entity.items[slots[0]].clone() else {
+            continue;
+        };
+        if u64::from(max_stack(game, &proto.item)) * (slots.len() as u64) < total {
+            continue;
+        }
+        let spare = std::mem::take(&mut empties);
+        let counts = factory::sort_counts(total, slots.len(), spare.len(), 1);
+        let mut targets = slots.clone();
+        let mut left = spare;
+        while targets.len() < counts.len() {
+            targets.push(left.remove(0));
+        }
+        empties = left;
+        for (&i, &c) in targets.iter().zip(&counts) {
+            entity.items[i] = (c > 0).then(|| ItemStack { count: c as u32, ..proto.clone() });
+        }
+    }
 }
 
 fn max_stack(game: &Game<'_>, id: &str) -> u32 {
@@ -4702,6 +4753,9 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
                 let done = i64::from(saved.get(i).copied().unwrap_or(0).max(0));
                 entity.data.push((done * 20 / ticks).clamp(0, 20) as i32);
             }
+            // Then whether auto-sort is on (the sorting tab).
+            entity.data.resize(redstone_slot(&l) + 5 + 9, 0);
+            entity.data.push(get_int(&entity.nbt, "sorting") as i32 & 1);
         }
     }
 }
@@ -4720,6 +4774,7 @@ fn factory_slots(n: usize) -> Vec<([f32; 2], [f32; 2])> {
 fn draw_factory_slots(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, _block: &str, n: usize, l: &Layout, data: &[i32], origin: [f32; 2]) {
     let [ox, oy] = origin;
     let first = redstone_slot(l) + 5;
+    sprite(game, batch, "slot/power", [0.0, 0.0, 18.0, 18.0], [ox + 6.0, oy + 12.0, 18.0, 18.0]);
     for (i, (input, output)) in factory_slots(n).into_iter().enumerate() {
         sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + input[0] - 1.0, oy + input[1] - 1.0, 18.0, 18.0]);
         sprite(game, batch, "slot/output", [0.0, 0.0, 18.0, 18.0], [ox + output[0] - 1.0, oy + output[1] - 1.0, 18.0, 18.0]);
@@ -4815,6 +4870,8 @@ enum TabKind {
     Upgrade,
     Security,
     Redstone,
+    /// A factory's auto-sort toggle (`GuiSortingTab`).
+    Sort,
 }
 
 fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
@@ -4824,6 +4881,9 @@ fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
     if t & TAB_SIDES != 0 {
         out.push(Tab { at: [-26.0, 6.0], icon: "button/configuration", argb: 0xFFFF_FFFF, what: TabKind::Sides });
         out.push(Tab { at: [-26.0, 34.0], icon: "button/transporter_config", argb: 0xFFFF_FFFF, what: TabKind::Transporter });
+    }
+    if matches!(kind(block), Some(Kind::Factory(..))) {
+        out.push(Tab { at: [-26.0, 62.0], icon: "button/sorting", argb: 0xFFFF_FFFF, what: TabKind::Sort });
     }
     if t & TAB_UPGRADE != 0 {
         out.push(Tab { at: [right, 6.0], icon: "button/upgrade", argb: 0xFFFF_FFFF, what: TabKind::Upgrade });
@@ -4869,7 +4929,7 @@ fn draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: 
         let left = tab.at[0] < 0.0;
         let holder = if left { "holder_left" } else { "holder_right" };
         let [x, y] = [ox + tab.at[0], oy + tab.at[1]];
-        nine_slice_tinted(game, batch, holder, [26.0, 9.0], 4.0, [x, y, 26.0, 26.0], tab.argb);
+        nine_slice_tinted(game, batch, holder, [26.0, 9.0], 4.0, [x, y, 26.0, if tab.what == TabKind::Sort { 35.0 } else { 26.0 }], tab.argb);
         // The warning is a 16 px tiled sprite multiplied over the holder; the stripes tinted with the
         // tab's colour come close to that blend.
         if tab.what == TabKind::Redstone && control.warns(powered, last) {
@@ -4886,6 +4946,11 @@ fn draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: 
         let button = if hovered { "button_focus" } else { "button" };
         nine_slice_tinted(game, batch, button, [200.0, 20.0], 2.0, [bx, oy + by, bw, bh], 0xFFFF_FFFF);
         sprite(game, batch, tab.icon, [0.0, 0.0, 18.0, 18.0], [bx, oy + by, bw, bh]);
+        if tab.what == TabKind::Sort {
+            let word = if data.get(redstone_slot(l) + 5 + 9).copied().unwrap_or(0) != 0 { "On" } else { "Off" };
+            let tw = game.native_text_width(word) * 0.75;
+            game.native_text_scaled(batch, word, [x + (26.0 - tw) / 2.0 + if left { 1.0 } else { -1.0 }, y + 24.0], 0x40_4040, 0.75);
+        }
     }
 }
 
@@ -4904,6 +4969,7 @@ fn tab_tooltip(block: &str, l: &Layout, data: &[i32], at: [f32; 2], lines: &mut 
             lines.push("No Owner".into());
         }
         TabKind::Redstone => lines.push(redstone_of(l, data).0.name().into()),
+        TabKind::Sort => lines.push("Auto-Sort".into()),
     }
     true
 }
@@ -5551,6 +5617,8 @@ fn upgrade_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
 /// The menu buttons the redstone tab sends: the next mode (left click), the previous (right).
 const BUTTON_REDSTONE_NEXT: i32 = 100;
 const BUTTON_REDSTONE_PREVIOUS: i32 = 101;
+/// The factory's sorting tab (`GuiInteraction.AUTO_SORT_BUTTON`).
+const BUTTON_SORT: i32 = 102;
 
 /// The capacity of a multiblock's tank, from the size its master saved.
 fn multiblock_capacity(entity: &ModBlockEntity, key: &str) -> u64 {
@@ -5725,6 +5793,7 @@ pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32;
         // The side configuration tab opens its window on the first type (`GuiWindowCreatorTab`).
         Some(TabKind::Sides) if !right => set_window(block, Some(Window::Sides(0))),
         Some(TabKind::Upgrade) if !right => set_window(block, Some(Window::Upgrades(None))),
+        Some(TabKind::Sort) if !right => *button = Some(BUTTON_SORT),
         _ => {}
     }
 }
@@ -5741,6 +5810,11 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         let now = RedstoneControl::from_ordinal(get_int(&entity.nbt, "control"));
         let next = if id == BUTTON_REDSTONE_NEXT { now.next() } else { now.previous() };
         put_int(&mut entity.nbt, "control", next.ordinal());
+        return;
+    }
+    if id == BUTTON_SORT && matches!(kind(&entity.id), Some(Kind::Factory(..))) {
+        let on = get_int(&entity.nbt, "sorting") & 1 == 0;
+        put_int(&mut entity.nbt, "sorting", u32::from(on));
         return;
     }
     if window_button(game, pos, entity, id) || upgrade_button(game, pos, entity, id) {
@@ -5816,7 +5890,8 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
         return;
     };
     if let Some(Kind::Factory(n, ..)) = kind(block) {
-        let mut slots = vec![None; 2 * FACTORY_ROW];
+        let mut slots = vec![None; FACTORY_ENERGY + 1];
+        slots[FACTORY_ENERGY] = Some([7.0, 13.0]);
         for (i, (input, output)) in factory_slots(n).into_iter().enumerate() {
             slots[i] = Some(input);
             slots[FACTORY_ROW + i] = Some(output);
