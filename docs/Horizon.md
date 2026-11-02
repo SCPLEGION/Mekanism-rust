@@ -908,3 +908,13 @@ The laser, the laser amplifier and the laser tractor beam fire along their facin
   Horizon gives native mods no entity access yet. There are also no beam particles, and no upper
   threshold, delay or redstone modes on the amplifier. As with every furnace-template machine, the
   lasers face sideways only.
+
+## M50: Seismic Vibrator and Seismic Reader
+
+- **Vibrator.** It runs while it has 5 FE for the tick (it stores 20 FE and takes energy on every side),
+  and shakes the chunk it stands in (`TileEntitySeismicVibrator`).
+- **Reader.** Used in a chunk a running vibrator shakes, it costs 250 FE of its 12,000 (free in
+  creative; it charges at 60 FE/t). It lists the ores in the column under the player, from the top
+  down, with their heights (`ItemSeismicReader`). With no vibrator it says there are no vibrations.
+- **Not done:** the reader's screen, which shows every block of the column. Chat lists only the ores,
+  so the output stays short. The vibrator's piston also doesn't move.

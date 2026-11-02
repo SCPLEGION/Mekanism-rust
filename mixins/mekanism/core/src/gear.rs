@@ -21,6 +21,11 @@ pub fn item_energy(id: &str) -> Option<ItemEnergy> {
         "mekanism:energy_tablet" => (1_000_000, 5_000, true),
         "mekanism:atomic_disassembler" => (1_000_000, 5_000, false),
         "mekanism:electric_bow" => (120_000, 600, false),
+        crate::seismic::READER => (
+            crate::seismic::READER_CAPACITY,
+            crate::seismic::READER_CHARGE_RATE,
+            false,
+        ),
         crate::teleporter::PORTABLE => (
             crate::teleporter::PORTABLE_CAPACITY,
             crate::teleporter::PORTABLE_CHARGE_RATE,
