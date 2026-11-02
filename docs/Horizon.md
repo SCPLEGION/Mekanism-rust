@@ -941,3 +941,16 @@ The laser, the laser amplifier and the laser tractor beam fire along their facin
   it.
 - **Not done:** the HDPE pellet recipe takes ethene as a fluid. Nothing here makes ethene as a fluid,
   so that recipe can't run yet. Speed and energy upgrades don't change the chamber yet.
+
+## M53: Fluidic Plenisher
+
+- **Filling.** Pipes fill its 10,000 mB tank with water or lava. While it holds a bucket and has
+  2 FE for the tick, it places one bucket every 20 ticks; speed upgrades make that faster and energy
+  upgrades make it cheaper. The fill starts under the plenisher and spreads down and sideways, never
+  up, as `doPlenish` does. It fills air, flowing fluid and blocks that fluid washes away, and it
+  passes through source blocks without placing on them.
+- **Finishing.** After 4,000 spots, or when nothing is left to fill, the fill is done. From then on
+  the plenisher only keeps the block right under it filled. Sneak-right-click it with an empty hand
+  to start the fill over.
+- **Not done:** Mekanism's own fluids, such as heavy water and brine, have no blocks here, so the
+  plenisher only takes water and lava.
