@@ -241,6 +241,34 @@ pub fn teleport_energy(distance_sq: f64) -> u64 {
     (TOOL_TELEPORT_ENERGY as f64 * (distance_sq / 10.0)).ceil() as u64
 }
 
+/// `GearConfig.mekaToolEnergyUsageWeapon`: the energy a hit costs for each 4 of extra damage.
+pub const TOOL_WEAPON_ENERGY: f64 = 2_000.0;
+
+/// `ModuleAttackAmplificationUnit.AttackDamage`: the extra damage of the strongest mode the installed
+/// units reach (low 4, medium 8, high 16, extreme 24).
+pub fn attack_bonus(installed: &Installed) -> f32 {
+    [0.0, 4.0, 8.0, 16.0, 24.0][installed
+        .get("mekanism:attack_amplification_unit")
+        .copied()
+        .unwrap_or(0)
+        .min(4) as usize]
+}
+
+/// `ItemMekaTool.adjustAttributes` and `hurtEnemy`: the extra damage a hit gets with `stored` energy, and
+/// the energy it costs (2,000 FE per 4 damage). Short of the energy, the damage is scaled down by how
+/// much there is.
+pub fn attack(bonus: f32, stored: u64) -> (f32, u64) {
+    if bonus <= 0.0 {
+        return (0.0, 0);
+    }
+    let cost = (TOOL_WEAPON_ENERGY * f64::from(bonus) / 4.0) as u64;
+    if stored >= cost {
+        (bonus, cost)
+    } else {
+        (bonus * stored as f32 / cost as f32, stored)
+    }
+}
+
 /// `GearConfig.mekaSuitJetpackMaxStorage`: 24 buckets of hydrogen.
 pub const SUIT_JETPACK_CAPACITY: u64 = 24_000;
 /// `GearConfig.mekaSuitEnergyUsageSprintBoost`.
@@ -381,6 +409,16 @@ mod tests {
         assert_eq!(enchantments(&m), vec![("minecraft:fortune", 3)]);
         install(MEKA_TOOL, &mut m, "mekanism:silk_touch_unit", 1);
         assert_eq!(enchantments(&m), vec![("minecraft:silk_touch", 1)]);
+    }
+
+    #[test]
+    fn attack_amplification() {
+        let mut m = Installed::new();
+        assert_eq!(attack(attack_bonus(&m), 1_000), (0.0, 0));
+        install(MEKA_TOOL, &mut m, "mekanism:attack_amplification_unit", 2);
+        assert_eq!(attack_bonus(&m), 8.0);
+        assert_eq!(attack(8.0, 10_000), (8.0, 4_000));
+        assert_eq!(attack(8.0, 1_000), (2.0, 1_000));
     }
 
     #[test]

@@ -841,3 +841,19 @@ the suit, as with the jetpack.
 
 **Not ported:** breathing in rain, the geothermal generator unit (it installs but does nothing), and
 the other helmet, body armor, pants and boots units.
+
+## M46: Attack Amplification Unit
+
+Horizon's API 27 (SCPLEGION/horizon#8) adds `native_player_attack`, a player's melee damage before
+the target takes it. The bundle now pins that revision, `78220ffd`, on the `milestone/h7-damage-hooks`
+branch.
+- **Attack Amplification Unit** (Meka-Tool): each hit gets the damage of the strongest mode the
+  installed units reach: 4, 8, 16 or 24 (`ModuleAttackAmplificationUnit`). The bonus is scaled by
+  the attack strength, as the attack damage attribute is.
+- **Energy.** A hit costs 2,000 FE for each 4 of extra damage (`mekaToolEnergyUsageWeapon`). With
+  less energy than that, the bonus shrinks to what the energy pays for (`adjustAttributes`).
+  Creative costs nothing.
+
+**Still missing:** a damage hook on the player, which the MekaSuit's damage absorption needs.
+`PlayerMotion.hurt_caused_by` is in the client library, below the native hooks. It needs a per-player
+absorption field set by the game and charged after the hit, which is a larger Horizon change.

@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "76bd073a3c309be470bc0ee277d839f2ef78929f"
+horizon_revision = "78220ffdffa414bdf6ce0c4d939472a31cbb9701"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -227,4 +227,16 @@ bindings = [
   { name = "pos", ty = "[i32; 3]", value = "pos" },
   { name = "entity", ty = "&mut horizon_client::containers::ModBlockEntity", value = "&mut *entity" },
   { name = "id", ty = "i32", value = "id" },
+]
+
+[[injection]]
+id = "player-attack"
+hook = "player_attack"
+hook_version = 1
+kind = "HEAD"
+helper = "player_attack.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "strength", ty = "f32", value = "strength" },
+  { name = "amount", ty = "&mut f32", value = "&mut *amount" },
 ]
