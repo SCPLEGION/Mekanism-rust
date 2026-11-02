@@ -144,6 +144,10 @@ def block_template(name, blockstate):
     states = blockstate_properties(blockstate)
     if name.endswith("_ore"):
         return "minecraft:deepslate_iron_ore" if name.startswith("deepslate_") else "minecraft:iron_ore"
+    if name == "qio_redstone_adapter":
+        # A flat disc on the face it was placed on that powers its neighbours: a lever, which the bundle
+        # switches (its `powered`) instead of the player.
+        return "minecraft:lever"
     if name in MACHINES or name.endswith(TIERED_MACHINES):
         # No vanilla block with a block entity has no state at all; these wait for their milestone.
         return "minecraft:furnace" if "facing" in states else "minecraft:iron_block"
@@ -166,6 +170,21 @@ def block_template(name, blockstate):
     if "facing" in states:
         return "minecraft:furnace"
     return "minecraft:iron_block"
+
+
+def lever_blockstate(name, blockstate, ns):
+    """Mekanism's six `facing` variants as a lever's `face`, `facing` and `powered`: on the floor it
+    faces up, on the ceiling down, on a wall away from it; powered shows the lit model."""
+    out = {}
+    for face in ("floor", "wall", "ceiling"):
+        for facing in ("north", "south", "west", "east"):
+            mek = {"floor": "up", "ceiling": "down"}.get(face, facing)
+            base = blockstate["variants"][f"active=false,facing={mek}"]
+            for powered in ("false", "true"):
+                variant = {k: v for k, v in base.items() if k in ("x", "y")}
+                variant["model"] = f"{ns}:block/{name}_{'lit' if powered == 'true' else 'unlit'}"
+                out[f"face={face},facing={facing},powered={powered}"] = variant
+    return {"variants": out}
 
 
 def blockstate_properties(blockstate):
@@ -334,6 +353,8 @@ def build_module(ns, out):
             # The furnace's `lit` stands in for Mekanism's `active`: same meaning, same two values.
             path.write_text(json.dumps(rename_property(blockstate, "active", "lit"), indent=2) + "\n")
             report["active_as_lit"] = report.get("active_as_lit", 0) + 1
+        if template == "minecraft:lever":
+            path.write_text(json.dumps(lever_blockstate(name, blockstate, ns), indent=2) + "\n")
         declaration = {"template": template}
         if template == PIPE_TEMPLATE:
             size = pipe_models(ns, out, name, blockstate)

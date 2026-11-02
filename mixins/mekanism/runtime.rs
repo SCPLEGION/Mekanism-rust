@@ -111,6 +111,7 @@ enum Kind {
     QioDashboard,
     QioImporter,
     QioExporter,
+    QioRedstoneAdapter,
 }
 
 fn kind(id: &str) -> Option<Kind> {
@@ -137,6 +138,7 @@ fn kind(id: &str) -> Option<Kind> {
         qio::DASHBOARD => return Some(Kind::QioDashboard),
         qio::IMPORTER => return Some(Kind::QioImporter),
         qio::EXPORTER => return Some(Kind::QioExporter),
+        qio::REDSTONE_ADAPTER => return Some(Kind::QioRedstoneAdapter),
         _ => {}
     }
     use mekanism_core::generator as g;
@@ -441,6 +443,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         }
         Kind::QioExporter => {
             tick_exporter(game, pos, entity);
+            None
+        }
+        Kind::QioRedstoneAdapter => {
+            tick_redstone_adapter(game, pos, entity);
             None
         }
     };
@@ -5490,7 +5496,7 @@ static QIO_ARRAYS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMa
     std::sync::LazyLock::new(Default::default);
 
 fn is_qio(name: &str) -> bool {
-    [qio::DRIVE_ARRAY, qio::DASHBOARD, qio::IMPORTER, qio::EXPORTER].contains(&name)
+    [qio::DRIVE_ARRAY, qio::DASHBOARD, qio::IMPORTER, qio::EXPORTER, qio::REDSTONE_ADAPTER].contains(&name)
 }
 
 /// What a drive item holds (`QIODriveData` in its custom data).
@@ -5670,6 +5676,28 @@ fn tick_exporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     save_network(game, &net, &at);
 }
 
+/// A redstone adapter, each half second, powers its sides (its lever template's `powered`) while its
+/// frequency holds at least its count of its filter item, or the other way round when inverted
+/// (`TileEntityQIORedstoneAdapter.onUpdateServer`).
+fn tick_redstone_adapter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % qio::TRANSIT_DELAY);
+    if ticker != 0 {
+        return;
+    }
+    let stored = get_string(&entity.nbt, "frequency").and_then(|f| {
+        let (net, at) = load_network(game, &f);
+        (!at.is_empty()).then(|| get_string(&entity.nbt, "filter").map_or(0, |item| net.stored(&item)))
+    });
+    let emit = stored.is_some_and(|n| {
+        qio::adapter_emits(n, get_long(&entity.nbt, "count"), get_int(&entity.nbt, "inverted") != 0)
+    });
+    let powered = game.native_block_property(pos, "powered").as_deref() == Some("true");
+    if emit != powered {
+        game.native_set_block_property(pos, "powered", if emit { "true" } else { "false" });
+    }
+}
+
 fn qio_line(game: &mut Game<'_>, frequency: &str) -> String {
     let (net, _) = load_network(game, frequency);
     let (count, count_limit, types, type_limit) = net.totals();
@@ -5712,6 +5740,32 @@ pub(super) fn use_qio(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
             (None, false) => {
                 let filter = game.native_with_mod_block_entity(pos, |m| get_string(&m.nbt, "filter")).flatten();
                 tell(game, format!("QIO Exporter: {} on {}", filter.as_deref().unwrap_or("no filter"), frequency.as_deref().unwrap_or("no frequency")));
+            }
+        }
+        return true;
+    }
+    if name == qio::REDSTONE_ADAPTER {
+        let get = |game: &mut Game<'_>, key: &str| game.native_with_mod_block_entity(pos, |m| get_long(&m.nbt, key)).unwrap_or(0);
+        match (&held, sneaking) {
+            (Some(h), false) => {
+                let item = h.item.to_string();
+                game.native_with_mod_block_entity(pos, |m| m.nbt.insert("filter".into(), Tag::String(item.as_str().into())));
+                tell(game, format!("QIO Redstone Adapter filter: {item}"));
+            }
+            (Some(h), true) => {
+                let count = u64::from(h.count);
+                game.native_with_mod_block_entity(pos, |m| put_long(&mut m.nbt, "count", count));
+                tell(game, format!("QIO Redstone Adapter count: {count}"));
+            }
+            (None, true) => {
+                let inverted = get(game, "inverted") == 0;
+                game.native_with_mod_block_entity(pos, |m| put_int(&mut m.nbt, "inverted", u32::from(inverted)));
+                tell(game, format!("QIO Redstone Adapter inverted: {inverted}"));
+            }
+            (None, false) => {
+                let filter = game.native_with_mod_block_entity(pos, |m| get_string(&m.nbt, "filter")).flatten();
+                let count = get(game, "count");
+                tell(game, format!("QIO Redstone Adapter: {} >= {count} on {}", filter.as_deref().unwrap_or("no filter"), frequency.as_deref().unwrap_or("no frequency")));
             }
         }
         return true;
