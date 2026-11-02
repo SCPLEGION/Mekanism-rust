@@ -693,7 +693,7 @@ duration.
 
 The portable teleporter and both free runners now stack to 1.
 
-## Milestone 40: bins and personal storage
+## M40: bins and personal storage
 
 **Bins** (`TileEntityBin`, `BinInventorySlot`, `BinTier`)
 - A bin holds one item: 4,096 (basic), 8,192 (advanced), 32,768 (elite) or 262,144 (ultimate). A
