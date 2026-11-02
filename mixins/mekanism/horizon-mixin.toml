@@ -164,6 +164,7 @@ helper = "server_payload.rs"
 bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "channel", ty = "&str", value = "channel" },
+  { name = "data", ty = "&[u8]", value = "data" },
 ]
 
 [[injection]]
@@ -234,10 +235,35 @@ hook_version = 1
 kind = "HEAD"
 helper = "screen_tooltip.rs"
 bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
   { name = "block", ty = "&str", value = "block" },
   { name = "data", ty = "&[i32]", value = "data" },
   { name = "at", ty = "[f32; 2]", value = "at" },
   { name = "lines", ty = "&mut Vec<String>", value = "&mut *lines" },
+]
+
+[[injection]]
+id = "screen-typing"
+hook = "screen_typing"
+hook_version = 1
+kind = "HEAD"
+helper = "screen_typing.rs"
+bindings = [
+  { name = "block", ty = "&str", value = "block" },
+  { name = "typing", ty = "&mut bool", value = "&mut *typing" },
+]
+
+[[injection]]
+id = "screen-key"
+hook = "screen_key"
+hook_version = 1
+kind = "HEAD"
+helper = "screen_key.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "block", ty = "&str", value = "block" },
+  { name = "key", ty = "&str", value = "key" },
+  { name = "text", ty = "Option<&str>", value = "text" },
 ]
 
 [[injection]]
@@ -247,6 +273,7 @@ hook_version = 1
 kind = "HEAD"
 helper = "screen_click.rs"
 bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
   { name = "block", ty = "&str", value = "block" },
   { name = "data", ty = "&[i32]", value = "data" },
   { name = "at", ty = "[f32; 2]", value = "at" },
