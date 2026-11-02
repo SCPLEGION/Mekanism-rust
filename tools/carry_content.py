@@ -128,7 +128,7 @@ def pipe_models(ns, out, name, blockstate):
 
 # Items that hold energy in custom_data (mekanism:energy) stack to one, as Mekanism's do.
 SINGLE_ITEMS = {"energy_tablet", "atomic_disassembler", "electric_bow", "portable_teleporter", "free_runners", "free_runners_armored",
-                "qio_drive_base", "qio_drive_hyper_dense", "qio_drive_time_dilating", "qio_drive_supermassive"}
+                "meka_tool", "qio_drive_base", "qio_drive_hyper_dense", "qio_drive_time_dilating", "qio_drive_supermassive"}
 # ItemAtomicDisassembler's Tool: no drops from #mekanism:incorrect_for_disassembler, drops from every other
 # block (vanilla's tool rules take tags, so "every block" is the four mineable tags). Its speed comes from
 # the bundle (native_destroy_speed), from the energy it holds.
@@ -350,6 +350,14 @@ def build_module(ns, out):
             item["max_stack_size"] = 1
         if path.stem == "atomic_disassembler":
             item["components"] = {"minecraft:tool": DISASSEMBLER_TOOL}
+        # The Meka-Tool mines as the disassembler does and hits with `GearConfig`'s base damage (4) and
+        # attack speed (-2.4) in the main hand.
+        if path.stem == "meka_tool":
+            item["components"] = {"minecraft:tool": DISASSEMBLER_TOOL, "minecraft:attribute_modifiers": [
+                {"type": "minecraft:attack_damage", "id": "minecraft:base_attack_damage", "amount": 4.0,
+                 "operation": "add_value", "slot": "mainhand"},
+                {"type": "minecraft:attack_speed", "id": "minecraft:base_attack_speed", "amount": -2.4,
+                 "operation": "add_value", "slot": "mainhand"}]}
         # Jetpacks are worn on the chest: the iron chestplate's slot, without its iron look; the plain
         # jetpack gives no armour (the armored one keeps the chestplate's).
         if path.stem in ("jetpack", "jetpack_armored"):

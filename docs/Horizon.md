@@ -752,3 +752,30 @@ behind it into the drives, and it stores what hoppers put in it.
 - Frequencies across dimensions, and private frequencies.
 - Stacks with components (enchanted or damaged items) stay in the dashboard's slots and don't go into
   the drives.
+
+## M42: the Meka-Tool and modules
+
+**Modules** (`MekanismModules`, the `supported_modules` data map)
+- Every module knows which items take it and how many can be installed: 8 energy units, 4
+  excavation escalation units, and so on.
+- **Modification Station.** Right-click the station holding a Meka-Tool or a MekaSuit piece, and every
+  module in your inventory that the item takes goes in, up to its limit. Sneak and right-click to
+  take them all out again; you get the same module items back.
+- The installed modules show in the item's tooltip.
+- **Energy Unit.** Each one doubles the item's energy (16 MFE base) and charge rate (100 kFE/t base)
+  (`ModuleEnergyUnit`). Taking units out drops the energy above the new limit.
+
+**Meka-Tool** (`ItemMekaTool`)
+- It mines everything the Atomic Disassembler mines. It hits for 4 extra damage at an attack speed
+  of -2.4, and stacks to 1.
+- **Speed.** Efficiency 4 without modules. An Excavation Escalation Unit gives the fastest mode the
+  installed units reach: 16, 32, 64 or 128.
+- **Energy.** Breaking a block costs 10 FE times the efficiency, half for blocks that break at once.
+  With less energy than that, the tool mines slower.
+- **Teleportation Unit.** Right-click while looking at a block up to 100 blocks away to go to its top,
+  if two blocks of air are above it. It costs 1,000 FE per 10 blocks² of distance (`ItemMekaTool.use`).
+
+**Not ported**
+- The modification station's screen, and choosing a module's mode. The tool always uses its fastest.
+- Attack amplification, silk touch, fortune, vein mining, blasting, farming and shearing units: they
+  install, but do nothing yet.
