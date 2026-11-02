@@ -16,6 +16,7 @@ use mekanism_core::qio;
 use mekanism_core::laser;
 use mekanism_core::seismic;
 use mekanism_core::chargepad;
+use mekanism_core::entangloporter::{self as qe, Frequency};
 use mekanism_core::sorter::{self, Sorter};
 use mekanism_core::plenisher::{self, Plenisher, Spot};
 use mekanism_core::fission;
@@ -101,6 +102,8 @@ enum Kind {
     Sorter,
     /// The Chargepad: charges an item of the player standing on it.
     Chargepad,
+    /// The Quantum Entangloporter: shares energy, fluid and chemicals across its frequency.
+    Entangloporter,
     /// The Solar Neutron Activator: lithium into tritium in the sun.
     Activator,
     /// A Thermoelectric Boiler's valve; the first valve runs it.
@@ -196,6 +199,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:fluidic_plenisher" => return Some(Kind::Plenisher),
         "mekanism:logistical_sorter" => return Some(Kind::Sorter),
         chargepad::CHARGEPAD => return Some(Kind::Chargepad),
+        qe::ENTANGLOPORTER => return Some(Kind::Entangloporter),
         "mekanism:solar_neutron_activator" => return Some(Kind::Activator),
         boiler::VALVE => return Some(Kind::BoilerValve),
         boiler::HEATER => return Some(Kind::Heater),
@@ -371,7 +375,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::LaserAmplifier
             | Kind::Vibrator
             | Kind::Sorter
-            | Kind::Chargepad,
+            | Kind::Chargepad
+            | Kind::Entangloporter,
         ) => {
             *container = Some(ModContainer {
                 slots: 3,
@@ -436,6 +441,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             None
         }
         Kind::Pump => tick_pump(game, pos, entity),
+        Kind::Entangloporter => tick_entangloporter(game, pos, entity),
         Kind::Plenisher => tick_plenisher(game, pos, entity),
         Kind::Sorter => {
             tick_sorter(game, pos, entity);
@@ -1029,6 +1035,7 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
             Kind::Rotary if chem::rotary_chemical(chemical).is_some() => Some(("fluid", chem::ROTARY_TANK)),
             Kind::Washer if chemical == "minecraft:water" => Some(("fluid", nuclear::WASHER_TANK)),
             Kind::Reaction if chemical == "minecraft:water" => Some(("fluid", REACTION_TANK)),
+            Kind::Entangloporter if qe_takes(nbt, "fluid", chemical) => Some(("fluid_in", qe::FLUID_BUFFER)),
             Kind::Plenisher
                 if plenisher::placeable(chemical).is_some()
                     && get_tank(nbt, "fluid", plenisher::PLENISHER_TANK).accepts(chemical) =>
@@ -1070,6 +1077,7 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
             Some(("input", REACTION_TANK))
         }
         Kind::DynamicValve if valve_takes(nbt, chemical) => Some(("buffer", dynamic_tank::VALVE_BUFFER)),
+        Kind::Entangloporter if qe_takes(nbt, "chemical", chemical) => Some(("chemical_in", qe::CHEMICAL_BUFFER)),
         _ => None,
     }
 }
@@ -1896,6 +1904,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::FusionPort
                 | Kind::Washer
                 | Kind::Pump
+                | Kind::Entangloporter
                 | Kind::Plenisher
                 | Kind::BoilerValve
                 | Kind::DynamicValve
@@ -1903,6 +1912,7 @@ fn serves(family: &str, kind: Kind) -> bool {
         "tube" => matches!(
             kind,
             Kind::Reaction
+                | Kind::Entangloporter
                 | Kind::Oxidizer
                 | Kind::Advanced(_)
                 | Kind::Nucleosynthesizer
@@ -2751,6 +2761,10 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Laser if facing_away => Some((laser::LASER_STORAGE, u64::MAX)),
         Kind::Vibrator => Some((seismic::VIBRATOR_STORAGE, u64::MAX)),
         Kind::Chargepad => Some((chargepad::STORAGE, u64::MAX)),
+        // What it took in waits in its own buffer until its tick moves it into the frequency's.
+        Kind::Entangloporter if nbt.contains_key(&JavaString::from("frequency")) => {
+            Some((get_long(nbt, "energy") + qe::ENERGY_BUFFER.saturating_sub(get_long(nbt, "shared_energy")), u64::MAX))
+        }
         Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE, u64::MAX)),
         Kind::Rotary => Some((machine::STORAGE_MULTIPLIER * chem::ROTARY_USAGE, u64::MAX)),
         Kind::Heater => Some((machine::STORAGE_MULTIPLIER * heater_usage(nbt), u64::MAX)),
@@ -3709,6 +3723,110 @@ fn tick_pump(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) ->
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "fluid", &tank);
     Some(active)
+}
+
+// --- Quantum Entangloporter --------------------------------------------------------------------------
+
+/// The frequencies' contents (`InventoryFrequency`), by name. Every entangloporter keeps a copy of its
+/// frequency's in its NBT, so the first one to tick after a load brings it back.
+static FREQUENCIES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Frequency>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn qe_frequency(nbt: &Compound) -> Option<String> {
+    match nbt.get(&JavaString::from("frequency")) {
+        Some(Tag::String(s)) => s.to_string().ok(),
+        _ => None,
+    }
+}
+
+/// Whether an entangloporter takes `chemical` into its `kind` ("fluid" or "chemical") buffer: it has a
+/// frequency, whose tank is empty or holds it, and its own buffer does too.
+fn qe_takes(nbt: &Compound, kind: &str, chemical: &str) -> bool {
+    let (shared, inbox, cap) = match kind {
+        "fluid" => ("shared_fluid", "fluid_in", qe::FLUID_BUFFER),
+        _ => ("shared_chemical", "chemical_in", qe::CHEMICAL_BUFFER),
+    };
+    qe_frequency(nbt).is_some() && get_tank(nbt, shared, cap).accepts(chemical) && get_tank(nbt, inbox, cap).accepts(chemical)
+}
+
+/// An entangloporter: what it took in goes into its frequency, and the frequency's energy, fluid and
+/// chemical go out of its front into what is there.
+fn tick_entangloporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let Some(name) = qe_frequency(&entity.nbt) else {
+        return Some(false);
+    };
+    let saved = || Frequency {
+        energy: get_long(&entity.nbt, "shared_energy").min(qe::ENERGY_BUFFER),
+        fluid: get_tank(&entity.nbt, "shared_fluid", qe::FLUID_BUFFER),
+        chemical: get_tank(&entity.nbt, "shared_chemical", qe::CHEMICAL_BUFFER),
+    };
+    let mut freq = FREQUENCIES.lock().ok()?.entry(name.clone()).or_insert_with(saved).clone();
+    let mut energy = get_long(&entity.nbt, "energy");
+    let mut fluid = get_tank(&entity.nbt, "fluid_in", qe::FLUID_BUFFER);
+    let mut chemical = get_tank(&entity.nbt, "chemical_in", qe::CHEMICAL_BUFFER);
+    freq.absorb(&mut energy, &mut fluid, &mut chemical);
+    if let Some(front) = game.native_block_property(pos, "facing").and_then(|f| direction(&f)) {
+        let mut out = EnergyContainer::new(qe::ENERGY_BUFFER, u64::MAX);
+        out.stored = freq.energy;
+        push_energy(game, pos, &mut out, Some(front), false);
+        freq.energy = out.stored;
+        push_chemical(game, pos, &mut freq.fluid, Some(front), u64::MAX, false);
+        push_chemical(game, pos, &mut freq.chemical, Some(front), u64::MAX, false);
+    }
+    put_long(&mut entity.nbt, "energy", energy);
+    put_tank(&mut entity.nbt, "fluid_in", &fluid);
+    put_tank(&mut entity.nbt, "chemical_in", &chemical);
+    put_long(&mut entity.nbt, "shared_energy", freq.energy);
+    put_tank(&mut entity.nbt, "shared_fluid", &freq.fluid);
+    put_tank(&mut entity.nbt, "shared_chemical", &freq.chemical);
+    if let Ok(mut all) = FREQUENCIES.lock() {
+        all.insert(name, freq);
+    }
+    Some(true)
+}
+
+/// A right click on an entangloporter: a named name tag sets its frequency; an empty hand shows it and
+/// what the frequency holds.
+pub(super) fn use_entangloporter(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || kind(block_name(game, pos)) != Some(Kind::Entangloporter) {
+        return false;
+    }
+    let held = game.inventory.get(game.selected).cloned().flatten();
+    if let Some(tag) = held.as_ref().filter(|s| &*s.item == "minecraft:name_tag").and_then(|s| s.custom_name()) {
+        let shared = FREQUENCIES.lock().ok().and_then(|all| all.get(tag.as_str()).cloned());
+        game.native_with_mod_block_entity(pos, |m| {
+            m.nbt.insert("frequency".into(), Tag::String(tag.as_str().into()));
+            // Its copy of the frequency is the frequency's own from now on.
+            let f = shared.unwrap_or_default();
+            put_long(&mut m.nbt, "shared_energy", f.energy);
+            put_tank(&mut m.nbt, "shared_fluid", &f.fluid);
+            put_tank(&mut m.nbt, "shared_chemical", &f.chemical);
+        });
+        tell(game, format!("Quantum Entangloporter frequency: {tag}"));
+        return true;
+    }
+    if held.is_some() {
+        return false;
+    }
+    let Some(line) = game.native_with_mod_block_entity(pos, |m| {
+        let Some(name) = qe_frequency(&m.nbt) else {
+            return "Quantum Entangloporter: no frequency (right-click with a named name tag)".to_owned();
+        };
+        let tank = |key, cap| {
+            let t = get_tank(&m.nbt, key, cap);
+            t.chemical.map_or("empty".to_owned(), |c| format!("{} mB {c}", t.amount))
+        };
+        format!(
+            "Quantum Entangloporter {name}: {} FE, fluid {}, chemical {}",
+            get_long(&m.nbt, "shared_energy"),
+            tank("shared_fluid", qe::FLUID_BUFFER),
+            tank("shared_chemical", qe::CHEMICAL_BUFFER)
+        )
+    }) else {
+        return false;
+    };
+    tell(game, line);
+    true
 }
 
 /// The Fluidic Plenisher: with a bucket in its tank and the energy for the tick, every 20 ticks

@@ -983,3 +983,17 @@ the stacks a filter turns down. The bundle now pins that revision, `8c71132e`, o
 - **Not done:** the pad is a full block here (the furnace template), so you stand on top of it, not
   in a thin plate. Robits, and the rule that energy only goes in from the back and the bottom, aren't
   ported.
+
+## M56: Quantum Entangloporter
+
+- **Frequencies.** Right-click an entangloporter with a named name tag to put it on that frequency.
+  An empty-hand click shows the frequency and what it holds. Every entangloporter on one frequency
+  shares one energy buffer (256,000,000 FE), one fluid tank (256,000 mB) and one chemical tank
+  (8,192,000 mB), in any dimension (`InventoryFrequency`).
+- **Moving things.** Cables, pipes and tubes fill it from any side. Each tick it moves what it took
+  in into the frequency, and the frequency's energy, fluid and chemical go out of its front, the face
+  it was placed facing, into the cable, pipe, tube or machine there. The Configurator's side settings
+  still apply.
+- **Saving.** The frequencies live in memory. Each entangloporter keeps a copy of its frequency in its
+  own NBT, and the first one to tick after a load brings the frequency back.
+- **Not done:** the item slot, heat, and private frequencies (all frequencies are public).

@@ -10,6 +10,7 @@ pub mod chargepad;
 pub mod chemical;
 pub mod dynamic_tank;
 pub mod energy;
+pub mod entangloporter;
 pub mod evaporation;
 pub mod factory;
 pub mod fission;
