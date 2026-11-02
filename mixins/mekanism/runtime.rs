@@ -124,6 +124,8 @@ enum Kind {
     BioGenerator,
     /// The Fuelwood Heater: furnace fuel into heat for a boiler.
     FuelwoodHeater,
+    /// The Pressurized Reaction Chamber: an item, water and a chemical into an item and a chemical.
+    Reaction,
 }
 
 fn kind(id: &str) -> Option<Kind> {
@@ -186,6 +188,7 @@ fn kind(id: &str) -> Option<Kind> {
         boiler::VALVE => return Some(Kind::BoilerValve),
         boiler::HEATER => return Some(Kind::Heater),
         boiler::FUELWOOD_HEATER => return Some(Kind::FuelwoodHeater),
+        REACTION_CHAMBER => return Some(Kind::Reaction),
         mekanism_core::generator::BIO_GENERATOR => return Some(Kind::BioGenerator),
         "mekanism:chemical_washer" => return Some(Kind::Washer),
         "mekanism:chemical_crystallizer" => return Some(Kind::Crystallizer),
@@ -329,6 +332,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::Advanced(_)) => (vec![0, 1], vec![2]),
         // The nucleosynthesizer's item in the first slot, antimatter pellets in the middle one.
         Some(Kind::Nucleosynthesizer) => (vec![0, 1], vec![2]),
+        // The reaction chamber's item in the first slot, its energy slot in the middle.
+        Some(Kind::Reaction) => (vec![0, 1], vec![2]),
         // Water buckets in the first slot (empty buckets out of the last), and an empty bucket in the
         // middle one fills with brine.
         Some(Kind::Evaporation) => (vec![0, 1], vec![2]),
@@ -422,6 +427,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         Kind::Heater => tick_heater(entity),
         Kind::FuelwoodHeater => tick_fuelwood_heater(game, entity),
         Kind::BioGenerator => tick_bio_generator(game, pos, entity),
+        Kind::Reaction => tick_reaction(game, pos, entity),
         Kind::Washer => tick_washer(game, pos, entity),
         Kind::Crystallizer => tick_crystallizer(entity),
         Kind::Advanced(m) => tick_advanced(game, entity, m),
@@ -1001,6 +1007,7 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
             Kind::Separator if chem::separates(chemical) => Some(("fluid", chem::SEPARATOR_FLUID)),
             Kind::Rotary if chem::rotary_chemical(chemical).is_some() => Some(("fluid", chem::ROTARY_TANK)),
             Kind::Washer if chemical == "minecraft:water" => Some(("fluid", nuclear::WASHER_TANK)),
+            Kind::Reaction if chemical == "minecraft:water" => Some(("fluid", REACTION_TANK)),
             Kind::DynamicValve if valve_takes(nbt, chemical) => Some(("buffer", dynamic_tank::VALVE_BUFFER)),
             // Brine crystallizes into salt.
             Kind::Crystallizer if nuclear::find_crystallizing(chemical).is_some() => Some(("input", nuclear::CRYSTALLIZER_TANK)),
@@ -1032,6 +1039,9 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
         Kind::Crystallizer if nuclear::find_crystallizing(chemical).is_some() => Some(("input", nuclear::CRYSTALLIZER_TANK)),
         Kind::Activator if isotopes::activating(chemical).is_some() => Some(("input", isotopes::ACTIVATOR_TANK)),
         Kind::Nucleosynthesizer if chemical == chem::ANTIMATTER => Some(("chemical", chem::NUCLEOSYNTHESIZER_TANK)),
+        Kind::Reaction if mekanism_core::recipes::reaction_input(chemical) && get_tank(nbt, "input", REACTION_TANK).accepts(chemical) => {
+            Some(("input", REACTION_TANK))
+        }
         Kind::DynamicValve if valve_takes(nbt, chemical) => Some(("buffer", dynamic_tank::VALVE_BUFFER)),
         _ => None,
     }
@@ -1848,7 +1858,9 @@ fn serves(family: &str, kind: Kind) -> bool {
         ),
         "pipe" => matches!(
             kind,
-            Kind::FluidTank(_)
+            Kind::Reaction
+                | Kind::BioGenerator
+                | Kind::FluidTank(_)
                 | Kind::Separator
                 | Kind::Rotary
                 | Kind::HeatGenerator
@@ -1862,7 +1874,8 @@ fn serves(family: &str, kind: Kind) -> bool {
         ),
         "tube" => matches!(
             kind,
-            Kind::Oxidizer
+            Kind::Reaction
+                | Kind::Oxidizer
                 | Kind::Advanced(_)
                 | Kind::Nucleosynthesizer
                 | Kind::ChemicalInfuser
@@ -2596,6 +2609,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Separator => Some((machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE, u64::MAX)),
         Kind::Advanced(m) => Some((m.usage * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
         Kind::Nucleosynthesizer => Some((machine::STORAGE_MULTIPLIER * chem::NUCLEOSYNTHESIZER_USAGE, u64::MAX)),
+        Kind::Reaction => Some((reaction_capacity(nbt), u64::MAX)),
         Kind::Teleporter => Some((teleporter::STORAGE, u64::MAX)),
         // A laser takes energy on every side but its front; amplifiers and tractor beams only from lasers.
         Kind::Laser if facing_away => Some((laser::LASER_STORAGE, u64::MAX)),
@@ -4068,6 +4082,22 @@ fn layout(block: &str) -> Option<Layout> {
         // GuiDynamicTank: one gauge for the fluid or chemical.
         // GuiAntiprotonicNucleosynthesizer, on the advanced machines' panel: the item, the antimatter
         // pellets below it, the output, and the antimatter gauge on the left.
+        // GuiPRC: the item (54, 40), energy (141, 22) and output (116, 40) slots; the fluid, chemical and
+        // output gauges.
+        Kind::Reaction => Layout {
+            slots: [
+                Some(([54.0, 40.0], "slot/normal")),
+                Some(([141.0, 22.0], "slot/power")),
+                Some(([116.0, 40.0], "slot/output")),
+            ],
+            gauges: vec![
+                gauge("fluid", REACTION_TANK, 5.0, 10.0, STANDARD),
+                gauge("input", REACTION_TANK, 28.0, 10.0, STANDARD),
+                gauge("output", REACTION_TANK, 140.0, 40.0, STANDARD),
+            ],
+            power: Some(PowerBar::Vertical([163.0, 15.0])),
+            progress: Some(([77.0, 38.0], "progress/bar", [25.0, 9.0])),
+        },
         Kind::Nucleosynthesizer => Layout {
             slots: [
                 Some(([64.0, 17.0], "slot/normal")),
@@ -6616,5 +6646,87 @@ fn tick_fuelwood_heater(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Opt
     }
     put_int(&mut entity.nbt, "burn_time", burn);
     entity.nbt.insert("heat_out".into(), Tag::Double(heat.to_bits()));
+    Some(active)
+}
+
+// --- Pressurized Reaction Chamber -------------------------------------------------------------------
+
+const REACTION_CHAMBER: &str = "mekanism:pressurized_reaction_chamber";
+/// `TileEntityPressurizedReactionChamber.MAX_FLUID` and `MAX_GAS`.
+const REACTION_TANK: u64 = 10_000;
+/// `UsageConfig.pressurizedReactionBase`: 2 FE a tick, plus the recipe's own.
+const REACTION_USAGE: u64 = 2;
+
+/// The energy it holds: four ticks of its base usage, or one tick of the current recipe's when that is
+/// more (`AttributeEnergy.getStorage`).
+fn reaction_capacity(nbt: &Compound) -> u64 {
+    (machine::STORAGE_MULTIPLIER * REACTION_USAGE).max(REACTION_USAGE + get_long(nbt, "recipe_energy"))
+}
+
+/// A reaction chamber tick: while the first slot, the water and the chemical make a recipe and there is
+/// room for its products, it works through the recipe's duration, then takes the inputs and gives the
+/// item to the last slot and the chemical to its output tank, which tubes beside it empty.
+fn tick_reaction(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let mut fluid = get_tank(&entity.nbt, "fluid", REACTION_TANK);
+    let mut input = get_tank(&entity.nbt, "input", REACTION_TANK);
+    let mut output = get_tank(&entity.nbt, "output", REACTION_TANK);
+    pull_fluid(game, pos, &mut fluid, "minecraft:water");
+    let items = world_items!(game);
+    let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
+    let stack = entity.items.first().cloned().flatten();
+    let recipe = stack.as_ref().and_then(|s| {
+        mekanism_core::recipes::find_reaction(&s.item, s.count, fluid.chemical.as_deref(), input.chemical.as_deref(), &in_tag)
+    });
+    put_long(&mut entity.nbt, "recipe_energy", recipe.map_or(0, |r| r.energy));
+    let capacity = reaction_capacity(&entity.nbt);
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut progress = get_int(&entity.nbt, "progress");
+    let out = entity.items.get(2).cloned().flatten();
+    let mut active = false;
+    let mut ticks = 0;
+    match (recipe, stack) {
+        (Some(r), Some(stack)) => {
+            ticks = r.duration.max(1);
+            let item_fits = r.output.is_none_or(|(id, n)| {
+                let max = items.get(id).map_or(64, |i| i.max_stack);
+                out.as_ref().is_none_or(|o| &*o.item == id && o.count + n <= max)
+            });
+            let gas_fits = r.output_chemical.is_none_or(|(id, n)| output.accepts(id) && output.amount + n <= output.capacity);
+            if item_fits
+                && gas_fits
+                && fluid.amount >= r.fluid_amount
+                && input.amount >= r.chemical_amount
+                && energy.consume(REACTION_USAGE + r.energy)
+            {
+                active = true;
+                progress += 1;
+                if progress >= ticks {
+                    progress = 0;
+                    fluid.extract(r.fluid_amount);
+                    input.extract(r.chemical_amount);
+                    let left = stack.count - r.item_count;
+                    entity.items[0] = (left > 0).then(|| ItemStack { count: left, ..stack });
+                    if let Some((id, n)) = r.output {
+                        entity.items[2] = Some(match out {
+                            Some(o) => ItemStack { count: o.count + n, ..o },
+                            None => stack_of(id, n),
+                        });
+                    }
+                    if let Some((id, n)) = r.output_chemical {
+                        output.insert(id, n);
+                    }
+                }
+            }
+        }
+        _ => progress = 0,
+    }
+    push_chemical(game, pos, &mut output, None, u64::MAX, false);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "progress", progress);
+    put_tank(&mut entity.nbt, "fluid", &fluid);
+    put_tank(&mut entity.nbt, "input", &input);
+    put_tank(&mut entity.nbt, "output", &output);
+    entity.data = vec![(energy.stored * 1000 / capacity.max(1)) as i32, 1000, progress as i32, ticks as i32];
     Some(active)
 }

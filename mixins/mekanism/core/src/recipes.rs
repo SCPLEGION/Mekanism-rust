@@ -131,6 +131,49 @@ pub struct NucleosynthesizingRecipe {
     pub duration: u32,
 }
 
+/// `mekanism:reaction` (the Pressurized Reaction Chamber): an item, a fluid and a chemical over
+/// `duration` ticks into an item and/or a chemical, for 2 FE a tick plus `energy`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReactionRecipe {
+    pub id: &'static str,
+    pub item: Ingredient,
+    pub item_count: u32,
+    pub fluid: &'static str,
+    pub fluid_amount: u64,
+    pub chemical: &'static str,
+    pub chemical_amount: u64,
+    pub duration: u32,
+    pub energy: u64,
+    pub output: Option<(&'static str, u32)>,
+    pub output_chemical: Option<(&'static str, u64)>,
+}
+
+/// The first reaction whose item takes `count` of `item` and whose fluid and chemical are those given.
+pub fn find_reaction(
+    item: &str,
+    count: u32,
+    fluid: Option<&str>,
+    chemical: Option<&str>,
+    in_tag: &dyn Fn(&str, &str) -> bool,
+) -> Option<ReactionRecipe> {
+    crate::recipe_table::REACTION
+        .iter()
+        .find(|r| {
+            count >= r.item_count
+                && r.item.matches(item, in_tag)
+                && fluid.is_none_or(|f| f == r.fluid)
+                && chemical.is_none_or(|c| c == r.chemical)
+        })
+        .copied()
+}
+
+/// Whether some reaction takes `chemical` as its chemical input.
+pub fn reaction_input(chemical: &str) -> bool {
+    crate::recipe_table::REACTION
+        .iter()
+        .any(|r| r.chemical == chemical)
+}
+
 pub fn find_purifying(
     item: &str,
     count: u32,
@@ -217,6 +260,36 @@ pub fn table(kind: &str) -> &'static [ItemRecipe] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coal_gasification_makes_hydrogen_and_sulfur() {
+        let tags = |tag: &str, item: &str| tag == "minecraft:coals" && item == "minecraft:coal";
+        let r = super::find_reaction(
+            "minecraft:coal",
+            1,
+            Some("minecraft:water"),
+            Some("mekanism:oxygen"),
+            &tags,
+        )
+        .unwrap();
+        assert_eq!(
+            (r.fluid_amount, r.chemical_amount, r.duration),
+            (100, 100, 100)
+        );
+        assert_eq!(r.output, Some(("mekanism:dust_sulfur", 1)));
+        assert_eq!(r.output_chemical, Some(("mekanism:hydrogen", 100)));
+        assert!(
+            super::find_reaction(
+                "minecraft:coal",
+                1,
+                Some("minecraft:water"),
+                Some("mekanism:hydrogen"),
+                &tags
+            )
+            .is_none()
+        );
+        assert!(super::reaction_input("mekanism:plutonium"));
+    }
+
     #[test]
     fn coal_and_four_mb_of_antimatter_make_a_diamond() {
         let r = crate::recipe_table::NUCLEOSYNTHESIZING
