@@ -823,3 +823,21 @@ unit) and takes the modules for its slot at the Modification Station (M42).
 
 **Not ported:** extended vein mining (non-ore veins), and the farming, shearing and attack
 amplification units.
+
+## M45: MekaSuit utility modules
+
+The client tells the server when a module has work to do, and the server does it on its own copy of
+the suit, as with the jetpack.
+- **Electrolytic Breathing Unit** (helmet): while you are short of air, it gives 2^units air a tick
+  (2, 4, 8 or 16). Each unit of air costs 4 FE, twice hydrogen's energy density. The hydrogen it makes
+  (two for each air) fills a jetpack, or body armor with a Jetpack Unit, on your chest
+  (`ModuleElectrolyticBreathingUnit`).
+- **Charge Distribution Unit** (body armor): once a second, the body armor charges the held item and
+  then the rest of your inventory, at up to 10 kFE a tick. Then the worn suit pieces share their
+  energy evenly (`ModuleChargeDistributionUnit`).
+- **Solar Recharging Unit** (Generators, helmet, up to 8): once a second, the helmet charges as a
+  solar panel just above your eyes would, at 500 FE a tick peak for each unit
+  (`ModuleSolarRechargingUnit`).
+
+**Not ported:** breathing in rain, the geothermal generator unit (it installs but does nothing), and
+the other helmet, body armor, pants and boots units.

@@ -70,6 +70,12 @@ pub const MODULES: &[(&str, u32, Fits)] = &[
     ("mekanism:magnetic_attraction_unit", 4, Fits::Boots),
     ("mekanism:frost_walker_unit", 2, Fits::Boots),
     ("mekanism:soul_surfer_unit", 3, Fits::Boots),
+    ("mekanismgenerators:solar_recharging_unit", 8, Fits::Helmet),
+    (
+        "mekanismgenerators:geothermal_generator_unit",
+        8,
+        Fits::Legs,
+    ),
 ];
 
 pub fn is_container(item: &str) -> bool {
@@ -277,6 +283,62 @@ pub fn sprint_push(boost: f32, yaw_degrees: f32, on_ground: bool, in_water: bool
     [-yaw.sin() * f64::from(b), yaw.cos() * f64::from(b)]
 }
 
+/// `ModuleElectrolyticBreathingUnit`: 2^units of oxygen (air) a tick under water, each costing twice
+/// hydrogen's energy density (4 FE); the hydrogen it makes alongside (two for each) fills a jetpack on
+/// the chest.
+pub const BREATHING_USAGE: u64 = 4;
+
+pub fn breathing_rate(installed: &Installed) -> u32 {
+    match installed
+        .get("mekanism:electrolytic_breathing_unit")
+        .copied()
+        .unwrap_or(0)
+    {
+        0 => 0,
+        n => 1 << n.min(4),
+    }
+}
+
+/// One breathing tick: the air given, the hydrogen made and the energy it all costs, for `rate`, the
+/// air missing and the hydrogen room on the chest.
+pub fn breathe(rate: u32, air_missing: u32, hydrogen_room: u64) -> (u32, u64, u64) {
+    let oxygen = rate.min(air_missing);
+    let hydrogen = u64::from(2 * rate).min(hydrogen_room);
+    let used = u64::from(oxygen).max(hydrogen.div_ceil(2));
+    (oxygen, hydrogen, BREATHING_USAGE * used)
+}
+
+/// `GearConfig.mekaSuitSolarRechargingRate`: the Solar Recharging Unit's peak, times the installed units.
+pub const SOLAR_RATE: u64 = 500;
+/// `GearConfig.mekaSuitInventoryChargeRate`: what the Charge Distribution Unit gives the inventory a
+/// tick.
+pub const INVENTORY_CHARGE_RATE: u64 = 10_000;
+
+/// `EmitUtils.sendToAcceptors` over the worn pieces: `total` split evenly by count, what a full piece
+/// can't take going to the others.
+pub fn split_evenly(total: u64, capacities: &[u64]) -> Vec<u64> {
+    let mut out = vec![0; capacities.len()];
+    let mut left = total;
+    let mut open: Vec<usize> = (0..capacities.len()).collect();
+    while left > 0 && !open.is_empty() {
+        let share = (left / open.len() as u64).max(1);
+        let mut next = Vec::new();
+        for &i in &open {
+            let give = share.min(capacities[i] - out[i]).min(left);
+            out[i] += give;
+            left -= give;
+            if out[i] < capacities[i] {
+                next.push(i);
+            }
+            if left == 0 {
+                break;
+            }
+        }
+        open = next;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +381,18 @@ mod tests {
         assert_eq!(enchantments(&m), vec![("minecraft:fortune", 3)]);
         install(MEKA_TOOL, &mut m, "mekanism:silk_touch_unit", 1);
         assert_eq!(enchantments(&m), vec![("minecraft:silk_touch", 1)]);
+    }
+
+    #[test]
+    fn breathing_and_sharing() {
+        let mut m = Installed::new();
+        assert_eq!(breathing_rate(&m), 0);
+        install(HELMET, &mut m, "mekanism:electrolytic_breathing_unit", 2);
+        assert_eq!(breathing_rate(&m), 4);
+        assert_eq!(breathe(4, 3, 0), (3, 0, 12));
+        assert_eq!(breathe(4, 0, 100), (0, 8, 16));
+        assert_eq!(split_evenly(100, &[10, 1_000, 1_000]), vec![10, 45, 45]);
+        assert_eq!(split_evenly(7, &[100, 100]), vec![4, 3]);
     }
 
     #[test]

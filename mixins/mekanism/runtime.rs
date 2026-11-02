@@ -806,8 +806,19 @@ fn overworld(game: &Game<'_>) -> bool {
 fn tick_solar(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, peak: u64, storage: u64) -> Option<bool> {
     let mut energy = EnergyContainer::new(storage, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(storage);
+    let produced = sun_production(game, pos, peak);
+    energy.insert(produced, Action::Execute);
+    charge_slot(entity, 0, &mut energy);
+    push_energy(game, pos, &mut energy, None, false);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    entity.data = vec![(energy.stored * 1000 / storage.max(1)) as i32, 1000, produced as i32, peak as i32];
+    Some(produced > 0)
+}
+
+/// What a solar panel at `pos` with `peak` makes this tick.
+fn sun_production(game: &Game<'_>, pos: [i32; 3], peak: u64) -> u64 {
     let sees_sun = overworld(game) && game.sky_darken() < 4 && can_see_sky(game, pos);
-    let produced = if sees_sun {
+    if sees_sun {
         let mut sky = game.res.environment().sample(game.world.day_time, None, None);
         let (rain, thunder) = game.world.weather.levels(1.0);
         horizon_client::environment::apply_weather(&mut sky, rain, thunder);
@@ -820,13 +831,7 @@ fn tick_solar(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, p
         mekanism_core::generator::solar_production(peak, true, sky.sky_light_factor, m)
     } else {
         0
-    };
-    energy.insert(produced, Action::Execute);
-    charge_slot(entity, 0, &mut energy);
-    push_energy(game, pos, &mut energy, None, false);
-    put_long(&mut entity.nbt, "energy", energy.stored);
-    entity.data = vec![(energy.stored * 1000 / storage.max(1)) as i32, 1000, produced as i32, peak as i32];
-    Some(produced > 0)
+    }
 }
 
 /// The wind generator: its multiplier is worked out once a second, from the height of its top.
@@ -3072,6 +3077,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     }
     free_runners_tick(game);
     mekasuit_sprint(game);
+    mekasuit_client(game);
     let Some(chest) = game.armor[1].as_ref().filter(|s| is_jetpack(s)) else {
         return;
     };
@@ -3099,6 +3105,14 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str) {
     if channel == MEKASUIT_CHANNEL && game.native_on(MOD_ID) {
         mekasuit_sprint_paid(game);
         return;
+    }
+    if game.native_on(MOD_ID) {
+        match channel {
+            BREATHING_CHANNEL => return mekasuit_breathe(game),
+            CHARGE_CHANNEL => return mekasuit_distribute(game),
+            SOLAR_CHANNEL => return mekasuit_solar(game),
+            _ => {}
+        }
     }
     if channel != JETPACK_CHANNEL || !game.native_on(MOD_ID) {
         return;
@@ -6027,4 +6041,132 @@ pub(super) fn meka_tool_area(game: &mut Game<'_>, pos: [i32; 3]) {
         let _ = game.break_block_as_player(at);
     }
     AREA_MINING.store(false, Relaxed);
+}
+
+/// The window tells the server, each tick its player is short of air, to run the helmet's Electrolytic
+/// Breathing Unit; and once a second to run the Charge Distribution and Solar Recharging Units. The
+/// server does the work on its own copy of the suit.
+const BREATHING_CHANNEL: &str = "mekanism:mekasuit_breathing";
+const CHARGE_CHANNEL: &str = "mekanism:mekasuit_charge";
+const SOLAR_CHANNEL: &str = "mekanism:mekasuit_solar";
+/// `Player.getMaxAirSupply`.
+const MAX_AIR: i32 = 300;
+
+static SUIT_TICKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn worn_module(game: &Game<'_>, slot: usize, item: &str, module: &str) -> bool {
+    game.armor[slot].as_ref().is_some_and(|s| &*s.item == item && modules_of(s).contains_key(module))
+}
+
+fn mekasuit_client(game: &mut Game<'_>) {
+    let tick = SUIT_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let short_of_air = game.player.as_ref().is_some_and(|p| p.air < MAX_AIR);
+    if short_of_air && worn_module(game, 0, modules::HELMET, "mekanism:electrolytic_breathing_unit") {
+        game.native_send_to_server(BREATHING_CHANNEL, &[1]);
+    }
+    if tick % 20 != 0 {
+        return;
+    }
+    if worn_module(game, 1, modules::BODYARMOR, "mekanism:charge_distribution_unit") {
+        game.native_send_to_server(CHARGE_CHANNEL, &[1]);
+    }
+    if worn_module(game, 0, modules::HELMET, "mekanismgenerators:solar_recharging_unit") {
+        game.native_send_to_server(SOLAR_CHANNEL, &[1]);
+    }
+}
+
+/// `ModuleElectrolyticBreathingUnit.tickServer`, under water: air for energy, and the hydrogen into a
+/// jetpack on the chest.
+fn mekasuit_breathe(game: &mut Game<'_>) {
+    let Some(helmet) = game.armor[0].as_ref().filter(|s| &*s.item == modules::HELMET) else {
+        return;
+    };
+    let rate = modules::breathing_rate(&modules_of(helmet));
+    let stored = stored_energy(helmet);
+    let Some(air) = game.player.as_ref().map(|p| p.air) else {
+        return;
+    };
+    let room = game.armor[1].as_ref().filter(|s| is_jetpack(s)).map_or(0, |c| jetpack_capacity(c) - jetpack_fuel(c));
+    let (oxygen, hydrogen, cost) = modules::breathe(rate, (MAX_AIR - air).max(0) as u32, room);
+    if rate == 0 || cost == 0 || stored < cost {
+        return;
+    }
+    if let Some(helmet) = game.armor[0].as_mut() {
+        set_energy(helmet, stored - cost);
+    }
+    if let Some(p) = game.player.as_mut() {
+        p.air = (p.air + oxygen as i32).min(MAX_AIR);
+    }
+    if hydrogen > 0
+        && let Some(chest) = game.armor[1].as_mut()
+    {
+        let fuel = jetpack_fuel(chest);
+        set_jetpack_fuel(chest, fuel + hydrogen);
+    }
+}
+
+/// `ModuleChargeDistributionUnit.tickServer`, for the second since the last note: the body armor charges
+/// the held item and then the rest of the inventory, at most 10 kFE a tick; then the worn suit pieces
+/// share their energy evenly.
+fn mekasuit_distribute(game: &mut Game<'_>) {
+    let Some(body) = game.armor[1].as_ref().filter(|s| &*s.item == modules::BODYARMOR) else {
+        return;
+    };
+    let mut available = stored_energy(body).min(modules::INVENTORY_CHARGE_RATE * 20);
+    let mut given = 0;
+    let selected = game.selected;
+    let order = std::iter::once(selected).chain((0..game.inventory.len().min(36)).filter(|&i| i != selected));
+    for i in order.collect::<Vec<_>>() {
+        if available == 0 {
+            break;
+        }
+        let Some(stack) = game.inventory.get_mut(i).and_then(|s| s.as_mut()) else {
+            continue;
+        };
+        let Some(e) = item_energy_of(stack) else {
+            continue;
+        };
+        let stored = stored_energy(stack);
+        let put = e.capacity.saturating_sub(stored).min(e.rate * 20).min(available);
+        if put > 0 {
+            set_energy(stack, stored + put);
+            available -= put;
+            given += put;
+        }
+    }
+    if let Some(body) = game.armor[1].as_mut() {
+        let stored = stored_energy(body);
+        set_energy(body, stored - given);
+    }
+    let pieces: Vec<usize> = (0..4).filter(|&i| game.armor[i].as_ref().is_some_and(|s| modules::is_container(&s.item))).collect();
+    if pieces.len() < 2 {
+        return;
+    }
+    let total: u64 = pieces.iter().filter_map(|&i| game.armor[i].as_ref()).map(stored_energy).sum();
+    let caps: Vec<u64> = pieces.iter().map(|&i| game.armor[i].as_ref().and_then(item_energy_of).map_or(0, |e| e.capacity)).collect();
+    for (&i, share) in pieces.iter().zip(modules::split_evenly(total, &caps)) {
+        if let Some(piece) = game.armor[i].as_mut() {
+            set_energy(piece, share);
+        }
+    }
+}
+
+/// `ModuleSolarRechargingUnit.tickServer`, for the second since the last note: the helmet charges as a
+/// solar panel above the player's eyes does, 500 FE a tick at its peak for each installed unit.
+fn mekasuit_solar(game: &mut Game<'_>) {
+    let Some(helmet) = game.armor[0].as_ref().filter(|s| &*s.item == modules::HELMET) else {
+        return;
+    };
+    let units = modules_of(helmet).get("mekanismgenerators:solar_recharging_unit").copied().unwrap_or(0);
+    let capacity = item_energy_of(helmet).map_or(0, |e| e.capacity);
+    let stored = stored_energy(helmet);
+    let Some(at) = game.player.as_ref().map(|p| [p.position.x, p.position.y + 1.62 + 0.2, p.position.z].map(|v| v.floor() as i32)) else {
+        return;
+    };
+    let made = sun_production(game, at, modules::SOLAR_RATE * u64::from(units)) * 20;
+    if made > 0
+        && let Some(helmet) = game.armor[0].as_mut()
+    {
+        set_energy(helmet, (stored + made).min(capacity.max(stored)));
+    }
 }
