@@ -9,6 +9,10 @@ pub const VALVE: &str = "mekanism:boiler_valve";
 pub const DISPERSER: &str = "mekanism:pressure_disperser";
 pub const ELEMENT: &str = "mekanism:superheating_element";
 pub const HEATER: &str = "mekanism:resistive_heater";
+/// The Fuelwood Heater: furnace fuel into heat (`GeneralConfig.heatPerFuelTick`, 400 a tick of burn
+/// time).
+pub const FUELWOOD_HEATER: &str = "mekanism:fuelwood_heater";
+pub const HEAT_PER_FUEL_TICK: f64 = 400.0;
 
 /// `general.boiler`: `waterPerTank`, `steamPerTank`, `waterConductivity`, `superheatingHeatTransfer`.
 pub const WATER_PER_BLOCK: u64 = 16_000;

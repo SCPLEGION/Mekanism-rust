@@ -120,6 +120,10 @@ enum Kind {
     TractorBeam,
     /// A Seismic Vibrator: lets a Seismic Reader see under its chunk while it has energy.
     Vibrator,
+    /// The Bio-Generator: bioethanol (from bio fuel) into energy.
+    BioGenerator,
+    /// The Fuelwood Heater: furnace fuel into heat for a boiler.
+    FuelwoodHeater,
 }
 
 fn kind(id: &str) -> Option<Kind> {
@@ -181,6 +185,8 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:solar_neutron_activator" => return Some(Kind::Activator),
         boiler::VALVE => return Some(Kind::BoilerValve),
         boiler::HEATER => return Some(Kind::Heater),
+        boiler::FUELWOOD_HEATER => return Some(Kind::FuelwoodHeater),
+        mekanism_core::generator::BIO_GENERATOR => return Some(Kind::BioGenerator),
         "mekanism:chemical_washer" => return Some(Kind::Washer),
         "mekanism:chemical_crystallizer" => return Some(Kind::Crystallizer),
         _ => {}
@@ -307,7 +313,9 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
     let (inputs, outputs) = match kind(block) {
         Some(Kind::Machine(..)) => (vec![0, 1], vec![2]),
         // The heat generator burns from the middle slot; generators charge an item in the first.
-        Some(Kind::HeatGenerator) => (vec![0, 1], vec![]),
+        Some(Kind::HeatGenerator | Kind::BioGenerator) => (vec![0, 1], vec![]),
+        // The fuelwood heater burns from the first slot.
+        Some(Kind::FuelwoodHeater) => (vec![0], vec![]),
         Some(Kind::Wind | Kind::GasGenerator) => (vec![0], vec![]),
         // The plain solar generator is an iron block with no menu.
         Some(Kind::Solar(..)) if block.ends_with("advanced_solar_generator") => (vec![0], vec![]),
@@ -412,6 +420,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         Kind::Activator => tick_activator(game, pos, entity),
         Kind::BoilerValve => tick_boiler_valve(game, pos, entity),
         Kind::Heater => tick_heater(entity),
+        Kind::FuelwoodHeater => tick_fuelwood_heater(game, entity),
+        Kind::BioGenerator => tick_bio_generator(game, pos, entity),
         Kind::Washer => tick_washer(game, pos, entity),
         Kind::Crystallizer => tick_crystallizer(entity),
         Kind::Advanced(m) => tick_advanced(game, entity, m),
@@ -3934,6 +3944,13 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
         },
+        // The bio-generator's fuel slot and bioethanol gauge (GuiBioGenerator).
+        Kind::BioGenerator => Layout {
+            slots: [Some(([143.0, 35.0], "slot/power")), Some(([17.0, 35.0], "slot/normal")), None],
+            gauges: vec![gauge("fuel", mekanism_core::generator::BIO_TANK, 55.0, 18.0, WIDE)],
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
+            progress: None,
+        },
         // The gas-burning generator's fuel gauge (GuiGasGenerator).
         Kind::GasGenerator => Layout {
             slots: [Some(([143.0, 35.0], "slot/power")), None, None],
@@ -4099,6 +4116,7 @@ fn energy_capacity(entity: &ModBlockEntity) -> u64 {
     match kind(&entity.id) {
         Some(Kind::HeatGenerator) => HeatGenerator::new().energy.capacity,
         Some(Kind::Wind) => mekanism_core::generator::WIND_STORAGE,
+        Some(Kind::BioGenerator) => mekanism_core::generator::BIO_STORAGE,
         Some(Kind::GasGenerator) => chem::GAS_GENERATOR_STORAGE,
         Some(Kind::Solar(_, storage)) => storage,
         Some(Kind::FusionPort) => fusion::ENERGY_CAPACITY,
@@ -5043,7 +5061,7 @@ fn find_boiler(game: &Game<'_>, start: [i32; 3]) -> Option<(boiler::Boiler, Vec<
             for z in lo[2] - 1..=hi[2] + 1 {
                 let at = [x, y, z];
                 let outside = (0..3).filter(|&k| at[k] < lo[k] || at[k] > hi[k]).count();
-                if outside == 1 && block_name(game, at) == boiler::HEATER {
+                if outside == 1 && [boiler::HEATER, boiler::FUELWOOD_HEATER].contains(&block_name(game, at)) {
                     heaters.push(at);
                 }
             }
@@ -6527,4 +6545,76 @@ fn seismic_reader_use(game: &mut Game<'_>, claimed: &mut bool) {
     for line in ores {
         tell(game, format!("  {line}"));
     }
+}
+
+// --- Bio-Generator and Fuelwood Heater --------------------------------------------------------------
+
+/// The bioethanol an item gives the bio-generator (`biofuelFromItem`).
+fn bio_fuel_of(game: &Game<'_>, item: &str) -> u64 {
+    use mekanism_core::generator as g;
+    let items = world_items!(game);
+    let in_tag = |tag: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
+    if in_tag("c:fuels/bio") {
+        g::BIO_FUEL_PER_ITEM
+    } else if in_tag("c:fuels/block/bio") {
+        9 * g::BIO_FUEL_PER_ITEM
+    } else {
+        0
+    }
+}
+
+/// A bio-generator tick: a bio fuel in the middle slot becomes bioethanol when it all fits, pipes
+/// bring more, and 1 mB a tick makes 25 FE while there is room for it.
+fn tick_bio_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    use mekanism_core::generator as g;
+    let mut energy = EnergyContainer::new(g::BIO_STORAGE, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(g::BIO_STORAGE);
+    let mut fuel = get_tank(&entity.nbt, "fuel", g::BIO_TANK);
+    if let Some(Some(item)) = entity.items.get(1).cloned() {
+        let amount = bio_fuel_of(game, &item.item);
+        if amount > 0 && fuel.accepts(g::BIOETHANOL) && fuel.capacity - fuel.amount >= amount {
+            fuel.insert(g::BIOETHANOL, amount);
+            entity.items[1] = (item.count > 1).then(|| ItemStack { count: item.count - 1, ..item });
+        }
+    }
+    pull_fluid(game, pos, &mut fuel, g::BIOETHANOL);
+    let (used, made) = g::bio_tick(fuel.amount, energy.capacity - energy.stored);
+    fuel.extract(used);
+    energy.insert(made, Action::Execute);
+    charge_slot(entity, 0, &mut energy);
+    push_energy(game, pos, &mut energy, None, false);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_tank(&mut entity.nbt, "fuel", &fuel);
+    Some(made > 0)
+}
+
+/// A fuelwood heater tick: when its burn runs out it burns the next furnace fuel of its slot; while it
+/// burns it makes 400 heat a tick for the boiler beside it (kept up to 20 ticks' worth, as the
+/// resistive heater's).
+fn tick_fuelwood_heater(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool> {
+    let mut burn = get_int(&entity.nbt, "burn_time");
+    if burn == 0
+        && let Some(Some(fuel)) = entity.items.first().cloned()
+    {
+        let time = game.res.providers().burn_time(world_items!(game), &fuel, false).max(0) as u32;
+        if time > 0 {
+            burn = time;
+            entity.items[0] = if fuel.count > 1 {
+                Some(ItemStack { count: fuel.count - 1, ..fuel })
+            } else if &*fuel.item == "minecraft:lava_bucket" {
+                Some(stack_of("minecraft:bucket", 1))
+            } else {
+                None
+            };
+        }
+    }
+    let active = burn > 0;
+    let mut heat = get_double(&entity.nbt, "heat_out").unwrap_or(0.0);
+    if active {
+        burn -= 1;
+        heat = (heat + boiler::HEAT_PER_FUEL_TICK).min(boiler::HEAT_PER_FUEL_TICK * 20.0);
+    }
+    put_int(&mut entity.nbt, "burn_time", burn);
+    entity.nbt.insert("heat_out".into(), Tag::Double(heat.to_bits()));
+    Some(active)
 }

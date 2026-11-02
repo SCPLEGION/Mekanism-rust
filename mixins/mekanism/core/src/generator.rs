@@ -210,6 +210,25 @@ pub fn wind_generation(multiplier: f64) -> u64 {
     }
 }
 
+/// The Bio-Generator (`TileEntityBioGenerator`, `GeneratorsConfig.bio*`): 1 mB of bioethanol a tick
+/// makes 25 FE.
+pub const BIO_GENERATOR: &str = "mekanismgenerators:bio_generator";
+pub const BIOETHANOL: &str = "mekanismgenerators:bioethanol";
+pub const BIO_GENERATION: u64 = 25;
+pub const BIO_STORAGE: u64 = 30 * 20;
+pub const BIO_TANK: u64 = 200;
+/// `bioFuelPerItem`: the bioethanol a bio fuel gives (nine times that for a block of it).
+pub const BIO_FUEL_PER_ITEM: u64 = 64;
+
+/// One tick of a bio-generator with `fuel` mB and `room` FE free: (fuel used, energy made).
+pub fn bio_tick(fuel: u64, room: u64) -> (u64, u64) {
+    if fuel >= 1 && room >= BIO_GENERATION {
+        (1, BIO_GENERATION)
+    } else {
+        (0, 0)
+    }
+}
+
 #[cfg(test)]
 mod sun_and_wind_tests {
     use super::*;
@@ -234,5 +253,12 @@ mod sun_and_wind_tests {
         assert_eq!(wind_multiplier(319, -64, 319), 5.0);
         assert_eq!(wind_generation(wind_multiplier(319, -64, 319)), 5);
         assert_eq!(wind_generation(wind_multiplier(100, -64, 319)), 2);
+    }
+
+    #[test]
+    fn bio_generator_needs_room() {
+        assert_eq!(bio_tick(10, 600), (1, 25));
+        assert_eq!(bio_tick(10, 24), (0, 0));
+        assert_eq!(bio_tick(0, 600), (0, 0));
     }
 }
