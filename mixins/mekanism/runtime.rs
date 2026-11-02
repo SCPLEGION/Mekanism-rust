@@ -12,6 +12,7 @@ use mekanism_core::energy::{Action, EnergyContainer};
 use mekanism_core::evaporation as evap;
 use mekanism_core::gear;
 use mekanism_core::nuclear;
+use mekanism_core::qio;
 use mekanism_core::fission;
 use mekanism_core::fusion;
 use mekanism_core::bin::{self, Bin};
@@ -104,6 +105,11 @@ enum Kind {
     Bin(BaseTier),
     /// A personal chest or barrel: six rows that open for their owner only.
     PersonalStorage,
+    /// A QIO drive array, dashboard, importer or exporter.
+    QioDriveArray,
+    QioDashboard,
+    QioImporter,
+    QioExporter,
 }
 
 fn kind(id: &str) -> Option<Kind> {
@@ -124,6 +130,13 @@ fn kind(id: &str) -> Option<Kind> {
     }
     if bin::is_personal(id) {
         return Some(Kind::PersonalStorage);
+    }
+    match id {
+        qio::DRIVE_ARRAY => return Some(Kind::QioDriveArray),
+        qio::DASHBOARD => return Some(Kind::QioDashboard),
+        qio::IMPORTER => return Some(Kind::QioImporter),
+        qio::EXPORTER => return Some(Kind::QioExporter),
+        _ => {}
     }
     use mekanism_core::generator as g;
     match id {
@@ -247,6 +260,21 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             outputs: vec![],
             menu: Some("minecraft:generic_9x6".into()),
         });
+        return;
+    }
+    // QIO: the drive array's two rows (its first twelve slots hold drives), the dashboard's six rows,
+    // and an importer's slot that hoppers fill.
+    let qio_menu = match kind(block) {
+        Some(Kind::QioDriveArray) => Some((18, "minecraft:generic_9x2")),
+        Some(Kind::QioDashboard) => Some((qio::DASHBOARD_SLOTS, "minecraft:generic_9x6")),
+        _ => None,
+    };
+    if let Some((slots, menu)) = qio_menu {
+        *container = Some(ModContainer { slots, faces: Default::default(), inputs: vec![], outputs: vec![], menu: Some(menu.into()) });
+        return;
+    }
+    if let Some(Kind::QioImporter) = kind(block) {
+        *container = Some(ModContainer { slots: 1, faces: std::array::from_fn(|_| vec![0]), inputs: vec![0], outputs: vec![], menu: None });
         return;
     }
     let (inputs, outputs) = match kind(block) {
@@ -398,6 +426,22 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             None
         }
         Kind::PersonalStorage => None,
+        Kind::QioDriveArray => {
+            tick_drive_array(game, pos, entity);
+            None
+        }
+        Kind::QioDashboard => {
+            tick_dashboard(game, entity);
+            None
+        }
+        Kind::QioImporter => {
+            tick_importer(game, pos, entity);
+            None
+        }
+        Kind::QioExporter => {
+            tick_exporter(game, pos, entity);
+            None
+        }
     };
     screen_data(entity);
     multiblock_data(game, pos, entity);
@@ -2942,6 +2986,10 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
         let line = bin_line(t, &bin_of(c));
         lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
     }
+    if let Some(d) = drive_of(stack) {
+        let line = format!("Stored: {} / {} items, {} / {} types", d.total(), d.count_limit, d.items.len(), d.type_limit);
+        lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+    }
     if let Some(Tag::Compound(c)) = custom_data(stack).and_then(|c| c.get(&JavaString::from(PERSONAL_KEY)))
         && let Some(name) = get_string(c, "owner_name")
     {
@@ -5369,4 +5417,268 @@ pub(super) fn use_personal_storage(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 /// Only its owner breaks a personal chest or barrel.
 pub(super) fn protect_personal(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     use_personal_storage(game, pos)
+}
+
+// --- QIO --------------------------------------------------------------------------------------------
+
+const QIO_KEY: &str = "mekanism:qio";
+
+/// The drive arrays this server has seen, by frequency, as `TELEPORTERS`.
+#[allow(clippy::type_complexity)]
+static QIO_ARRAYS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Vec<(super::Dim, [i32; 3])>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn is_qio(name: &str) -> bool {
+    [qio::DRIVE_ARRAY, qio::DASHBOARD, qio::IMPORTER, qio::EXPORTER].contains(&name)
+}
+
+/// What a drive item holds (`QIODriveData` in its custom data).
+fn drive_of(stack: &ItemStack) -> Option<qio::Drive> {
+    let (count_limit, type_limit) = qio::drive_tier(&stack.item)?;
+    let mut items = std::collections::BTreeMap::new();
+    if let Some(Tag::Compound(c)) = custom_data(stack).and_then(|c| c.get(&JavaString::from(QIO_KEY))) {
+        for (k, v) in c.iter() {
+            if let (Ok(id), Tag::Long(n)) = (k.to_string(), v)
+                && *n > 0
+            {
+                items.insert(id, *n as u64);
+            }
+        }
+    }
+    Some(qio::Drive { count_limit, type_limit, items })
+}
+
+fn put_drive(stack: &mut ItemStack, d: &qio::Drive) {
+    let mut c = Compound::new();
+    for (k, v) in &d.items {
+        c.insert(k.as_str().into(), Tag::Long(*v as i64));
+    }
+    set_custom_compound(stack, QIO_KEY, c);
+}
+
+/// The drives of `frequency`'s arrays in this dimension, and where each one is (array, slot).
+fn load_network(game: &mut Game<'_>, frequency: &str) -> (qio::Network, Vec<([i32; 3], usize)>) {
+    let dim = game.dim;
+    let arrays: Vec<[i32; 3]> = QIO_ARRAYS
+        .lock()
+        .ok()
+        .and_then(|all| all.get(frequency).map(|l| l.iter().filter(|(d, _)| *d == dim).map(|(_, p)| *p).collect()))
+        .unwrap_or_default();
+    let mut net = qio::Network::default();
+    let mut at = Vec::new();
+    for pos in arrays {
+        let drives = game.native_with_mod_block_entity(pos, |m| {
+            if m.id != qio::DRIVE_ARRAY || get_string(&m.nbt, "frequency").as_deref() != Some(frequency) {
+                return Vec::new();
+            }
+            m.items.iter().take(qio::DRIVE_SLOTS).enumerate().filter_map(|(i, s)| Some((i, drive_of(s.as_ref()?)?))).collect()
+        });
+        for (slot, d) in drives.unwrap_or_default() {
+            net.drives.push(d);
+            at.push((pos, slot));
+        }
+    }
+    (net, at)
+}
+
+fn save_network(game: &mut Game<'_>, net: &qio::Network, at: &[([i32; 3], usize)]) {
+    for (d, &(pos, slot)) in net.drives.iter().zip(at) {
+        game.native_with_mod_block_entity(pos, |m| {
+            if let Some(Some(stack)) = m.items.get_mut(slot) {
+                put_drive(stack, d);
+            }
+        });
+    }
+}
+
+/// Puts the plain stacks of `slots` into the network, keeping what doesn't fit.
+fn return_to_network(net: &mut qio::Network, slots: &mut [Option<ItemStack>]) {
+    for slot in slots.iter_mut() {
+        let Some(s) = slot.clone().filter(plain) else {
+            continue;
+        };
+        let took = net.insert(&s.item, u64::from(s.count)) as u32;
+        *slot = (s.count > took).then(|| ItemStack { count: s.count - took, ..s });
+    }
+}
+
+/// A drive array puts itself on its frequency once a second.
+fn tick_drive_array(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
+    if ticker != 0 {
+        return;
+    }
+    let dim = game.dim;
+    if let Ok(mut all) = QIO_ARRAYS.lock() {
+        for list in all.values_mut() {
+            list.retain(|&(d, p)| (d, p) != (dim, pos));
+        }
+        if let Some(f) = get_string(&entity.nbt, "frequency") {
+            all.entry(f).or_default().push((dim, pos));
+        }
+    }
+}
+
+/// The dashboard's six rows are a window on its frequency: each tick what is in them goes back into the
+/// drives, and the most stored items fill them again, a stack of each. Taking a stack out of the menu
+/// takes it from the drives; putting one in stores it.
+fn tick_dashboard(game: &mut Game<'_>, entity: &mut ModBlockEntity) {
+    let Some(frequency) = get_string(&entity.nbt, "frequency") else {
+        return;
+    };
+    let (mut net, at) = load_network(game, &frequency);
+    if at.is_empty() {
+        return;
+    }
+    let before = net.clone();
+    if entity.items.len() < qio::DASHBOARD_SLOTS {
+        entity.items.resize(qio::DASHBOARD_SLOTS, None);
+    }
+    return_to_network(&mut net, &mut entity.items);
+    let mut list = net.list().into_iter();
+    for slot in entity.items.iter_mut().filter(|s| s.is_none()) {
+        let Some((item, _)) = list.next() else {
+            break;
+        };
+        let max = max_stack(game, &item);
+        let n = net.extract(&item, u64::from(max)) as u32;
+        *slot = (n > 0).then(|| stack_of(&item, n));
+    }
+    if net != before {
+        save_network(game, &net, &at);
+    }
+}
+
+/// The block an importer or exporter works on (the one behind its face) and that block's face toward it.
+fn qio_target(game: &Game<'_>, pos: [i32; 3]) -> Option<([i32; 3], horizon_core::geometry::Direction)> {
+    let d = game.native_block_property(pos, "facing").and_then(|f| direction(&f))?;
+    Some(([pos[0] - d[0], pos[1] - d[1], pos[2] - d[2]], horizon_core::geometry::Direction::ALL[face_index(d)]))
+}
+
+/// An importer, each half second, takes up to 64 items from the block behind it (and what hoppers put
+/// in it) into its frequency (`TileEntityQIOImporter.tryImport`).
+fn tick_importer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % qio::TRANSIT_DELAY);
+    let Some(frequency) = get_string(&entity.nbt, "frequency").filter(|_| ticker == 0) else {
+        return;
+    };
+    let (mut net, at) = load_network(game, &frequency);
+    if at.is_empty() {
+        return;
+    }
+    let before = net.clone();
+    return_to_network(&mut net, &mut entity.items);
+    if let Some((back, face)) = qio_target(game, pos)
+        && let Some(stack) = game.native_extract_item(back, face, qio::TRANSIT_COUNT)
+    {
+        let mut left = [Some(stack)];
+        return_to_network(&mut net, &mut left);
+        if let [Some(rest)] = left {
+            game.native_insert_item(back, face, rest);
+        }
+    }
+    if net != before {
+        save_network(game, &net, &at);
+    }
+}
+
+/// An exporter, each half second, puts up to 64 of its filter item from its frequency into the block
+/// behind it (`TileEntityQIOExporter.tryEject`, one item filter).
+fn tick_exporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % qio::TRANSIT_DELAY);
+    if ticker != 0 {
+        return;
+    }
+    let (Some(frequency), Some(filter)) = (get_string(&entity.nbt, "frequency"), get_string(&entity.nbt, "filter")) else {
+        return;
+    };
+    let Some((back, face)) = qio_target(game, pos) else {
+        return;
+    };
+    let (mut net, at) = load_network(game, &frequency);
+    let n = net.extract(&filter, u64::from(qio::TRANSIT_COUNT.min(max_stack(game, &filter)))) as u32;
+    if n == 0 {
+        return;
+    }
+    if let Some(rest) = game.native_insert_item(back, face, stack_of(&filter, n)) {
+        net.insert(&filter, u64::from(rest.count));
+    }
+    save_network(game, &net, &at);
+}
+
+fn qio_line(game: &mut Game<'_>, frequency: &str) -> String {
+    let (net, _) = load_network(game, frequency);
+    let (count, count_limit, types, type_limit) = net.totals();
+    format!("QIO {frequency}: {count} / {count_limit} items, {types} / {type_limit} types")
+}
+
+/// A right click on a QIO block:
+/// - with a named name tag, sets its frequency to the name;
+/// - on an exporter with an item, makes that item its filter (sneaking with an empty hand clears it);
+/// - sneaking with an empty hand, shows the frequency's totals.
+///
+/// Otherwise the drive array and the dashboard open their menus.
+pub(super) fn use_qio(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) {
+        return false;
+    }
+    let name = block_name(game, pos).to_owned();
+    if !is_qio(&name) {
+        return false;
+    }
+    let held = game.inventory.get(game.selected).cloned().flatten();
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    if let Some(tag) = held.as_ref().filter(|s| &*s.item == "minecraft:name_tag").and_then(|s| s.custom_name()) {
+        game.native_with_mod_block_entity(pos, |m| m.nbt.insert("frequency".into(), Tag::String(tag.as_str().into())));
+        tell(game, format!("QIO frequency: {tag}"));
+        return true;
+    }
+    let frequency = game.native_with_mod_block_entity(pos, |m| get_string(&m.nbt, "frequency")).flatten();
+    if name == qio::EXPORTER {
+        match (&held, sneaking) {
+            (Some(h), _) => {
+                let item = h.item.to_string();
+                game.native_with_mod_block_entity(pos, |m| m.nbt.insert("filter".into(), Tag::String(item.as_str().into())));
+                tell(game, format!("QIO Exporter filter: {item}"));
+            }
+            (None, true) => {
+                game.native_with_mod_block_entity(pos, |m| m.nbt.remove(&JavaString::from("filter")));
+                tell(game, "QIO Exporter filter cleared".to_owned());
+            }
+            (None, false) => {
+                let filter = game.native_with_mod_block_entity(pos, |m| get_string(&m.nbt, "filter")).flatten();
+                tell(game, format!("QIO Exporter: {} on {}", filter.as_deref().unwrap_or("no filter"), frequency.as_deref().unwrap_or("no frequency")));
+            }
+        }
+        return true;
+    }
+    if held.is_none() && (sneaking || name == qio::IMPORTER) {
+        let line = match frequency {
+            Some(f) => qio_line(game, &f),
+            None => "QIO: no frequency (name it with a name tag)".to_owned(),
+        };
+        tell(game, line);
+        return true;
+    }
+    false
+}
+
+/// Before a dashboard breaks, what its rows show goes back into the drives, so it doesn't spill them.
+pub(super) fn before_break(game: &mut Game<'_>, pos: [i32; 3]) {
+    if !game.native_on(MOD_ID) || block_name(game, pos) != qio::DASHBOARD {
+        return;
+    }
+    let Some(Some((frequency, mut items))) = game.native_with_mod_block_entity(pos, |m| Some((get_string(&m.nbt, "frequency")?, m.items.clone()))) else {
+        return;
+    };
+    let (mut net, at) = load_network(game, &frequency);
+    if at.is_empty() {
+        return;
+    }
+    return_to_network(&mut net, &mut items);
+    save_network(game, &net, &at);
+    game.native_with_mod_block_entity(pos, |m| m.items = items);
 }

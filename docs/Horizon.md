@@ -718,3 +718,37 @@ The portable teleporter and both free runners now stack to 1.
   rule (every face works).
 - Personal storage has no security settings (public or trusted players) and no item form to open
   from your hand.
+
+## M41: QIO
+
+**Drives and the drive array** (`QIODriveTier`, `TileEntityQIODriveArray`)
+- Drives hold 16,000 items in 128 types (base), 128,000 in 256 (hyper-dense), 1,048,000 in 1,024
+  (time-dilating) or 16 billion in 8,192 (supermassive).
+- A drive keeps its items in its own data, so a drive taken out of an array, or a broken array, loses
+  nothing. Its tooltip shows what it holds, and drives stack to 1.
+- The drive array's menu has two rows, and drives work in its first twelve slots.
+
+**Frequency.** Right-click a QIO block with a name tag renamed in an anvil, and the name becomes its
+frequency. Every drive array, dashboard, importer and exporter on the same frequency in a dimension
+shares the drives. Sneak and right-click with an empty hand (or click an importer) to see the
+frequency's items and types.
+
+**Dashboard** (`TileEntityQIODashboard`)
+- Its six rows show the most stored items, a stack of each.
+- Take a stack out of the menu and it comes out of the drives. Put a stack in and the drives store
+  it. A dashboard broken while it shows items puts them back first.
+
+**Importer** (`TileEntityQIOImporter`): every half second it takes up to 64 items from the block
+behind it into the drives, and it stores what hoppers put in it.
+
+**Exporter** (`TileEntityQIOExporter`)
+- Right-click it with an item to make that item its filter. Sneak with an empty hand to clear it.
+- Every half second it puts up to 64 of the filter item into the block behind it.
+
+**Not ported**
+- The dashboard's search, sorting and crafting grid.
+- Exporter filters for tags, mods or several items, and upgrades.
+- The redstone adapter and the portable dashboard.
+- Frequencies across dimensions, and private frequencies.
+- Stacks with components (enchanted or damaged items) stay in the dashboard's slots and don't go into
+  the drives.
