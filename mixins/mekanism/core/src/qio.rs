@@ -128,6 +128,28 @@ impl Network {
     }
 }
 
+/// `GuiQIOItemViewer`'s search box holds at most this many characters.
+pub const MAX_SEARCH: usize = 50;
+
+/// `GuiQIOItemViewer.isValidSearchChar`: letters, digits and a few marks.
+pub fn valid_search_char(c: char) -> bool {
+    c.is_alphanumeric() || "_ -/.\"'|():".contains(c)
+}
+
+/// Whether the dashboard lists `item` for a search: every word of the query is part of the item's
+/// name (its id's path with spaces for underscores), without regard to case.
+pub fn matches_search(item: &str, query: &str) -> bool {
+    let path = item
+        .split_once(':')
+        .map_or(item, |(_, p)| p)
+        .replace('_', " ")
+        .to_lowercase();
+    query
+        .to_lowercase()
+        .split_whitespace()
+        .all(|w| path.contains(w))
+}
+
 /// Whether a redstone adapter emits: some of its item, at least `count` of it, unless inverted.
 pub fn adapter_emits(stored: u64, count: u64, inverted: bool) -> bool {
     (stored > 0 && stored >= count) != inverted
@@ -188,5 +210,14 @@ mod tests {
         assert!(!adapter_emits(9, 10, false));
         assert!(adapter_emits(10, 10, false));
         assert!(adapter_emits(9, 10, true));
+    }
+
+    #[test]
+    fn search_finds_words_in_names() {
+        assert!(matches_search("minecraft:iron_ingot", "IRON"));
+        assert!(matches_search("minecraft:iron_ingot", "ing iron"));
+        assert!(!matches_search("minecraft:gold_ingot", "iron"));
+        assert!(matches_search("minecraft:gold_ingot", ""));
+        assert!(valid_search_char('_') && !valid_search_char('\u{a7}'));
     }
 }
