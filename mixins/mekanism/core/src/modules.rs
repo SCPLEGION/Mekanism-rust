@@ -367,9 +367,56 @@ pub fn split_evenly(total: u64, capacities: &[u64]) -> Vec<u64> {
     out
 }
 
+/// `GearConfig.mekaSuitEnergyUsageDamage`: the energy each point of damage a MekaSuit piece takes costs.
+pub const SUIT_DAMAGE_ENERGY: f32 = 100_000.0;
+
+/// `ItemMekaSuitArmor`'s absorption of each piece (helmet, body armor, pants, boots): a whole suit
+/// takes every hit that armor can stop.
+pub const SUIT_ABSORPTION: [f32; 4] = [0.15, 0.4, 0.3, 0.15];
+
+/// The share of each hit the worn pieces take: those with the energy for at least one point of it.
+pub fn suit_share(stored: [Option<u64>; 4]) -> f32 {
+    stored
+        .iter()
+        .zip(SUIT_ABSORPTION)
+        .filter(|(e, _)| e.is_some_and(|e| e as f32 >= SUIT_DAMAGE_ENERGY))
+        .map(|(_, r)| r)
+        .sum()
+}
+
+/// What `absorbed` damage, taken at `suit_share(stored)`, costs each piece (never more than it holds).
+pub fn suit_costs(absorbed: f32, stored: [Option<u64>; 4]) -> [u64; 4] {
+    let share = suit_share(stored);
+    let mut out = [0; 4];
+    if share <= 0.0 || absorbed <= 0.0 {
+        return out;
+    }
+    for (i, e) in stored.iter().enumerate() {
+        if let Some(e) = e.filter(|&e| e as f32 >= SUIT_DAMAGE_ENERGY) {
+            let cost = absorbed * SUIT_ABSORPTION[i] / share * SUIT_DAMAGE_ENERGY;
+            out[i] = (cost.round() as u64).min(e);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suit_absorbs_with_energy() {
+        let full = Some(16_000_000);
+        assert!((suit_share([full; 4]) - 1.0).abs() < 1e-6);
+        assert!((suit_share([None, full, Some(10), full]) - 0.55).abs() < 1e-6);
+        // 5.5 damage taken by body armor (0.4) and boots (0.15).
+        let costs = suit_costs(5.5, [None, full, Some(10), full]);
+        assert_eq!(costs, [0, 400_000, 0, 150_000]);
+        assert_eq!(
+            suit_costs(1.0, [Some(150_000), None, None, None]),
+            [100_000, 0, 0, 0]
+        );
+    }
 
     #[test]
     fn modules_fit_their_items_up_to_their_limit() {

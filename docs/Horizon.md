@@ -857,3 +857,17 @@ branch.
 **Still missing:** a damage hook on the player, which the MekaSuit's damage absorption needs.
 `PlayerMotion.hurt_caused_by` is in the client library, below the native hooks. It needs a per-player
 absorption field set by the game and charged after the hit, which is a larger Horizon change.
+
+## M47: MekaSuit damage absorption
+
+Horizon's API 28 (SCPLEGION/horizon#9) adds `native_player_damage`. A player's body carries the share
+of each hit that a mod's armor takes before vanilla armor, and the damage it took since the last call.
+The bundle now pins that revision, `074750a8`, on the `milestone/h8-damage-absorption` branch.
+- **Absorption.** Each worn MekaSuit piece with energy for at least one point of damage takes its
+  part of every hit: helmet 15%, body armor 40%, pants 30%, boots 15%, so a full suit takes it all
+  (`ItemMekaSuitArmor`). Damage tagged `minecraft:bypasses_armor` (starving, the void, `/kill`)
+  goes through.
+- **Energy.** Each point a piece takes costs it 100,000 FE (`mekaSuitEnergyUsageDamage`). Creative
+  costs nothing.
+- **Timing.** The share is refreshed right after an absorbed hit and every 10 ticks, so a piece put on
+  or charged starts absorbing within half a second.
