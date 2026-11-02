@@ -692,3 +692,29 @@ duration.
 - Frequencies are all public, and there is no travel between dimensions or teleporter screen.
 
 The portable teleporter and both free runners now stack to 1.
+
+## M40: bins and personal storage
+
+**Bins** (`TileEntityBin`, `BinInventorySlot`, `BinTier`)
+- A bin holds one item: 4,096 (basic), 8,192 (advanced), 32,768 (elite) or 262,144 (ultimate). A
+  creative bin gives without emptying, and an empty one is a void for hoppers.
+- **Putting in.** Right-click with an item to put the held stack in. Click again within 5 ticks to put
+  in every matching stack of your inventory, as vanilla's double click does.
+- **Taking out.** Right-click with an empty hand to take a stack out. Mekanism uses a left click, but
+  Horizon's native API has no left click hook.
+- **Lock.** Sneak and right-click with an empty hand to lock the bin to its item, or unlock it. A
+  locked bin keeps its item type when it empties.
+- **Hoppers.** Hoppers above or beside a bin fill it, and a hopper below takes from it.
+- **Breaking.** A broken bin drops itself with its items and lock, and its tooltip shows them.
+- A bin holds only plain items, without damage or components.
+
+**Personal chest and barrel** (`TileEntityPersonalStorage`)
+- Six rows of nine slots. They open only for the player who placed them, and only that player can
+  break them. No hopper reaches them.
+- Broken, they drop themselves with their contents and owner. The tooltip names the owner.
+
+**Not ported**
+- A bin doesn't push into the inventory below it by itself, and there is no bin screen or front-face
+  rule (every face works).
+- Personal storage has no security settings (public or trusted players) and no item form to open
+  from your hand.

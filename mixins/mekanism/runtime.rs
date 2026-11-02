@@ -14,6 +14,7 @@ use mekanism_core::gear;
 use mekanism_core::nuclear;
 use mekanism_core::fission;
 use mekanism_core::fusion;
+use mekanism_core::bin::{self, Bin};
 use mekanism_core::boiler;
 use mekanism_core::isotopes;
 use mekanism_core::turbine;
@@ -99,6 +100,10 @@ enum Kind {
     Crystallizer,
     /// A mechanical pipe and the mB of fluid it carries in a tick.
     Pipe(u64),
+    /// A bin: many of one item.
+    Bin(BaseTier),
+    /// A personal chest or barrel: six rows that open for their owner only.
+    PersonalStorage,
 }
 
 fn kind(id: &str) -> Option<Kind> {
@@ -113,6 +118,12 @@ fn kind(id: &str) -> Option<Kind> {
     }
     if id == HEAT_GENERATOR {
         return Some(Kind::HeatGenerator);
+    }
+    if let Some(t) = bin::tier_of(id) {
+        return Some(Kind::Bin(t));
+    }
+    if bin::is_personal(id) {
+        return Some(Kind::PersonalStorage);
     }
     use mekanism_core::generator as g;
     match id {
@@ -212,6 +223,29 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             inputs,
             outputs,
             menu: Some("minecraft:generic_9x2".into()),
+        });
+        return;
+    }
+    // A bin: hoppers fill its input slot from above and the sides and take from its output slot below;
+    // it has no menu (its contents show on a right click).
+    if let Some(Kind::Bin(_)) = kind(block) {
+        *container = Some(ModContainer {
+            slots: 2,
+            faces: [vec![1], vec![0], vec![0], vec![0], vec![0], vec![0]],
+            inputs: vec![0],
+            outputs: vec![1],
+            menu: None,
+        });
+        return;
+    }
+    // Personal storage: six rows that no hopper reaches.
+    if let Some(Kind::PersonalStorage) = kind(block) {
+        *container = Some(ModContainer {
+            slots: bin::PERSONAL_SLOTS,
+            faces: Default::default(),
+            inputs: vec![],
+            outputs: vec![],
+            menu: Some("minecraft:generic_9x6".into()),
         });
         return;
     }
@@ -359,6 +393,11 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             tick_pipe(game, pos, entity, rate);
             None
         }
+        Kind::Bin(t) => {
+            tick_bin(game, entity, t);
+            None
+        }
+        Kind::PersonalStorage => None,
     };
     screen_data(entity);
     multiblock_data(game, pos, entity);
@@ -2744,6 +2783,33 @@ pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
                 let energy = get_long(&m.nbt, "energy");
                 (energy > 0).then(|| with_energy(&m.id, energy))?
             }
+            // A bin keeps its items and lock (`BinUpgradeData` through its item's components).
+            Kind::Bin(t) => {
+                let b = settle_bin(m, t);
+                put_bin(&mut m.nbt, &b);
+                if b.count == 0 && b.lock.is_none() {
+                    return None;
+                }
+                let mut c = Compound::new();
+                put_bin(&mut c, &b);
+                let mut stack = stack_of(&m.id, 1);
+                set_custom_compound(&mut stack, BIN_KEY, c);
+                stack
+            }
+            // Personal storage keeps its contents and owner (`PersonalStorageContentsLootFunction`).
+            Kind::PersonalStorage => {
+                let mut c = Compound::new();
+                c.insert("Items".into(), horizon_items::item_nbt::encode_items(&m.items));
+                for key in ["owner", "owner_name"] {
+                    if let Some(v) = get_string(&m.nbt, key) {
+                        c.insert(key.into(), Tag::String(v.as_str().into()));
+                    }
+                }
+                let mut stack = stack_of(&m.id, 1);
+                set_custom_compound(&mut stack, PERSONAL_KEY, c);
+                m.items.iter_mut().for_each(|i| *i = None);
+                stack
+            }
             _ => {
                 let (key, item_key, _) = kept_tank(k)?;
                 let Some(Tag::Compound(tank)) = m.nbt.get(&JavaString::from(key)) else {
@@ -2794,13 +2860,44 @@ fn item_tank(stack: &ItemStack, key: &str, capacity: u64) -> Option<ChemicalTank
 
 /// A placed energy cube or tank takes what its item held.
 pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
-    if !game.native_on(MOD_ID) || custom_data(stack).is_none() {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    // Personal storage belongs to whoever placed it, unless its item names an owner already.
+    if bin::is_personal(&stack.item) {
+        let kept = custom_data(stack).and_then(|c| match c.get(&JavaString::from(PERSONAL_KEY)) {
+            Some(Tag::Compound(k)) => Some(k.clone()),
+            _ => None,
+        });
+        let player = game.native_acting_player();
+        game.native_with_mod_block_entity(pos, |m| {
+            if let Some(k) = &kept {
+                let items = horizon_items::item_nbt::decode_items(k.get(&JavaString::from("Items")), bin::PERSONAL_SLOTS);
+                m.items = items;
+            }
+            let owner = kept.as_ref().and_then(|k| Some((get_string(k, "owner")?, get_string(k, "owner_name").unwrap_or_default())));
+            let owner = owner.or_else(|| player.map(|p| (uuid_text(p.uuid), p.name)));
+            if let Some((uuid, name)) = owner {
+                m.nbt.insert("owner".into(), Tag::String(uuid.as_str().into()));
+                m.nbt.insert("owner_name".into(), Tag::String(name.as_str().into()));
+            }
+        });
+        return;
+    }
+    if custom_data(stack).is_none() {
         return;
     }
     let energy = stored_energy(stack);
     game.native_with_mod_block_entity(pos, |m| match kind(&m.id) {
         Some(Kind::EnergyCube(t)) if energy > 0 => {
             put_long(&mut m.nbt, "energy", energy.min(tier::energy_cube(t).0));
+        }
+        Some(Kind::Bin(t)) => {
+            if let Some(Tag::Compound(c)) = custom_data(stack).and_then(|c| c.get(&JavaString::from(BIN_KEY))) {
+                let mut b = bin_of(c);
+                b.count = b.count.min(bin::capacity(t));
+                put_bin(&mut m.nbt, &b);
+            }
         }
         Some(k) => {
             if let Some((key, item_key, capacity)) = kept_tank(k)
@@ -2838,6 +2935,18 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
             let line = format!("Stored: {} mB {id}", tank.amount);
             lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
         }
+    }
+    if let Some(Tag::Compound(c)) = custom_data(stack).and_then(|c| c.get(&JavaString::from(BIN_KEY)))
+        && let Some(t) = bin::tier_of(&stack.item)
+    {
+        let line = bin_line(t, &bin_of(c));
+        lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+    }
+    if let Some(Tag::Compound(c)) = custom_data(stack).and_then(|c| c.get(&JavaString::from(PERSONAL_KEY)))
+        && let Some(name) = get_string(c, "owner_name")
+    {
+        let line = format!("Owner: {name}");
+        lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
     }
     let energy = stored_energy(stack);
     if energy == 0 {
@@ -5098,4 +5207,166 @@ pub(super) fn show_turbine(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
     true
+}
+
+// --- Bins and personal storage ----------------------------------------------------------------------
+
+const BIN_KEY: &str = "mekanism:bin";
+const PERSONAL_KEY: &str = "mekanism:personal_storage";
+
+fn bin_of(nbt: &Compound) -> Bin {
+    let count = get_long(nbt, "count");
+    Bin { item: get_string(nbt, "item").filter(|_| count > 0), count, lock: get_string(nbt, "lock") }
+}
+
+fn put_bin(nbt: &mut Compound, b: &Bin) {
+    nbt.insert("item".into(), Tag::String(b.item.as_deref().unwrap_or("").into()));
+    put_long(nbt, "count", b.count);
+    nbt.insert("lock".into(), Tag::String(b.lock.as_deref().unwrap_or("").into()));
+}
+
+/// A stack a bin can hold: no damage and no components (a bin keeps only the item id).
+fn plain(stack: &ItemStack) -> bool {
+    stack.damage == 0 && stack.extra.is_none()
+}
+
+/// The bin with what its output slot shows put back in it (the output slot is a window on the bin for
+/// hoppers below; the bin refills it each tick).
+fn settle_bin(entity: &mut ModBlockEntity, tier: BaseTier) -> Bin {
+    let mut b = bin_of(&entity.nbt);
+    if entity.items.len() < 2 {
+        entity.items.resize(2, None);
+    }
+    if let Some(s) = entity.items[1].take() {
+        if tier == BaseTier::Creative || b.item.as_deref() == Some(&*s.item) {
+            if tier != BaseTier::Creative {
+                b.count += u64::from(s.count);
+            }
+        } else if b.insert(tier, &s.item, u64::from(s.count), false) < u64::from(s.count) {
+            entity.items[1] = Some(s);
+        }
+    }
+    b
+}
+
+/// A bin's tick: what hoppers put in the input slot goes in, and the output slot shows a stack of it for
+/// hoppers below to take (`BinInventorySlot` through the item handler).
+fn tick_bin(game: &mut Game<'_>, entity: &mut ModBlockEntity, tier: BaseTier) {
+    let mut b = settle_bin(entity, tier);
+    if let Some(s) = entity.items[0].clone().filter(plain) {
+        let took = b.insert(tier, &s.item, u64::from(s.count), false) as u32;
+        if took > 0 {
+            entity.items[0] = (s.count > took).then(|| ItemStack { count: s.count - took, ..s });
+        }
+    }
+    if entity.items[1].is_none()
+        && let Some(item) = b.item.clone()
+    {
+        let max = max_stack(game, &item);
+        if let Some((item, n)) = b.extract(tier, u64::from(max)) {
+            entity.items[1] = Some(stack_of(&item, n as u32));
+        }
+    }
+    let ticks = get_int(&entity.nbt, "add_ticks");
+    put_int(&mut entity.nbt, "add_ticks", ticks.saturating_sub(1));
+    put_bin(&mut entity.nbt, &b);
+}
+
+fn bin_line(tier: BaseTier, b: &Bin) -> String {
+    let name = format!("{}{} Bin", tier.name()[..1].to_uppercase(), &tier.name()[1..]);
+    let lock = if b.lock.is_some() { " (locked)" } else { "" };
+    match b.item_type() {
+        Some(item) => {
+            let count = if tier == BaseTier::Creative { "∞".to_owned() } else { format!("{} / {}", b.count, bin::capacity(tier)) };
+            format!("{name}: {count} {item}{lock}")
+        }
+        None => format!("{name}: empty / {}", bin::capacity(tier)),
+    }
+}
+
+/// A right click on a bin (`BlockBin.useItemOn`; Horizon has no left click hook, so the empty hand
+/// takes items out here):
+/// - with an item, puts the held stack in; a second click within 5 ticks puts in every matching stack of
+///   the inventory;
+/// - with an empty hand, takes a stack out (vanilla's sneaking left click);
+/// - sneaking with an empty hand, locks the bin to its item, or unlocks it.
+pub(super) fn use_bin(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) {
+        return false;
+    }
+    let Some(tier) = bin::tier_of(block_name(game, pos)) else {
+        return false;
+    };
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let selected = game.selected;
+    let held = game.inventory.get(selected).cloned().flatten();
+    let Some((mut b, armed)) = game.native_with_mod_block_entity(pos, |m| (settle_bin(m, tier), get_int(&m.nbt, "add_ticks"))) else {
+        return false;
+    };
+    let mut add_ticks = 0;
+    match held {
+        Some(h) => {
+            if plain(&h) {
+                let took = b.insert(tier, &h.item, u64::from(h.count), true) as u32;
+                if took > 0 {
+                    game.inventory[selected] = (h.count > took).then(|| ItemStack { count: h.count - took, ..h });
+                }
+            }
+            add_ticks = bin::DOUBLE_CLICK_TICKS;
+        }
+        None if sneaking => {
+            b.toggle_lock(tier);
+        }
+        None if armed > 0 && b.item_type().is_some() => {
+            let item = b.item_type().unwrap_or_default().to_owned();
+            for i in 0..game.inventory.len().min(36) {
+                let Some(s) = game.inventory[i].clone().filter(|s| *s.item == *item && plain(s)) else {
+                    continue;
+                };
+                let took = b.insert(tier, &item, u64::from(s.count), true) as u32;
+                game.inventory[i] = (s.count > took).then(|| ItemStack { count: s.count - took, ..s });
+            }
+        }
+        None => {
+            let max = b.item.as_deref().map_or(64, |i| max_stack(game, i));
+            if let Some((item, n)) = b.extract(tier, u64::from(max)) {
+                game.give_or_drop(stack_of(&item, n as u32));
+            }
+        }
+    }
+    let line = bin_line(tier, &b);
+    game.native_with_mod_block_entity(pos, |m| {
+        put_bin(&mut m.nbt, &b);
+        put_int(&mut m.nbt, "add_ticks", add_ticks);
+    });
+    tell(game, line);
+    true
+}
+
+fn uuid_text(uuid: u128) -> String {
+    format!("{uuid:032x}")
+}
+
+/// A right click on someone else's personal chest or barrel: it stays shut (`TileEntityPersonalStorage`
+/// with its owner's security). The owner's click opens the six-row menu as a chest's.
+pub(super) fn use_personal_storage(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || !bin::is_personal(block_name(game, pos)) {
+        return false;
+    }
+    let Some(player) = game.native_acting_player() else {
+        return false;
+    };
+    let owner = game.native_with_mod_block_entity(pos, |m| (get_string(&m.nbt, "owner"), get_string(&m.nbt, "owner_name"))).unwrap_or_default();
+    match owner {
+        (Some(uuid), name) if uuid != uuid_text(player.uuid) => {
+            tell(game, format!("This belongs to {}", name.unwrap_or_else(|| "another player".to_owned())));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Only its owner breaks a personal chest or barrel.
+pub(super) fn protect_personal(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    use_personal_storage(game, pos)
 }

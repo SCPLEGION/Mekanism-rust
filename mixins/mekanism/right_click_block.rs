@@ -1,6 +1,6 @@
 // A player's right click on a block, before the block reacts (hook point `native_right_click_block`,
-// API 21): the Configurator sets a face's mode, an upgrade in hand goes into a Mekanism machine, and
-// a bucket fills or empties a fluid tank.
+// API 21): the Configurator sets a face's mode, an upgrade in hand goes into a Mekanism machine, a
+// bucket fills or empties a fluid tank, a bin takes or gives items, and personal storage stays shut for others.
 fn on_right_click_block(game: &mut crate::game::Game<'_>, pos: [i32; 3], face: [i32; 3], canceled: &mut bool) {
     if *canceled {
         return;
@@ -15,6 +15,8 @@ fn on_right_click_block(game: &mut crate::game::Game<'_>, pos: [i32; 3], face: [
         || crate::game::mekanism::use_sps_port(game, pos)
         || crate::game::mekanism::use_dynamic_valve(game, pos)
         || crate::game::mekanism::use_teleporter(game, pos)
+        || crate::game::mekanism::use_bin(game, pos)
+        || crate::game::mekanism::use_personal_storage(game, pos)
     {
         *canceled = true;
     }
