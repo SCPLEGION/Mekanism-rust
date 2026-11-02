@@ -4179,6 +4179,42 @@ pub(super) fn use_fusion(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 // pieces for the tooltip, then its upgrades.
 
 const SPRITES: &str = "mekanism:gui/sprites/";
+/// Mekanism's own GUI textures outside `sprites/` (the gauges' fluid textures the content build copies).
+const SPRITES_ROOT: &str = "mekanism:gui/";
+
+/// What a gauge fills with (`GuiTankGauge`): a fluid's still texture tinted with its colour (water's
+/// blue; lava as it is), and a chemical's icon (`mek_liquid/liquid`, steam's own) tinted with its
+/// chemical's colour; grey for anything unknown.
+fn gauge_texture(chemical: Option<&(&str, &str, u32)>) -> (String, u32) {
+    match chemical {
+        Some(("minecraft:water", ..)) => ("block/water_still".into(), 0xFF3F_76E4),
+        Some(("minecraft:lava", ..)) => ("block/lava_still".into(), 0xFFFF_FFFF),
+        Some(("mekanism:steam", ..)) => (format!("{SPRITES_ROOT}gauge_fluid/steam"), 0xFFFF_FFFF),
+        Some((_, _, rgb)) => (format!("{SPRITES_ROOT}gauge_fluid/liquid"), 0xFF00_0000 | rgb),
+        None => (format!("{SPRITES_ROOT}gauge_fluid/liquid"), 0xFF8A_8A8A),
+    }
+}
+
+/// A texture tiled 16 px at a time over `rect` from its bottom up, the top tile cut short
+/// (`MekanismRenderer.renderTiledSprite`); a flat colour when the texture is missing.
+fn fill_tiled(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, texture: &str, rect: [f32; 4], argb: u32) {
+    let [x, y, w, h] = rect;
+    let mut drawn = true;
+    let mut dy = 0.0;
+    while dy < h {
+        let th = (h - dy).min(16.0);
+        let mut dx = 0.0;
+        while dx < w {
+            let tw = (w - dx).min(16.0);
+            drawn &= game.native_sprite_tinted(batch, texture, [0.0, 16.0 - th, tw, th], [x + dx, y + h - dy - th, tw, th], argb);
+            dx += 16.0;
+        }
+        dy += 16.0;
+    }
+    if !drawn {
+        game.native_fill(batch, rect, argb);
+    }
+}
 /// Where the data slots after the furnace's four begin: stored energy, capacity (4 pieces each), the
 /// speed and energy upgrades, and the energy used a tick (4 pieces).
 const DATA_STORED: usize = 4;
@@ -5779,12 +5815,12 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
             sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + 18.0 * col as f32, oy + y - 1.0, 18.0, 18.0]);
         }
     }
-    let gauge = |batch: &mut horizon_client::hud::HudBatch, at: [f32; 2], size: [f32; 2], fill: f32, argb: u32| {
+    let gauge = |batch: &mut horizon_client::hud::HudBatch, at: [f32; 2], size: [f32; 2], fill: f32, (texture, argb): (&str, u32)| {
         let [x, y] = [ox + at[0], oy + at[1]];
         nine_slice(game, batch, "gauge/normal", 5.0, 2.0, [x, y, size[0], size[1]]);
         let h = (size[1] - 2.0) * fill.clamp(0.0, 1.0);
         if h > 0.0 {
-            game.native_fill(batch, [x + 1.0, y + size[1] - 1.0 - h, size[0] - 2.0, h], argb);
+            fill_tiled(game, batch, texture, [x + 1.0, y + size[1] - 1.0 - h, size[0] - 2.0, h], argb);
         }
         let overlay = match size {
             SMALL => "small",
@@ -5797,8 +5833,8 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
         let at = DATA_GAUGES + i * GAUGE_SLOTS;
         let (amount, capacity) = (read_wide(data, at), read_wide(data, at + 4).max(1));
         let chemical = usize::try_from(data.get(at + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c));
-        let rgb = chemical.map_or(0x8A8A8A, |c| c.2);
-        gauge(batch, g.at, g.size, amount as f32 / capacity as f32, 0xFF00_0000 | rgb);
+        let (texture, argb) = gauge_texture(chemical);
+        gauge(batch, g.at, g.size, amount as f32 / capacity as f32, (&texture, argb));
     }
     // The stored energy and capacity, else the furnace's first two slots.
     let capacity = read_wide(data, DATA_CAPACITY);
@@ -5824,7 +5860,8 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
                 sprite(game, batch, "bar/horizontal_power", [0.0, 0.0, 2.0, 2.0], [ox + x + 1.0, oy + y + 1.0, filled, h - 2.0]);
             }
         }
-        Some(PowerBar::Gauge(at)) => gauge(batch, at, WIDE, energy, 0xFFC4_1E1E),
+        // `GuiEnergyGauge` fills with Mekanism's energy texture.
+        Some(PowerBar::Gauge(at)) => gauge(batch, at, WIDE, energy, (&format!("{SPRITES_ROOT}gauge_fluid/energy"), 0xFFFF_FFFF)),
         None => {}
     }
     if let Some((at, name, [w, h])) = l.progress {

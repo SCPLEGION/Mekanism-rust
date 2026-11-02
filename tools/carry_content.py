@@ -336,6 +336,7 @@ def build_module(ns, out):
     # Items told apart by a Mekanism data component (upgrades, modules): Horizon has no mod components, so
     # the type goes in vanilla's custom_data, the model is chosen by custom_model_data, and the name is
     # spelled out with item_name.
+    report["gauge_textures"] = gauge_textures(ns, out)
     report["component_items"] = component_items(ns, out)
     report["component_recipes"] = component_recipes(out / "data" / ns / "recipe")
 
@@ -421,6 +422,49 @@ def build_module(ns, out):
 # Mekanism's item components that only tell items of one id apart, by the lang key of their values'
 # names ("upgrade.mekanism.speed"), to custom_data in carried recipes.
 COMPONENT_NAMES = {"mekanism:upgrade_type": "upgrade", "mekanism:module_type": "module"}
+
+
+def first_frame_png(data, size):
+    """An animated strip's first `size`-row frame, as a PNG: its first scanlines are a valid image of
+    their own (the first row's filter has no row above it either way)."""
+    import struct
+    import zlib
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    chunks, at = [], 8
+    while at < len(data):
+        n, kind = struct.unpack(">I4s", data[at:at + 8])
+        chunks.append((kind, data[at + 8:at + 8 + n]))
+        at += 12 + n
+    ihdr = dict(chunks)[b"IHDR"]
+    width, _, depth, color, _, _, interlace = struct.unpack(">IIBBBBB", ihdr)
+    assert interlace == 0
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
+    row = 1 + (width * channels * depth + 7) // 8
+    pixels = zlib.decompress(b"".join(c for k, c in chunks if k == b"IDAT"))[:row * size]
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+    out = data[:8] + chunk(b"IHDR", struct.pack(">II", width, size) + ihdr[8:])
+    for kind, body in chunks:
+        if kind in (b"PLTE", b"tRNS"):
+            out += chunk(kind, body)
+    return out + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b"")
+
+
+def gauge_textures(ns, out):
+    """The textures Mekanism's gauges fill with (`mek_liquid/*`, the chemicals' base icon), first frames
+    copied under `textures/gui/gauge_fluid/`: Horizon's GUI atlas holds a content mod's `textures/gui` only."""
+    src = out / "assets" / ns / "textures/mek_liquid"
+    dst = out / "assets" / ns / "textures/gui/gauge_fluid"
+    count = 0
+    for texture in sorted(src.glob("*.png")) if src.is_dir() else []:
+        if texture.stem.endswith("_flow"):
+            continue
+        dst.mkdir(parents=True, exist_ok=True)
+        (dst / texture.name).write_bytes(first_frame_png(texture.read_bytes(), 16))
+        count += 1
+    return count
 
 
 def component_items(ns, out):
