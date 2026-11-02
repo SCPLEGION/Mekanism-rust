@@ -382,6 +382,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::Chargepad
             | Kind::Entangloporter
             | Kind::Teleporter
+            | Kind::QioRedstoneAdapter
             // Their item slots (buckets, energy) are not ported; the screen shows their tanks.
             | Kind::Activator
             | Kind::Centrifuge
@@ -548,6 +549,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     };
     screen_data(entity, facing);
     frequency_tick(game, pos, entity);
+    adapter_sync(game, pos, entity);
     sorter_sync(game, pos, entity);
     multiblock_data(game, pos, entity);
     if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Pipe(_)) {
@@ -3420,6 +3422,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
         frequency_payload(game, data);
         return;
     }
+    if channel == ADAPTER_CHANNEL && game.native_on(MOD_ID) {
+        adapter_payload(game, data);
+        return;
+    }
     if channel == QIO_CHANNEL && game.native_on(MOD_ID) {
         qio_payload(game, data);
         return;
@@ -5820,6 +5826,10 @@ pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32;
         qio_click(game, block, at);
         return;
     }
+    if kind(block) == Some(Kind::QioRedstoneAdapter) {
+        adapter_click(game, at);
+        return;
+    }
     if window_click(block, data, at, right, button) {
         return;
     }
@@ -5897,6 +5907,17 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
 
 pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::NativeScreen>) {
     if screen.is_some() {
+        return;
+    }
+    // `GuiQIORedstoneAdapter`: 26 px taller than a machine's, no slots of its own.
+    if kind(block) == Some(Kind::QioRedstoneAdapter) {
+        *screen = Some(super::native_hooks::NativeScreen { width: 176.0, height: 192.0, slots: vec![None; 3], inventory_y: 110.0, inventory_x: 8.0, own_labels: true });
+        return;
+    }
+    // `GuiPersonalStorageTile`: six rows of nine over the inventory, 56 px taller than a machine's.
+    if kind(block) == Some(Kind::PersonalStorage) {
+        let slots = (0..bin::PERSONAL_SLOTS).map(|i| Some([8.0 + 18.0 * (i % 9) as f32, 18.0 + 18.0 * (i / 9) as f32])).collect();
+        *screen = Some(super::native_hooks::NativeScreen { width: 176.0, height: 222.0, slots, inventory_y: 140.0, inventory_x: 8.0, own_labels: true });
         return;
     }
     // `GuiQIODriveArray` and `GuiQIODashboard`.
@@ -6079,6 +6100,14 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
         draw_qio_screen(game, batch, block, origin);
         return;
     }
+    if kind(block) == Some(Kind::PersonalStorage) {
+        draw_storage_screen(game, batch, origin);
+        return;
+    }
+    if kind(block) == Some(Kind::QioRedstoneAdapter) {
+        draw_adapter_screen(game, batch, origin);
+        return;
+    }
     let Some(l) = layout(block) else {
         return;
     };
@@ -6198,6 +6227,14 @@ pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f3
     }
     if is_qio_screen(block) {
         qio_tooltip(game, block, at, lines);
+        return;
+    }
+    if kind(block) == Some(Kind::QioRedstoneAdapter) {
+        if inside(at, ADAPTER_INVERT) {
+            lines.push("Toggle Signal".into());
+        } else if inside(at, ADAPTER_FUZZY) {
+            lines.push("Fuzzy Mode".into());
+        }
         return;
     }
     let Some(l) = layout(block) else {
@@ -7518,6 +7555,10 @@ pub(super) fn use_qio(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         return true;
     }
     if name == qio::REDSTONE_ADAPTER {
+        // Its screen sets the item, count and signal (`GuiQIORedstoneAdapter`).
+        return false;
+    }
+    if name == qio::REDSTONE_ADAPTER && false {
         let get = |game: &mut Game<'_>, key: &str| game.native_with_mod_block_entity(pos, |m| get_long(&m.nbt, key)).unwrap_or(0);
         match (&held, sneaking) {
             (Some(h), false) => {
@@ -8903,7 +8944,7 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
     if is_freq_screen(block) {
         *typing |= FREQ_UI.with_borrow(|ui| ui.text.focused);
     }
-    *typing |= qio_typing(block) || filter_typing(block);
+    *typing |= qio_typing(block) || filter_typing(block) || adapter_typing(block);
 }
 
 /// A key on the selector's focused text box (hook point `native_screen_key`): Enter sets the name as
@@ -8915,6 +8956,10 @@ pub(super) fn screen_key(game: &mut Game<'_>, block: &str, key: &str, text: Opti
     }
     if is_sorter(block) {
         filter_key(key, text);
+        return;
+    }
+    if kind(block) == Some(Kind::QioRedstoneAdapter) {
+        adapter_key(game, key, text);
         return;
     }
     if !is_freq_screen(block) || !game.native_on(MOD_ID) {
@@ -10234,4 +10279,224 @@ fn transporter_button(entity: &mut ModBlockEntity, id: i32) -> bool {
         step(&mut entity.nbt, &format!("ej_in{side}"), how);
     }
     true
+}
+
+/// The personal chest's and barrel's screen (`GuiPersonalStorageTile`): the panel, its title, six rows of
+/// slots, then the inventory.
+fn draw_storage_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 176.0, 222.0]);
+    game.native_text(batch, &game.native_screen_title().unwrap_or_default(), [ox + 8.0, oy + 6.0], 0x40_4040, false);
+    for row in 0..6 {
+        for col in 0..9 {
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + 18.0 * col as f32, oy + 17.0 + 18.0 * row as f32, 18.0, 18.0]);
+        }
+    }
+    game.native_text(batch, "Inventory", [ox + 8.0, oy + 129.0], 0x40_4040, false);
+    for row in 0..4 {
+        let y = if row < 3 { 140.0 + 18.0 * row as f32 } else { 198.0 };
+        for col in 0..9 {
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + 18.0 * col as f32, oy + y - 1.0, 18.0, 18.0]);
+        }
+    }
+}
+
+// --- QIO Redstone Adapter screen (GuiQIORedstoneAdapter) -------------------------------------------------
+
+const ADAPTER_CHANNEL: &str = "mekanism:qio_adapter";
+const ADAPTER_FREQ: [f32; 4] = [7.0, 16.0, 161.0, 12.0];
+const ADAPTER_SLOT: [f32; 4] = [7.0, 30.0, 18.0, 18.0];
+const ADAPTER_INFO: [f32; 4] = [27.0, 30.0, 141.0, 64.0];
+const ADAPTER_INVERT: [f32; 4] = [9.0, 64.0, 14.0, 14.0];
+const ADAPTER_FUZZY: [f32; 4] = [9.0, 80.0, 14.0, 14.0];
+const ADAPTER_TEXT: [f32; 4] = [29.0, 80.0, 137.0, 12.0];
+
+thread_local! {
+    static ADAPTER_TEXT_BOX: std::cell::RefCell<freq::TextBox> = std::cell::RefCell::new(freq::TextBox::default());
+}
+
+struct AdapterView {
+    pos: [i32; 3],
+    frequency: Option<String>,
+    item: Option<String>,
+    count: u64,
+    inverted: bool,
+    fuzzy: bool,
+    stored: u64,
+}
+
+fn adapter_view(game: &Game<'_>) -> Option<AdapterView> {
+    let (x, y, z) = game.container?;
+    let (_, c) = game.native_client_block_entity([x, y, z])?;
+    Some(AdapterView {
+        pos: [x, y, z],
+        frequency: get_string(c, "frequency"),
+        item: get_string(c, "filter"),
+        count: get_long(c, "count"),
+        inverted: get_int(c, "inverted") == 1,
+        fuzzy: get_int(c, "fuzzy") == 1,
+        stored: get_long(c, "stored"),
+    })
+}
+
+/// What the screen shows: the frequency, the item and count, the signal's sense, and what the
+/// frequency stores of the item.
+fn adapter_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    if kind(&entity.id) != Some(Kind::QioRedstoneAdapter) {
+        return;
+    }
+    let mut client = Compound::new();
+    let frequency = get_string(&entity.nbt, "frequency");
+    let item = get_string(&entity.nbt, "filter");
+    if let Some(f) = &frequency {
+        client.insert("frequency".into(), Tag::String(f.as_str().into()));
+    }
+    if let Some(i) = &item {
+        client.insert("filter".into(), Tag::String(i.as_str().into()));
+        if let Some(f) = &frequency {
+            put_long(&mut client, "stored", load_network(game, f).0.stored(i));
+        }
+    }
+    put_long(&mut client, "count", get_long(&entity.nbt, "count"));
+    put_int(&mut client, "inverted", get_int(&entity.nbt, "inverted"));
+    put_int(&mut client, "fuzzy", get_int(&entity.nbt, "fuzzy"));
+    let same = matches!(entity.nbt.get(&JavaString::from("client")), Some(Tag::Compound(c)) if *c == client);
+    if !same {
+        entity.nbt.insert("client".into(), Tag::Compound(client));
+        game.native_sync_block_entity(pos);
+    }
+}
+
+/// A player's press on the adapter's screen: `pos`, an op (0 the item in hand, 1 clear the item, 2 invert,
+/// 3 fuzzy, 4 the count) and the count. Only within reach.
+fn adapter_payload(game: &mut Game<'_>, data: &[u8]) {
+    let (Some(pos), Some(&op), Some(count), Some(player)) = (data.get(..12), data.get(12), data.get(13..17), game.native_acting_player()) else {
+        return;
+    };
+    let int = |i: usize| i32::from_be_bytes([pos[i], pos[i + 1], pos[i + 2], pos[i + 3]]);
+    let pos = [int(0), int(4), int(8)];
+    let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    if !near || kind(block_name(game, pos)) != Some(Kind::QioRedstoneAdapter) {
+        return;
+    }
+    let held = game.inventory.get(game.selected).cloned().flatten().map(|h| h.item.to_string());
+    let count = u32::from_be_bytes([count[0], count[1], count[2], count[3]]).min(i32::MAX as u32);
+    game.native_with_mod_block_entity(pos, |m| match op {
+        0 => {
+            if let Some(item) = held {
+                m.nbt.insert("filter".into(), Tag::String(item.as_str().into()));
+            }
+        }
+        1 => {
+            m.nbt.remove(&JavaString::from("filter"));
+        }
+        2 => put_int(&mut m.nbt, "inverted", u32::from(get_int(&m.nbt, "inverted") == 0)),
+        3 => put_int(&mut m.nbt, "fuzzy", u32::from(get_int(&m.nbt, "fuzzy") == 0)),
+        4 => put_long(&mut m.nbt, "count", u64::from(count)),
+        _ => {}
+    });
+}
+
+fn send_adapter(game: &Game<'_>, pos: [i32; 3], op: u8, count: u32) {
+    let mut data = Vec::new();
+    for c in pos {
+        data.extend(c.to_be_bytes());
+    }
+    data.push(op);
+    data.extend(count.to_be_bytes());
+    game.native_send_to_server(ADAPTER_CHANNEL, &data);
+}
+
+fn draw_adapter_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let at = |r: [f32; 4]| [ox + r[0], oy + r[1], r[2], r[3]];
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 176.0, 192.0]);
+    let title = game.native_screen_title().unwrap_or_default();
+    centred(game, batch, &title, ox, 176.0, oy + 4.0, 0x40_4040);
+    for row in 0..4 {
+        let y = if row < 3 { 110.0 + 18.0 * row as f32 } else { 168.0 };
+        for col in 0..9 {
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + 18.0 * col as f32, oy + y - 1.0, 18.0, 18.0]);
+        }
+    }
+    game.native_text(batch, "Inventory", [ox + 8.0, oy + 99.0], 0x40_4040, false);
+    let Some(v) = adapter_view(game) else {
+        return;
+    };
+    let s = at(ADAPTER_FREQ);
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, s, 0xFFFF_FFFF);
+    let line = v.frequency.as_ref().map_or("No frequency".to_owned(), |f| format!("Frequency: {f}"));
+    game.native_text_scaled(batch, &line, [s[0] + 3.0, s[1] + 3.0], 0x3C_FE9A, 0.8);
+    // The item slot (a click with an item sets it, shift with an empty hand clears it).
+    sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], at(ADAPTER_SLOT));
+    if let Some(item) = &v.item {
+        game.native_item_stack(batch, &stack_of(item, 1), [ox + 8.0, oy + 31.0], 16.0);
+    }
+    let s = at(ADAPTER_INFO);
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, s, 0xFFFF_FFFF);
+    let mut lines = vec![v.item.as_deref().map_or("Undefined item".to_owned(), filter_name)];
+    lines.push(format!("Trigger Count {} {}", if v.inverted { "<" } else { ">=" }, v.count));
+    if v.item.is_some() && v.frequency.is_some() {
+        lines.push(format!("Stored: {}", v.stored));
+    }
+    lines.push(format!("Fuzzy Mode: {}", if v.fuzzy { "On" } else { "Off" }));
+    for (i, l) in lines.iter().enumerate() {
+        game.native_text_scaled(batch, l, [s[0] + 3.0, s[1] + 3.0 + 10.0 * i as f32], 0x3C_FE9A, 0.8);
+    }
+    draw_button(game, batch, at(ADAPTER_INVERT), inside(mouse, ADAPTER_INVERT), true, 0xFFFF_FFFF, Some((if v.inverted { "button/toggle_flipped" } else { "button/toggle" }, 14.0)));
+    draw_button(game, batch, at(ADAPTER_FUZZY), inside(mouse, ADAPTER_FUZZY), true, 0xFFFF_FFFF, Some(("button/fuzzy", 14.0)));
+    // The count's text box (`GuiTextField`, digits).
+    let b = at(ADAPTER_TEXT);
+    ADAPTER_TEXT_BOX.with_borrow(|t| {
+        game.native_fill(batch, [b[0] - 1.0, b[1] - 1.0, b[2] + 2.0, b[3] + 2.0], if t.focused { 0xFFFF_FFFF } else { 0xFFA0_A0A0 });
+        game.native_fill(batch, b, 0xFF00_0000);
+        game.native_text(batch, &t.value, [b[0] + 2.0, b[1] + 2.0], 0xE0_E0E0, false);
+        if t.focused && (game.ticks / 6) % 2 == 0 {
+            let before: String = t.value.chars().take(t.cursor).collect();
+            game.native_text(batch, "_", [b[0] + 2.0 + game.native_text_width(&before), b[1] + 2.0], 0xE0_E0E0, false);
+        }
+    });
+}
+
+fn adapter_click(game: &Game<'_>, at: [f32; 2]) {
+    let Some(v) = adapter_view(game) else {
+        return;
+    };
+    ADAPTER_TEXT_BOX.with_borrow_mut(|t| t.focused = inside(at, ADAPTER_TEXT));
+    let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);
+    let holding = game.inventory.get(game.selected).is_some_and(|h| h.is_some());
+    if inside(at, ADAPTER_SLOT) {
+        // `stack.isEmpty() == event.hasShiftDown()`: set with an item and no shift, clear with none and shift.
+        if holding && !shift {
+            send_adapter(game, v.pos, 0, 0);
+        } else if !holding && shift {
+            send_adapter(game, v.pos, 1, 0);
+        }
+    } else if inside(at, ADAPTER_INVERT) {
+        send_adapter(game, v.pos, 2, 0);
+    } else if inside(at, ADAPTER_FUZZY) {
+        send_adapter(game, v.pos, 3, 0);
+    }
+}
+
+fn adapter_typing(block: &str) -> bool {
+    kind(block) == Some(Kind::QioRedstoneAdapter) && ADAPTER_TEXT_BOX.with_borrow(|t| t.focused)
+}
+
+/// A key in the count box: digits (ten at most); Enter sends the count and clears the box
+/// (`configureDigitalInput`).
+fn adapter_key(game: &Game<'_>, key: &str, text: Option<&str>) {
+    let Some(v) = adapter_view(game) else {
+        return;
+    };
+    ADAPTER_TEXT_BOX.with_borrow_mut(|t| {
+        if t.key(key, text, |c| c.is_ascii_digit(), 10) == freq::Typed::Enter {
+            if let Ok(n) = t.value.parse::<u64>() {
+                send_adapter(game, v.pos, 4, n.min(u64::from(i32::MAX as u32)) as u32);
+            }
+            *t = freq::TextBox { focused: true, ..Default::default() };
+        }
+    });
 }
