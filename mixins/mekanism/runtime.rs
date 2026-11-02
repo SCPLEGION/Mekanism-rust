@@ -2111,6 +2111,10 @@ fn load_sorter(nbt: &Compound) -> Sorter {
         single_item: get_int(nbt, "single") == 1,
         round_robin: get_int(nbt, "round_robin") == 1,
         disabled: strings_of(nbt, "disabled"),
+        opts: match nbt.get(&JavaString::from("filter_opts")) {
+            Some(Tag::String(o)) => Sorter::parse_opts(&o.to_string().unwrap_or_default()),
+            _ => Default::default(),
+        },
     }
 }
 
@@ -2120,6 +2124,7 @@ fn save_sorter(nbt: &mut Compound, s: &Sorter) {
     put_int(nbt, "single", u32::from(s.single_item));
     put_int(nbt, "round_robin", u32::from(s.round_robin));
     nbt.insert("disabled".into(), string_list(&s.disabled));
+    nbt.insert("filter_opts".into(), Tag::String(s.save_opts().as_str().into()));
 }
 
 /// The Logistical Sorter, every 10 ticks: each filter in turn takes its items from the inventory behind
@@ -2143,23 +2148,31 @@ fn tick_sorter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
     let front_face = horizon_core::geometry::Direction::ALL[face_index([-d[0], -d[1], -d[2]])];
     let max = settings.max_move();
     let mut choices: Vec<Option<&str>> = settings.active().map(|f| Some(f.as_str())).collect();
+    let item_tags = world_items!(game).item_tags.clone();
+    let in_tag = |tag: &str, item: &str| item_tags.get(tag).is_some_and(|t| t.contains(item));
     if settings.auto_eject {
         choices.push(None);
     }
-    // The item tags the filters name, read once.
-    let tags: std::collections::HashMap<&str, std::collections::HashSet<String>> = {
-        let items = world_items!(game);
-        let named = settings.active().filter_map(|f| f.strip_prefix('#'));
-        named.map(|t| (t, items.item_tags.get(t).cloned().unwrap_or_default())).collect()
-    };
     for filter in choices {
-        let wanted = |s: &ItemStack| {
-            filter.is_none_or(|f| Sorter::matches(f, &s.item, &|tag: &str| tags.get(tag).is_some_and(|t| t.contains(&*s.item))))
+        // A filter in size mode moves between its min and max items (`SorterFilter.mapInventory`);
+        // auto-eject takes what no filter refuses the default for (`strictFinder`).
+        let opts = filter.map(|f| settings.opts_of(f));
+        let ranged = opts.filter(|o| o.size_mode && !settings.single_item);
+        let take = ranged.map_or(max, |o| u32::from(o.max).clamp(1, max));
+        let wanted = |s: &ItemStack| match filter {
+            Some(f) => Sorter::matches_item(f, &s.item, &in_tag),
+            None => settings.auto_eject_allows(&s.item, &in_tag),
         };
-        let stack = game.native_extract_item_where(back, back_face, max, &wanted);
+        let stack = game.native_extract_item_where(back, back_face, take, &wanted);
         let Some(stack) = stack else {
             continue;
         };
+        if let Some(o) = ranged
+            && stack.count < u32::from(o.min)
+        {
+            game.native_insert_item(back, back_face, stack);
+            continue;
+        }
         let left = if is_transporter(block_name(game, front)) {
             route_items(game, front, pos, stack)
         } else {
@@ -5131,6 +5144,9 @@ fn centred(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, text: &st
 /// type tabs, the close button, the title, the eject screen and button, the face buttons with the
 /// block beside each face, the clear button and the "Slots" label.
 pub(super) fn screen_overlay(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    if is_sorter(block) {
+        return draw_filter_window(game, batch, origin);
+    }
     let shown = match window(block) {
         Some(Window::Sides(shown)) => shown,
         Some(Window::Upgrades(selected)) => return draw_upgrade_window(game, block, data, batch, origin, selected),
@@ -5214,6 +5230,10 @@ pub(super) fn creative_tabs(tabs: &mut Vec<crate::game::native_hooks::NativeCrea
 /// What Mekanism's own parts cover on a screen (hook point `native_screen_covers`, API 32): its tabs
 /// beside the panel, and the open window with its type tabs.
 pub(super) fn screen_covers(block: &str, at: [f32; 2], covered: &mut bool) {
+    if is_sorter(block) {
+        *covered |= FILTER_EDIT.with_borrow(|e| e.is_some()) && inside(at, FILTER_WINDOW);
+        return;
+    }
     let Some(l) = layout(block) else {
         return;
     };
@@ -6148,7 +6168,9 @@ pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f3
         return;
     }
     if is_sorter(block) {
-        sorter_tooltip(game, at, lines);
+        if !filter_window_tooltip(game, at, lines) {
+            sorter_tooltip(game, at, lines);
+        }
         return;
     }
     if is_qio_screen(block) {
@@ -8858,7 +8880,7 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
     if is_freq_screen(block) {
         *typing |= FREQ_UI.with_borrow(|ui| ui.text.focused);
     }
-    *typing |= qio_typing(block);
+    *typing |= qio_typing(block) || filter_typing(block);
 }
 
 /// A key on the selector's focused text box (hook point `native_screen_key`): Enter sets the name as
@@ -8866,6 +8888,10 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
 pub(super) fn screen_key(game: &mut Game<'_>, block: &str, key: &str, text: Option<&str>) {
     if kind(block) == Some(Kind::QioDashboard) && game.native_on(MOD_ID) {
         qio_key(game, key, text);
+        return;
+    }
+    if is_sorter(block) {
+        filter_key(key, text);
         return;
     }
     if !is_freq_screen(block) || !game.native_on(MOD_ID) {
@@ -9133,6 +9159,7 @@ struct SorterView {
     single: bool,
     eject: bool,
     round_robin: bool,
+    opts: std::collections::BTreeMap<String, sorter::Opts>,
 }
 
 fn strings_of(nbt: &Compound, key: &str) -> Vec<String> {
@@ -9150,7 +9177,7 @@ fn sorter_view(game: &Game<'_>) -> Option<([i32; 3], SorterView)> {
     let (x, y, z) = game.container?;
     let (_, c) = game.native_client_block_entity([x, y, z])?;
     let flag = |k: &str| get_int(c, k) == 1;
-    Some(([x, y, z], SorterView { filters: strings_of(c, "filters"), disabled: strings_of(c, "disabled"), single: flag("single"), eject: flag("eject"), round_robin: flag("round_robin") }))
+    Some(([x, y, z], SorterView { filters: strings_of(c, "filters"), disabled: strings_of(c, "disabled"), single: flag("single"), eject: flag("eject"), round_robin: flag("round_robin"), opts: match c.get(&JavaString::from("filter_opts")) { Some(Tag::String(o)) => Sorter::parse_opts(&o.to_string().unwrap_or_default()), _ => Default::default() } }))
 }
 
 /// Sends the sorter's settings to the players looking at it when they change.
@@ -9162,6 +9189,7 @@ fn sorter_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
     let mut client = Compound::new();
     client.insert("filters".into(), string_list(&s.filters));
     client.insert("disabled".into(), string_list(&s.disabled));
+    client.insert("filter_opts".into(), Tag::String(s.save_opts().as_str().into()));
     put_int(&mut client, "single", u32::from(s.single_item));
     put_int(&mut client, "eject", u32::from(s.auto_eject));
     put_int(&mut client, "round_robin", u32::from(s.round_robin));
@@ -9185,6 +9213,7 @@ fn sorter_payload(game: &mut Game<'_>, data: &[u8]) {
     let held = game.inventory.get(game.selected).cloned().flatten();
     let filter = held.as_ref().and_then(|h| match r.op {
         sorter::Op::AddItem => Some(h.item.to_string()),
+        sorter::Op::AddMod => h.item.split_once(':').map(|(ns, _)| format!("@{ns}")),
         sorter::Op::AddTag => {
             let items = world_items!(game);
             let mut tags: Vec<&String> = items.item_tags.iter().filter(|(_, t)| t.contains(&*h.item)).map(|(k, _)| k).collect();
@@ -9209,9 +9238,28 @@ fn sorter_payload(game: &mut Game<'_>, data: &[u8]) {
             sorter::Op::Delete => {
                 s.remove(index);
             }
-            sorter::Op::AddItem | sorter::Op::AddTag => {
+            sorter::Op::AddItem | sorter::Op::AddTag | sorter::Op::AddMod => {
                 if let Some(f) = filter.filter(|f| !s.filters.contains(f)) {
                     s.filters.push(f);
+                }
+            }
+            sorter::Op::AllowDefault => {
+                s.edit(index, |o| o.allow_default = !o.allow_default);
+            }
+            sorter::Op::SizeMode => {
+                s.edit(index, |o| o.size_mode = !o.size_mode);
+            }
+            sorter::Op::ColorNext | sorter::Op::ColorPrevious => {
+                let next = r.op == sorter::Op::ColorNext;
+                s.edit(index, |o| o.color = sorter::Opts::step_color(o.color, next));
+            }
+            sorter::Op::ColorClear => {
+                s.edit(index, |o| o.color = None);
+            }
+            sorter::Op::Range => {
+                let (lo, hi) = (r.value >> 8, r.value & 0xFF);
+                if sorter::Opts::valid_range(lo, hi) {
+                    s.edit(index, |o| (o.min, o.max) = (lo, hi));
                 }
             }
         }
@@ -9220,7 +9268,11 @@ fn sorter_payload(game: &mut Game<'_>, data: &[u8]) {
 }
 
 fn send_sorter(game: &Game<'_>, op: sorter::Op, pos: [i32; 3], index: usize) {
-    let r = sorter::Request { op, pos, index: index.min(usize::from(u16::MAX)) as u16 };
+    send_sorter_value(game, op, pos, index, 0);
+}
+
+fn send_sorter_value(game: &Game<'_>, op: sorter::Op, pos: [i32; 3], index: usize, value: u16) {
+    let r = sorter::Request { op, pos, index: index.min(usize::from(u16::MAX)) as u16, value };
     game.native_send_to_server(SORTER_CHANNEL, &r.encode());
 }
 
@@ -9228,6 +9280,7 @@ fn send_sorter(game: &Game<'_>, op: sorter::Op, pos: [i32; 3], index: usize) {
 fn filter_name(f: &str) -> String {
     match f.strip_prefix('#') {
         Some(tag) => tag.to_owned(),
+        None if f.starts_with('@') => f[1..].to_owned(),
         None => {
             let path = f.split_once(':').map_or(f, |(_, p)| p);
             path.split('_').map(|w| w.chars().next().map_or(String::new(), |c| c.to_uppercase().chain(w.chars().skip(1)).collect())).collect::<Vec<_>>().join(" ")
@@ -9243,6 +9296,12 @@ fn sorter_click(game: &Game<'_>, at: [f32; 2], right: bool) -> bool {
         return false;
     };
     let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);
+    if right && filter_window_right_click(game, pos, at) {
+        return true;
+    }
+    if filter_window_click(game, pos, &view, at) {
+        return true;
+    }
     use sorter::Op;
     for (r, op) in SORTER_TOGGLES.iter().zip([Op::Single, Op::RoundRobin, Op::AutoEject]) {
         if inside(at, *r) {
@@ -9276,6 +9335,9 @@ fn sorter_click(game: &Game<'_>, at: [f32; 2], right: bool) -> bool {
             send_sorter(game, Op::Toggle, pos, index);
         } else if right {
             send_sorter(game, Op::Delete, pos, index);
+        } else {
+            // A click on the filter opens its window (`GuiSorterItemStackFilter` and the others).
+            open_filter_window(&view, pos, index);
         }
         return true;
     }
@@ -9305,7 +9367,7 @@ fn draw_sorter_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
     let view = sorter_view(game);
     let (pos, view) = match view {
         Some((p, v)) => (p, v),
-        None => ([0; 3], SorterView { filters: vec![], disabled: vec![], single: false, eject: false, round_robin: false }),
+        None => ([0; 3], SorterView { filters: vec![], disabled: vec![], single: false, eject: false, round_robin: false, opts: Default::default() }),
     };
     let on = |b: bool| if b { "\u{a7}aON" } else { "\u{a7}cOFF" };
     let small = |batch: &mut horizon_client::hud::HudBatch, text: &str, x: f32, y: f32| {
@@ -9622,4 +9684,211 @@ fn qio_tooltip(game: &Game<'_>, block: &str, at: [f32; 2], lines: &mut Vec<Strin
         lines.push(format!("\u{a7}7Items: \u{a7}9{}\u{a7}7 / \u{a7}9{}", v.items, v.item_cap));
         lines.push(format!("\u{a7}7Types: \u{a7}9{}\u{a7}7 / \u{a7}9{}", v.types, v.type_cap));
     }
+}
+
+// --- Sorter filter window (GuiSorterItemStackFilter, GuiSorterTagFilter, GuiSorterModIDFilter) ----------
+
+/// The window over the sorter's screen: 200 × 90, centred, 30 px down (`GuiFilterHolder.addWindow`).
+const FILTER_WINDOW: [f32; 4] = [38.0, 30.0, 200.0, 90.0];
+const FILTER_CLOSE: [f32; 4] = [6.0, 6.0, 8.0, 8.0];
+const FILTER_SCREEN: [f32; 4] = [29.0, 18.0, 116.0, 42.0];
+const FILTER_DELETE: [f32; 4] = [24.0, 62.0, 60.0, 20.0];
+const FILTER_SAVE: [f32; 4] = [86.0, 62.0, 60.0, 20.0];
+const FILTER_DEFAULT: [f32; 4] = [148.0, 18.0, 11.0, 11.0];
+const FILTER_SIZE: [f32; 4] = [148.0, 56.0, 11.0, 11.0];
+const FILTER_COLOR: [f32; 4] = [8.0, 44.0, 16.0, 16.0];
+const FILTER_MIN: [f32; 4] = [174.0, 31.0, 20.0, 11.0];
+const FILTER_MAX: [f32; 4] = [174.0, 43.0, 20.0, 11.0];
+
+struct FilterEdit {
+    pos: [i32; 3],
+    index: usize,
+    min: freq::TextBox,
+    max: freq::TextBox,
+}
+
+thread_local! {
+    static FILTER_EDIT: std::cell::RefCell<Option<FilterEdit>> = const { std::cell::RefCell::new(None) };
+}
+
+fn open_filter_window(view: &SorterView, pos: [i32; 3], index: usize) {
+    let Some(f) = view.filters.get(index) else {
+        return;
+    };
+    let o = view.opts.get(f).copied().unwrap_or_default();
+    let boxed = |n: u16| freq::TextBox { value: n.to_string(), cursor: n.to_string().len(), focused: false };
+    FILTER_EDIT.with_borrow_mut(|e| *e = Some(FilterEdit { pos, index, min: boxed(o.min), max: boxed(o.max) }));
+}
+
+fn close_filter_window() {
+    FILTER_EDIT.with_borrow_mut(|e| *e = None);
+}
+
+fn window_rect(r: [f32; 4]) -> [f32; 4] {
+    [FILTER_WINDOW[0] + r[0], FILTER_WINDOW[1] + r[1], r[2], r[3]]
+}
+
+fn filter_edit_open(pos: [i32; 3]) -> Option<usize> {
+    FILTER_EDIT.with_borrow(|e| e.as_ref().filter(|e| e.pos == pos).map(|e| e.index))
+}
+
+/// The window's drawing (hook point `native_screen_overlay`).
+fn draw_filter_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let Some((pos, view)) = sorter_view(game) else {
+        return;
+    };
+    let Some(index) = filter_edit_open(pos) else {
+        return;
+    };
+    let Some(filter) = view.filters.get(index) else {
+        close_filter_window();
+        return;
+    };
+    let o = view.opts.get(filter).copied().unwrap_or_default();
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let at = [cursor[0] - ox, cursor[1] - oy];
+    let screen = |r: [f32; 4]| {
+        let [x, y, w, h] = window_rect(r);
+        [ox + x, oy + y, w, h]
+    };
+    let hover = |r: [f32; 4]| inside(at, window_rect(r));
+    let [x, y, w, h] = screen([0.0, 0.0, FILTER_WINDOW[2], FILTER_WINDOW[3]]);
+    nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
+    nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
+    draw_button(game, batch, screen(FILTER_CLOSE), hover(FILTER_CLOSE), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+    let (what, name) = match filter.as_bytes().first() {
+        Some(b'#') => ("Tag Filter", filter[1..].to_owned()),
+        Some(b'@') => ("Mod ID Filter", filter[1..].to_owned()),
+        _ => ("Item Filter", filter_name(filter)),
+    };
+    centred(game, batch, what, x, w, y + 5.0, 0x40_4040);
+    // The filter's slot, and the inner screen with what it names.
+    sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [x + 7.0, y + 18.0, 18.0, 18.0]);
+    if !filter.starts_with(['#', '@']) {
+        game.native_item_stack(batch, &stack_of(filter, 1), [x + 8.0, y + 19.0], 16.0);
+    }
+    let s = screen(FILTER_SCREEN);
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, s, 0xFFFF_FFFF);
+    game.native_text(batch, what, [s[0] + 3.0, s[1] + 3.0], 0x3C_FE9A, false);
+    game.native_text_scaled(batch, &name, [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8);
+    // The colour slot and button (`ColorButton`).
+    sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [x + 7.0, y + 43.0, 18.0, 18.0]);
+    if let Some(c) = o.color {
+        game.native_fill(batch, screen(FILTER_COLOR), 0xFF00_0000 | freq::COLORS[usize::from(c) % 16].1);
+    }
+    // The switches and their words.
+    draw_button(game, batch, screen(FILTER_DEFAULT), hover(FILTER_DEFAULT), true, 0xFFFF_FFFF, Some(("button/default", 11.0)));
+    game.native_text(batch, if o.allow_default { "On" } else { "Off" }, [x + 159.0, y + 20.0], 0x40_4040, false);
+    draw_button(game, batch, screen(FILTER_SIZE), hover(FILTER_SIZE), true, 0xFFFF_FFFF, Some(("button/silk_touch", 11.0)));
+    let size_text = if view.single && o.size_mode { "\u{a7}cOn" } else if o.size_mode { "On" } else { "Off" };
+    game.native_text(batch, size_text, [x + 159.0, y + 58.0], 0x40_4040, false);
+    game.native_text(batch, "Min:", [x + 146.0, y + 32.0], 0x40_4040, false);
+    game.native_text(batch, "Max:", [x + 146.0, y + 44.0], 0x40_4040, false);
+    FILTER_EDIT.with_borrow(|e| {
+        let Some(e) = e else {
+            return;
+        };
+        for (r, t) in [(FILTER_MIN, &e.min), (FILTER_MAX, &e.max)] {
+            let b = screen(r);
+            game.native_fill(batch, [b[0] - 1.0, b[1] - 1.0, b[2] + 2.0, b[3] + 2.0], if t.focused { 0xFFFF_FFFF } else { 0xFFA0_A0A0 });
+            game.native_fill(batch, b, 0xFF00_0000);
+            game.native_text(batch, &t.value, [b[0] + 2.0, b[1] + 2.0], 0xE0_E0E0, false);
+            if t.focused && (game.ticks / 6) % 2 == 0 {
+                let before: String = t.value.chars().take(t.cursor).collect();
+                game.native_text(batch, "_", [b[0] + 2.0 + game.native_text_width(&before), b[1] + 2.0], 0xE0_E0E0, false);
+            }
+        }
+    });
+    for (r, label) in [(FILTER_DELETE, "Delete"), (FILTER_SAVE, "Save")] {
+        let b = screen(r);
+        draw_button(game, batch, b, hover(r), true, 0xFFFF_FFFF, None);
+        centred(game, batch, label, b[0], b[2], b[1] + 6.0, 0xFF_FFFF);
+    }
+}
+
+/// A press on the open window: true when the window is open (it takes every click).
+fn filter_window_click(game: &Game<'_>, pos: [i32; 3], view: &SorterView, at: [f32; 2]) -> bool {
+    let Some(index) = filter_edit_open(pos) else {
+        return false;
+    };
+    let on = |r: [f32; 4]| inside(at, window_rect(r));
+    let _ = view;
+    let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);
+    use sorter::Op;
+    FILTER_EDIT.with_borrow_mut(|e| {
+        let Some(edit) = e.as_mut() else {
+            return;
+        };
+        edit.min.focused = on(FILTER_MIN);
+        edit.max.focused = on(FILTER_MAX);
+    });
+    if on(FILTER_CLOSE) {
+        close_filter_window();
+    } else if on(FILTER_DEFAULT) {
+        send_sorter(game, Op::AllowDefault, pos, index);
+    } else if on(FILTER_SIZE) {
+        send_sorter(game, Op::SizeMode, pos, index);
+    } else if on(FILTER_COLOR) {
+        send_sorter(game, if shift { Op::ColorClear } else { Op::ColorNext }, pos, index);
+    } else if on(FILTER_DELETE) {
+        send_sorter(game, Op::Delete, pos, index);
+        close_filter_window();
+    } else if on(FILTER_SAVE) {
+        let range = FILTER_EDIT.with_borrow(|e| {
+            let e = e.as_ref()?;
+            let num = |t: &freq::TextBox, empty: u16| if t.value.is_empty() { Some(empty) } else { t.value.parse::<u16>().ok() };
+            Some((num(&e.min, 0)?, num(&e.max, 64)?))
+        });
+        // A range that is not 0 <= min <= max <= 64 keeps the window open (`validateAndSaveSorterFilter`).
+        if let Some((lo, hi)) = range.filter(|(lo, hi)| sorter::Opts::valid_range(*lo, *hi)) {
+            send_sorter_value(game, Op::Range, pos, index, lo << 8 | hi);
+            close_filter_window();
+        }
+    }
+    true
+}
+
+/// A right click on the colour button steps it back; the rest of the window has no right click.
+fn filter_window_right_click(game: &Game<'_>, pos: [i32; 3], at: [f32; 2]) -> bool {
+    let Some(index) = filter_edit_open(pos) else {
+        return false;
+    };
+    if inside(at, window_rect(FILTER_COLOR)) {
+        send_sorter(game, sorter::Op::ColorPrevious, pos, index);
+    }
+    true
+}
+
+fn filter_window_tooltip(game: &Game<'_>, at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    let Some((pos, view)) = sorter_view(game) else {
+        return false;
+    };
+    let Some(index) = filter_edit_open(pos) else {
+        return false;
+    };
+    let on = |r: [f32; 4]| inside(at, window_rect(r));
+    if on(FILTER_DEFAULT) {
+        lines.push("Allow Default".into());
+    } else if on(FILTER_SIZE) {
+        lines.push(if view.single { "\u{a7}cSize Mode conflicts with single item mode".into() } else { "Size Mode".into() });
+    } else if on(FILTER_COLOR) {
+        let color = view.filters.get(index).and_then(|f| view.opts.get(f)).and_then(|o| o.color);
+        lines.push(color.map_or("None", |c| freq::COLORS[usize::from(c) % 16].0).into());
+    }
+    inside(at, FILTER_WINDOW)
+}
+
+fn filter_typing(block: &str) -> bool {
+    is_sorter(block) && FILTER_EDIT.with_borrow(|e| e.as_ref().is_some_and(|e| e.min.focused || e.max.focused))
+}
+
+fn filter_key(key: &str, text: Option<&str>) {
+    FILTER_EDIT.with_borrow_mut(|e| {
+        let Some(e) = e else {
+            return;
+        };
+        let t = if e.min.focused { &mut e.min } else { &mut e.max };
+        t.key(key, text, |c| c.is_ascii_digit(), 2);
+    });
 }

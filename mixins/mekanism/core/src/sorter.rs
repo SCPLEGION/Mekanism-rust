@@ -8,6 +8,79 @@ pub const DELAY: u32 = 10;
 /// `Item.ABSOLUTE_MAX_STACK_SIZE`: what one operation moves, or 1 in single-item mode.
 pub const MAX_MOVE: u32 = 64;
 
+/// What a filter adds to its item, tag or mod id (`SorterFilter`): the transporter colour, whether
+/// auto-eject may still send the items it names, and the item counts of one operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Opts {
+    pub allow_default: bool,
+    /// `sizeMode`: only move between `min` and `max` items at once.
+    pub size_mode: bool,
+    pub min: u16,
+    pub max: u16,
+    /// A transporter colour (`EnumColor` ordinal), none for default.
+    pub color: Option<u8>,
+}
+
+impl Default for Opts {
+    fn default() -> Opts {
+        Opts {
+            allow_default: false,
+            size_mode: false,
+            min: 0,
+            max: 64,
+            color: None,
+        }
+    }
+}
+
+impl Opts {
+    /// `SorterFilter.setMinMax`'s rule: `0 <= min <= max <= 64`.
+    pub fn valid_range(min: u16, max: u16) -> bool {
+        min <= max && max <= u16::from(crate::sorter::MAX_MOVE as u8)
+    }
+
+    /// `TransporterUtils.increment` and `decrement` over none and the 16 dye colours.
+    pub fn step_color(color: Option<u8>, next: bool) -> Option<u8> {
+        match (color, next) {
+            (None, true) => Some(0),
+            (Some(15), true) => None,
+            (Some(c), true) => Some(c + 1),
+            (None, false) => Some(15),
+            (Some(0), false) => None,
+            (Some(c), false) => Some(c - 1),
+        }
+    }
+
+    fn save(&self) -> String {
+        format!(
+            "{}\t{}\t{}\t{}\t{}",
+            u8::from(self.allow_default),
+            u8::from(self.size_mode),
+            self.min,
+            self.max,
+            self.color.map_or(-1, i32::from)
+        )
+    }
+
+    fn load(text: &str) -> Option<Opts> {
+        let mut f = text.split('\t');
+        let flag = |v: &str| v == "1";
+        let o = Opts {
+            allow_default: flag(f.next()?),
+            size_mode: flag(f.next()?),
+            min: f.next()?.parse().ok()?,
+            max: f.next()?.parse().ok()?,
+            color: f
+                .next()?
+                .parse::<i32>()
+                .ok()
+                .and_then(|c| u8::try_from(c).ok())
+                .filter(|c| *c < 16),
+        };
+        Opts::valid_range(o.min, o.max).then_some(o)
+    }
+}
+
 /// The sorter's settings (`filters`, `autoEject`, `singleItem`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Sorter {
@@ -19,6 +92,8 @@ pub struct Sorter {
     pub round_robin: bool,
     /// Filters switched off in the screen (`IFilter.isEnabled`), by their text.
     pub disabled: Vec<String>,
+    /// The options of the filters that are not at their defaults, by filter text.
+    pub opts: std::collections::BTreeMap<String, Opts>,
 }
 
 impl Sorter {
@@ -44,6 +119,64 @@ impl Sorter {
         } else {
             self.filters.push(item.to_owned());
             true
+        }
+    }
+
+    /// A filter's options (the defaults when it has none).
+    pub fn opts_of(&self, filter: &str) -> Opts {
+        self.opts.get(filter).copied().unwrap_or_default()
+    }
+
+    /// Changes filter `index`'s options with `change`; false if there is no such filter.
+    pub fn edit(&mut self, index: usize, change: impl FnOnce(&mut Opts)) -> bool {
+        let Some(f) = self.filters.get(index).cloned() else {
+            return false;
+        };
+        let mut o = self.opts_of(&f);
+        change(&mut o);
+        if o == Opts::default() {
+            self.opts.remove(&f);
+        } else {
+            self.opts.insert(f, o);
+        }
+        true
+    }
+
+    /// The options saved in one string, a filter's text and its fields on each line.
+    pub fn save_opts(&self) -> String {
+        self.opts
+            .iter()
+            .map(|(k, o)| format!("{k}\t{}", o.save()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn parse_opts(saved: &str) -> std::collections::BTreeMap<String, Opts> {
+        saved
+            .lines()
+            .filter_map(|l| {
+                let (k, rest) = l.split_once('\t')?;
+                Some((k.to_owned(), Opts::load(rest)?))
+            })
+            .collect()
+    }
+
+    /// `strictFinder`: whether auto-eject may send `item`: no enabled filter that names it may refuse
+    /// the default.
+    pub fn auto_eject_allows(&self, item: &str, in_tag: &dyn Fn(&str, &str) -> bool) -> bool {
+        !self
+            .active()
+            .any(|f| !self.opts_of(f).allow_default && Sorter::matches_item(f, item, in_tag))
+    }
+
+    /// Whether `filter` (an item id, `#tag` or `@mod id`) takes `item`.
+    pub fn matches_item(filter: &str, item: &str, in_tag: &dyn Fn(&str, &str) -> bool) -> bool {
+        match filter.as_bytes().first() {
+            Some(b'#') => in_tag(&filter[1..], item),
+            Some(b'@') => item
+                .split_once(':')
+                .is_some_and(|(ns, _)| ns == &filter[1..]),
+            _ => filter == item,
         }
     }
 
@@ -92,6 +225,9 @@ impl Sorter {
         }
         let f = self.filters.remove(index);
         self.disabled.retain(|d| *d != f);
+        if !self.filters.contains(&f) {
+            self.opts.remove(&f);
+        }
         true
     }
 
@@ -124,9 +260,18 @@ pub enum Op {
     /// A filter for the item in the player's hand, or its first tag.
     AddItem,
     AddTag,
+    /// A filter for the mod id of the item in hand.
+    AddMod,
+    AllowDefault,
+    SizeMode,
+    ColorNext,
+    ColorPrevious,
+    ColorClear,
+    /// The filter's range: `value` is `min << 8 | max`.
+    Range,
 }
 
-const OPS: [Op; 11] = [
+const OPS: [Op; 18] = [
     Op::Single,
     Op::RoundRobin,
     Op::AutoEject,
@@ -138,6 +283,13 @@ const OPS: [Op; 11] = [
     Op::Delete,
     Op::AddItem,
     Op::AddTag,
+    Op::AddMod,
+    Op::AllowDefault,
+    Op::SizeMode,
+    Op::ColorNext,
+    Op::ColorPrevious,
+    Op::ColorClear,
+    Op::Range,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +297,8 @@ pub struct Request {
     pub op: Op,
     pub pos: [i32; 3],
     pub index: u16,
+    /// The number a `Range` sets.
+    pub value: u16,
 }
 
 impl Request {
@@ -154,11 +308,12 @@ impl Request {
             out.extend(c.to_be_bytes());
         }
         out.extend(self.index.to_be_bytes());
+        out.extend(self.value.to_be_bytes());
         out
     }
 
     pub fn decode(data: &[u8]) -> Option<Request> {
-        if data.len() != 15 {
+        if data.len() != 17 {
             return None;
         }
         let op = *OPS.get(usize::from(data[0]))?;
@@ -167,6 +322,7 @@ impl Request {
             op,
             pos: [int(1), int(5), int(9)],
             index: u16::from_be_bytes([data[13], data[14]]),
+            value: u16::from_be_bytes([data[15], data[16]]),
         })
     }
 }
@@ -236,9 +392,42 @@ mod tests {
             op: Op::Bottom,
             pos: [-3, 70, 9000],
             index: 40,
+            value: 12,
         };
         assert_eq!(Request::decode(&r.encode()), Some(r));
-        assert_eq!(Request::decode(&[99; 15]), None);
+        assert_eq!(Request::decode(&[99; 17]), None);
         assert_eq!(Request::decode(&[0; 3]), None);
+    }
+
+    #[test]
+    fn options_save_and_filters_match_mod_ids() {
+        let mut s = Sorter {
+            filters: vec!["@mekanism".into(), "minecraft:dirt".into()],
+            ..Sorter::default()
+        };
+        assert!(s.edit(0, |o| {
+            o.allow_default = true;
+            o.min = 4;
+            o.max = 32;
+            o.color = Some(5);
+        }));
+        assert!(!s.edit(9, |_| {}));
+        assert_eq!(Sorter::parse_opts(&s.save_opts()), s.opts);
+        assert!(s.edit(0, |o| *o = Opts::default()));
+        assert!(s.opts.is_empty());
+        let tag = |_: &str, _: &str| false;
+        assert!(Sorter::matches_item(
+            "@mekanism",
+            "mekanism:ingot_osmium",
+            &tag
+        ));
+        assert!(!Sorter::matches_item("@mekanism", "mekanismtools:x", &tag));
+        // Auto-eject skips what a filter names, unless that filter allows the default.
+        assert!(!s.auto_eject_allows("minecraft:dirt", &tag));
+        s.edit(1, |o| o.allow_default = true);
+        assert!(s.auto_eject_allows("minecraft:dirt", &tag));
+        assert_eq!(Opts::step_color(None, false), Some(15));
+        assert_eq!(Opts::step_color(Some(15), true), None);
+        assert!(!Opts::valid_range(5, 4) && !Opts::valid_range(0, 65));
     }
 }
