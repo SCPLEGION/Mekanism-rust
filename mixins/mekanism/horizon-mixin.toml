@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "47f42a1837c63f13eb768f6efee8eef34d43bfac"
+horizon_revision = "40a2e8c9cb61b14a4fac1beb46b7bbb3e1e73227"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -190,6 +190,16 @@ bindings = [
   { name = "data", ty = "&[i32]", value = "data" },
   { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
   { name = "origin", ty = "[f32; 2]", value = "origin" },
+]
+
+[[injection]]
+id = "creative-tabs"
+hook = "creative_tabs"
+hook_version = 1
+kind = "HEAD"
+helper = "creative_tabs.rs"
+bindings = [
+  { name = "tabs", ty = "&mut Vec<crate::game::native_hooks::NativeCreativeTab>", value = "&mut *tabs" },
 ]
 
 [[injection]]

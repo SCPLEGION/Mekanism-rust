@@ -523,7 +523,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::QioDashboard => {
-                tick_dashboard(game, entity);
+                tick_dashboard(game, pos, entity);
                 None
             }
             Kind::QioImporter => {
@@ -3356,6 +3356,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
         frequency_payload(game, data);
         return;
     }
+    if channel == QIO_CHANNEL && game.native_on(MOD_ID) {
+        qio_payload(game, data);
+        return;
+    }
     if channel == SORTER_CHANNEL && game.native_on(MOD_ID) {
         sorter_payload(game, data);
         return;
@@ -5123,6 +5127,24 @@ pub(super) fn screen_overlay(game: &Game<'_>, block: &str, data: &[i32], batch: 
     centred(game, batch, "Slots", x, w, y + 120.0, 0x78_7878);
 }
 
+/// Mekanism's creative tabs (hook point `native_creative_tabs`, API 34): the Mekanism, Generators, Additions and
+/// Tools tabs, their items in the order of the Java registries (`tools/gen_creative_tabs.py`).
+pub(super) fn creative_tabs(tabs: &mut Vec<crate::game::native_hooks::NativeCreativeTab>) {
+    use crate::game::native_hooks::{NativeCreativeTab, NativeStack};
+    for tab in mekanism_core::creative_tabs::CREATIVE_TABS {
+        tabs.push(NativeCreativeTab {
+            id: tab.id.to_owned(),
+            title: tab.title.to_owned(),
+            icon: tab.icon.to_owned(),
+            items: tab
+                .items
+                .iter()
+                .map(|item| NativeStack { item: (*item).to_owned(), count: 1, components: String::new() })
+                .collect(),
+        });
+    }
+}
+
 /// What Mekanism's own parts cover on a screen (hook point `native_screen_covers`, API 32): its tabs
 /// beside the panel, and the open window with its type tabs.
 pub(super) fn screen_covers(block: &str, at: [f32; 2], covered: &mut bool) {
@@ -5684,6 +5706,10 @@ pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32;
         sorter_click(game, at, right);
         return;
     }
+    if is_qio_screen(block) {
+        qio_click(game, block, at);
+        return;
+    }
     if window_click(block, data, at, right, button) {
         return;
     }
@@ -5754,6 +5780,11 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
 
 pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::NativeScreen>) {
     if screen.is_some() {
+        return;
+    }
+    // `GuiQIODriveArray` and `GuiQIODashboard`.
+    if is_qio_screen(block) {
+        *screen = Some(qio_screen(block));
         return;
     }
     // `GuiLogisticalSorter`: 100 wider and 88 taller than a machine's, no slots of its own.
@@ -5926,6 +5957,10 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
         draw_sorter_screen(game, batch, origin);
         return;
     }
+    if is_qio_screen(block) {
+        draw_qio_screen(game, batch, block, origin);
+        return;
+    }
     let Some(l) = layout(block) else {
         return;
     };
@@ -6039,6 +6074,10 @@ pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f3
     }
     if is_sorter(block) {
         sorter_tooltip(game, at, lines);
+        return;
+    }
+    if is_qio_screen(block) {
+        qio_tooltip(game, block, at, lines);
         return;
     }
     let Some(l) = layout(block) else {
@@ -7194,25 +7233,30 @@ fn tick_drive_array(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
             all.entry(f).or_default().push((dim, pos));
         }
     }
+    let net = get_string(&entity.nbt, "frequency").map(|f| load_network(game, &f).0);
+    qio_sync(game, pos, entity, net.as_ref());
 }
 
 /// The dashboard's six rows are a window on its frequency: each tick what is in them goes back into the
 /// drives, and the most stored items fill them again, a stack of each. Taking a stack out of the menu
 /// takes it from the drives; putting one in stores it.
-fn tick_dashboard(game: &mut Game<'_>, entity: &mut ModBlockEntity) {
+fn tick_dashboard(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     let Some(frequency) = get_string(&entity.nbt, "frequency") else {
+        qio_sync(game, pos, entity, None);
         return;
     };
     let (mut net, at) = load_network(game, &frequency);
+    qio_sync(game, pos, entity, Some(&net));
     if at.is_empty() {
         return;
     }
+    let search = get_string(&entity.nbt, "search").unwrap_or_default();
     let before = net.clone();
     if entity.items.len() < qio::DASHBOARD_SLOTS {
         entity.items.resize(qio::DASHBOARD_SLOTS, None);
     }
     return_to_network(&mut net, &mut entity.items);
-    let mut list = net.list().into_iter();
+    let mut list = net.list().into_iter().filter(|(item, _)| qio::matches_search(item, &search));
     for slot in entity.items.iter_mut().filter(|s| s.is_none()) {
         let Some((item, _)) = list.next() else {
             break;
@@ -8739,11 +8783,16 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
     if is_freq_screen(block) {
         *typing |= FREQ_UI.with_borrow(|ui| ui.text.focused);
     }
+    *typing |= qio_typing(block);
 }
 
 /// A key on the selector's focused text box (hook point `native_screen_key`): Enter sets the name as
 /// a new frequency (`setEnterHandler`).
 pub(super) fn screen_key(game: &mut Game<'_>, block: &str, key: &str, text: Option<&str>) {
+    if kind(block) == Some(Kind::QioDashboard) && game.native_on(MOD_ID) {
+        qio_key(game, key, text);
+        return;
+    }
     if !is_freq_screen(block) || !game.native_on(MOD_ID) {
         return;
     }
@@ -9283,5 +9332,219 @@ fn sorter_tooltip(game: &Game<'_>, at: [f32; 2], lines: &mut Vec<String>) {
             lines.push(view.filters[first + i].clone());
             lines.push("Right click: delete".to_owned());
         }
+    }
+}
+
+// --- QIO screens (GuiQIODriveArray, GuiQIODashboard) ---------------------------------------------------
+
+const QIO_CHANNEL: &str = "mekanism:qio";
+
+fn is_qio_screen(block: &str) -> bool {
+    matches!(kind(block), Some(Kind::QioDriveArray | Kind::QioDashboard))
+}
+
+/// A dashboard's width: 16 + 9 columns of slots + 18 (`GuiQIOItemViewer.calcWidth`).
+const QIO_WIDTH: f32 = 196.0;
+const QIO_HEIGHT: f32 = 247.0;
+
+/// What the screens show of the network, in the block entity's `client` compound.
+fn qio_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, net: Option<&qio::Network>) {
+    let mut client = Compound::new();
+    if let Some(f) = get_string(&entity.nbt, "frequency") {
+        client.insert("frequency".into(), Tag::String(f.as_str().into()));
+    }
+    if let Some(net) = net {
+        let (items, item_cap, types, type_cap) = net.totals();
+        put_long(&mut client, "items", items);
+        put_long(&mut client, "item_cap", item_cap);
+        put_long(&mut client, "types", types as u64);
+        put_long(&mut client, "type_cap", type_cap as u64);
+    }
+    let same = matches!(entity.nbt.get(&JavaString::from("client")), Some(Tag::Compound(c)) if *c == client);
+    if !same {
+        entity.nbt.insert("client".into(), Tag::Compound(client));
+        game.native_sync_block_entity(pos);
+    }
+}
+
+/// A dashboard's search, from its player: `pos` and the text.
+fn qio_payload(game: &mut Game<'_>, data: &[u8]) {
+    let (Some(pos), Some(player)) = (data.get(..12), game.native_acting_player()) else {
+        return;
+    };
+    let int = |i: usize| i32::from_be_bytes([pos[i], pos[i + 1], pos[i + 2], pos[i + 3]]);
+    let pos = [int(0), int(4), int(8)];
+    let Ok(text) = std::str::from_utf8(&data[12..]) else {
+        return;
+    };
+    let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    if !near || text.chars().count() > qio::MAX_SEARCH || !text.chars().all(qio::valid_search_char) || kind(block_name(game, pos)) != Some(Kind::QioDashboard) {
+        return;
+    }
+    game.native_with_mod_block_entity(pos, |m| {
+        m.nbt.insert("search".into(), Tag::String(text.into()));
+    });
+}
+
+struct QioView {
+    pos: [i32; 3],
+    frequency: Option<String>,
+    items: u64,
+    item_cap: u64,
+    types: u64,
+    type_cap: u64,
+}
+
+fn qio_view(game: &Game<'_>) -> Option<QioView> {
+    let (x, y, z) = game.container?;
+    let (_, c) = game.native_client_block_entity([x, y, z])?;
+    Some(QioView {
+        pos: [x, y, z],
+        frequency: get_string(c, "frequency"),
+        items: get_long(c, "items"),
+        item_cap: get_long(c, "item_cap"),
+        types: get_long(c, "types"),
+        type_cap: get_long(c, "type_cap"),
+    })
+}
+
+thread_local! {
+    static QIO_SEARCH: std::cell::RefCell<([i32; 3], freq::TextBox)> = std::cell::RefCell::new(([0; 3], freq::TextBox::default()));
+}
+
+const QIO_SEARCH_BOX: [f32; 4] = [50.0, 30.0, 136.0, 10.0];
+
+fn qio_slots(block: &str) -> Vec<Option<[f32; 2]>> {
+    match kind(block) {
+        Some(Kind::QioDriveArray) => (0..18)
+            .map(|i| (i < qio::DRIVE_SLOTS).then(|| [34.0 + 18.0 * (i % 6) as f32, 70.0 + 18.0 * (i / 6) as f32]))
+            .collect(),
+        _ => (0..qio::DASHBOARD_SLOTS).map(|i| Some([8.0 + 18.0 * (i % 9) as f32, 44.0 + 18.0 * (i / 9) as f32])).collect(),
+    }
+}
+
+fn qio_screen(block: &str) -> super::native_hooks::NativeScreen {
+    if kind(block) == Some(Kind::QioDriveArray) {
+        super::native_hooks::NativeScreen { width: 176.0, height: 206.0, slots: qio_slots(block), inventory_y: 124.0, inventory_x: 8.0, own_labels: true }
+    } else {
+        super::native_hooks::NativeScreen {
+            width: QIO_WIDTH,
+            height: QIO_HEIGHT,
+            slots: qio_slots(block),
+            inventory_y: QIO_HEIGHT - 82.0,
+            inventory_x: 8.0 + (QIO_WIDTH - 176.0) / 2.0,
+            own_labels: true,
+        }
+    }
+}
+
+fn draw_qio_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let drive = kind(block) == Some(Kind::QioDriveArray);
+    let (w, h) = if drive { (176.0, 206.0) } else { (QIO_WIDTH, QIO_HEIGHT) };
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, w, h]);
+    let view = qio_view(game);
+    let title = game.native_screen_title().unwrap_or_default();
+    let tw = game.native_text_width(&title);
+    game.native_text(batch, &title, [ox + (w - tw) / 2.0, oy + if drive { 4.0 } else { 5.0 }], 0x40_4040, false);
+    let (inv_x, inv_y) = ((w - 176.0) / 2.0 + 7.0, h - 82.0);
+    for row in 0..4 {
+        let y = if row < 3 { inv_y + 18.0 * row as f32 } else { inv_y + 58.0 };
+        for col in 0..9 {
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + inv_x + 18.0 * col as f32, oy + y - 1.0, 18.0, 18.0]);
+        }
+    }
+    game.native_text(batch, "Inventory", [ox + inv_x + 1.0, oy + inv_y - 11.0], 0x40_4040, false);
+    for slot in qio_slots(block).into_iter().flatten() {
+        sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + slot[0] - 1.0, oy + slot[1] - 1.0, 18.0, 18.0]);
+    }
+    let frequency = view.as_ref().and_then(|v| v.frequency.clone());
+    if drive {
+        // `GuiQIOFrequencyDataScreen`: the frequency, and digital bars for the items and types held.
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, [ox + 15.0, oy + 19.0, w - 32.0, 46.0], 0xFFFF_FFFF);
+        if let Some(f) = &frequency {
+            game.native_text_scaled(batch, &format!("Frequency: {f}"), [ox + 20.0, oy + 24.0], 0x3C_FE9A, 0.8);
+        }
+        let ratio = |a: u64, b: u64| if b == 0 { 0.0 } else { (a as f64 / b as f64).clamp(0.0, 1.0) as f32 };
+        let (items, types) = view.as_ref().map_or((0.0, 0.0), |v| (ratio(v.items, v.item_cap), ratio(v.types, v.type_cap)));
+        for (x, fill, label) in [(26.0, items, "Items"), (98.0, types, "Types")] {
+            nine_slice_tinted(game, batch, "bar/digital", [5.0, 5.0], 1.0, [ox + x, oy + 39.0, 50.0, 8.0], 0xFFFF_FFFF);
+            let filled = (48.0 * fill).floor();
+            if filled > 0.0 {
+                game.native_fill(batch, [ox + x + 1.0, oy + 40.0, filled, 6.0], 0xFF3C_FE9A);
+            }
+            let lw = game.native_text_width(label) * 0.8;
+            game.native_text_scaled(batch, label, [ox + x + (50.0 - lw) / 2.0, oy + 51.0], 0x3C_FE9A, 0.8);
+        }
+    } else {
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, [ox + 7.0, oy + 15.0, w - 16.0, 12.0], 0xFFFF_FFFF);
+        let line = frequency.map_or("No frequency".to_owned(), |f| format!("Frequency: {f}"));
+        game.native_text_scaled(batch, &line, [ox + 10.0, oy + 18.0], 0x3C_FE9A, 0.8);
+        let label_w = game.native_text_width("Search:");
+        game.native_text(batch, "Search:", [ox + 4.0 + (46.0 - label_w) / 2.0 - 2.0, oy + 31.0], 0x40_4040, false);
+        let [bx, by, bw, bh] = QIO_SEARCH_BOX;
+        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, [ox + bx - 1.0, oy + by - 1.0, bw + 2.0, bh + 2.0], 0xFFFF_FFFF);
+        let pos = view.as_ref().map_or([0; 3], |v| v.pos);
+        QIO_SEARCH.with_borrow(|(at, text)| {
+            if *at != pos {
+                return;
+            }
+            game.native_text(batch, &text.value, [ox + bx + 2.0, oy + by + 1.0], 0xFF_FFFF, true);
+            if text.focused && (game.ticks / 6) % 2 == 0 {
+                let before: String = text.value.chars().take(text.cursor).collect();
+                game.native_text(batch, "_", [ox + bx + 2.0 + game.native_text_width(&before), oy + by + 1.0], 0xFF_FFFF, true);
+            }
+        });
+    }
+}
+
+fn qio_click(game: &Game<'_>, block: &str, at: [f32; 2]) {
+    if kind(block) != Some(Kind::QioDashboard) {
+        return;
+    }
+    let Some(view) = qio_view(game) else {
+        return;
+    };
+    QIO_SEARCH.with_borrow_mut(|(pos, text)| {
+        if *pos != view.pos {
+            *pos = view.pos;
+            *text = freq::TextBox::default();
+        }
+        text.focused = inside(at, QIO_SEARCH_BOX);
+    });
+}
+
+fn qio_typing(block: &str) -> bool {
+    kind(block) == Some(Kind::QioDashboard) && QIO_SEARCH.with_borrow(|(_, t)| t.focused)
+}
+
+/// A key in the dashboard's search box: it sends the new text to the server as it changes.
+fn qio_key(game: &Game<'_>, key: &str, text: Option<&str>) {
+    let Some(view) = qio_view(game) else {
+        return;
+    };
+    QIO_SEARCH.with_borrow_mut(|(pos, t)| {
+        if *pos != view.pos || !t.focused {
+            return;
+        }
+        if t.key(key, text, qio::valid_search_char, qio::MAX_SEARCH) == freq::Typed::Changed {
+            let mut data = Vec::new();
+            for c in view.pos {
+                data.extend(c.to_be_bytes());
+            }
+            data.extend(t.value.as_bytes());
+            game.native_send_to_server(QIO_CHANNEL, &data);
+        }
+    });
+}
+
+fn qio_tooltip(game: &Game<'_>, block: &str, at: [f32; 2], lines: &mut Vec<String>) {
+    let Some(v) = qio_view(game).filter(|v| v.frequency.is_some()) else {
+        return;
+    };
+    let area = if kind(block) == Some(Kind::QioDriveArray) { [15.0, 19.0, 144.0, 46.0] } else { [7.0, 15.0, 180.0, 12.0] };
+    if inside(at, area) {
+        lines.push(format!("\u{a7}7Items: \u{a7}9{}\u{a7}7 / \u{a7}9{}", v.items, v.item_cap));
+        lines.push(format!("\u{a7}7Types: \u{a7}9{}\u{a7}7 / \u{a7}9{}", v.types, v.type_cap));
     }
 }
