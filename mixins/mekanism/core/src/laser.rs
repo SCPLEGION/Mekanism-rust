@@ -19,6 +19,41 @@ pub const ENERGY_PER_HARDNESS: f64 = 100_000.0;
 /// The tractor beam's three rows of nine.
 pub const TRACTOR_SLOTS: usize = 27;
 
+/// `general.laser.energyPerDamage`: FE a point of damage to an entity in the beam takes.
+pub const ENERGY_PER_DAMAGE: u64 = 2_500;
+/// Half the beam's width, as its box reaches around the beam's line.
+pub const BEAM_HALF_WIDTH: f64 = 0.25;
+
+/// The damage `energy` does to an entity in the beam, and the ticks it burns for (`fireLaser`).
+pub fn damage(energy: u64) -> (f32, i32) {
+    let value = energy as f64 / ENERGY_PER_DAMAGE as f64;
+    (value as f32, value.min(f64::from(i32::MAX)) as i32)
+}
+
+/// The energy a hit used, from the health the entity lost.
+pub fn spent(lost: f32, energy: u64) -> u64 {
+    ((f64::from(lost) * ENERGY_PER_DAMAGE as f64) as u64).min(energy)
+}
+
+/// The beam's box from the laser at `pos` facing `d`, `length` blocks long from the laser's face.
+pub fn beam_box(pos: [i32; 3], d: [i32; 3], length: f64) -> ([f64; 3], [f64; 3]) {
+    let center = pos.map(|c| f64::from(c) + 0.5);
+    let mut min = [0.0; 3];
+    let mut max = [0.0; 3];
+    for i in 0..3 {
+        if d[i] == 0 {
+            min[i] = center[i] - BEAM_HALF_WIDTH;
+            max[i] = center[i] + BEAM_HALF_WIDTH;
+        } else {
+            let start = center[i] + f64::from(d[i]) * 0.501;
+            let end = start + f64::from(d[i]) * length;
+            min[i] = start.min(end);
+            max[i] = start.max(end);
+        }
+    }
+    (min, max)
+}
+
 pub fn is_receptor(id: &str) -> bool {
     id == AMPLIFIER || id == TRACTOR_BEAM
 }
@@ -52,6 +87,18 @@ pub fn dig(progress: u64, energy: u64, hardness: f32) -> (u64, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn beam_damage() {
+        assert_eq!(damage(5_000), (2.0, 2));
+        assert_eq!(spent(2.0, 5_000), 5_000);
+        assert_eq!(spent(10.0, 5_000), 5_000);
+        let (min, max) = beam_box([0, 0, 0], [1, 0, 0], 3.0);
+        assert!((min[0] - 1.001).abs() < 1e-9 && (max[0] - 4.001).abs() < 1e-9);
+        assert_eq!((min[1], max[1]), (0.25, 0.75));
+        let (min, max) = beam_box([0, 0, 0], [0, 0, -1], 1.0);
+        assert!((max[2] + 0.001).abs() < 1e-9 && (min[2] + 1.001).abs() < 1e-9);
+    }
 
     #[test]
     fn firing() {
