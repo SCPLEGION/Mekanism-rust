@@ -82,6 +82,19 @@ impl Factory {
     }
 }
 
+/// `TileEntityFactory.sortInventory`: how `total` items of one kind spread over the `holders` input
+/// slots that hold them and the `empties` empty ones, when each slot needs `min` items to run a
+/// recipe. An empty slot is used only while the stack can fill another slot; the rest is split evenly,
+/// the first slots taking the remainder.
+pub fn sort_counts(total: u64, holders: usize, empties: usize, min: u64) -> Vec<u64> {
+    let min = min.max(1);
+    let slots = ((total / min) as usize)
+        .clamp(holders, holders + empties)
+        .max(1);
+    let (each, extra) = (total / slots as u64, (total % slots as u64) as usize);
+    (0..slots).map(|i| each + u64::from(i < extra)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +155,13 @@ mod tests {
         f.tick(&mut more, &mut outputs, &ops);
         assert_eq!(f.machine.energy.stored, 0);
         assert!(f.active);
+    }
+
+    #[test]
+    fn sorting_spreads_a_stack_over_the_slots_it_can_fill() {
+        assert_eq!(sort_counts(10, 1, 3, 1), vec![3, 3, 2, 2]);
+        assert_eq!(sort_counts(10, 2, 3, 4), vec![5, 5]);
+        assert_eq!(sort_counts(7, 3, 0, 1), vec![3, 2, 2]);
+        assert_eq!(sort_counts(1, 1, 3, 1), vec![1]);
     }
 }
