@@ -19,6 +19,10 @@ pub const BASE_CHARGE_RATE: u64 = 100_000;
 /// `GearConfig.mekaTool*`.
 pub const TOOL_BASE_EFFICIENCY: u64 = 4;
 pub const TOOL_ENERGY_USAGE: u64 = 10;
+/// `GearConfig.mekaToolEnergyUsageSilk`.
+pub const TOOL_ENERGY_USAGE_SILK: u64 = 100;
+/// `GearConfig.disassemblerMiningCount`: how many blocks of each ore a vein takes.
+pub const VEIN_COUNT: usize = 128;
 pub const TOOL_TELEPORT_ENERGY: u64 = 1_000;
 pub const TOOL_TELEPORT_REACH: f64 = 100.0;
 
@@ -121,9 +125,18 @@ pub fn tool_efficiency(installed: &Installed) -> u64 {
     }
 }
 
-/// `ItemMekaTool.getDestroyEnergy`: 10 FE times the efficiency, half for blocks that break at once.
-pub fn tool_destroy_energy(efficiency: u64, hardness: f32) -> u64 {
-    let base = TOOL_ENERGY_USAGE * efficiency;
+/// `ItemMekaTool.getDestroyEnergy`: 10 FE (100 with silk touch) times the efficiency, half for blocks
+/// that break at once.
+pub fn tool_destroy_energy(efficiency: u64, hardness: f32, silk: bool) -> u64 {
+    let usage = if silk {
+        TOOL_ENERGY_USAGE_SILK
+    } else {
+        TOOL_ENERGY_USAGE
+    };
+    halved(usage * efficiency, hardness)
+}
+
+fn halved(base: u64, hardness: f32) -> u64 {
     if hardness == 0.0 {
         (base / 2).max(1)
     } else {
@@ -131,10 +144,86 @@ pub fn tool_destroy_energy(efficiency: u64, hardness: f32) -> u64 {
     }
 }
 
+/// What a block vein-mined or blasted `distance` steps from the first one costs (`veinMineArea`'s
+/// multiplier, on the energy without the efficiency's share): half the base energy times the
+/// distance to the power 1.5 for ores and 2 for anything else.
+pub fn area_energy(silk: bool, hardness: f32, distance: u32, ore: bool) -> u64 {
+    let usage = if silk {
+        TOOL_ENERGY_USAGE_SILK
+    } else {
+        TOOL_ENERGY_USAGE
+    };
+    let multiplier = 0.5 * f64::from(distance).powf(if ore { 1.5 } else { 2.0 });
+    (halved(usage, hardness) as f64 * multiplier).ceil() as u64
+}
+
+/// `ModuleBlastingUnit.BlastingPower`: the radius of the strongest power the installed units reach.
+pub fn blast_radius(installed: &Installed) -> i32 {
+    installed
+        .get("mekanism:blasting_unit")
+        .copied()
+        .unwrap_or(0)
+        .min(4) as i32
+}
+
+/// `ModuleVeinMiningUnit`: whether vein mining is installed.
+pub fn veins(installed: &Installed) -> bool {
+    installed
+        .get("mekanism:vein_mining_unit")
+        .copied()
+        .unwrap_or(0)
+        > 0
+}
+
+/// `IBlastingItem.findPositions`: the offsets a blast clears around the mined block, by the axis of the
+/// face it was hit on (0 x, 1 y, 2 z): a square flat on top and bottom faces, and on side faces a wall
+/// from one block below to `2r - 1` above.
+pub fn blast_offsets(radius: i32, axis: usize) -> Vec<[i32; 3]> {
+    let (lo, hi) = match axis {
+        1 => ([-radius, 0, -radius], [radius, 0, radius]),
+        0 => ([0, -1, -radius], [0, 2 * radius - 1, radius]),
+        _ => ([-radius, -1, 0], [radius, 2 * radius - 1, 0]),
+    };
+    let mut out = Vec::new();
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                if [x, y, z] != [0, 0, 0] {
+                    out.push([x, y, z]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The enchantments a container's enchantment modules stand for (`registerEnchantBased`): silk touch
+/// (which wins over fortune, as they exclude each other), fortune and frost walker, at the installed
+/// count.
+pub fn enchantments(installed: &Installed) -> Vec<(&'static str, u32)> {
+    let n = |m: &str| installed.get(m).copied().unwrap_or(0);
+    let mut out = Vec::new();
+    if n("mekanism:silk_touch_unit") > 0 {
+        out.push(("minecraft:silk_touch", 1));
+    } else if n("mekanism:fortune_unit") > 0 {
+        out.push(("minecraft:fortune", n("mekanism:fortune_unit")));
+    }
+    if n("mekanism:frost_walker_unit") > 0 {
+        out.push(("minecraft:frost_walker", n("mekanism:frost_walker_unit")));
+    }
+    out
+}
+
+pub const MODULE_ENCHANTMENTS: [&str; 3] = [
+    "minecraft:silk_touch",
+    "minecraft:fortune",
+    "minecraft:frost_walker",
+];
+
 /// `ItemMekaTool.getDestroySpeed`: the efficiency while the energy is there, the base efficiency scaled
 /// by how much of it there is otherwise.
-pub fn tool_destroy_speed(efficiency: u64, stored: u64, hardness: f32) -> f32 {
-    let required = tool_destroy_energy(efficiency, hardness);
+pub fn tool_destroy_speed(efficiency: u64, stored: u64, hardness: f32, silk: bool) -> f32 {
+    let required = tool_destroy_energy(efficiency, hardness, silk);
     if stored < required {
         return TOOL_BASE_EFFICIENCY as f32 * (stored as f32 / required as f32);
     }
@@ -210,10 +299,26 @@ mod tests {
     fn tool_energy() {
         let none = Installed::new();
         assert_eq!(tool_efficiency(&none), 4);
-        assert_eq!(tool_destroy_energy(16, 1.5), 160);
-        assert_eq!(tool_destroy_energy(16, 0.0), 80);
-        assert_eq!(tool_destroy_speed(16, 80, 1.5), 2.0);
+        assert_eq!(tool_destroy_energy(16, 1.5, false), 160);
+        assert_eq!(tool_destroy_energy(16, 0.0, false), 80);
+        assert_eq!(tool_destroy_energy(4, 1.5, true), 400);
+        assert_eq!(tool_destroy_speed(16, 80, 1.5, false), 2.0);
+        assert_eq!(area_energy(false, 3.0, 2, false), 20);
+        assert_eq!(area_energy(false, 3.0, 4, true), 40);
         assert_eq!(teleport_energy(250.0), 25_000);
+    }
+
+    #[test]
+    fn blasting_and_enchantments() {
+        assert_eq!(blast_offsets(1, 1).len(), 8);
+        let wall = blast_offsets(2, 2);
+        assert_eq!(wall.len(), 5 * 5 - 1);
+        assert!(wall.contains(&[0, -1, 0]) && wall.contains(&[2, 3, 0]));
+        let mut m = Installed::new();
+        install(MEKA_TOOL, &mut m, "mekanism:fortune_unit", 3);
+        assert_eq!(enchantments(&m), vec![("minecraft:fortune", 3)]);
+        install(MEKA_TOOL, &mut m, "mekanism:silk_touch_unit", 1);
+        assert_eq!(enchantments(&m), vec![("minecraft:silk_touch", 1)]);
     }
 
     #[test]
