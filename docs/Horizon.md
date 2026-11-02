@@ -884,5 +884,5 @@ would, while the frequency holds at least its count of its filter item. Inverted
   stack sets the count to the stack's size; sneaking with an empty hand inverts it; an empty hand shows
   the settings.
 - **Not done:** fuzzy mode. Horizon tells items apart by id only, so the exact and fuzzy counts are the
-  same here. Also, the block under the adapter's neighbours are not told when it switches, so a lamp
-  beside that block only notices at its next update.
+  same here. Also, when the adapter switches, only its own neighbours are updated. A lamp next to the
+  block the adapter sits on notices the change only at that lamp's next update.
