@@ -8,6 +8,7 @@ pub const DRIVE_ARRAY: &str = "mekanism:qio_drive_array";
 pub const DASHBOARD: &str = "mekanism:qio_dashboard";
 pub const IMPORTER: &str = "mekanism:qio_importer";
 pub const EXPORTER: &str = "mekanism:qio_exporter";
+pub const REDSTONE_ADAPTER: &str = "mekanism:qio_redstone_adapter";
 /// `TileEntityQIODriveArray`: twelve drive slots.
 pub const DRIVE_SLOTS: usize = 12;
 /// The dashboard's view: six rows of nine.
@@ -110,6 +111,11 @@ impl Network {
         out
     }
 
+    /// How many of `item` the drives hold (`QIOFrequency.getStored`).
+    pub fn stored(&self, item: &str) -> u64 {
+        self.drives.iter().filter_map(|d| d.items.get(item)).sum()
+    }
+
     pub fn totals(&self) -> (u64, u64, usize, usize) {
         let types: std::collections::BTreeSet<&String> =
             self.drives.iter().flat_map(|d| d.items.keys()).collect();
@@ -120,6 +126,11 @@ impl Network {
             self.drives.iter().map(|d| d.type_limit).sum(),
         )
     }
+}
+
+/// Whether a redstone adapter emits: some of its item, at least `count` of it, unless inverted.
+pub fn adapter_emits(stored: u64, count: u64, inverted: bool) -> bool {
+    (stored > 0 && stored >= count) != inverted
 }
 
 #[cfg(test)]
@@ -167,5 +178,15 @@ mod tests {
         assert!(n.drives[0].items.is_empty());
         assert_eq!(n.insert("b", 5), 5);
         assert_eq!(n.list(), vec![("b".to_owned(), 5)]);
+        assert_eq!(n.stored("b"), 5);
+    }
+
+    #[test]
+    fn adapter_threshold() {
+        assert!(!adapter_emits(0, 0, false));
+        assert!(adapter_emits(1, 0, false));
+        assert!(!adapter_emits(9, 10, false));
+        assert!(adapter_emits(10, 10, false));
+        assert!(adapter_emits(9, 10, true));
     }
 }

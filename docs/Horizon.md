@@ -871,3 +871,18 @@ The bundle now pins that revision, `074750a8`, on the `milestone/h8-damage-absor
   costs nothing.
 - **Timing.** The share is refreshed right after an absorbed hit and every 10 ticks, so a piece put on
   or charged starts absorbing within half a second.
+
+## M48: QIO Redstone Adapter
+
+The adapter reads its QIO frequency every half second and powers its neighbours, like a redstone torch
+would, while the frequency holds at least its count of its filter item. Inverted, it does the opposite
+(`TileEntityQIORedstoneAdapter`). With no frequency, or no drive array on it, it stays off.
+- **Block.** It is a lever under the hood: placed on any face like Mekanism's disc, it gives 15 to its
+  sides and strongly powers the block it sits on. Its `powered` is switched by the bundle; a click never
+  flips it.
+- **Controls** (no screen yet): a name tag sets the frequency; an item sets the filter; sneaking with a
+  stack sets the count to the stack's size; sneaking with an empty hand inverts it; an empty hand shows
+  the settings.
+- **Not done:** fuzzy mode. Horizon tells items apart by id only, so the exact and fuzzy counts are the
+  same here. Also, when the adapter switches, only its own neighbours are updated. A lamp next to the
+  block the adapter sits on notices the change only at that lamp's next update.
