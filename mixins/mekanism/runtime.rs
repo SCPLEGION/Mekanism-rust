@@ -13,6 +13,7 @@ use mekanism_core::evaporation as evap;
 use mekanism_core::gear;
 use mekanism_core::nuclear;
 use mekanism_core::qio;
+use mekanism_core::laser;
 use mekanism_core::fission;
 use mekanism_core::fusion;
 use mekanism_core::bin::{self, Bin};
@@ -112,6 +113,10 @@ enum Kind {
     QioImporter,
     QioExporter,
     QioRedstoneAdapter,
+    /// A laser, laser amplifier or tractor beam: fires its energy along its facing.
+    Laser,
+    LaserAmplifier,
+    TractorBeam,
 }
 
 fn kind(id: &str) -> Option<Kind> {
@@ -139,6 +144,9 @@ fn kind(id: &str) -> Option<Kind> {
         qio::IMPORTER => return Some(Kind::QioImporter),
         qio::EXPORTER => return Some(Kind::QioExporter),
         qio::REDSTONE_ADAPTER => return Some(Kind::QioRedstoneAdapter),
+        laser::LASER => return Some(Kind::Laser),
+        laser::AMPLIFIER => return Some(Kind::LaserAmplifier),
+        laser::TRACTOR_BEAM => return Some(Kind::TractorBeam),
         _ => {}
     }
     use mekanism_core::generator as g;
@@ -276,6 +284,18 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         *container = Some(ModContainer { slots, faces: Default::default(), inputs: vec![], outputs: vec![], menu: Some(menu.into()) });
         return;
     }
+    // The tractor beam's three rows: what its beam breaks, which hoppers take from any face.
+    if let Some(Kind::TractorBeam) = kind(block) {
+        let all: Vec<usize> = (0..laser::TRACTOR_SLOTS).collect();
+        *container = Some(ModContainer {
+            slots: laser::TRACTOR_SLOTS,
+            faces: std::array::from_fn(|_| all.clone()),
+            inputs: vec![],
+            outputs: all,
+            menu: Some("minecraft:generic_9x3".into()),
+        });
+        return;
+    }
     if let Some(Kind::QioImporter) = kind(block) {
         *container = Some(ModContainer { slots: 1, faces: std::array::from_fn(|_| vec![0]), inputs: vec![0], outputs: vec![], menu: None });
         return;
@@ -317,7 +337,9 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::BoilerValve
             | Kind::SpsPort
             | Kind::DynamicValve
-            | Kind::InductionPort,
+            | Kind::InductionPort
+            | Kind::Laser
+            | Kind::LaserAmplifier,
         ) => {
             *container = Some(ModContainer {
                 slots: 3,
@@ -449,6 +471,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             tick_redstone_adapter(game, pos, entity);
             None
         }
+        Kind::Laser | Kind::LaserAmplifier | Kind::TractorBeam => tick_laser(game, pos, entity),
     };
     screen_data(entity);
     multiblock_data(game, pos, entity);
@@ -2558,6 +2581,8 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Advanced(m) => Some((m.usage * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
         Kind::Nucleosynthesizer => Some((machine::STORAGE_MULTIPLIER * chem::NUCLEOSYNTHESIZER_USAGE, u64::MAX)),
         Kind::Teleporter => Some((teleporter::STORAGE, u64::MAX)),
+        // A laser takes energy on every side but its front; amplifiers and tractor beams only from lasers.
+        Kind::Laser if facing_away => Some((laser::LASER_STORAGE, u64::MAX)),
         Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE, u64::MAX)),
         Kind::Rotary => Some((machine::STORAGE_MULTIPLIER * chem::ROTARY_USAGE, u64::MAX)),
         Kind::Heater => Some((machine::STORAGE_MULTIPLIER * heater_usage(nbt), u64::MAX)),
@@ -4041,7 +4066,7 @@ fn layout(block: &str) -> Option<Layout> {
             power: None,
             progress: None,
         },
-        Kind::InductionPort => Layout {
+        Kind::InductionPort | Kind::Laser | Kind::LaserAmplifier => Layout {
             slots: [None; 3],
             gauges: vec![],
             power: Some(PowerBar::Gauge([55.0, 18.0])),
@@ -4068,6 +4093,7 @@ fn energy_capacity(entity: &ModBlockEntity) -> u64 {
         Some(Kind::FusionPort) => fusion::ENERGY_CAPACITY,
         Some(Kind::TurbineValve) => turbine_of(&entity.nbt).energy_capacity(),
         Some(Kind::InductionPort) => get_long(&entity.nbt, "capacity"),
+        Some(Kind::LaserAmplifier | Kind::TractorBeam) => laser::RECEPTOR_STORAGE,
         Some(Kind::FissionPort | Kind::BoilerValve | Kind::SpsPort | Kind::DynamicValve) => 0,
         _ => receiver(&entity.id, &entity.nbt, true, false).map_or(0, |r| r.0),
     }
@@ -6274,4 +6300,152 @@ pub(super) fn player_damage(game: &mut Game<'_>, absorbed: f32, share: &mut f32)
         }
     }
     *share = modules::suit_share(stored(game));
+}
+
+// --- Lasers -----------------------------------------------------------------------------------------
+
+/// Blocks a laser's beam passes through (`ClipContext.Block.OUTLINE` with no fluids): those with no
+/// outline.
+fn beam_passes(name: &str) -> bool {
+    matches!(
+        name,
+        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" | "minecraft:water" | "minecraft:lava"
+            | "minecraft:bubble_column" | "minecraft:light" | "minecraft:structure_void"
+    )
+}
+
+/// A laser, amplifier or tractor beam's tick (`TileEntityBasicLaser.onUpdateServer`): it fires what it
+/// can along its facing, up to 64 blocks. The beam's energy goes into an amplifier or tractor beam it
+/// meets, or digs into the block it meets until that breaks; a tractor beam keeps the drops.
+fn tick_laser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = if entity.id == laser::LASER { laser::LASER_STORAGE } else { laser::RECEPTOR_STORAGE };
+    let stored = get_long(&entity.nbt, "energy").min(capacity);
+    let max = match get_long(&entity.nbt, "max_threshold") {
+        0 => laser::RECEPTOR_STORAGE,
+        n => n,
+    };
+    let firing = laser::to_fire(&entity.id, stored, get_long(&entity.nbt, "min_threshold"), max);
+    let facing = game.native_block_property(pos, "facing").and_then(|f| direction(&f));
+    let (Some(d), true) = (facing, firing > 0) else {
+        put_long(&mut entity.nbt, "progress", 0);
+        put_long(&mut entity.nbt, "energy", stored);
+        return Some(false);
+    };
+    put_long(&mut entity.nbt, "energy", stored - firing);
+    let hit = (1..=laser::RANGE).map(|k| [pos[0] + d[0] * k, pos[1] + d[1] * k, pos[2] + d[2] * k]).find(|&at| {
+        let state = game.world.block(at[0], at[1], at[2]);
+        !beam_passes(&game.res.facts().get(state).name)
+    });
+    let Some(at) = hit else {
+        put_long(&mut entity.nbt, "progress", 0);
+        return Some(true);
+    };
+    // A receptor takes the energy; what it has no room for is lost.
+    let name = block_name(game, at).to_owned();
+    if laser::is_receptor(&name) {
+        game.native_with_mod_block_entity(at, |m| {
+            let e = get_long(&m.nbt, "energy");
+            put_long(&mut m.nbt, "energy", e.saturating_add(firing).min(laser::RECEPTOR_STORAGE));
+        });
+        return Some(true);
+    }
+    // Coordinates can be negative: read them as they were written.
+    let coord = |k: &str| match entity.nbt.get(&JavaString::from(k)) {
+        Some(Tag::Int(v)) => Some(*v),
+        _ => None,
+    };
+    let target = [coord("dig_x"), coord("dig_y"), coord("dig_z")];
+    let mut progress = get_long(&entity.nbt, "progress");
+    if target != at.map(Some) {
+        progress = 0;
+        for (k, v) in ["dig_x", "dig_y", "dig_z"].into_iter().zip(at) {
+            entity.nbt.insert(k.into(), Tag::Int(v));
+        }
+    }
+    let state = game.world.block(at[0], at[1], at[2]);
+    let hardness = game.res.facts().get(state).hardness;
+    let (progress, broke) = laser::dig(progress, firing, hardness);
+    put_long(&mut entity.nbt, "progress", progress);
+    if broke {
+        laser_break(game, entity, at);
+    }
+    Some(true)
+}
+
+/// The beam breaks the block at `at` (`withFakePlayer`, with a disassembler's drops): they fall where it
+/// was, or go into a tractor beam's rows (what has no room falls there too).
+fn laser_break(game: &mut Game<'_>, entity: &mut ModBlockEntity, at: [i32; 3]) {
+    let state = game.world.block(at[0], at[1], at[2]);
+    let registry = game.pack.assets.registry;
+    let drops = match &game.world_tables {
+        Some(t) => &t.items,
+        None => game.res.items(),
+    }
+    .block_drops_with(registry, state, None, &[], &mut game.world.random);
+    let block = horizon_core::position::BlockPos::new(at[0], at[1], at[2]);
+    game.with_level(|b, level, ticks| b.destroy_block(level, ticks, block, false));
+    let mut lost = Vec::new();
+    for stack in drops.into_iter().filter(|s| s.count > 0 && &*s.item != "minecraft:air") {
+        let left = if entity.id == laser::TRACTOR_BEAM { store_drop(game, &mut entity.items, stack) } else { Some(stack) };
+        if let Some(left) = left {
+            lost.push(Some(left));
+        }
+    }
+    if !lost.is_empty() {
+        game.with_level(|_, level, _| level.drop_lost_contents(block, lost));
+    }
+}
+
+/// Puts `stack` into `slots`, onto stacks of the same item first, then into empty slots; gives back
+/// what has no room.
+fn store_drop(game: &Game<'_>, slots: &mut Vec<Option<ItemStack>>, mut stack: ItemStack) -> Option<ItemStack> {
+    if slots.len() < laser::TRACTOR_SLOTS {
+        slots.resize(laser::TRACTOR_SLOTS, None);
+    }
+    let max = max_stack(game, &stack.item);
+    for slot in slots.iter_mut().flatten() {
+        if slot.item == stack.item && slot.extra == stack.extra && slot.count < max {
+            let put = (max - slot.count).min(stack.count);
+            slot.count += put;
+            stack.count -= put;
+            if stack.count == 0 {
+                return None;
+            }
+        }
+    }
+    if let Some(empty) = slots.iter_mut().find(|s| s.is_none()) {
+        *empty = Some(stack);
+        return None;
+    }
+    Some(stack)
+}
+
+/// A right click with an empty hand on a laser or amplifier, or a sneaking one on a tractor beam, shows
+/// its energy and digging; sneaking on an amplifier with a stack sets its lower threshold to the
+/// stack's size times 10,000 (an empty sneaking hand clears it).
+pub(super) fn use_laser(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) {
+        return false;
+    }
+    let name = block_name(game, pos).to_owned();
+    let k = kind(&name);
+    if !matches!(k, Some(Kind::Laser | Kind::LaserAmplifier | Kind::TractorBeam)) {
+        return false;
+    }
+    let held = game.inventory.get(game.selected).cloned().flatten();
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    if k == Some(Kind::LaserAmplifier) && sneaking {
+        let min = held.as_ref().map_or(0, |h| u64::from(h.count) * 10_000);
+        game.native_with_mod_block_entity(pos, |m| put_long(&mut m.nbt, "min_threshold", min));
+        tell(game, format!("Laser Amplifier lower threshold: {min} FE"));
+        return true;
+    }
+    if held.is_some() || (k == Some(Kind::TractorBeam) && !sneaking) {
+        return false;
+    }
+    let Some((energy, progress)) = game.native_with_mod_block_entity(pos, |m| (get_long(&m.nbt, "energy"), get_long(&m.nbt, "progress"))) else {
+        return false;
+    };
+    tell(game, format!("{name}: {energy} FE stored, {progress} FE into the block it digs"));
+    true
 }

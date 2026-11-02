@@ -886,3 +886,25 @@ would, while the frequency holds at least its count of its filter item. Inverted
 - **Not done:** fuzzy mode. Horizon tells items apart by id only, so the exact and fuzzy counts are the
   same here. Also, when the adapter switches, only its own neighbours are updated. A lamp next to the
   block the adapter sits on notices the change only at that lamp's next update.
+
+## M49: Lasers
+
+The laser, the laser amplifier and the laser tractor beam fire along their facing, up to 64 blocks
+(`TileEntityBasicLaser`).
+- **Laser.** It takes energy from cables on every side but its front, stores 80 FE and fires 20 FE
+  each tick.
+- **Beam.** The beam passes through air and fluids and stops at the first other block. An amplifier
+  or tractor beam there takes the energy (up to 5,000,000 FE). Any other block takes it as digging:
+  it breaks once it has had 100,000 FE for each point of its hardness (stone: 150,000), and its
+  drops fall where it was. Unbreakable blocks take nothing.
+- **Amplifier.** It fires everything it holds each tick, between its thresholds. Sneaking with a
+  stack sets the lower threshold to the stack's size × 10,000 FE (an empty hand sets 0). Many lasers
+  aimed at one amplifier make one strong beam.
+- **Tractor beam.** It fires what it holds, and keeps the drops of what it breaks in its three rows
+  (hoppers take them out). What has no room falls where the block was.
+- **Info.** An empty-hand click on a laser or amplifier, or a sneaking one on a tractor beam, shows
+  the energy and the digging progress.
+- **Not done:** hurting entities in the beam, and the tractor beam picking up dropped items, because
+  Horizon gives native mods no entity access yet. There are also no beam particles, and no upper
+  threshold, delay or redstone modes on the amplifier. As with every furnace-template machine, the
+  lasers face sideways only.

@@ -17,6 +17,7 @@ pub mod gear;
 pub mod generator;
 pub mod heat;
 pub mod isotopes;
+pub mod laser;
 pub mod machine;
 pub mod matrix;
 pub mod miner;
