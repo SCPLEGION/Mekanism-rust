@@ -29,6 +29,7 @@ pub mod plenisher;
 pub mod qio;
 pub mod recipe_table;
 pub mod recipes;
+pub mod redstone;
 pub mod seismic;
 pub mod sides;
 pub mod slurry_table;

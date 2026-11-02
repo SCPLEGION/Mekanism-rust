@@ -12,6 +12,7 @@ use mekanism_core::energy::{Action, EnergyContainer};
 use mekanism_core::evaporation as evap;
 use mekanism_core::gear;
 use mekanism_core::nuclear;
+use mekanism_core::redstone::RedstoneControl;
 use mekanism_core::qio;
 use mekanism_core::laser;
 use mekanism_core::seismic;
@@ -406,121 +407,127 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
         return;
     };
     TICKING.set(Some((pos, [Transmission::Item, Transmission::Chemical, Transmission::Energy].map(|t| sides_of(&entity.nbt, t)))));
-    let active = match k {
-        Kind::Machine(recipe, usage) => tick_machine(game, entity, recipe, usage),
-        Kind::Factory(n, recipe, usage) => tick_factory(game, entity, n, recipe, usage),
-        Kind::HeatGenerator => tick_generator(game, pos, entity),
-        Kind::Solar(peak, storage) => tick_solar(game, pos, entity, peak, storage),
-        Kind::Wind => tick_wind(game, pos, entity),
-        Kind::EnergyCube(t) => {
-            tick_cube(game, pos, entity, t);
-            None
+    // A machine its redstone control holds back does nothing this tick and goes dark.
+    let allowed = tabs(&entity.id) & TAB_REDSTONE == 0 || redstone_allows(game, pos, entity);
+    let active = if !allowed {
+        Some(false)
+    } else {
+        match k {
+            Kind::Machine(recipe, usage) => tick_machine(game, entity, recipe, usage),
+            Kind::Factory(n, recipe, usage) => tick_factory(game, entity, n, recipe, usage),
+            Kind::HeatGenerator => tick_generator(game, pos, entity),
+            Kind::Solar(peak, storage) => tick_solar(game, pos, entity, peak, storage),
+            Kind::Wind => tick_wind(game, pos, entity),
+            Kind::EnergyCube(t) => {
+                tick_cube(game, pos, entity, t);
+                None
+            }
+            Kind::Cable(rate) => {
+                tick_cable(game, pos, entity, rate);
+                None
+            }
+            Kind::Oxidizer => tick_oxidizer(game, pos, entity),
+            Kind::Dissolution => tick_dissolution(game, pos, entity),
+            Kind::Centrifuge => tick_centrifuge(game, pos, entity),
+            Kind::FissionPort => {
+                tick_fission_port(game, pos, entity);
+                None
+            }
+            Kind::TurbineValve => tick_turbine_valve(game, pos, entity),
+            Kind::FusionPort => {
+                tick_fusion_port(game, pos, entity);
+                None
+            }
+            Kind::SpsPort => {
+                tick_sps_port(game, pos, entity);
+                None
+            }
+            Kind::DynamicValve => {
+                tick_dynamic_valve(game, pos, entity);
+                None
+            }
+            Kind::Pump => tick_pump(game, pos, entity),
+            Kind::Entangloporter => tick_entangloporter(game, pos, entity),
+            Kind::Plenisher => tick_plenisher(game, pos, entity),
+            Kind::Sorter => {
+                tick_sorter(game, pos, entity);
+                None
+            }
+            Kind::Activator => tick_activator(game, pos, entity),
+            Kind::BoilerValve => tick_boiler_valve(game, pos, entity),
+            Kind::Heater => tick_heater(entity),
+            Kind::FuelwoodHeater => tick_fuelwood_heater(game, entity),
+            Kind::BioGenerator => tick_bio_generator(game, pos, entity),
+            Kind::Reaction => tick_reaction(game, pos, entity),
+            Kind::Washer => tick_washer(game, pos, entity),
+            Kind::Crystallizer => tick_crystallizer(entity),
+            Kind::Advanced(m) => tick_advanced(game, entity, m),
+            Kind::Nucleosynthesizer => tick_nucleosynthesizer(game, entity),
+            Kind::Teleporter => {
+                tick_teleporter(game, pos, entity);
+                None
+            }
+            Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
+            Kind::Evaporation => tick_evaporation(game, pos, entity),
+            Kind::Rotary => tick_rotary(game, pos, entity),
+            Kind::Transporter(pull) => {
+                tick_transporter(game, pos, entity, pull);
+                None
+            }
+            Kind::InductionPort => {
+                tick_induction_port(game, pos, entity);
+                None
+            }
+            Kind::Infuser => tick_infuser(game, entity),
+            Kind::Separator => tick_separator(game, pos, entity),
+            Kind::GasGenerator => tick_gas_generator(game, pos, entity),
+            Kind::ChemicalTank(t) => {
+                tick_chemical_tank(game, pos, entity, t);
+                None
+            }
+            Kind::Tube(rate) => {
+                tick_tube(game, pos, entity, rate);
+                None
+            }
+            Kind::DigitalMiner => tick_miner(game, pos, entity),
+            Kind::FluidTank(t) => {
+                tick_fluid_tank(game, pos, entity, t);
+                None
+            }
+            Kind::Pipe(rate) => {
+                tick_pipe(game, pos, entity, rate);
+                None
+            }
+            Kind::Bin(t) => {
+                tick_bin(game, entity, t);
+                None
+            }
+            Kind::PersonalStorage => None,
+            Kind::QioDriveArray => {
+                tick_drive_array(game, pos, entity);
+                None
+            }
+            Kind::QioDashboard => {
+                tick_dashboard(game, entity);
+                None
+            }
+            Kind::QioImporter => {
+                tick_importer(game, pos, entity);
+                None
+            }
+            Kind::QioExporter => {
+                tick_exporter(game, pos, entity);
+                None
+            }
+            Kind::QioRedstoneAdapter => {
+                tick_redstone_adapter(game, pos, entity);
+                None
+            }
+            Kind::Laser | Kind::LaserAmplifier | Kind::TractorBeam => tick_laser(game, pos, entity),
+            Kind::Vibrator => tick_vibrator(game, pos, entity),
+            // Lit for a second after it last charged something.
+            Kind::Chargepad => Some((game.world.game_time.max(0) as u64).saturating_sub(get_long(&entity.nbt, "charged_at")) <= 20),
         }
-        Kind::Cable(rate) => {
-            tick_cable(game, pos, entity, rate);
-            None
-        }
-        Kind::Oxidizer => tick_oxidizer(game, pos, entity),
-        Kind::Dissolution => tick_dissolution(game, pos, entity),
-        Kind::Centrifuge => tick_centrifuge(game, pos, entity),
-        Kind::FissionPort => {
-            tick_fission_port(game, pos, entity);
-            None
-        }
-        Kind::TurbineValve => tick_turbine_valve(game, pos, entity),
-        Kind::FusionPort => {
-            tick_fusion_port(game, pos, entity);
-            None
-        }
-        Kind::SpsPort => {
-            tick_sps_port(game, pos, entity);
-            None
-        }
-        Kind::DynamicValve => {
-            tick_dynamic_valve(game, pos, entity);
-            None
-        }
-        Kind::Pump => tick_pump(game, pos, entity),
-        Kind::Entangloporter => tick_entangloporter(game, pos, entity),
-        Kind::Plenisher => tick_plenisher(game, pos, entity),
-        Kind::Sorter => {
-            tick_sorter(game, pos, entity);
-            None
-        }
-        Kind::Activator => tick_activator(game, pos, entity),
-        Kind::BoilerValve => tick_boiler_valve(game, pos, entity),
-        Kind::Heater => tick_heater(entity),
-        Kind::FuelwoodHeater => tick_fuelwood_heater(game, entity),
-        Kind::BioGenerator => tick_bio_generator(game, pos, entity),
-        Kind::Reaction => tick_reaction(game, pos, entity),
-        Kind::Washer => tick_washer(game, pos, entity),
-        Kind::Crystallizer => tick_crystallizer(entity),
-        Kind::Advanced(m) => tick_advanced(game, entity, m),
-        Kind::Nucleosynthesizer => tick_nucleosynthesizer(game, entity),
-        Kind::Teleporter => {
-            tick_teleporter(game, pos, entity);
-            None
-        }
-        Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
-        Kind::Evaporation => tick_evaporation(game, pos, entity),
-        Kind::Rotary => tick_rotary(game, pos, entity),
-        Kind::Transporter(pull) => {
-            tick_transporter(game, pos, entity, pull);
-            None
-        }
-        Kind::InductionPort => {
-            tick_induction_port(game, pos, entity);
-            None
-        }
-        Kind::Infuser => tick_infuser(game, entity),
-        Kind::Separator => tick_separator(game, pos, entity),
-        Kind::GasGenerator => tick_gas_generator(game, pos, entity),
-        Kind::ChemicalTank(t) => {
-            tick_chemical_tank(game, pos, entity, t);
-            None
-        }
-        Kind::Tube(rate) => {
-            tick_tube(game, pos, entity, rate);
-            None
-        }
-        Kind::DigitalMiner => tick_miner(game, pos, entity),
-        Kind::FluidTank(t) => {
-            tick_fluid_tank(game, pos, entity, t);
-            None
-        }
-        Kind::Pipe(rate) => {
-            tick_pipe(game, pos, entity, rate);
-            None
-        }
-        Kind::Bin(t) => {
-            tick_bin(game, entity, t);
-            None
-        }
-        Kind::PersonalStorage => None,
-        Kind::QioDriveArray => {
-            tick_drive_array(game, pos, entity);
-            None
-        }
-        Kind::QioDashboard => {
-            tick_dashboard(game, entity);
-            None
-        }
-        Kind::QioImporter => {
-            tick_importer(game, pos, entity);
-            None
-        }
-        Kind::QioExporter => {
-            tick_exporter(game, pos, entity);
-            None
-        }
-        Kind::QioRedstoneAdapter => {
-            tick_redstone_adapter(game, pos, entity);
-            None
-        }
-        Kind::Laser | Kind::LaserAmplifier | Kind::TractorBeam => tick_laser(game, pos, entity),
-        Kind::Vibrator => tick_vibrator(game, pos, entity),
-        // Lit for a second after it last charged something.
-        Kind::Chargepad => Some((game.world.game_time.max(0) as u64).saturating_sub(get_long(&entity.nbt, "charged_at")) <= 20),
     };
     screen_data(entity);
     multiblock_data(game, pos, entity);
@@ -4541,7 +4548,190 @@ fn screen_data(entity: &mut ModBlockEntity) {
         entity.data.extend(wide(tank.capacity));
         entity.data.push(chemical_index(tank.chemical.as_deref()));
     }
+    // Then the redstone mode, with whether the machine got a signal this tick and the last (2 bits).
+    if tabs(&entity.id) & TAB_REDSTONE != 0 {
+        entity.data.resize(DATA_GAUGES + l.gauges.len() * GAUGE_SLOTS, 0);
+        let signal = get_int(&entity.nbt, "powered") & 3;
+        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2) as i32);
+    }
 }
+
+/// Where a screen's redstone data slot is (after its gauges).
+fn redstone_slot(l: &Layout) -> usize {
+    DATA_GAUGES + l.gauges.len() * GAUGE_SLOTS
+}
+
+/// The redstone mode and the signal now and last tick, from the screen's data.
+fn redstone_of(l: &Layout, data: &[i32]) -> (RedstoneControl, bool, bool) {
+    let v = data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32;
+    (RedstoneControl::from_ordinal(v & 3), v & 4 != 0, v & 8 != 0)
+}
+
+/// Whether the block's redstone control lets it run this tick (`TileEntityMekanism.isRedstoneActivated`);
+/// keeps the signal of this tick and the last in `powered` (bit 0 now, bit 1 last tick).
+fn redstone_allows(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> bool {
+    let at = horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]);
+    let powered = game.with_level(|b, level, ticks| b.has_neighbor_signal(level, ticks, at));
+    let last = get_int(&entity.nbt, "powered") & 1 != 0;
+    put_int(&mut entity.nbt, "powered", u32::from(powered) | u32::from(last) << 1);
+    RedstoneControl::from_ordinal(get_int(&entity.nbt, "control")).allows(powered, last)
+}
+
+// --- Tabs -------------------------------------------------------------------------------------------
+//
+// The tabs Mekanism's screens add beside the panel (`GuiMekanismTile.addGenericTabs` and
+// `GuiConfigurableTile`): each a holder (`holder_left`/`holder_right`, tinted with the tab's colour),
+// a button inset 4 px and the tab's 18×18 icon on it.
+
+const TAB_UPGRADE: u8 = 1;
+const TAB_REDSTONE: u8 = 2;
+const TAB_SECURITY: u8 = 4;
+/// The side and transporter configuration tabs.
+const TAB_SIDES: u8 = 8;
+
+/// Which tabs a block's screen has: machines have them all; generators no side configuration;
+/// energy cubes and chemical tanks no upgrades (`without(AttributeUpgradeSupport)`); fluid tanks no
+/// redstone either; multiblocks none.
+fn tabs(block: &str) -> u8 {
+    let all = TAB_UPGRADE | TAB_REDSTONE | TAB_SECURITY | TAB_SIDES;
+    match kind(block) {
+        Some(
+            Kind::Machine(..)
+            | Kind::Factory(..)
+            | Kind::Oxidizer
+            | Kind::Dissolution
+            | Kind::Crystallizer
+            | Kind::Separator
+            | Kind::Infuser
+            | Kind::Advanced(_)
+            | Kind::Rotary
+            | Kind::Reaction
+            | Kind::Nucleosynthesizer
+            | Kind::ChemicalInfuser
+            | Kind::Washer
+            | Kind::Centrifuge,
+        ) => all,
+        Some(Kind::HeatGenerator | Kind::BioGenerator | Kind::GasGenerator | Kind::Wind | Kind::Solar(..) | Kind::DigitalMiner) => {
+            TAB_UPGRADE | TAB_REDSTONE | TAB_SECURITY
+        }
+        Some(Kind::EnergyCube(_) | Kind::ChemicalTank(_)) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
+        Some(Kind::Vibrator) => TAB_REDSTONE | TAB_SECURITY,
+        Some(Kind::FluidTank(_)) => TAB_SECURITY,
+        _ => 0,
+    }
+}
+
+/// A tab on a screen: where its holder is, its icon, its colour (`SpecialColors`; white for the
+/// tabs that register none) and what it is.
+struct Tab {
+    at: [f32; 2],
+    icon: &'static str,
+    argb: u32,
+    what: TabKind,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TabKind {
+    Sides,
+    Transporter,
+    Upgrade,
+    Security,
+    Redstone,
+}
+
+fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
+    let t = tabs(block);
+    let mut out = vec![];
+    if t & TAB_SIDES != 0 {
+        out.push(Tab { at: [-26.0, 6.0], icon: "button/configuration", argb: 0xFFFF_FFFF, what: TabKind::Sides });
+        out.push(Tab { at: [-26.0, 34.0], icon: "button/transporter_config", argb: 0xFFFF_FFFF, what: TabKind::Transporter });
+    }
+    if t & TAB_UPGRADE != 0 {
+        out.push(Tab { at: [176.0, 6.0], icon: "button/upgrade", argb: 0xFFFF_FFFF, what: TabKind::Upgrade });
+    }
+    if t & TAB_SECURITY != 0 {
+        out.push(Tab { at: [176.0, 34.0], icon: "security/public", argb: 0xFFFF_A160, what: TabKind::Security });
+    }
+    if t & TAB_REDSTONE != 0 {
+        let icon = redstone_of(l, data).0.sprite();
+        out.push(Tab { at: [176.0, 137.0], icon, argb: 0xFFC9_071F, what: TabKind::Redstone });
+    }
+    out
+}
+
+/// The part of a tab that takes clicks and shows its tooltip: the button inside the holder's border.
+fn tab_button(tab: &Tab) -> [f32; 4] {
+    [tab.at[0] + 4.0, tab.at[1] + 4.0, 18.0, 18.0]
+}
+
+/// A nine-slice sprite of `size` with a `border` px frame, tinted, drawn over `dst`.
+fn nine_slice_tinted(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, name: &str, size: [f32; 2], border: f32, dst: [f32; 4], argb: u32) {
+    let [x, y, w, h] = dst;
+    let b = border;
+    let cols = [(0.0, b, x, b), (b, size[0] - 2.0 * b, x + b, w - 2.0 * b), (size[0] - b, b, x + w - b, b)];
+    let rows = [(0.0, b, y, b), (b, size[1] - 2.0 * b, y + b, h - 2.0 * b), (size[1] - b, b, y + h - b, b)];
+    for (su, sw, dx, dw) in cols {
+        for (sv, sh, dy, dh) in rows {
+            if dw > 0.0 && dh > 0.0 {
+                game.native_sprite_tinted(batch, &format!("{SPRITES}{name}"), [su, sv, sw, sh], [dx, dy, dw, dh], argb);
+            }
+        }
+    }
+}
+
+/// Draws a screen's tabs (`GuiSideHolder.draw`, `GuiInsetElement.drawBackground`): the holder, the
+/// button (`button`, or `button_focus` under the cursor) one pixel in from the panel's side, its icon;
+/// a redstone tab whose machine waits for a signal shows its warning stripes over the holder.
+fn draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, l: &Layout, data: &[i32], origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let (control, powered, last) = redstone_of(l, data);
+    for tab in screen_tabs(block, l, data) {
+        let left = tab.at[0] < 0.0;
+        let holder = if left { "holder_left" } else { "holder_right" };
+        let [x, y] = [ox + tab.at[0], oy + tab.at[1]];
+        nine_slice_tinted(game, batch, holder, [26.0, 9.0], 4.0, [x, y, 26.0, 26.0], tab.argb);
+        // The warning is a 16 px tiled sprite multiplied over the holder; the stripes tinted with the
+        // tab's colour come close to that blend.
+        if tab.what == TabKind::Redstone && control.warns(powered, last) {
+            for (dx, w) in [(0.0, 16.0), (16.0, 10.0)] {
+                for (dy, h) in [(0.0, 16.0), (16.0, 10.0)] {
+                    let name = format!("{SPRITES}warning");
+                    game.native_sprite_tinted(batch, &name, [0.0, 0.0, w, h], [x + dx, y + dy, w, h], tab.argb);
+                }
+            }
+        }
+        let [bx, by, bw, bh] = tab_button(&tab);
+        let bx = ox + bx + if left { 1.0 } else { -1.0 };
+        let hovered = inside([cursor[0] - ox, cursor[1] - oy], tab_button(&tab));
+        let button = if hovered { "button_focus" } else { "button" };
+        nine_slice_tinted(game, batch, button, [200.0, 20.0], 2.0, [bx, oy + by, bw, bh], 0xFFFF_FFFF);
+        sprite(game, batch, tab.icon, [0.0, 0.0, 18.0, 18.0], [bx, oy + by, bw, bh]);
+    }
+}
+
+/// A tab's tooltip (`MekanismLang.SIDE_CONFIG`, `TRANSPORTER_CONFIG`, `UPGRADES`, the security tab's
+/// mode and owner, the redstone mode).
+fn tab_tooltip(block: &str, l: &Layout, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    let Some(tab) = screen_tabs(block, l, data).into_iter().find(|t| inside(at, tab_button(t))) else {
+        return false;
+    };
+    match tab.what {
+        TabKind::Sides => lines.push("Side Config".into()),
+        TabKind::Transporter => lines.push("Transporter Config".into()),
+        TabKind::Upgrade => lines.push("Upgrades".into()),
+        TabKind::Security => {
+            lines.push("§7Security: Public".into());
+            lines.push("No Owner".into());
+        }
+        TabKind::Redstone => lines.push(redstone_of(l, data).0.name().into()),
+    }
+    true
+}
+
+/// The menu buttons the redstone tab sends: the next mode (left click), the previous (right).
+const BUTTON_REDSTONE_NEXT: i32 = 100;
+const BUTTON_REDSTONE_PREVIOUS: i32 = 101;
 
 /// The capacity of a multiblock's tank, from the size its master saved.
 fn multiblock_capacity(entity: &ModBlockEntity, key: &str) -> u64 {
@@ -4688,9 +4878,16 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
 }
 
 /// A press on a reactor's button (hook point `native_screen_click`, API 20).
-pub(super) fn screen_click(block: &str, at: [f32; 2], button: &mut Option<i32>) {
+pub(super) fn screen_click(block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
     if let Some(i) = buttons(block).iter().position(|(r, _)| inside(at, *r)) {
         *button = Some(i as i32);
+        return;
+    }
+    let Some(l) = layout(block) else {
+        return;
+    };
+    if screen_tabs(block, &l, data).iter().any(|t| t.what == TabKind::Redstone && inside(at, tab_button(t))) {
+        *button = Some(if right { BUTTON_REDSTONE_PREVIOUS } else { BUTTON_REDSTONE_NEXT });
     }
 }
 
@@ -4699,6 +4896,13 @@ pub(super) fn screen_click(block: &str, at: [f32; 2], button: &mut Option<i32>) 
 /// its injection rate (1). The press goes to the reactor's master port.
 pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id: i32) {
     if !game.native_on(MOD_ID) {
+        return;
+    }
+    // The redstone tab (`GuiInteraction.NEXT_REDSTONE_CONTROL` / `PREVIOUS_REDSTONE_CONTROL`).
+    if matches!(id, BUTTON_REDSTONE_NEXT | BUTTON_REDSTONE_PREVIOUS) && tabs(&entity.id) & TAB_REDSTONE != 0 {
+        let now = RedstoneControl::from_ordinal(get_int(&entity.nbt, "control"));
+        let next = if id == BUTTON_REDSTONE_NEXT { now.next() } else { now.previous() };
+        put_int(&mut entity.nbt, "control", next.ordinal());
         return;
     }
     let Some(Some(master)) = multiblock_master(entity, pos) else {
@@ -4853,8 +5057,9 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
         }
     }
     if l.power.is_some() {
-    sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
+        sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
     }
+    draw_tabs(game, batch, block, &l, data, origin);
     let text_x = if l.gauges.len() > 2 { 50.0 } else { 30.0 };
     for (i, line) in multiblock_lines(block, data).iter().enumerate() {
         game.native_text(batch, line, [ox + text_x, oy + 16.0 + 10.0 * i as f32], 0x40_4040, false);
@@ -4877,6 +5082,9 @@ pub(super) fn screen_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mu
     let Some(l) = layout(block) else {
         return;
     };
+    if tab_tooltip(block, &l, data, at, lines) {
+        return;
+    }
     let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0);
     for (i, g) in l.gauges.iter().enumerate() {
         if inside(at, [g.at[0], g.at[1], g.size[0], g.size[1]]) {

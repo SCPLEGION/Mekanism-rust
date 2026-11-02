@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "b342dda321e8259d689fc66fb80609a55e226a8f"
+horizon_revision = "cdf0e4f82048bf548a0055a0ab728755009df53f"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -212,7 +212,9 @@ kind = "HEAD"
 helper = "screen_click.rs"
 bindings = [
   { name = "block", ty = "&str", value = "block" },
+  { name = "data", ty = "&[i32]", value = "data" },
   { name = "at", ty = "[f32; 2]", value = "at" },
+  { name = "right", ty = "bool", value = "right" },
   { name = "button", ty = "&mut Option<i32>", value = "&mut *button" },
 ]
 
