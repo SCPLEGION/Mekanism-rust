@@ -21,6 +21,7 @@ pub mod machine;
 pub mod matrix;
 pub mod miner;
 pub mod nuclear;
+pub mod qio;
 pub mod recipe_table;
 pub mod recipes;
 pub mod sides;
