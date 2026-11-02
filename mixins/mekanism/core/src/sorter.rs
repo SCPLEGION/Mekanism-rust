@@ -169,6 +169,27 @@ impl Sorter {
             .any(|f| !self.opts_of(f).allow_default && Sorter::matches_item(f, item, in_tag))
     }
 
+    /// The filter a typed name makes: `kind` 0 an item id (`minecraft:` without a namespace), 1 a
+    /// tag, 2 a mod id; none for a name that is empty, too long or has characters ids may not.
+    pub fn named_filter(kind: u16, name: &str) -> Option<String> {
+        let name = name.trim().trim_start_matches(['#', '@']);
+        let ok = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-./:".contains(c));
+        if !ok {
+            return None;
+        }
+        match kind {
+            0 if name.contains(':') => Some(name.to_owned()),
+            0 => Some(format!("minecraft:{name}")),
+            1 => Some(format!("#{name}")),
+            2 if !name.contains([':', '/']) => Some(format!("@{name}")),
+            _ => None,
+        }
+    }
+
     /// Whether `filter` (an item id, `#tag` or `@mod id`) takes `item`.
     pub fn matches_item(filter: &str, item: &str, in_tag: &dyn Fn(&str, &str) -> bool) -> bool {
         match filter.as_bytes().first() {
@@ -269,9 +290,13 @@ pub enum Op {
     ColorClear,
     /// The filter's range: `value` is `min << 8 | max`.
     Range,
+    /// A filter made from a typed name: `index` says item (0), tag (1) or mod id (2).
+    AddNamed,
+    /// The colour: `value` is the dye + 1, or 0 for none.
+    SetColor,
 }
 
-const OPS: [Op; 18] = [
+const OPS: [Op; 20] = [
     Op::Single,
     Op::RoundRobin,
     Op::AutoEject,
@@ -290,15 +315,19 @@ const OPS: [Op; 18] = [
     Op::ColorPrevious,
     Op::ColorClear,
     Op::Range,
+    Op::AddNamed,
+    Op::SetColor,
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
     pub op: Op,
     pub pos: [i32; 3],
     pub index: u16,
     /// The number a `Range` sets.
     pub value: u16,
+    /// The typed name of an `AddNamed`.
+    pub name: String,
 }
 
 impl Request {
@@ -309,11 +338,12 @@ impl Request {
         }
         out.extend(self.index.to_be_bytes());
         out.extend(self.value.to_be_bytes());
+        out.extend(self.name.as_bytes());
         out
     }
 
     pub fn decode(data: &[u8]) -> Option<Request> {
-        if data.len() != 17 {
+        if data.len() < 17 {
             return None;
         }
         let op = *OPS.get(usize::from(data[0]))?;
@@ -323,6 +353,7 @@ impl Request {
             pos: [int(1), int(5), int(9)],
             index: u16::from_be_bytes([data[13], data[14]]),
             value: u16::from_be_bytes([data[15], data[16]]),
+            name: std::str::from_utf8(&data[17..]).ok()?.to_owned(),
         })
     }
 }
@@ -393,8 +424,15 @@ mod tests {
             pos: [-3, 70, 9000],
             index: 40,
             value: 12,
+            name: String::new(),
         };
-        assert_eq!(Request::decode(&r.encode()), Some(r));
+        assert_eq!(Request::decode(&r.encode()), Some(r.clone()));
+        let named = Request {
+            op: Op::AddNamed,
+            name: "c:ingots".into(),
+            ..r
+        };
+        assert_eq!(Request::decode(&named.encode()), Some(named));
         assert_eq!(Request::decode(&[99; 17]), None);
         assert_eq!(Request::decode(&[0; 3]), None);
     }
@@ -429,5 +467,24 @@ mod tests {
         assert_eq!(Opts::step_color(None, false), Some(15));
         assert_eq!(Opts::step_color(Some(15), true), None);
         assert!(!Opts::valid_range(5, 4) && !Opts::valid_range(0, 65));
+    }
+
+    #[test]
+    fn typed_names_make_filters() {
+        assert_eq!(
+            Sorter::named_filter(0, "dirt").as_deref(),
+            Some("minecraft:dirt")
+        );
+        assert_eq!(
+            Sorter::named_filter(1, "c:ingots").as_deref(),
+            Some("#c:ingots")
+        );
+        assert_eq!(
+            Sorter::named_filter(2, "@mekanism").as_deref(),
+            Some("@mekanism")
+        );
+        assert_eq!(Sorter::named_filter(2, "a:b"), None);
+        assert_eq!(Sorter::named_filter(0, "Dirt"), None);
+        assert_eq!(Sorter::named_filter(0, ""), None);
     }
 }
