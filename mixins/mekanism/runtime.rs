@@ -2808,9 +2808,14 @@ pub(super) fn spend_disassembler_energy(game: &mut Game<'_>, pos: [i32; 3]) {
         let cost = gear::destroy_energy(disassembler_mode(stack), hardness);
         set_energy(stack, stored.saturating_sub(cost));
     }
-    if let Some(stack) = game.held_mut().as_mut().filter(|s| &*s.item == modules::MEKA_TOOL) {
+    // The blocks a vein or a blast takes pay their own way (`meka_tool_area`).
+    if !AREA_MINING.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(stack) = game.held_mut().as_mut().filter(|s| &*s.item == modules::MEKA_TOOL)
+    {
         let stored = stored_energy(stack);
-        let cost = modules::tool_destroy_energy(modules::tool_efficiency(&modules_of(stack)), hardness);
+        let installed = modules_of(stack);
+        let silk = installed.contains_key("mekanism:silk_touch_unit");
+        let cost = modules::tool_destroy_energy(modules::tool_efficiency(&installed), hardness, silk);
         set_energy(stack, stored.saturating_sub(cost));
     }
 }
@@ -5817,6 +5822,11 @@ pub(super) fn use_modification_station(game: &mut Game<'_>, pos: [i32; 3]) -> bo
     let stored = stored_energy(&stack);
     set_custom_compound(&mut stack, MODULES_KEY, c);
     set_custom_compound(&mut stack, MODULE_ITEMS_KEY, kept);
+    // Silk touch, fortune and frost walker units are those enchantments on the item.
+    let mut levels: Vec<(Arc<str>, u32)> =
+        stack.enchantments().iter().filter(|(e, _)| !modules::MODULE_ENCHANTMENTS.contains(&&**e)).cloned().collect();
+    levels.extend(modules::enchantments(&installed).into_iter().map(|(e, l)| (Arc::from(e), l)));
+    stack.set_crafting_enchantments(levels);
     // Fewer energy units hold less (`ModuleEnergyUnit.onRemoved`).
     let capacity = item_energy_of(&stack).map_or(stored, |e| e.capacity);
     set_energy(&mut stack, stored.min(capacity));
@@ -5832,8 +5842,9 @@ pub(super) fn use_modification_station(game: &mut Game<'_>, pos: [i32; 3]) -> bo
 
 /// The Meka-Tool's mining speed: its efficiency while it holds the energy for the block.
 fn meka_tool_speed(stack: &ItemStack, hardness: f32) -> f32 {
-    let efficiency = modules::tool_efficiency(&modules_of(stack));
-    modules::tool_destroy_speed(efficiency, stored_energy(stack), hardness)
+    let installed = modules_of(stack);
+    let silk = installed.contains_key("mekanism:silk_touch_unit");
+    modules::tool_destroy_speed(modules::tool_efficiency(&installed), stored_energy(stack), hardness, silk)
 }
 
 /// A right click with the Meka-Tool and its Teleportation Unit: to the top of the block looked at, up to
@@ -5910,4 +5921,110 @@ fn mekasuit_sprint_paid(game: &mut Game<'_>) {
     let cost = modules::sprint_energy(modules::sprint_boost(&modules_of(pants)));
     let stored = stored_energy(pants);
     set_energy(pants, stored.saturating_sub(cost));
+}
+
+/// Set while the Meka-Tool breaks the extra blocks of a vein or a blast, so those breaks don't start
+/// another one.
+static AREA_MINING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn is_vein_ore(game: &Game<'_>, name: &str) -> bool {
+    let items = world_items!(game);
+    items.block_in_tag(mekanism_core::miner::ORE_TAG, name) || items.block_in_tag("minecraft:logs", name)
+}
+
+/// `IBlastingItem.canBlastBlock`: not air, not a liquid, and breakable.
+fn can_blast(game: &Game<'_>, at: [i32; 3]) -> bool {
+    let facts = game.res.facts().get(game.world.block(at[0], at[1], at[2]));
+    facts.hardness > 0.0 && !matches!(&*facts.name, "minecraft:water" | "minecraft:lava")
+}
+
+/// A Meka-Tool breaking `pos` (`ItemMekaTool.mineBlock`, outside creative): its Blasting Unit takes the
+/// blocks around it on the face's plane (not while sneaking), and its Vein Mining Unit follows every
+/// ore or log among them through the blocks of the same kind touching it, up to 128 of each. Each extra
+/// block costs `area_energy` by how far it is; the work stops when the tool runs out.
+pub(super) fn meka_tool_area(game: &mut Game<'_>, pos: [i32; 3]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !game.native_on(MOD_ID) || game.creative || AREA_MINING.load(Relaxed) {
+        return;
+    }
+    let Some(installed) = game.held().filter(|s| &*s.item == modules::MEKA_TOOL).map(modules_of) else {
+        return;
+    };
+    let silk = installed.contains_key("mekanism:silk_touch_unit");
+    let mut initial = vec![pos];
+    let radius = modules::blast_radius(&installed);
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    if radius > 0 && !sneaking && can_blast(game, pos)
+        && let Some((_, dir)) = game.aim()
+    {
+        let axis = (0..3).max_by(|&a, &b| dir[a].abs().total_cmp(&dir[b].abs())).unwrap_or(1);
+        for o in modules::blast_offsets(radius, axis) {
+            let at = [pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]];
+            if can_blast(game, at) {
+                initial.push(at);
+            }
+        }
+    }
+    // `ModuleVeinMiningUnit.findPositions`, without extended mode: only ores spread.
+    let mut found: Vec<([i32; 3], u32)> = Vec::new();
+    if modules::veins(&installed) {
+        let mut ores = std::collections::HashSet::new();
+        for &at in &initial {
+            let name = block_name(game, at).to_owned();
+            if is_vein_ore(game, &name) {
+                ores.insert(name);
+            }
+        }
+        let max = initial.len() + modules::VEIN_COUNT * ores.len();
+        let mut seen: std::collections::HashSet<[i32; 3]> = initial.iter().copied().collect();
+        let mut frontier: std::collections::VecDeque<([i32; 3], u32)> = initial.iter().map(|&p| (p, 0)).collect();
+        while let Some((at, d)) = frontier.pop_front() {
+            found.push((at, d));
+            if found.len() >= max {
+                break;
+            }
+            let name = block_name(game, at).to_owned();
+            if !ores.contains(&name) {
+                continue;
+            }
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        let next = [at[0] + dx, at[1] + dy, at[2] + dz];
+                        if !seen.contains(&next) && block_name(game, next) == name {
+                            seen.insert(next);
+                            frontier.push_back((next, d + 1));
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        found = initial.iter().map(|&p| (p, 0)).collect();
+    }
+    if found.len() <= 1 {
+        return;
+    }
+    AREA_MINING.store(true, Relaxed);
+    for (at, d) in found {
+        if at == pos {
+            continue;
+        }
+        let facts = game.res.facts().get(game.world.block(at[0], at[1], at[2])).clone();
+        if facts.hardness < 0.0 || &*facts.name == "minecraft:air" {
+            continue;
+        }
+        let ore = is_vein_ore(game, &facts.name);
+        let cost = modules::area_energy(silk, facts.hardness, d.max(1), ore);
+        let Some(tool) = game.held_mut().as_mut().filter(|s| &*s.item == modules::MEKA_TOOL) else {
+            break;
+        };
+        let stored = stored_energy(tool);
+        if stored < cost {
+            break;
+        }
+        set_energy(tool, stored - cost);
+        let _ = game.break_block_as_player(at);
+    }
+    AREA_MINING.store(false, Relaxed);
 }

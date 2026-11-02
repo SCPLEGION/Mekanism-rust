@@ -802,3 +802,24 @@ unit) and takes the modules for its slot at the Modification Station (M42).
 - The elytra and gravitational modulating units, the jump boost, and the helmet's units (breathing,
   vision, food). The remaining body armor and boots units also do nothing yet.
 - The HUD and module modes. Every module uses its strongest mode.
+
+## M44: the Meka-Tool's mining modules
+
+- **Silk Touch, Fortune, Frost Walker Units.** These units are the vanilla enchantments of the same
+  name (`registerEnchantBased`), so the game's own loot and frost walking use them. Installing them at
+  the Modification Station puts the enchantment on the item, and taking them out removes it. Silk
+  touch excludes fortune, so silk touch wins when both are installed.
+- **Silk touch energy.** With silk touch, a block costs 100 FE times the efficiency instead of 10.
+- **Blasting Unit.** Breaking a block also breaks the blocks around it on the plane of the face you
+  look at (`IBlastingItem.findPositions`). The radius is 1 to 4, by the installed units. On top and
+  bottom faces it clears a square; on side faces, a wall from one block below to `2r - 1` above.
+  Air, liquids and unbreakable blocks are skipped. Sneaking mines a single block.
+- **Vein Mining Unit.** Every ore (`#c:ores`) or log (`#minecraft:logs`) among the broken blocks
+  carries on through the touching blocks of the same kind, up to 128 of each kind
+  (`ModuleVeinMiningUnit.findPositions`).
+- **Energy.** Each extra block costs half the base energy times its distance (in steps from the first
+  block) to the power 1.5 for ores and 2 for other blocks (`veinMineArea`). The work stops when the
+  tool runs out. Not in creative.
+
+**Not ported:** extended vein mining (non-ore veins), and the farming, shearing and attack
+amplification units.
