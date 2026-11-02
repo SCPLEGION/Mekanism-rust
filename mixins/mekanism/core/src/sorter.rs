@@ -267,12 +267,11 @@ pub enum Op {
     ColorNext,
     ColorPrevious,
     ColorClear,
-    /// The filter's minimum; `value` is the number.
-    Min,
-    Max,
+    /// The filter's range: `value` is `min << 8 | max`.
+    Range,
 }
 
-const OPS: [Op; 19] = [
+const OPS: [Op; 18] = [
     Op::Single,
     Op::RoundRobin,
     Op::AutoEject,
@@ -290,8 +289,7 @@ const OPS: [Op; 19] = [
     Op::ColorNext,
     Op::ColorPrevious,
     Op::ColorClear,
-    Op::Min,
-    Op::Max,
+    Op::Range,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -299,7 +297,7 @@ pub struct Request {
     pub op: Op,
     pub pos: [i32; 3],
     pub index: u16,
-    /// The number a `Min` or `Max` sets.
+    /// The number a `Range` sets.
     pub value: u16,
 }
 
