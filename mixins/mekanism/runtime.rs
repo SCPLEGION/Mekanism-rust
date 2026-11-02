@@ -15,6 +15,7 @@ use mekanism_core::nuclear;
 use mekanism_core::qio;
 use mekanism_core::laser;
 use mekanism_core::seismic;
+use mekanism_core::plenisher::{self, Plenisher, Spot};
 use mekanism_core::fission;
 use mekanism_core::fusion;
 use mekanism_core::bin::{self, Bin};
@@ -92,6 +93,8 @@ enum Kind {
     FusionPort,
     /// The Electric Pump: water (or heavy water) from below.
     Pump,
+    /// The Fluidic Plenisher: fills the space below it with fluid.
+    Plenisher,
     /// The Solar Neutron Activator: lithium into tritium in the sun.
     Activator,
     /// A Thermoelectric Boiler's valve; the first valve runs it.
@@ -184,6 +187,7 @@ fn kind(id: &str) -> Option<Kind> {
         sps::PORT => return Some(Kind::SpsPort),
         dynamic_tank::VALVE => return Some(Kind::DynamicValve),
         "mekanism:electric_pump" => return Some(Kind::Pump),
+        "mekanism:fluidic_plenisher" => return Some(Kind::Plenisher),
         "mekanism:solar_neutron_activator" => return Some(Kind::Activator),
         boiler::VALVE => return Some(Kind::BoilerValve),
         boiler::HEATER => return Some(Kind::Heater),
@@ -422,6 +426,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             None
         }
         Kind::Pump => tick_pump(game, pos, entity),
+        Kind::Plenisher => tick_plenisher(game, pos, entity),
         Kind::Activator => tick_activator(game, pos, entity),
         Kind::BoilerValve => tick_boiler_valve(game, pos, entity),
         Kind::Heater => tick_heater(entity),
@@ -701,7 +706,7 @@ pub(super) fn install_upgrade(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     let want = if sneaking { held.count } else { 1 };
     let installed = game.native_with_mod_block_entity(pos, |m| {
         let target = self::kind(&m.id);
-        if !matches!(target, Some(Kind::Machine(..) | Kind::Factory(..) | Kind::DigitalMiner | Kind::Pump))
+        if !matches!(target, Some(Kind::Machine(..) | Kind::Factory(..) | Kind::DigitalMiner | Kind::Pump | Kind::Plenisher))
             || (kind == Upgrade::Filter && target != Some(Kind::Pump))
         {
             return None;
@@ -1008,6 +1013,12 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
             Kind::Rotary if chem::rotary_chemical(chemical).is_some() => Some(("fluid", chem::ROTARY_TANK)),
             Kind::Washer if chemical == "minecraft:water" => Some(("fluid", nuclear::WASHER_TANK)),
             Kind::Reaction if chemical == "minecraft:water" => Some(("fluid", REACTION_TANK)),
+            Kind::Plenisher
+                if plenisher::placeable(chemical).is_some()
+                    && get_tank(nbt, "fluid", plenisher::PLENISHER_TANK).accepts(chemical) =>
+            {
+                Some(("fluid", plenisher::PLENISHER_TANK))
+            }
             Kind::DynamicValve if valve_takes(nbt, chemical) => Some(("buffer", dynamic_tank::VALVE_BUFFER)),
             // Brine crystallizes into salt.
             Kind::Crystallizer if nuclear::find_crystallizing(chemical).is_some() => Some(("input", nuclear::CRYSTALLIZER_TANK)),
@@ -1869,6 +1880,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::FusionPort
                 | Kind::Washer
                 | Kind::Pump
+                | Kind::Plenisher
                 | Kind::BoilerValve
                 | Kind::DynamicValve
         ),
@@ -2621,6 +2633,11 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
             let u = upgrades(nbt);
             let usage = u.energy_per_tick(isotopes::PUMP_USAGE);
             Some((u.max_energy(machine::STORAGE_MULTIPLIER * isotopes::PUMP_USAGE).max(usage), u64::MAX))
+        }
+        Kind::Plenisher => {
+            let u = upgrades(nbt);
+            let usage = u.energy_per_tick(plenisher::PLENISHER_USAGE);
+            Some((u.max_energy(machine::STORAGE_MULTIPLIER * plenisher::PLENISHER_USAGE).max(usage), u64::MAX))
         }
         // The matrix's first port holds its energy; the others take a tick's worth and pass it on.
         Kind::InductionPort if get_long(nbt, "rate") > 0 => {
@@ -3567,6 +3584,98 @@ fn tick_pump(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) ->
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "fluid", &tank);
     Some(active)
+}
+
+/// The Fluidic Plenisher: with a bucket in its tank and the energy for the tick, every 20 ticks
+/// (fewer with speed upgrades) it places a bucket of water or lava in the next spot of its fill.
+fn tick_plenisher(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let u = upgrades(&entity.nbt);
+    let usage = u.energy_per_tick(plenisher::PLENISHER_USAGE);
+    let capacity = u.max_energy(machine::STORAGE_MULTIPLIER * plenisher::PLENISHER_USAGE).max(usage);
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut tank = get_tank(&entity.nbt, "fluid", plenisher::PLENISHER_TANK);
+    let mut progress = get_int(&entity.nbt, "progress");
+    let mut active = false;
+    let block = tank.chemical.as_deref().and_then(plenisher::placeable);
+    if let Some(block) = block.filter(|_| tank.amount >= plenisher::BUCKET)
+        && energy.stored >= usage
+    {
+        let mut fill = load_plenisher(&entity.nbt);
+        progress += 1;
+        if progress >= u.ticks(plenisher::PLENISHER_TICKS) {
+            progress = 0;
+            if let Some(at) = fill.operate(pos, |at| plenish_spot(game, at))
+                && let Some(state) = game.pack.assets.registry.default_state(block)
+            {
+                let at = horizon_core::position::BlockPos::new(at[0], at[1], at[2]);
+                if game.with_level(|b, level, ticks| b.set_block(level, ticks, at, state, 3)) {
+                    tank.extract(plenisher::BUCKET);
+                    active = true;
+                }
+            }
+            // A finished fill only spends energy when it places a block.
+            if !fill.finished || active {
+                energy.consume(usage);
+                active = true;
+            }
+        } else if !fill.finished {
+            energy.consume(usage);
+            active = true;
+        }
+        save_plenisher(&mut entity.nbt, &fill);
+    }
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "progress", progress);
+    put_tank(&mut entity.nbt, "fluid", &tank);
+    Some(active)
+}
+
+/// What a plenisher sees at `at` (`canReplace`): air, flowing fluid and the blocks
+/// fluids wash away are free, a source is passed through, the rest is in the way.
+fn plenish_spot(game: &Game<'_>, at: [i32; 3]) -> Spot {
+    if !game.world.loaded(at[0], at[2]) || !(game.world.bottom_y()..game.world.top_y()).contains(&at[1]) {
+        return Spot::Blocked;
+    }
+    let facts = game.res.facts().get(game.world.block(at[0], at[1], at[2]));
+    let name = &*facts.name;
+    if matches!(name, "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air") {
+        return Spot::Free;
+    }
+    if facts.fluid != horizon_client::blocks::Fluid::None {
+        let source = facts.waterlogged || game.native_block_property(at, "level").as_deref() == Some("0");
+        return if source { Spot::Source } else { Spot::Free };
+    }
+    // `canBeReplaced(fluid)`: water and lava both wash away replaceable blocks.
+    if facts.replaceable { Spot::Free } else { Spot::Blocked }
+}
+
+fn load_plenisher(nbt: &Compound) -> Plenisher {
+    let spots = |key: &str| match nbt.get(&JavaString::from(key)) {
+        Some(Tag::IntArray(v)) => Plenisher::unflatten(v),
+        _ => Vec::new(),
+    };
+    Plenisher { active: spots("active"), used: spots("used").into_iter().collect(), finished: get_int(nbt, "finished") == 1 }
+}
+
+fn save_plenisher(nbt: &mut Compound, fill: &Plenisher) {
+    nbt.insert("active".into(), Tag::IntArray(Plenisher::flatten(fill.active.iter().copied())));
+    nbt.insert("used".into(), Tag::IntArray(Plenisher::flatten(fill.used.iter().copied())));
+    put_int(nbt, "finished", u32::from(fill.finished));
+}
+
+/// Sneak-right-click on a plenisher with an empty hand starts its fill over.
+pub(super) fn use_plenisher(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || kind(block_name(game, pos)) != Some(Kind::Plenisher) {
+        return false;
+    }
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    if !sneaking || game.inventory.get(game.selected).cloned().flatten().is_some() {
+        return false;
+    }
+    game.native_with_mod_block_entity(pos, |m| save_plenisher(&mut m.nbt, &Plenisher::default()));
+    tell(game, "Reset the Fluidic Plenisher".to_owned());
+    true
 }
 
 /// The Solar Neutron Activator: while it sees the sun, lithium piped in becomes tritium, up to 64 mB a

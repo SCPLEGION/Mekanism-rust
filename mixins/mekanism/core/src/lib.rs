@@ -23,6 +23,7 @@ pub mod matrix;
 pub mod miner;
 pub mod modules;
 pub mod nuclear;
+pub mod plenisher;
 pub mod qio;
 pub mod recipe_table;
 pub mod recipes;

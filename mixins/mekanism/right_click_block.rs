@@ -1,7 +1,7 @@
 // A player's right click on a block, before the block reacts (hook point `native_right_click_block`,
 // API 21): the Configurator sets a face's mode, an upgrade in hand goes into a Mekanism machine, a
 // bucket fills or empties a fluid tank, a bin takes or gives items, personal storage stays shut for
-// others, QIO blocks take a frequency or a filter, lasers show their energy, and the
+// others, QIO blocks take a frequency or a filter, lasers show their energy, a plenisher resets, and the
 // Modification Station installs modules.
 fn on_right_click_block(game: &mut crate::game::Game<'_>, pos: [i32; 3], face: [i32; 3], canceled: &mut bool) {
     if *canceled {
@@ -21,6 +21,7 @@ fn on_right_click_block(game: &mut crate::game::Game<'_>, pos: [i32; 3], face: [
         || crate::game::mekanism::use_personal_storage(game, pos)
         || crate::game::mekanism::use_qio(game, pos)
         || crate::game::mekanism::use_laser(game, pos)
+        || crate::game::mekanism::use_plenisher(game, pos)
         || crate::game::mekanism::use_modification_station(game, pos)
     {
         *canceled = true;
