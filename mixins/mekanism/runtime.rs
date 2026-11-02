@@ -4770,6 +4770,14 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
             entity.data.resize(redstone_slot(&l) + 5 + 9, 0);
             entity.data.push(get_int(&entity.nbt, "sorting") as i32 & 1);
         }
+        // Last, the transporter window's ejector: the output colour, the six input colours (each the
+        // dye + 1, or 0 for none) and strict input.
+        if tabs(&entity.id) & TAB_SIDES != 0 {
+            entity.data.resize(redstone_slot(&l) + EJECTOR_AT, 0);
+            for key in ["ej_out", "ej_in0", "ej_in1", "ej_in2", "ej_in3", "ej_in4", "ej_in5", "ej_strict"] {
+                entity.data.push(get_int(&entity.nbt, key) as i32);
+            }
+        }
     }
 }
 
@@ -4999,6 +5007,8 @@ enum Window {
     Sides(usize),
     /// The upgrade window and the registry index of the upgrade selected in its list.
     Upgrades(Option<usize>),
+    /// The transporter configuration window (`GuiTransporterConfig`).
+    Transporter,
 }
 
 thread_local! {
@@ -5150,6 +5160,7 @@ pub(super) fn screen_overlay(game: &Game<'_>, block: &str, data: &[i32], batch: 
     let shown = match window(block) {
         Some(Window::Sides(shown)) => shown,
         Some(Window::Upgrades(selected)) => return draw_upgrade_window(game, block, data, batch, origin, selected),
+        Some(Window::Transporter) => return draw_transporter_window(game, block, data, batch, origin),
         None => return,
     };
     let Some(l) = layout(block) else {
@@ -5241,6 +5252,7 @@ pub(super) fn screen_covers(block: &str, at: [f32; 2], covered: &mut bool) {
     let open = match window(block) {
         Some(Window::Sides(shown)) => inside(at, SIDE_WINDOW) || window_type_tabs(block, shown).iter().any(|(_, r)| inside(at, *r)),
         Some(Window::Upgrades(_)) => inside(at, UPGRADE_WINDOW),
+        Some(Window::Transporter) => inside(at, TRANSPORTER_WINDOW),
         None => false,
     };
     *covered |= tab || open;
@@ -5251,6 +5263,7 @@ fn window_click(block: &str, data: &[i32], at: [f32; 2], right: bool, button: &m
     let shown = match window(block) {
         Some(Window::Sides(shown)) => shown,
         Some(Window::Upgrades(selected)) => return upgrade_window_click(block, data, at, selected, button),
+        Some(Window::Transporter) => return transporter_window_click(block, data, at, right, button),
         None => return false,
     };
     let types = transmissions(block);
@@ -5281,6 +5294,7 @@ fn window_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<Strin
     let shown = match window(block) {
         Some(Window::Sides(shown)) => shown,
         Some(Window::Upgrades(_)) => return upgrade_window_tooltip(block, data, at, lines),
+        Some(Window::Transporter) => return transporter_window_tooltip(block, data, at, lines),
         None => return false,
     };
     let Some(l) = layout(block) else {
@@ -5821,6 +5835,7 @@ pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32;
         // The side configuration tab opens its window on the first type (`GuiWindowCreatorTab`).
         Some(TabKind::Sides) if !right => set_window(block, Some(Window::Sides(0))),
         Some(TabKind::Upgrade) if !right => set_window(block, Some(Window::Upgrades(None))),
+        Some(TabKind::Transporter) if !right => set_window(block, Some(Window::Transporter)),
         Some(TabKind::Sort) if !right => *button = Some(BUTTON_SORT),
         _ => {}
     }
@@ -5845,7 +5860,7 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         put_int(&mut entity.nbt, "sorting", u32::from(on));
         return;
     }
-    if window_button(game, pos, entity, id) || upgrade_button(game, pos, entity, id) {
+    if transporter_button(entity, id) || window_button(game, pos, entity, id) || upgrade_button(game, pos, entity, id) {
         return;
     }
     let Some(Some(master)) = multiblock_master(entity, pos) else {
@@ -10059,4 +10074,164 @@ fn filter_key(key: &str, text: Option<&str>) {
             t.key(key, text, |c| c.is_ascii_digit(), 2);
         }
     });
+}
+
+// --- Transporter configuration window (GuiTransporterConfig) ---------------------------------------------
+
+/// Where the ejector's data starts after the screen's redstone slot (after the factory's progress and
+/// sorting slots).
+const EJECTOR_AT: usize = 5 + 10;
+const TRANSPORTER_WINDOW: [f32; 4] = [10.0, 15.0, 156.0, 119.0];
+const TRANSPORTER_SCREEN: [f32; 4] = [38.0, 15.0, 80.0, 12.0];
+const TRANSPORTER_STRICT: [f32; 4] = [136.0, 6.0, 14.0, 14.0];
+const TRANSPORTER_COLOR: [f32; 4] = [112.0, 49.0, 16.0, 16.0];
+/// The side buttons by relative side (front, left, right, back, top, bottom), 22 × 22.
+const TRANSPORTER_SIDES: [[f32; 2]; 6] = [[41.0, 57.0], [18.0, 57.0], [64.0, 57.0], [18.0, 80.0], [41.0, 34.0], [41.0, 80.0]];
+/// The menu buttons it sends: strict input, the output colour (+0 next, +1 clear, +2 previous), and each
+/// side's input colour (310 + 3 × side, the same steps).
+const BUTTON_STRICT: i32 = 300;
+const BUTTON_OUT_COLOR: i32 = 301;
+const BUTTON_IN_COLOR: i32 = 310;
+
+fn in_transporter(r: [f32; 4]) -> [f32; 4] {
+    [TRANSPORTER_WINDOW[0] + r[0], TRANSPORTER_WINDOW[1] + r[1], r[2], r[3]]
+}
+
+/// The ejector as the screen's data holds it: the output colour, the input colours, strict input.
+fn ejector_of(data: &[i32], l: &Layout) -> (Option<u8>, [Option<u8>; 6], bool) {
+    let at = redstone_slot(l) + EJECTOR_AT;
+    let color = |i: usize| data.get(at + i).copied().filter(|c| (1..=16).contains(c)).map(|c| (c - 1) as u8);
+    (color(0), std::array::from_fn(|s| color(1 + s)), data.get(at + 7).copied().unwrap_or(0) != 0)
+}
+
+fn dye_rgb(c: u8) -> u32 {
+    freq::COLORS[usize::from(c) % 16].1
+}
+
+fn draw_transporter_window(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let Some(l) = layout(block) else {
+        return;
+    };
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let at = [cursor[0] - ox, cursor[1] - oy];
+    let screen = |r: [f32; 4]| {
+        let [x, y, w, h] = in_transporter(r);
+        [ox + x, oy + y, w, h]
+    };
+    let hover = |r: [f32; 4]| inside(at, in_transporter(r));
+    let [x, y, w, h] = screen([0.0, 0.0, TRANSPORTER_WINDOW[2], TRANSPORTER_WINDOW[3]]);
+    nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
+    nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
+    draw_button(game, batch, screen(WINDOW_CLOSE), hover(WINDOW_CLOSE), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+    let (out, ins, strict) = ejector_of(data, &l);
+    // The title leaves room for the strict input button (`getTitlePadEnd`).
+    centred(game, batch, "Transporter Config", x, w - 18.0, y + 5.0, 0x40_4040);
+    let s = screen(TRANSPORTER_SCREEN);
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, s, 0xFFFF_FFFF);
+    game.native_text_scaled(batch, &format!("Strict Input: {}", if strict { "On" } else { "Off" }), [s[0] + 3.0, s[1] + 3.0], 0x3C_FE9A, 0.8);
+    draw_button(game, batch, screen(TRANSPORTER_STRICT), hover(TRANSPORTER_STRICT), true, 0xFFFF_FFFF, Some(("button/exclamation", 14.0)));
+    sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [x + 111.0, y + 48.0, 18.0, 18.0]);
+    if let Some(c) = out {
+        game.native_fill(batch, screen(TRANSPORTER_COLOR), 0xFF00_0000 | dye_rgb(c));
+    }
+    let (packed, _) = window_sides(&l, data, Transmission::Item);
+    let pos = game.container.map(|(x, y, z)| [x, y, z]);
+    let facing = pos.and_then(|p| game.native_block_property(p, "facing")).and_then(|f| direction(&f)).map_or(2, face_index);
+    for (side, [bx, by]) in TRANSPORTER_SIDES.iter().enumerate() {
+        let r = [*bx, *by, 22.0, 22.0];
+        let mode = Sides::relative_get(packed, side);
+        let enabled = matches!(mode, SideMode::Input | SideMode::Default);
+        let (_, rgb, _) = mode.data_type();
+        draw_button(game, batch, screen(r), enabled && hover(r), enabled, button_tint(rgb), None);
+        if let Some(c) = ins[side] {
+            let b = screen(r);
+            game.native_fill(batch, [b[0] + 5.0, b[1] + 5.0, 12.0, 12.0], 0xFF00_0000 | dye_rgb(c));
+        } else if let Some(p) = pos {
+            let d = DIRECTIONS[side_config::relative_face(facing, side)].1;
+            let beside = game.native_block([p[0] + d[0], p[1] + d[1], p[2] + d[2]]);
+            if !beside.ends_with(":air") {
+                let b = screen(r);
+                game.native_item_stack(batch, &stack_of(&beside, 1), [b[0] + 3.0, b[1] + 3.0], 16.0);
+            }
+        }
+    }
+    centred(game, batch, "Input", x + 18.0, 68.0, y + 105.0, 0x40_4040);
+    centred(game, batch, "Output", x + 86.0, w - 86.0, y + 68.0, 0x40_4040);
+}
+
+fn transporter_window_click(block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) -> bool {
+    if !inside(at, TRANSPORTER_WINDOW) {
+        return false;
+    }
+    let Some(l) = layout(block) else {
+        return true;
+    };
+    let on = |r: [f32; 4]| inside(at, in_transporter(r));
+    // Shift clears the colour; the key state is not here, so a middle step is the clear: left steps on,
+    // right steps back (`MekClickType`), and the cycle passes through none.
+    let step = i32::from(right) * 2;
+    if on(WINDOW_CLOSE) {
+        set_window(block, None);
+    } else if on(TRANSPORTER_STRICT) {
+        *button = Some(BUTTON_STRICT);
+    } else if on(TRANSPORTER_COLOR) {
+        *button = Some(BUTTON_OUT_COLOR + step);
+    } else {
+        let (packed, _) = window_sides(&l, data, Transmission::Item);
+        if let Some(side) = TRANSPORTER_SIDES.iter().position(|[x, y]| on([*x, *y, 22.0, 22.0]))
+            && matches!(Sides::relative_get(packed, side), SideMode::Input | SideMode::Default)
+        {
+            *button = Some(BUTTON_IN_COLOR + 3 * side as i32 + step);
+        }
+    }
+    true
+}
+
+fn transporter_window_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    if !inside(at, TRANSPORTER_WINDOW) {
+        return false;
+    }
+    let Some(l) = layout(block) else {
+        return true;
+    };
+    let on = |r: [f32; 4]| inside(at, in_transporter(r));
+    let (out, ins, _) = ejector_of(data, &l);
+    let name = |c: Option<u8>| c.map_or("None", |c| freq::COLORS[usize::from(c) % 16].0);
+    if on(TRANSPORTER_STRICT) {
+        lines.push("Strict Input".into());
+    } else if on(TRANSPORTER_COLOR) {
+        lines.push(name(out).into());
+    } else if let Some(side) = TRANSPORTER_SIDES.iter().position(|[x, y]| on([*x, *y, 22.0, 22.0])) {
+        lines.push(name(ins[side]).into());
+    }
+    true
+}
+
+/// A press of the transporter window, on the server: strict input, the output colour, a side's input
+/// colour, stepping through none and the sixteen dyes.
+fn transporter_button(entity: &mut ModBlockEntity, id: i32) -> bool {
+    if tabs(&entity.id) & TAB_SIDES == 0 || !(BUTTON_STRICT..BUTTON_IN_COLOR + 18).contains(&id) {
+        return false;
+    }
+    let step = |nbt: &mut Compound, key: &str, how: i32| {
+        let now = get_int(nbt, key);
+        let cur = (now > 0).then(|| (now - 1) as u8);
+        // `TransporterUtils.increment` and `decrement`; a middle press clears.
+        let next = match how {
+            1 => None,
+            h => sorter::Opts::step_color(cur, h == 0),
+        };
+        put_int(nbt, key, next.map_or(0, |c| u32::from(c) + 1));
+    };
+    if id == BUTTON_STRICT {
+        let on = get_int(&entity.nbt, "ej_strict") == 0;
+        put_int(&mut entity.nbt, "ej_strict", u32::from(on));
+    } else if (BUTTON_OUT_COLOR..BUTTON_OUT_COLOR + 3).contains(&id) {
+        step(&mut entity.nbt, "ej_out", id - BUTTON_OUT_COLOR);
+    } else if id >= BUTTON_IN_COLOR {
+        let (side, how) = ((id - BUTTON_IN_COLOR) / 3, (id - BUTTON_IN_COLOR) % 3);
+        step(&mut entity.nbt, &format!("ej_in{side}"), how);
+    }
+    true
 }
