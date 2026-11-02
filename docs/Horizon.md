@@ -971,3 +971,15 @@ the stacks a filter turns down. The bundle now pins that revision, `8c71132e`, o
   filters.
 - **Not done:** transporter colours, round robin and the min/max size modes. Without colours, every
   filtered item takes the same nearest-first route.
+
+## M55: Chargepad
+
+- **Charging.** A player standing on a chargepad gets one item charged: the first one that takes
+  energy, looking through the inventory, then the armor, then the offhand (`TileEntityChargepad`). It
+  takes up to 1,024 FE a tick, from the pad's energy. The game looks at each player every 10 ticks,
+  through the `native_player_damage` call, so the pad gives ten ticks' worth at a time and stores
+  10,240 FE. Spectators don't charge. The pad stays lit for a second after it last charged
+  something.
+- **Not done:** the pad is a full block here (the furnace template), so you stand on top of it, not
+  in a thin plate. Robits, and the rule that energy only goes in from the back and the bottom, aren't
+  ported.
