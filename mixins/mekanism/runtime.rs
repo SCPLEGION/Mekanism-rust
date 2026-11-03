@@ -4845,7 +4845,12 @@ fn layout(block: &str) -> Option<Layout> {
         Kind::TurbineValve => Layout {
             slots: [None; 3],
             // `GuiIndustrialTurbine`: a medium steam gauge, the energy bar at the right edge.
-            gauges: vec![gauge("steam", 0, 6.0, 13.0, MEDIUM)],
+            // The two "stats" gauges carry the counts the statistics screen shows (never drawn as gauges).
+            gauges: vec![
+                gauge("steam", 0, 6.0, 13.0, MEDIUM),
+                gauge("stats_a", 1 << 58, 0.0, 0.0, SMALL),
+                gauge("stats_b", 1 << 58, 0.0, 0.0, SMALL),
+            ],
             power: Some(PowerBar::Vertical([178.0, 16.0])),
             progress: None,
         },
@@ -5035,6 +5040,17 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
         if g.key == "lava" {
             tank = ChemicalTank::new(g.capacity);
             tank.insert("minecraft:lava", u64::from(get_int(&entity.nbt, "lava")));
+        }
+        if g.key.starts_with("stats_") && kind(&entity.id) == Some(Kind::TurbineValve) {
+            let t = turbine_of(&entity.nbt);
+            let max_production = (t.energy_multiplier() * t.max_flow()).clamp(0.0, f64::from(i32::MAX)) as u64;
+            let packed = if g.key == "stats_a" {
+                t.lower_volume & 0xF_FFFF | (t.dispersers & 0xFFF) << 20 | (t.vents & 0xFFF) << 32 | (t.blades() & 0xFF) << 44
+            } else {
+                t.coils & 0xFFF | (t.condensers & 0xFFF) << 12 | max_production << 24
+            };
+            tank = ChemicalTank::new(g.capacity);
+            tank.insert("minecraft:lava", packed);
         }
         if matches!(g.key, "plasma" | "case") && kind(&entity.id) == Some(Kind::FusionPort) {
             let p = fusion_plasma(&entity.nbt);
@@ -6703,15 +6719,15 @@ pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32;
     if kind(block) == Some(Kind::FusionPort) && fusion_click(game, block, at, right) {
         return;
     }
-    if kind(block) == Some(Kind::BoilerValve) && !right && inside(at, STATS_TAB_BUTTON) {
-        if boiler_stats_open(block) {
+    if matches!(kind(block), Some(Kind::BoilerValve | Kind::TurbineValve)) && !right && inside(at, STATS_TAB_BUTTON) {
+        if STATS_VIEW.get().is_some() {
             STATS_VIEW.set(None);
         } else if let Some((x, y, z)) = game.container {
             STATS_VIEW.set(Some(([x, y, z], game.ticks as u64)));
         }
         return;
     }
-    if boiler_stats_open(block) {
+    if boiler_stats_open(block) || turbine_stats_open(block) {
         return;
     }
     if kind(block) == Some(Kind::FissionPort) {
@@ -6841,10 +6857,14 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
     screen_base(block, screen);
     // The QIO blocks swap to the selector's layout while their tab's screen is open: 176 x 155, none
     // of the inventory (it is moved out of the way).
-    if matches!(kind(block), Some(Kind::FissionPort | Kind::FusionPort | Kind::BoilerValve)) && let Some(s) = screen.as_mut() {
+    if matches!(kind(block), Some(Kind::FissionPort | Kind::FusionPort | Kind::BoilerValve | Kind::TurbineValve)) && let Some(s) = screen.as_mut() {
         // `GuiFissionReactorStats` (the default 176 x 166), `GuiFusionReactorInfo` (186 wide): no inventory.
         s.alt = Some(Box::new(super::native_hooks::NativeScreen {
-            width: if kind(block) == Some(Kind::FusionPort) { 186.0 } else { 176.0 },
+            width: match kind(block) {
+                Some(Kind::FusionPort) => 186.0,
+                Some(Kind::TurbineValve) => 190.0,
+                _ => 176.0,
+            },
             height: 166.0,
             slots: vec![None; s.slots.len()],
             inventory_y: 4000.0,
@@ -7427,6 +7447,44 @@ thread_local! {
 
 const BOILER_GRAPHS: [[f32; 4]; 2] = [[7.0, 82.0, 162.0, 38.0], [7.0, 121.0, 162.0, 38.0]];
 
+fn turbine_stats_open(block: &str) -> bool {
+    kind(block) == Some(Kind::TurbineValve) && STATS_VIEW.get().is_some()
+}
+
+/// `GuiTurbineStats`.
+fn draw_turbine_stats(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 190.0, 166.0]);
+    centred(game, batch, "Turbine Statistics", ox, 190.0, oy + 4.0, 0x40_4040);
+    draw_stats_tab(game, batch, origin, "transmission/chemicals");
+    sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
+    let (a, _, _) = fusion_gauge(data, 1);
+    let (b, _, _) = fusion_gauge(data, 2);
+    let (volume, dispersers, vents, blades) = (a & 0xF_FFFF, a >> 20 & 0xFFF, a >> 32 & 0xFFF, a >> 44 & 0xFF);
+    let (coils, condensers, max_production) = (b & 0xFFF, b >> 12 & 0xFFF, b >> 24);
+    let flow = |n: u64, per: f64| n as f64 * per;
+    let produced = volume as f64 * dispersers as f64 * turbine::DISPERSER_FLOW;
+    let dispersers_limiting = produced < flow(vents, turbine::VENT_FLOW);
+    let vents_limiting = produced > flow(vents, turbine::VENT_FLOW);
+    let per_coil = turbine::BLADES_PER_COIL;
+    let text = |batch: &mut horizon_client::hud::HudBatch, t: &str, x: f32, y: f32, rgb: u32, limiting: bool| {
+        game.native_text(batch, t, [ox + x, oy + y], rgb, false);
+        if limiting {
+            game.native_text(batch, "(Limiting)", [ox + x + game.native_text_width(t) + game.native_text_width(" "), oy + y], 0xAA_0000, false);
+        }
+    };
+    let (g, h) = (0x40_4040, 0x20_2020);
+    text(batch, &format!("Tank Volume: {volume}"), 6.0, 26.0, g, false);
+    text(batch, "Steam Flow", 6.0, 40.0, h, false);
+    text(batch, &format!("Dispersers: {dispersers}"), 10.0, 49.0, g, dispersers_limiting);
+    text(batch, &format!("Vents: {vents}"), 10.0, 58.0, g, vents_limiting);
+    text(batch, "Production", 6.0, 72.0, h, false);
+    text(batch, &format!("Blades: {blades}"), 10.0, 81.0, g, coils * per_coil > blades);
+    text(batch, &format!("Coils: {coils}"), 10.0, 90.0, g, coils * per_coil < blades);
+    text(batch, &format!("Max Production: {}", mekanism_core::energy::format_fe(max_production)), 6.0, 104.0, g, false);
+    text(batch, &format!("Max Water Output: {} mB/t", thousands(condensers * turbine::CONDENSER_RATE)), 6.0, 113.0, g, false);
+}
+
 fn boiler_stats_open(block: &str) -> bool {
     kind(block) == Some(Kind::BoilerValve) && STATS_VIEW.get().is_some()
 }
@@ -7783,6 +7841,10 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
         draw_boiler_stats(game, batch, data, origin);
         return;
     }
+    if turbine_stats_open(block) {
+        draw_turbine_stats(game, batch, data, origin);
+        return;
+    }
     if qio_select_open(block) {
         draw_qio_select(game, batch, block, origin);
         return;
@@ -7891,7 +7953,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         };
         sprite(game, batch, &format!("gauge/overlay/{overlay}"), [0.0, 0.0, size[0] - 2.0, size[1] - 2.0], [x + 1.0, y + 1.0, size[0] - 2.0, size[1] - 2.0]);
     };
-    for (i, g) in l.gauges.iter().enumerate().filter(|_| kind(block) != Some(Kind::FusionPort)) {
+    for (i, g) in l.gauges.iter().enumerate().filter(|(_, g)| kind(block) != Some(Kind::FusionPort) && !g.key.starts_with("stats_")) {
         let at = DATA_GAUGES + i * GAUGE_SLOTS;
         let (amount, capacity) = (read_wide(data, at), read_wide(data, at + 4).max(1));
         let chemical = usize::try_from(data.get(at + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c));
@@ -7955,6 +8017,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         draw_dynamic_rate_bar(game, batch, [ox + 7.0, oy + 79.0], 160.0, (get(2) / 1000.0).clamp(0.0, 1.0));
     }
     if kind(block) == Some(Kind::TurbineValve) && get(0) > 0.0 {
+        draw_stats_tab(game, batch, origin, "button/stats");
         // The steam input's `GuiVerticalRateBar` at (40, 13).
         let flow = (data.get(1).copied().unwrap_or(0) as u64 & 0x7FFF) | (data.get(2).copied().unwrap_or(0) as u64 & 0x7FFF) << 15;
         let max = (data.get(DATA_SPEED).copied().unwrap_or(0) as u64 & 0x7FFF) | (data.get(DATA_ENERGY_UPGRADES).copied().unwrap_or(0) as u64 & 0x7FFF) << 15;
@@ -8038,6 +8101,18 @@ pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f3
         return;
     }
     if kind(block) == Some(Kind::FusionPort) && fusion_tooltip(block, data, at, lines) {
+        return;
+    }
+    if kind(block) == Some(Kind::TurbineValve) && turbine_stats_open(block) {
+        if inside(at, STATS_TAB_BUTTON) {
+            lines.push("Main".to_owned());
+        } else if inside(at, [-26.0, 137.0, 26.0, 26.0]) {
+            lines.push(format!("Storing: {}", mekanism_core::energy::format_fe(read_wide(data, DATA_STORED))));
+        }
+        return;
+    }
+    if kind(block) == Some(Kind::TurbineValve) && inside(at, STATS_TAB_BUTTON) {
+        lines.push("Turbine Statistics".to_owned());
         return;
     }
     if kind(block) == Some(Kind::BoilerValve) {
@@ -8144,7 +8219,7 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         }
     }
     let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0);
-    for (i, g) in l.gauges.iter().enumerate().filter(|_| kind(block) != Some(Kind::FusionPort)) {
+    for (i, g) in l.gauges.iter().enumerate().filter(|(_, g)| kind(block) != Some(Kind::FusionPort) && !g.key.starts_with("stats_")) {
         if inside(at, [g.at[0], g.at[1], g.size[0], g.size[1]]) {
             let d = DATA_GAUGES + i * GAUGE_SLOTS;
             let amount = read_wide(data, d);
@@ -10572,7 +10647,7 @@ pub(super) fn screen_alt(game: &Game<'_>, block: &str, alt: &mut bool) {
         }
         return;
     }
-    if matches!(kind(block), Some(Kind::FissionPort | Kind::BoilerValve)) {
+    if matches!(kind(block), Some(Kind::FissionPort | Kind::BoilerValve | Kind::TurbineValve)) {
         if let Some((pos, seen)) = STATS_VIEW.get() {
             let here = game.container.map(|(x, y, z)| [x, y, z]);
             if here != Some(pos) || now.saturating_sub(seen) > 10 {
