@@ -6635,9 +6635,14 @@ fn multiblock_data(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
     };
     entity.data[..4].copy_from_slice(&state);
     entity.data.splice(DATA_USAGE..DATA_USAGE + 4, wide(usage));
-    // The turbine's max flow rate, in the two upgrade slots (30 bits).
-    if kind(&entity.id) == Some(Kind::TurbineValve) {
-        let max = turbine_of(&entity.nbt).max_flow() as u64;
+    // The turbine's max flow rate and the boiler's max boil rate, in the two upgrade slots (30 bits).
+    if matches!(kind(&entity.id), Some(Kind::TurbineValve | Kind::BoilerValve)) {
+        let max = if kind(&entity.id) == Some(Kind::BoilerValve) {
+            let b = boiler_of(&entity.nbt);
+            b.max_boil(get_double(&entity.nbt, "heat").unwrap_or(b.heat_capacity() * boiler::BOIL_TEMP))
+        } else {
+            turbine_of(&entity.nbt).max_flow() as u64
+        };
         entity.data[DATA_SPEED] = (max & 0x7FFF) as i32;
         entity.data[DATA_ENERGY_UPGRADES] = ((max >> 15) & 0x7FFF) as i32;
     }
@@ -6696,6 +6701,17 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
 /// A press on a reactor's button (hook point `native_screen_click`, API 20).
 pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
     if kind(block) == Some(Kind::FusionPort) && fusion_click(game, block, at, right) {
+        return;
+    }
+    if kind(block) == Some(Kind::BoilerValve) && !right && inside(at, STATS_TAB_BUTTON) {
+        if boiler_stats_open(block) {
+            STATS_VIEW.set(None);
+        } else if let Some((x, y, z)) = game.container {
+            STATS_VIEW.set(Some(([x, y, z], game.ticks as u64)));
+        }
+        return;
+    }
+    if boiler_stats_open(block) {
         return;
     }
     if kind(block) == Some(Kind::FissionPort) {
@@ -6825,7 +6841,7 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
     screen_base(block, screen);
     // The QIO blocks swap to the selector's layout while their tab's screen is open: 176 x 155, none
     // of the inventory (it is moved out of the way).
-    if matches!(kind(block), Some(Kind::FissionPort | Kind::FusionPort)) && let Some(s) = screen.as_mut() {
+    if matches!(kind(block), Some(Kind::FissionPort | Kind::FusionPort | Kind::BoilerValve)) && let Some(s) = screen.as_mut() {
         // `GuiFissionReactorStats` (the default 176 x 166), `GuiFusionReactorInfo` (186 wide): no inventory.
         s.alt = Some(Box::new(super::native_hooks::NativeScreen {
             width: if kind(block) == Some(Kind::FusionPort) { 186.0 } else { 176.0 },
@@ -7385,6 +7401,103 @@ fn fusion_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<Strin
     }
 }
 
+/// The max rate the master wrote into the two upgrade slots (30 bits).
+fn wide_max(data: &[i32]) -> u64 {
+    (data.get(DATA_SPEED).copied().unwrap_or(0) as u64 & 0x7FFF) | (data.get(DATA_ENERGY_UPGRADES).copied().unwrap_or(0) as u64 & 0x7FFF) << 15
+}
+
+/// `TextUtils.format`: digits in groups of three.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+thread_local! {
+    /// `GuiLongGraph`s of the boiler's statistics: the tick sampled, the boil rates, the max boil rates and the
+    /// first graph's scale (it only grows, from 10).
+    static BOILER_GRAPH: std::cell::RefCell<(u64, Vec<u64>, Vec<u64>, u64)> = const { std::cell::RefCell::new((0, Vec::new(), Vec::new(), 10)) };
+}
+
+const BOILER_GRAPHS: [[f32; 4]; 2] = [[7.0, 82.0, 162.0, 38.0], [7.0, 121.0, 162.0, 38.0]];
+
+fn boiler_stats_open(block: &str) -> bool {
+    kind(block) == Some(Kind::BoilerValve) && STATS_VIEW.get().is_some()
+}
+
+/// A `GuiGraph`: the screen, then a column per sample (the graphed value, its integral, the hovered column).
+fn draw_long_graph(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2], rect: [f32; 4], samples: &[u64], scale: u64, mouse: [f32; 2]) {
+    let [ox, oy] = origin;
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + rect[0], oy + rect[1], rect[2], rect[3]], 0xFFFF_FFFF);
+    let height = rect[3] - 2.0;
+    let hover = (mouse[0] - rect[0]).floor();
+    for (i, &v) in samples.iter().enumerate() {
+        let h = (v.min(scale) as f64 * f64::from(height) / scale as f64) as f32;
+        let h = h.floor();
+        let (x, y) = (ox + rect[0] + 1.0 + i as f32, oy + rect[1] + 1.0 + height - h);
+        game.native_fill(batch, [x, y, 1.0, 1.0], 0xFF28_FF74);
+        let alpha = ((0.2 + 0.8 * i as f32 / samples.len() as f32) * 255.0).round() as u32;
+        game.native_fill(batch, [x, y, 1.0, h], alpha << 24 | 0x24AF5A);
+        if hover == i as f32 && mouse[1] >= rect[1] && mouse[1] < rect[1] + height {
+            game.native_fill(batch, [x, oy + rect[1] + 1.0, 1.0, height], 0x806D_B8FB);
+            game.native_fill(batch, [x, y, 1.0, 1.0], 0xFFAD_DCFF);
+        }
+    }
+}
+
+/// `GuiBoilerStats`.
+fn draw_boiler_stats(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 176.0, 166.0]);
+    centred(game, batch, "Boiler Statistics", ox, 176.0, oy + 4.0, 0x40_4040);
+    draw_stats_tab(game, batch, origin, "transmission/chemicals");
+    sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
+    let (_, water_cap, _) = fusion_gauge(data, 1);
+    let (_, steam_cap, _) = fusion_gauge(data, 2);
+    let elements = data.get(2).copied().unwrap_or(0).max(0) as u64;
+    let capacity = elements * 16_000_000 / 10;
+    let text = |t: &str, x: f32, y: f32, rgb: u32| game.native_text(batch, t, [ox + x, oy + y], rgb, false);
+    text(&format!("Max Water: {} mB", thousands(water_cap)), 8.0, 26.0, 0x40_4040);
+    text(&format!("Max Steam: {} mB", thousands(steam_cap)), 8.0, 35.0, 0x40_4040);
+    text("Heat Transfer", 8.0, 49.0, 0x20_2020);
+    text(&format!("Superheaters: {elements}"), 14.0, 58.0, 0x40_4040);
+    text(&format!("Boil Capacity: {} mB/t", thousands(capacity)), 8.0, 72.0, 0x40_4040);
+    BOILER_GRAPH.with_borrow_mut(|(last, rates, maxes, scale)| {
+        if *last != game.ticks as u64 {
+            *last = game.ticks as u64;
+            for (v, value) in [(&mut *rates, read_wide(data, DATA_USAGE)), (&mut *maxes, wide_max(data))] {
+                if v.len() >= 160 {
+                    v.remove(0);
+                }
+                v.push(value);
+            }
+            *scale = rates.iter().copied().fold(*scale, u64::max);
+        }
+        draw_long_graph(game, batch, origin, BOILER_GRAPHS[0], rates, *scale, mouse);
+        draw_long_graph(game, batch, origin, BOILER_GRAPHS[1], maxes, capacity.max(1), mouse);
+    });
+}
+
+/// The graphs' tooltip for the hovered column.
+fn boiler_graph_tooltip(at: [f32; 2], lines: &mut Vec<String>) {
+    BOILER_GRAPH.with_borrow(|(_, rates, maxes, _)| {
+        for (rect, samples, label) in [(BOILER_GRAPHS[0], rates, "Boil Rate"), (BOILER_GRAPHS[1], maxes, "Max Boil")] {
+            let index = (at[0] - rect[0]).floor();
+            if inside(at, rect) && index >= 0.0 && let Some(v) = samples.get(index as usize) {
+                lines.push(format!("{label}: {} mB/t", thousands(*v)));
+            }
+        }
+    });
+}
+
 /// The fission rate limit packet: the port's position and the limit as a big-endian f64.
 const FISSION_CHANNEL: &str = "mekanism:fission_limit";
 /// The tab (`GuiTabElementType`: at -26, 6) and its button.
@@ -7666,6 +7779,10 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
         draw_fusion_view(game, batch, data, origin, view);
         return;
     }
+    if boiler_stats_open(block) {
+        draw_boiler_stats(game, batch, data, origin);
+        return;
+    }
     if qio_select_open(block) {
         draw_qio_select(game, batch, block, origin);
         return;
@@ -7849,9 +7966,10 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         }
     }
     if kind(block) == Some(Kind::BoilerValve) && get(0) > 0.0 {
+        draw_stats_tab(game, batch, origin, "button/stats");
         // The two `GuiVerticalRateBar`s: the boil rate over the max, and the max over what the elements carry.
         let boil = read_wide(data, DATA_USAGE) as f64;
-        let max = f64::from(get(3));
+        let max = ((data.get(DATA_SPEED).copied().unwrap_or(0) as u64 & 0x7FFF) | (data.get(DATA_ENERGY_UPGRADES).copied().unwrap_or(0) as u64 & 0x7FFF) << 15) as f64;
         let elements = get(2) as u64;
         let level2 = if elements == 0 { 0.0 } else { max * 10.0 / (elements as f64 * 16_000_000.0) };
         for (bx, level) in [(44.0, if max > 0.0 { boil / max } else { 0.0 }), (166.0, level2)] {
@@ -7921,6 +8039,16 @@ pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f3
     }
     if kind(block) == Some(Kind::FusionPort) && fusion_tooltip(block, data, at, lines) {
         return;
+    }
+    if kind(block) == Some(Kind::BoilerValve) {
+        if inside(at, STATS_TAB_BUTTON) {
+            lines.push(if boiler_stats_open(block) { "Main" } else { "Boiler Statistics" }.to_owned());
+            return;
+        }
+        if boiler_stats_open(block) {
+            boiler_graph_tooltip(at, lines);
+            return;
+        }
     }
     if kind(block) == Some(Kind::FissionPort) {
         if inside(at, STATS_TAB_BUTTON) {
@@ -7999,7 +8127,7 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
             return;
         }
         if inside(at, [166.0, 13.0, 6.0, 58.0]) {
-            lines.push(format!("Max Boil: {} mB/t", data.get(3).copied().unwrap_or(0).max(0)));
+            lines.push(format!("Max Boil: {} mB/t", wide_max(data)));
             return;
         }
     }
@@ -10444,7 +10572,7 @@ pub(super) fn screen_alt(game: &Game<'_>, block: &str, alt: &mut bool) {
         }
         return;
     }
-    if kind(block) == Some(Kind::FissionPort) {
+    if matches!(kind(block), Some(Kind::FissionPort | Kind::BoilerValve)) {
         if let Some((pos, seen)) = STATS_VIEW.get() {
             let here = game.container.map(|(x, y, z)| [x, y, z]);
             if here != Some(pos) || now.saturating_sub(seen) > 10 {
