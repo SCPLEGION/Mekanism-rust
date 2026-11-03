@@ -7,6 +7,7 @@ use super::Game;
 use horizon_client::containers::{ModBlockEntity, ModContainer};
 use horizon_client::items::ItemStack;
 use horizon_world::nbt::{Compound, JavaString, Tag};
+use mekanism_core::bounding;
 use mekanism_core::chemical::{self as chem, ChemicalTank};
 use mekanism_core::energy::{Action, EnergyContainer};
 use mekanism_core::evaporation as evap;
@@ -4003,6 +4004,69 @@ fn item_tank(stack: &ItemStack, key: &str, capacity: u64) -> Option<ChemicalTank
     c.insert("t".into(), custom_data(stack)?.get(&JavaString::from(key))?.clone());
     let tank = get_tank(&c, "t", capacity);
     (tank.amount > 0).then_some(tank)
+}
+
+/// Blocks a machine's other cells may replace.
+fn cell_is_free(block: &str) -> bool {
+    matches!(
+        block,
+        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" | "minecraft:water" | "minecraft:short_grass"
+            | "minecraft:tall_grass" | "minecraft:snow" | "minecraft:fern" | "minecraft:dead_bush"
+    )
+}
+
+/// The facing a machine (or its bounding block) was placed with.
+fn machine_facing(game: &Game<'_>, pos: [i32; 3]) -> String {
+    game.native_block_property(pos, "facing").unwrap_or_else(|| "north".into())
+}
+
+/// A multi-block machine just placed at `pos` fills its other cells with bounding blocks
+/// (`AttributeHasBounding.placeBoundingBlocks`). When one of them is taken the machine does not stay:
+/// it goes back to the player's hands.
+pub(super) fn place_bounding_blocks(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    let id = game.native_block(pos);
+    if bounding::cells(&id).is_none() {
+        return;
+    }
+    let cells = bounding::fill(&id, &machine_facing(game, pos), pos);
+    if cells.iter().any(|(at, _)| !cell_is_free(&game.native_block(*at))) {
+        game.native_set_block(pos, "minecraft:air", &[]);
+        game.native_give_items(&stack.item, 1);
+        return;
+    }
+    let facing = machine_facing(game, pos);
+    for (at, bounding_id) in cells {
+        game.native_set_block(at, &bounding_id, &[("facing", &facing)]);
+    }
+}
+
+/// A machine broken at `pos` takes its bounding blocks with it (`removeBoundingBlocks`).
+pub(super) fn clear_bounding_blocks(game: &mut Game<'_>, pos: [i32; 3]) {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    let id = game.native_block(pos);
+    if bounding::cells(&id).is_none() {
+        return;
+    }
+    for (at, bounding_id) in bounding::fill(&id, &machine_facing(game, pos), pos) {
+        if game.native_block(at) == bounding_id {
+            game.native_set_block(at, "minecraft:air", &[]);
+        }
+    }
+}
+
+/// Where the machine that owns the bounding block at `pos` stands, if `pos` is one and its machine is still there.
+pub(super) fn bounding_owner(game: &Game<'_>, pos: [i32; 3]) -> Option<[i32; 3]> {
+    if !game.native_on(MOD_ID) {
+        return None;
+    }
+    let id = game.native_block(pos);
+    let (main, machine) = bounding::main_of(&id, &machine_facing(game, pos), pos)?;
+    (game.native_block(main) == machine).then_some(main)
 }
 
 /// A placed energy cube or tank takes what its item held.
