@@ -210,6 +210,11 @@ def mekasuit_points(point, pivot):
     return [-x - pivot[0] / 16, 1.5 - y - pivot[1] / 16, z - pivot[2] / 16]
 
 
+# The piece whose presence hides a piece's exclusive parts (`MekaSuitArmor(type, adjacentType)`).
+ADJACENT = {"mekasuit_helmet": "mekasuit_bodyarmor", "mekasuit_bodyarmor": "mekasuit_helmet",
+            "mekasuit_pants": "mekasuit_boots", "mekasuit_boots": "mekasuit_pants"}
+
+
 def build_mekasuit(ns, item, assets, out, textures_dirs, report):
     """Write the worn model and equipment asset of one MekaSuit piece; exclusive (`excl_`) parts, which show only
     while the neighbouring piece is not worn, are left out; shared parts are drawn by every piece that owns them."""
@@ -223,7 +228,8 @@ def build_mekasuit(ns, item, assets, out, textures_dirs, report):
     per_texture = {}
     for obj in objs:
         name = obj["name"]
-        if name.startswith("excl_") or keyword not in name:
+        exclusive = name.startswith("excl_")
+        if keyword not in name:
             continue
         bone = next((b for key, b, _ in BONES if key in name), None)
         pivot = next((p for key, _, p in BONES if key in name), None)
@@ -238,13 +244,15 @@ def build_mekasuit(ns, item, assets, out, textures_dirs, report):
             pts = [mekasuit_points(p, pivot) for p, _ in quad]
             uvs = [[uv[0], 1 - uv[1]] for _, uv in quad]
             poly, normal = polygon(pts, uvs)
-            per_texture.setdefault(texture, {}).setdefault(bone, []).append((poly, normal))
-    return write_layers(ns, item, per_texture, out, textures_dirs, report)
+            per_texture.setdefault((texture, exclusive), {}).setdefault(bone, []).append((poly, normal))
+    hide = {True: [f"{ns}:{ADJACENT[item]}"], False: []}
+    return write_layers(ns, item, per_texture, out, textures_dirs, report, hide)
 
 
-def write_layers(ns, item, per_texture, out, textures_dirs, report):
+def write_layers(ns, item, per_texture, out, textures_dirs, report, hide=None):
     layers = []
-    for n, (texture, bones) in enumerate(sorted(per_texture.items())):
+    for n, (key, bones) in enumerate(sorted(per_texture.items())):
+        texture, exclusive = key
         tns, _, tpath = texture.partition(":")
         name = f"{item}_{n}"
         children = {bone: {"pose": [0, 0, 0, 0, 0, 0, 1, 1, 1], "polygons": [p for p, _ in quads],
@@ -260,7 +268,10 @@ def write_layers(ns, item, per_texture, out, textures_dirs, report):
         sprite = out / "assets" / ns / "textures/entity/equipment/horizon_models" / f"{name}.png"
         sprite.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, sprite)
-        layers.append({"model": f"{ns}:{name}", "texture": f"{ns}:{name}"})
+        layer = {"model": f"{ns}:{name}", "texture": f"{ns}:{name}"}
+        if exclusive and hide:
+            layer["hide_with"] = hide[True]
+        layers.append(layer)
     if not layers:
         return False
     target = out / "assets" / ns / "equipment" / f"{item}.json"
