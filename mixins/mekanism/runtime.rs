@@ -5160,6 +5160,24 @@ fn centred(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, text: &st
 /// type tabs, the close button, the title, the eject screen and button, the face buttons with the
 /// block beside each face, the clear button and the "Slots" label.
 pub(super) fn screen_overlay(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let Some(id) = open_window_id(block) else {
+        return;
+    };
+    follow_drag(game, id, origin);
+    let off = window_offset(id);
+    let moved = [origin[0] + off[0], origin[1] + off[1]];
+    draw_window(game, block, data, batch, moved);
+    if let Some(r) = pin_button(id) {
+        let [x, y, w, h] = [moved[0] + r[0], moved[1] + r[1], r[2], r[3]];
+        let cursor = game.native_cursor();
+        let over = inside([cursor[0] - moved[0], cursor[1] - moved[1]], r);
+        let name = if window_pinned(id) { "button/pinned" } else { "button/unpinned" };
+        let tint = if over { 0xFFFF_FFFF } else { 0xFFE0_E0E0 };
+        game.native_sprite_tinted(batch, &format!("{SPRITES}{name}"), [0.0, 0.0, 24.0, 12.0], [x, y, w, h], tint);
+    }
+}
+
+fn draw_window(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
     if is_sorter(block) {
         return draw_filter_window(game, batch, origin);
     }
@@ -5247,14 +5265,16 @@ pub(super) fn creative_tabs(tabs: &mut Vec<crate::game::native_hooks::NativeCrea
 /// What Mekanism's own parts cover on a screen (hook point `native_screen_covers`, API 32): its tabs
 /// beside the panel, and the open window with its type tabs.
 pub(super) fn screen_covers(block: &str, at: [f32; 2], covered: &mut bool) {
+    let wat = window_at(block, at);
     if is_sorter(block) {
-        *covered |= filter_covers(at);
+        *covered |= filter_covers(wat);
         return;
     }
     let Some(l) = layout(block) else {
         return;
     };
     let tab = screen_tabs(block, &l, &[]).iter().any(|t| inside(at, [t.at[0], t.at[1], 26.0, 26.0]));
+    let at = wat;
     let open = match window(block) {
         Some(Window::Sides(shown)) => inside(at, SIDE_WINDOW) || window_type_tabs(block, shown).iter().any(|(_, r)| inside(at, *r)),
         Some(Window::Upgrades(_)) => inside(at, UPGRADE_WINDOW),
@@ -5262,6 +5282,144 @@ pub(super) fn screen_covers(block: &str, at: [f32; 2], covered: &mut bool) {
         None => false,
     };
     *covered |= tab || open;
+}
+
+
+// --- Window dragging and pinning (GuiWindow) ---------------------------------------------------------------
+
+/// The windows that move: the three of a machine's screen and the sorter's two.
+const WINDOW_SIDES: usize = 0;
+const WINDOW_UPGRADES: usize = 1;
+const WINDOW_TRANSPORTER: usize = 2;
+const WINDOW_FILTER: usize = 3;
+const WINDOW_SELECT: usize = 4;
+
+/// Where each window has been moved to (kept per type, as `SelectedWindowData.updateLastPosition`
+/// does), which are pinned, and the window being dragged with where the cursor took hold.
+#[derive(Default)]
+struct WindowMoves {
+    offsets: [[f32; 2]; 5],
+    pinned: [bool; 5],
+    drag: Option<(usize, [f32; 2])>,
+}
+
+thread_local! {
+    static MOVES: std::cell::RefCell<WindowMoves> = std::cell::RefCell::new(WindowMoves::default());
+}
+
+/// The window open on `block`'s screen, as an index into `WindowMoves`.
+fn open_window_id(block: &str) -> Option<usize> {
+    if is_sorter(block) {
+        return if FILTER_SELECT.get().is_some() {
+            Some(WINDOW_SELECT)
+        } else if FILTER_EDIT.with_borrow(|e| e.is_some()) {
+            Some(WINDOW_FILTER)
+        } else {
+            None
+        };
+    }
+    Some(match window(block)? {
+        Window::Sides(_) => WINDOW_SIDES,
+        Window::Upgrades(_) => WINDOW_UPGRADES,
+        Window::Transporter => WINDOW_TRANSPORTER,
+    })
+}
+
+/// A window's rectangle where it opens.
+fn window_home(id: usize) -> [f32; 4] {
+    [SIDE_WINDOW, UPGRADE_WINDOW, TRANSPORTER_WINDOW, FILTER_WINDOW, SELECT_WINDOW][id]
+}
+
+/// The pin button (`GuiPinButton`: 16 by 8, 16 in and 6 down) of the windows that can be pinned
+/// (`WindowType.canPin`: side configuration, transporter configuration, upgrades).
+fn pin_button(id: usize) -> Option<[f32; 4]> {
+    (id <= WINDOW_TRANSPORTER).then(|| {
+        let [x, y, ..] = window_home(id);
+        [x + 16.0, y + 6.0, 16.0, 8.0]
+    })
+}
+
+fn window_offset(id: usize) -> [f32; 2] {
+    MOVES.with_borrow(|m| m.offsets[id])
+}
+
+fn window_pinned(id: usize) -> bool {
+    MOVES.with_borrow(|m| m.pinned[id])
+}
+
+/// `at` in the open window's own frame: the screen's, less how far the window was moved.
+fn window_at(block: &str, at: [f32; 2]) -> [f32; 2] {
+    match open_window_id(block) {
+        Some(id) => {
+            let [dx, dy] = window_offset(id);
+            [at[0] - dx, at[1] - dy]
+        }
+        None => at,
+    }
+}
+
+/// Runs a press handler of the open window on `at` in the window's frame.
+fn windowed(block: &str, at: [f32; 2], handler: impl FnOnce([f32; 2]) -> bool) -> bool {
+    let Some(id) = open_window_id(block) else {
+        return handler(at);
+    };
+    let wat = window_at(block, at);
+    let [x, y, w, _] = window_home(id);
+    // `GuiWindow.mouseClicked`: a press in the top 18 px picks the window up (the buttons there act first).
+    let grip = inside(wat, [x, y, w, 18.0]) && !pin_button(id).is_some_and(|r| inside(wat, r));
+    let handled = handler(wat);
+    if handled && grip && open_window_id(block) == Some(id) && !window_close_hit(id, wat) {
+        MOVES.with_borrow_mut(|m| m.drag = Some((id, [at[0] - m.offsets[id][0], at[1] - m.offsets[id][1]])));
+    }
+    handled
+}
+
+/// Whether a press at `wat` is on the close button, which gives no grip.
+fn window_close_hit(id: usize, wat: [f32; 2]) -> bool {
+    let [x, y, ..] = window_home(id);
+    inside(wat, [x + WINDOW_CLOSE[0], y + WINDOW_CLOSE[1], WINDOW_CLOSE[2], WINDOW_CLOSE[3]])
+}
+
+/// The window follows the cursor while the left button stays down (`GuiWindow.onDrag`), and stays
+/// inside the screen's top left.
+fn follow_drag(game: &Game<'_>, id: usize, origin: [f32; 2]) {
+    MOVES.with_borrow_mut(|m| {
+        let Some((dragged, grab)) = m.drag else {
+            return;
+        };
+        if dragged != id || !game.native_mouse_down() {
+            m.drag = None;
+            return;
+        }
+        let cursor = game.native_cursor();
+        let home = window_home(id);
+        let off = [(cursor[0] - grab[0]).max(-(origin[0] + home[0])), (cursor[1] - grab[1]).max(-(origin[1] + home[1]))];
+        m.offsets[id] = off;
+    });
+}
+
+/// A press in the window's pin button (true when it was): toggles it. Handled apart from the
+/// window's own buttons since it is not one of theirs.
+fn pin_click(block: &str, at: [f32; 2]) -> bool {
+    let Some(id) = open_window_id(block) else {
+        return false;
+    };
+    let Some(r) = pin_button(id) else {
+        return false;
+    };
+    if !inside(window_at(block, at), r) {
+        return false;
+    }
+    MOVES.with_borrow_mut(|m| m.pinned[id] = !m.pinned[id]);
+    true
+}
+
+/// A press on a machine's window, with the pin button and the drag grip.
+fn windowed_click(block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) -> bool {
+    if pin_click(block, at) {
+        return true;
+    }
+    windowed(block, at, |wat| window_click(block, data, wat, right, button))
 }
 
 /// A press on the open window: true when it was on the window (`button` set for the server's part).
@@ -5819,7 +5977,7 @@ pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32;
         return;
     }
     if is_sorter(block) {
-        sorter_click(game, at, right);
+        sorter_click(game, block, at, right);
         return;
     }
     if is_qio_screen(block) {
@@ -5830,7 +5988,7 @@ pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32;
         adapter_click(game, at);
         return;
     }
-    if window_click(block, data, at, right, button) {
+    if windowed_click(block, data, at, right, button) {
         return;
     }
     if let Some(i) = buttons(block).iter().position(|(r, _)| inside(at, *r)) {
@@ -6220,7 +6378,7 @@ pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f3
         return;
     }
     if is_sorter(block) {
-        if !filter_window_tooltip(game, at, lines) {
+        if !filter_window_tooltip(game, window_at(block, at), lines) {
             sorter_tooltip(game, at, lines);
         }
         return;
@@ -6240,7 +6398,7 @@ pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f3
     let Some(l) = layout(block) else {
         return;
     };
-    if window_tooltip(block, data, at, lines) || tab_tooltip(block, &l, data, at, lines) {
+    if window_tooltip(block, data, window_at(block, at), lines) || tab_tooltip(block, &l, data, at, lines) {
         return;
     }
     let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0);
@@ -9368,12 +9526,12 @@ fn filter_name(f: &str) -> String {
 /// A press on the sorter's screen: its three switches, a filter's arrows (shift: to the end), radio
 /// and body (right click deletes it), the New Filter button (right click: for the held item's tag),
 /// and the scroll bar.
-fn sorter_click(game: &Game<'_>, at: [f32; 2], right: bool) -> bool {
+fn sorter_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool) -> bool {
     let Some((pos, view)) = sorter_view(game) else {
         return false;
     };
     let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);
-    if filter_window_click(game, pos, &view, at, right) {
+    if windowed(block, at, |wat| filter_window_click(game, pos, &view, wat, right)) {
         return true;
     }
     use sorter::Op;
