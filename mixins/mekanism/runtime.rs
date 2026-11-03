@@ -8003,7 +8003,7 @@ fn draw_window(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_c
         draw_button(game, batch, [tx + 5.0, ty + 4.0, 18.0, 18.0], hovered, true, 0xFFFF_FFFF, Some((icon, 18.0)));
     }
     let hover = |r: [f32; 4]| inside(at, in_window(r));
-    draw_button(game, batch, screen(WINDOW_CLOSE), hover(WINDOW_CLOSE), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+    sprite(game, batch, "button/close", [0.0, 0.0, 12.0, 12.0], screen(WINDOW_CLOSE));
     centred(game, batch, &format!("{} Config", transmission_look(t).0), x, w, y + 5.0, 0x40_4040);
     let (packed, no_eject) = window_sides(&l, data, t);
     let ejects = can_eject(block, t);
@@ -8381,7 +8381,8 @@ fn follow_drag(game: &Game<'_>, id: usize, origin: [f32; 2]) {
         }
         let cursor = game.native_cursor();
         let home = window_home(id);
-        let off = [(cursor[0] - grab[0]).max(-(origin[0] + home[0])), (cursor[1] - grab[1]).max(-(origin[1] + home[1]))];
+        // `grab` is in the screen's frame (relative to `origin`), the cursor in the window's: take the origin off.
+        let off = [(cursor[0] - origin[0] - grab[0]).max(-(origin[0] + home[0])), (cursor[1] - origin[1] - grab[1]).max(-(origin[1] + home[1]))];
         m.offsets[id] = off;
     });
 }
@@ -8645,7 +8646,7 @@ fn draw_upgrade_window(game: &Game<'_>, block: &str, data: &[i32], batch: &mut h
     let [x, y, w, h] = screen([0.0, 0.0, UPGRADE_WINDOW[2], UPGRADE_WINDOW[3]]);
     nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
     nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
-    draw_button(game, batch, screen(WINDOW_CLOSE), hover(WINDOW_CLOSE), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+    sprite(game, batch, "button/close", [0.0, 0.0, 12.0, 12.0], screen(WINDOW_CLOSE));
     centred(game, batch, "Upgrades", x, w, y + 5.0, 0x40_4040);
     // The list (`GuiUpgradeScrollList`): its holder, its scroll bar, a row a type.
     let list = screen(UPGRADE_LIST);
@@ -8704,7 +8705,7 @@ fn draw_upgrade_window(game: &Game<'_>, block: &str, data: &[i32], batch: &mut h
         (true, true) => "button_digital_focus",
         (true, false) => "button_digital",
     };
-    nine_slice_tinted(game, batch, base, [200.0, 20.0], 2.0, r, 0xFFFF_FFFF);
+    nine_slice_tinted(game, batch, base, [3.0, 3.0], 1.0, r, 0xFFFF_FFFF);
     centred(game, batch, "Uninstall", r[0], r[2], r[1] + 2.0, if active { 0x3C_FE9A } else { 0x78_7878 });
     let [px, py, ..] = screen([176.0, 37.0, 0.0, 0.0]);
     sprite(game, batch, "progress/installing/empty", [0.0, 0.0, 10.0, 14.0], [px, py, 10.0, 14.0]);
@@ -15255,7 +15256,7 @@ fn draw_filter_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
         let [x, y, w, h] = sc([0.0, 0.0, select_window()[2], select_window()[3]]);
         nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
         nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
-        draw_button(game, batch, sc(FILTER_CLOSE), inside(at, select_rect(FILTER_CLOSE)), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+        sprite(game, batch, "button/close", [0.0, 0.0, 12.0, 12.0], sc(FILTER_CLOSE));
         centred(game, batch, "Create Filter", x, w, y + 6.0, 0x40_4040);
         nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, sc([11.0, 18.0, 130.0, 62.0]), 0xFFFF_FFFF);
         for (k, label) in SELECT_NAMES.iter().enumerate() {
@@ -15282,7 +15283,7 @@ fn draw_filter_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
         let [x, y, w, h] = screen([0.0, 0.0, filter_window()[2], filter_window()[3]]);
         nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
         nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
-        draw_button(game, batch, screen(FILTER_CLOSE), hover(FILTER_CLOSE), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+        sprite(game, batch, "button/close", [0.0, 0.0, 12.0, 12.0], screen(FILTER_CLOSE));
         let what = SELECT_NAMES[usize::from(e.kind.min(2))];
         let title = if e.index.is_none() { format!("New {what}") } else { what.to_owned() };
         centred(game, batch, &title, x, w, y + 5.0, 0x40_4040);
@@ -15819,7 +15820,7 @@ fn draw_miner_windows(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
             let [x, y, w, h] = sc([0.0, 0.0, SELECT_WINDOW[2], SELECT_WINDOW[3]]);
             nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
             nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
-            draw_button(game, batch, sc(FILTER_CLOSE), inside(at, select_rect(FILTER_CLOSE)), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+            sprite(game, batch, "button/close", [0.0, 0.0, 12.0, 12.0], sc(FILTER_CLOSE));
             centred(game, batch, "Create New Filter", x, w, y + 6.0, 0x40_4040);
             nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, sc([11.0, 18.0, 130.0, 62.0]), 0xFFFF_FFFF);
             for (k, label) in ["ItemStack", "Tag", "Mod ID"].iter().enumerate() {
@@ -15846,7 +15847,7 @@ fn draw_miner_windows(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
         if new {
             draw_button(game, batch, win(MCFG_BACK_WIN), hover(MCFG_BACK_WIN), true, 0xFFFF_FFFF, Some(("button/back", 14.0)));
         } else {
-            draw_button(game, batch, win(FILTER_CLOSE), hover(FILTER_CLOSE), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+            sprite(game, batch, "button/close", [0.0, 0.0, 12.0, 12.0], win(FILTER_CLOSE));
         }
         let title = if new { format!("New: {what}") } else { format!("Edit: {what}") };
         let pad = if new { 3.0 } else { 0.0 };
@@ -16195,7 +16196,7 @@ fn draw_transporter_window(game: &Game<'_>, block: &str, data: &[i32], batch: &m
     let [x, y, w, h] = screen([0.0, 0.0, TRANSPORTER_WINDOW[2], TRANSPORTER_WINDOW[3]]);
     nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
     nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
-    draw_button(game, batch, screen(WINDOW_CLOSE), hover(WINDOW_CLOSE), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+    sprite(game, batch, "button/close", [0.0, 0.0, 12.0, 12.0], screen(WINDOW_CLOSE));
     let (out, ins, strict) = ejector_of(data, &l);
     // The title leaves room for the strict input button (`getTitlePadEnd`).
     centred(game, batch, "Transporter Config", x, w - 18.0, y + 5.0, 0x40_4040);
@@ -17133,7 +17134,7 @@ fn draw_od_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, or
         let [x, y, w, h] = screen([0.0, 0.0, OD_WINDOW[2], OD_WINDOW[3]]);
         nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
         nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
-        draw_button(game, batch, screen([6.0, 6.0, 8.0, 8.0]), hover([6.0, 6.0, 8.0, 8.0]), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+        sprite(game, batch, "button/close", [0.0, 0.0, 12.0, 12.0], screen([6.0, 6.0, 8.0, 8.0]));
         let title = format!("{}: Oredictionificator Filter", if e.index.is_none() { "New" } else { "Edit" });
         centred(game, batch, &title, x, w, y + 6.0, 0x40_4040);
         sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [x + 7.0, y + 18.0, 18.0, 18.0]);
