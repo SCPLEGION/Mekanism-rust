@@ -3662,11 +3662,24 @@ fn charge_slot(entity: &mut ModBlockEntity, index: usize, source: &mut EnergyCon
     }
 }
 
-/// `EnergyInventorySlot.discharge`: empties the item in slot `index` into `target`.
+/// The energy conversion recipes (`EnergyConversionRecipeProvider`): an item and the energy one of it makes.
+const REDSTONE_ENERGY: [(&str, u64); 2] = [("minecraft:redstone", 10_000), ("minecraft:redstone_block", 90_000)];
+
+/// `EnergyInventorySlot.fillContainerOrConvert`: empties the item in slot `index` into `target`, or, for an item
+/// that is no battery, turns one of it into energy when all of that fits.
 fn discharge_slot(entity: &mut ModBlockEntity, index: usize, target: &mut EnergyContainer) {
     if let Some((item, stored)) = energy_item(entity, index) {
         let after = gear::discharge(item, stored, target);
         put_item_energy(entity, index, stored, after);
+    } else if let Some(Some(stack)) = entity.items.get_mut(index)
+        && let Some(&(_, energy)) = REDSTONE_ENERGY.iter().find(|(id, _)| *stack.item == **id)
+        && target.stored + energy <= target.capacity
+    {
+        target.insert(energy, Action::Execute);
+        stack.count -= 1;
+        if stack.count == 0 {
+            entity.items[index] = None;
+        }
     }
 }
 
@@ -6239,19 +6252,27 @@ fn chemical_layout_slots(block: &str) -> &'static [usize] {
 pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu::SlotRule>) {
     use horizon_client::lan::menu::SlotRule;
     let energy = || SlotRule::Items(gear::energy_item_ids());
+    let convert = || {
+        let mut ids = gear::energy_item_ids();
+        ids.extend(REDSTONE_ENERGY.iter().map(|(id, _)| (*id).to_owned()));
+        SlotRule::Items(ids)
+    };
     if let Some(Kind::Factory(n, ..)) = kind(block) {
         *rules = vec![SlotRule::Any; FACTORY_ENERGY + 1];
         for i in 0..factory_slots(n).len() {
             rules[FACTORY_ROW + i] = SlotRule::Refuse;
         }
-        rules[FACTORY_ENERGY] = energy();
+        rules[FACTORY_ENERGY] = convert();
     } else if kind(block) == Some(Kind::Teleporter) {
-        *rules = vec![energy(), SlotRule::Any, SlotRule::Any];
+        *rules = vec![convert(), SlotRule::Any, SlotRule::Any];
     } else if let Some(l) = layout(block) {
         *rules = l
             .slots
             .iter()
-            .map(|s| match s.map(|(_, sprite)| sprite) {
+            .enumerate()
+            .map(|(i, s)| match s.map(|(_, sprite)| sprite) {
+                // `EnergyInventorySlot.fillOrConvert`: a consumer's slot also takes redstone, which it turns into energy.
+                Some("slot/power") if !matches!(kind(block), Some(Kind::HeatGenerator | Kind::BioGenerator | Kind::GasGenerator)) && !(matches!(kind(block), Some(Kind::EnergyCube(_))) && i == 0) => convert(),
                 Some("slot/power") => energy(),
                 Some(sprite) if sprite.starts_with("slot/output") => SlotRule::Refuse,
                 _ => SlotRule::Any,
