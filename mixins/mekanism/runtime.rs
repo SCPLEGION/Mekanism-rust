@@ -5804,21 +5804,28 @@ fn is_jetpack(stack: &ItemStack) -> bool {
     JETPACKS.contains(&&*stack.item) || (&*stack.item == modules::BODYARMOR && modules_of(stack).contains_key("mekanism:jetpack_unit"))
 }
 
+/// The chemical an item with a chemical tank holds: a scuba tank oxygen, a jetpack or flamethrower hydrogen.
+fn item_chemical(stack: &ItemStack) -> &'static str {
+    if &*stack.item == SCUBA_TANK { "mekanism:oxygen" } else { "mekanism:hydrogen" }
+}
+
 fn jetpack_capacity(stack: &ItemStack) -> u64 {
-    if &*stack.item == flamethrower::ITEM {
+    if &*stack.item == SCUBA_TANK {
+        SCUBA_CAPACITY
+    } else if &*stack.item == flamethrower::ITEM {
         flamethrower::CAPACITY
     } else if &*stack.item == modules::BODYARMOR { modules::SUIT_JETPACK_CAPACITY } else { gear::JETPACK_CAPACITY }
 }
 
 fn jetpack_fuel(stack: &ItemStack) -> u64 {
     item_tank(stack, CHEMICAL_KEY, jetpack_capacity(stack))
-        .filter(|t| t.chemical.as_deref() == Some("mekanism:hydrogen"))
+        .filter(|t| t.chemical.as_deref() == Some(item_chemical(stack)))
         .map_or(0, |t| t.amount)
 }
 
 fn set_jetpack_fuel(stack: &mut ItemStack, amount: u64) {
     let mut tank = ChemicalTank::new(jetpack_capacity(stack));
-    tank.insert("mekanism:hydrogen", amount);
+    tank.insert(item_chemical(stack), amount);
     let mut c = Compound::new();
     put_tank(&mut c, "t", &tank);
     let value = match c.get(&JavaString::from("t")) {
@@ -5962,6 +5969,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
         return;
     }
     loop_sounds(game);
+    scuba_client(game);
     free_runners_tick(game);
     mekasuit_sprint(game);
     mekasuit_client(game);
@@ -6057,6 +6065,14 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
             _ => {}
         }
     }
+    if channel == SCUBA_CHANNEL && game.native_on(MOD_ID) {
+        scuba_breathe(game);
+        return;
+    }
+    if channel == SCUBA_MODE_CHANNEL && game.native_on(MOD_ID) {
+        scuba_toggle(game);
+        return;
+    }
     if channel != JETPACK_CHANNEL || !game.native_on(MOD_ID) {
         return;
     }
@@ -6118,10 +6134,11 @@ pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         return false;
     }
     let selected = game.selected;
-    let Some(held) = game.inventory.get(selected).cloned().flatten().filter(|s| is_jetpack(s) || &*s.item == flamethrower::ITEM) else {
+    let Some(held) = game.inventory.get(selected).cloned().flatten().filter(|s| is_jetpack(s) || &*s.item == flamethrower::ITEM || &*s.item == SCUBA_TANK) else {
         return false;
     };
     let fuel = jetpack_fuel(&held);
+    let chemical = item_chemical(&held);
     let capacity = jetpack_capacity(&held);
     let room = capacity - fuel;
     let taken = game.native_with_mod_block_entity(pos, |m| {
@@ -6129,7 +6146,7 @@ pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
             return None;
         };
         let mut tank = get_tank(&m.nbt, "chemical", chem::chemical_tank(t).0);
-        if tank.chemical.as_deref() != Some("mekanism:hydrogen") {
+        if tank.chemical.as_deref() != Some(chemical) {
             return Some(0);
         }
         let n = tank.extract(room);
@@ -6140,14 +6157,141 @@ pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         return false;
     };
     let mut held = held;
-    let name = if &*held.item == flamethrower::ITEM { "Flamethrower" } else { "Jetpack" };
+    let name = if &*held.item == flamethrower::ITEM { "Flamethrower" } else if &*held.item == SCUBA_TANK { "Scuba Tank" } else { "Jetpack" };
     set_jetpack_fuel(&mut held, fuel + n);
     game.inventory[selected] = Some(held);
     if let Some(player) = game.native_acting_player() {
-        let line = format!("{name}: {} / {} mB hydrogen", fuel + n, capacity);
+        let line = format!("{name}: {} / {} mB {}", fuel + n, capacity, chemical.trim_start_matches("mekanism:"));
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
     true
+}
+
+/// Sets a number in an item's custom data, keeping the rest of it.
+fn set_custom_long(stack: &mut ItemStack, key: &str, value: u64) {
+    let extra = stack.extra.get_or_insert_with(Default::default);
+    let at = extra.other.iter().position(|(k, d)| k == "minecraft:custom_data" && matches!(d, Tag::Compound(_)));
+    let at = at.unwrap_or_else(|| {
+        extra.other.retain(|(k, _)| k != "minecraft:custom_data");
+        extra.other.push(("minecraft:custom_data".to_owned(), Tag::Compound(Compound::new())));
+        extra.other.len() - 1
+    });
+    if let Tag::Compound(c) = &mut extra.other[at].1 {
+        put_long(c, key, value);
+    }
+}
+
+// --- Scuba Mask and Tank --------------------------------------------------------------------------
+
+const SCUBA_TANK: &str = "mekanism:scuba_tank";
+const SCUBA_MASK: &str = "mekanism:scuba_mask";
+/// `GearConfig.scubaTankCapacity`: 24 buckets of oxygen.
+const SCUBA_CAPACITY: u64 = 24_000;
+const SCUBA_MODE_KEY: &str = "mekanism:scuba_tank_mode";
+/// The window asks the server to fill the wearer's air from the tank (the server swaps the player in).
+const SCUBA_CHANNEL: &str = "mekanism:scuba";
+const SCUBA_MODE_CHANNEL: &str = "mekanism:scuba_mode";
+
+/// `ItemScubaTank.getMode`: whether the tank flows.
+fn scuba_flowing(stack: &ItemStack) -> bool {
+    custom_data(stack).is_some_and(|c| get_long(c, SCUBA_MODE_KEY) == 1)
+}
+
+/// `CommonPlayerTickHandler.isScubaMaskOn`: a mask on the head and a flowing tank with oxygen on the chest.
+fn scuba_on(game: &Game<'_>) -> bool {
+    game.armor[0].as_ref().is_some_and(|s| &*s.item == SCUBA_MASK)
+        && game.armor[1].as_ref().is_some_and(|s| &*s.item == SCUBA_TANK && scuba_flowing(s) && jetpack_fuel(s) > 0)
+}
+
+/// On the window each tick: while the mask is on and the air is short, ask for air; in water, bubbles come from it.
+fn scuba_client(game: &mut Game<'_>) {
+    if !scuba_on(game) {
+        return;
+    }
+    let short = game.player.as_ref().is_some_and(|p| p.air < MAX_AIR);
+    if short {
+        game.native_send_to_server(SCUBA_CHANNEL, &[1]);
+    }
+}
+
+/// Server side, the player swapped in: one mB of oxygen and the air missing (`CommonPlayerTickHandler.playerTick`),
+/// and every fourth tick in water the mask's bubbles (`RenderTickHandler.doScubaRender`).
+fn scuba_breathe(game: &mut Game<'_>) {
+    if !scuba_on(game) {
+        return;
+    }
+    let Some(air) = game.player.as_ref().map(|p| p.air) else {
+        return;
+    };
+    let Some(tank) = game.armor[1].as_mut() else {
+        return;
+    };
+    let stored = jetpack_fuel(tank);
+    let give = (MAX_AIR - air).max(0) as u64;
+    // The first mB is spent whatever happens, then as much as the air can take.
+    let used = (1 + give).min(stored);
+    let gained = used.saturating_sub(1).min(give);
+    set_jetpack_fuel(tank, stored - used);
+    if let Some(p) = game.player.as_mut() {
+        p.air = (air + gained as i32).min(MAX_AIR);
+    }
+    scuba_bubbles(game);
+}
+
+fn scuba_bubbles(game: &mut Game<'_>) {
+    use horizon_client::particles::{ParticleOptions, ParticleType};
+    if game.ticks % 4 != 0 {
+        return;
+    }
+    let Some(me) = game.native_player() else {
+        return;
+    };
+    let in_water = game.player.as_ref().is_some_and(|p| p.fluids.was_touching_water);
+    if !in_water {
+        return;
+    }
+    let (yaw, pitch) = (f64::from(me.yaw).to_radians(), f64::from(me.pitch).to_radians());
+    // `Entity.getViewVector`.
+    let look = [-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos()];
+    let vec = [0.4 * look[0], 0.4 * look[1] - 0.2, 0.4 * look[2]];
+    let velocity = game.player.as_ref().map_or([0.0; 3], |p| [p.velocity.x, p.velocity.y, p.velocity.z]);
+    let motion = [vec[0] * 0.2 + velocity[0], vec[1] * 0.2 + velocity[1] + 0.2, vec[2] * 0.2 + velocity[2]];
+    let at = [me.x + vec[0], me.y + 1.62 + vec[1], me.z + vec[2]];
+    let options = ParticleOptions::simple(ParticleType::Bubble);
+    game.lan_send_particles(me.dimension, &options, None, at, motion, 1.0, 0);
+}
+
+/// `ModeChangeKey`, on the window: the mode key (M) held while the wheel turns asks the server to toggle the
+/// flow of a scuba tank in hand or worn.
+pub(super) fn wheel(game: &mut Game<'_>, steps: f32, claimed: &mut bool) {
+    if *claimed || !game.native_on(MOD_ID) || !game.native_playing() || !game.keys.contains(&winit::keyboard::KeyCode::KeyM) {
+        return;
+    }
+    if (steps.round() as i32).abs() % 2 != 1 {
+        return;
+    }
+    let held = game.inventory.get(game.selected).and_then(|s| s.as_ref()).is_some_and(|s| &*s.item == SCUBA_TANK);
+    let worn = game.armor[1].as_ref().is_some_and(|s| &*s.item == SCUBA_TANK);
+    if held || worn {
+        *claimed = true;
+        game.native_send_to_server(SCUBA_MODE_CHANNEL, &[1]);
+    }
+}
+
+/// Server side, the player swapped in: the tank in hand (or else on the chest) flips between flowing and not.
+fn scuba_toggle(game: &mut Game<'_>) {
+    let selected = game.selected;
+    let held = game.inventory.get(selected).and_then(|s| s.as_ref()).is_some_and(|s| &*s.item == SCUBA_TANK);
+    let stack = if held { game.inventory.get_mut(selected).and_then(|s| s.as_mut()) } else { game.armor[1].as_mut().filter(|s| &*s.item == SCUBA_TANK) };
+    let Some(stack) = stack else {
+        return;
+    };
+    let on = !scuba_flowing(stack);
+    set_custom_long(stack, SCUBA_MODE_KEY, u64::from(on));
+    if let Some(player) = game.native_acting_player() {
+        let line = format!("Flowing: {}", if on { "On" } else { "Off" });
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
 }
 
 // --- Free Runners -----------------------------------------------------------------------------------
