@@ -16073,6 +16073,10 @@ fn tick_stabilizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
     let per_tick = st::energy_per_tick(&grid);
     // The chunks stay loaded only while the whole usage can be paid.
     let active = energy.consume(per_tick);
+    if active {
+        // Horizon API 45: the chunks stay loaded while the whole usage is paid.
+        game.native_keep_chunks(&st::chunk_set(&grid, pos[0] >> 4, pos[2] >> 4));
+    }
     put_int(&mut entity.nbt, "warn", u32::from(per_tick > energy.stored + if active { per_tick } else { 0 }));
     put_long(&mut entity.nbt, "energy", energy.stored);
     entity.data = vec![(energy.stored * 1000 / capacity) as i32, 1000, 0, 0];
