@@ -19199,6 +19199,14 @@ pub(super) fn client_payload(channel: &str, data: &[u8]) {
 /// A right click on a Robit (the client sees its base type): the Robit's screen opens.
 pub(super) fn use_mob(game: &mut Game<'_>, id: u32, claimed: &mut bool) {
     if game.native_on(MOD_ID) && ROBITS.with_borrow(|set| set.contains(&id)) {
+        if ROBIT_VIEWS.with_borrow(|v| v.get(&id).is_some_and(|v| !v.access)) {
+            // The server answers with "You don't have access." and the screen stays shut.
+            let mut out = vec![6];
+            out.extend(id.to_be_bytes());
+            game.native_send_to_server(ROBIT_CHANNEL, &out);
+            *claimed = true;
+            return;
+        }
         ROBIT_UI.with_borrow_mut(|ui| *ui = Some(id));
         game.native_open_ui(ROBIT_SCREEN);
         let mut out = vec![6];
@@ -19232,6 +19240,8 @@ struct RobitView {
     /// The mode the security tab shows (`getEffectiveSecurityMode`) and whether the owner's override set it.
     sec_mode: u8,
     sec_over: bool,
+    /// Whether this viewer may use the Robit (`canAccess`).
+    access: bool,
     owner: String,
 }
 
@@ -19256,9 +19266,15 @@ fn send_robit_states(game: &mut Game<'_>, players: &[RobitPlayer]) {
         let (mode, overridden) = sec_effective_of(&data);
         out.push(mode.ordinal());
         out.push(u8::from(overridden));
-        out.extend(get_string(&data, "owner_name").unwrap_or_default().bytes());
+        let owner = get_string(&data, "owner");
+        let owner_name = get_string(&data, "owner_name").unwrap_or_default();
         for p in players {
-            game.native_send_to_player(p.uuid, ROBIT_STATE_CHANNEL, &out);
+            // `canAccess` for this viewer: the client does not open the screen for one who is shut out.
+            let allowed = owner.as_ref().is_none_or(|o| sec::can_access(mode, o, &uuid_text(p.uuid), sec_data(o).as_ref()));
+            let mut one = out.clone();
+            one.push(u8::from(allowed));
+            one.extend(owner_name.bytes());
+            game.native_send_to_player(p.uuid, ROBIT_STATE_CHANNEL, &one);
         }
     }
 }
@@ -19279,6 +19295,7 @@ fn robit_state_payload(data: &[u8]) {
         skin: String::new(),
         sec_mode: 0,
         sec_over: false,
+        access: true,
         owner: String::new(),
     };
     let mut at = 14;
@@ -19290,12 +19307,14 @@ fn robit_state_payload(data: &[u8]) {
     };
     let (name, skin) = (read().unwrap_or_default(), read().unwrap_or_default());
     let (sec_mode, sec_over) = (data.get(at).copied().unwrap_or(0), data.get(at + 1).copied().unwrap_or(0) != 0);
-    at += 2;
+    let access = data.get(at + 2).copied().unwrap_or(1) != 0;
+    at += 3;
     let view = RobitView {
         name,
         skin,
         sec_mode,
         sec_over,
+        access,
         owner: String::from_utf8_lossy(data.get(at..).unwrap_or_default()).into_owned(),
         ..view
     };
