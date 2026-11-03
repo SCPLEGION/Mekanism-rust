@@ -126,6 +126,8 @@ enum Kind {
     Stabilizer,
     /// The Security Desk: its owner's trusted players and default mode, and the items it locks.
     SecurityDesk,
+    /// The Modification Station: a module into an item in half a second.
+    ModificationStation,
     /// The Chargepad: charges an item of the player standing on it.
     Chargepad,
     /// The Quantum Entangloporter: shares energy, fluid and chemicals across its frequency.
@@ -213,6 +215,7 @@ fn kind(id: &str) -> Option<Kind> {
         fa::BLOCK => return Some(Kind::Assemblicator),
         st::BLOCK => return Some(Kind::Stabilizer),
         sec::DESK => return Some(Kind::SecurityDesk),
+        modules::STATION => return Some(Kind::ModificationStation),
         "mekanism:chemical_infuser" => return Some(Kind::ChemicalInfuser),
         "mekanism:antiprotonic_nucleosynthesizer" => return Some(Kind::Nucleosynthesizer),
         teleporter::TELEPORTER => return Some(Kind::Teleporter),
@@ -404,6 +407,17 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         });
         return;
     }
+    // The module slot, the item to fit it into and the energy slot.
+    if kind(block) == Some(Kind::ModificationStation) {
+        *container = Some(ModContainer {
+            slots: 3,
+            faces: std::array::from_fn(|_| vec![0, 1, 2]),
+            inputs: vec![0, 1, 2],
+            outputs: vec![1],
+            menu: Some("minecraft:furnace".into()),
+        });
+        return;
+    }
     // The desk's unlock and lock slots.
     if kind(block) == Some(Kind::SecurityDesk) {
         *container = Some(ModContainer {
@@ -576,6 +590,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             Kind::Assemblicator => tick_assemblicator(game, pos, entity),
             Kind::Stabilizer => tick_stabilizer(game, pos, entity),
             Kind::SecurityDesk => tick_security_desk(entity),
+            Kind::ModificationStation => tick_station(game, pos, entity),
             Kind::Dissolution => tick_dissolution(game, pos, entity),
             Kind::Centrifuge => tick_centrifuge(game, pos, entity),
             Kind::FissionPort => {
@@ -718,6 +733,7 @@ fn discharge_energy_slot(entity: &mut ModBlockEntity) {
         Some(Kind::Machine("combining", _) | Kind::Advanced(_) | Kind::Infuser | Kind::Painting | Kind::Nucleosynthesizer) => 3,
         Some(Kind::Pump | Kind::Plenisher) => 2,
         Some(Kind::Assemblicator) => fa::ENERGY_SLOT,
+        Some(Kind::ModificationStation) => 2,
         Some(Kind::Stabilizer) => 0,
         Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::PigmentMixer | Kind::Washer | Kind::Heater | Kind::Vibrator) => 0,
         _ => return,
@@ -2986,6 +3002,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Rotary
                 | Kind::Infuser
                 | Kind::Painting
+                | Kind::ModificationStation
                 | Kind::EnergyCube(_)
         ),
         _ => false,
@@ -3828,6 +3845,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Liquifier => Some((chem::LIQUIFIER_USAGE * u64::from(chem::LIQUIFIER_TICKS), u64::MAX)),
         Kind::Assemblicator => Some((asm_capacity(nbt), u64::MAX)),
         Kind::Stabilizer => Some((st_capacity(nbt), u64::MAX)),
+        Kind::ModificationStation => Some((station_capacity(nbt), u64::MAX)),
         Kind::Dissolution => Some((machine::STORAGE_MULTIPLIER * nuclear::DISSOLUTION_USAGE, u64::MAX)),
         Kind::Centrifuge => Some((machine::STORAGE_MULTIPLIER * nuclear::CENTRIFUGE_USAGE, u64::MAX)),
         Kind::Washer => Some((machine::STORAGE_MULTIPLIER * nuclear::WASHER_USAGE, u64::MAX)),
@@ -4509,6 +4527,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     }
     if channel == ST_CHANNEL && game.native_on(MOD_ID) {
         st_payload(game, data);
+        return;
+    }
+    if channel == STN_CHANNEL && game.native_on(MOD_ID) {
+        stn_payload(game, data);
         return;
     }
     if channel == SEC_CHANNEL && game.native_on(MOD_ID) {
@@ -5558,6 +5580,13 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
         },
+        // TileEntityModificationStation and GuiModificationStation.
+        Kind::ModificationStation => Layout {
+            slots: [Some(([35.0, 118.0], "slot/normal")), Some(([125.0, 118.0], "slot/normal")), Some(([151.0, 21.0], "slot/power"))],
+            gauges: vec![],
+            power: Some(PowerBar::Vertical([156.0, 40.0])),
+            progress: Some(([65.0, 123.0], "progress/large_right", [48.0, 8.0])),
+        },
         // TileEntitySecurityDesk and GuiSecurityDesk: the unlock slot above the lock slot, on their holder.
         Kind::SecurityDesk => Layout {
             slots: [Some(([146.0, 18.0], "slot/inner_holder_slot")), Some(([146.0, 97.0], "slot/inner_holder_slot")), None],
@@ -5907,6 +5936,7 @@ fn energy_capacity(entity: &ModBlockEntity) -> u64 {
         Some(Kind::HeatGenerator) => HeatGenerator::new().energy.capacity,
         Some(Kind::Wind) => mekanism_core::generator::WIND_STORAGE,
         Some(Kind::Stabilizer) => st_capacity(&entity.nbt),
+        Some(Kind::ModificationStation) => station_capacity(&entity.nbt),
         Some(Kind::BioGenerator) => mekanism_core::generator::BIO_STORAGE,
         Some(Kind::GasGenerator) => chem::GAS_GENERATOR_STORAGE,
         Some(Kind::Solar(_, storage)) => storage,
@@ -6076,6 +6106,7 @@ fn base_usage(k: Kind) -> Option<u64> {
         Kind::Advanced(m) => m.usage,
         Kind::Pump => isotopes::PUMP_USAGE,
         Kind::Plenisher => plenisher::PLENISHER_USAGE,
+        Kind::ModificationStation => modules::STATION_USAGE,
         _ => return None,
     })
 }
@@ -6104,7 +6135,7 @@ fn screen_height(block: &str) -> f32 {
         // `DEFAULT_IMAGE_HEIGHT + 64`.
         Some(Kind::Assemblicator) => 230.0,
         // `DEFAULT_IMAGE_HEIGHT + 64`.
-        Some(Kind::Oredictionificator | Kind::SecurityDesk) => 230.0,
+        Some(Kind::Oredictionificator | Kind::SecurityDesk | Kind::ModificationStation) => 230.0,
         _ => 166.0,
     }
 }
@@ -6251,7 +6282,8 @@ fn tabs(block: &str) -> u8 {
             | Kind::Nucleosynthesizer
             | Kind::ChemicalInfuser
             | Kind::Washer
-            | Kind::Centrifuge,
+            | Kind::Centrifuge
+            | Kind::ModificationStation,
         ) => all,
         Some(
             Kind::HeatGenerator | Kind::BioGenerator | Kind::GasGenerator | Kind::Wind | Kind::Solar(..) | Kind::DigitalMiner | Kind::Pump | Kind::Plenisher | Kind::Stabilizer,
@@ -6427,7 +6459,7 @@ fn set_window(block: &str, w: Option<Window>) {
 /// The types a block's side configuration has, in its config's order (`AttributeSideConfig`).
 fn transmissions(block: &str) -> &'static [Transmission] {
     match kind(block) {
-        Some(Kind::Machine(..) | Kind::Factory(..) | Kind::EnergyCube(_)) => &[Transmission::Item, Transmission::Energy],
+        Some(Kind::Machine(..) | Kind::Factory(..) | Kind::EnergyCube(_) | Kind::ModificationStation) => &[Transmission::Item, Transmission::Energy],
         Some(Kind::ChemicalTank(_)) => &[Transmission::Item, Transmission::Chemical],
         _ => &[Transmission::Item, Transmission::Chemical, Transmission::Energy],
     }
@@ -6825,6 +6857,10 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
                 _ => energy(),
             }));
         }
+        if kind(block) == Some(Kind::ModificationStation) {
+            rules[0] = SlotRule::Items(vec![modules::MODULE_ITEM.to_owned()]);
+            rules[1] = SlotRule::Items([modules::MEKA_TOOL, modules::HELMET, modules::BODYARMOR, modules::PANTS, modules::BOOTS].map(str::to_owned).to_vec());
+        }
         if kind(block) == Some(Kind::Assemblicator) {
             rules[fa::FORMULA_SLOT] = SlotRule::Items(vec![fa::FORMULA_ITEM.to_owned()]);
         }
@@ -6840,6 +6876,9 @@ pub(super) fn screen_wheel(game: &Game<'_>, block: &str, steps: f32, taken: &mut
     };
     if kind(block) == Some(Kind::SecurityDesk) {
         security_desk_wheel(steps);
+        *taken = true;
+    } else if kind(block) == Some(Kind::ModificationStation) {
+        station_wheel(game, steps);
         *taken = true;
     } else if miner_cfg_open(block) {
         if let Some(c) = miner_cfg(game)
@@ -7836,6 +7875,9 @@ pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32;
         security_desk_click(game, at, right);
         return;
     }
+    if kind(block) == Some(Kind::ModificationStation) && !inside(at, [-30.0, 0.0, 30.0, 300.0]) && at[0] < 176.0 {
+        station_click(game, at, right);
+    }
     if miner_cfg_open(block) {
         miner_cfg_click(game, at, right);
         return;
@@ -8189,7 +8231,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         slots,
         inventory_y: h - 82.0,
         inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(),
-        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort | Kind::FusionPort | Kind::SecurityDesk)),
+        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort | Kind::FusionPort | Kind::SecurityDesk | Kind::ModificationStation)),
         alt: None,
         ..Default::default()
     });
@@ -9353,6 +9395,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     if kind(block) == Some(Kind::SecurityDesk) {
         draw_security_desk(game, batch, height, origin);
     }
+    if kind(block) == Some(Kind::ModificationStation) {
+        draw_station(game, batch, height, origin);
+    }
     if let Some(Kind::ChemicalTank(t)) = kind(block) {
         draw_tank_screen(game, batch, &l, data, origin, t == BaseTier::Creative);
     }
@@ -9638,6 +9683,9 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         return;
     }
     if kind(block) == Some(Kind::SecurityDesk) && security_desk_tooltip(at, lines) {
+        return;
+    }
+    if kind(block) == Some(Kind::ModificationStation) && station_tooltip(game, at, lines) {
         return;
     }
     if is_qio_screen(block) {
@@ -11157,73 +11205,6 @@ fn item_energy_of(stack: &ItemStack) -> Option<gear::ItemEnergy> {
 fn module_name(id: &str) -> String {
     let path = id.split_once(':').map_or(id, |(_, p)| p);
     path.split('_').map(|w| w[..1].to_uppercase() + &w[1..]).collect::<Vec<_>>().join(" ")
-}
-
-/// A right click on the Modification Station holding a Meka-Tool or MekaSuit piece: every module in the
-/// inventory that it takes goes in, up to each module's limit; sneaking takes them all out again
-/// (`ModificationStationContainer`, without its screen).
-pub(super) fn use_modification_station(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
-    if !game.native_on(MOD_ID) || block_name(game, pos) != modules::STATION {
-        return false;
-    }
-    let selected = game.selected;
-    let Some(held) = game.inventory.get(selected).cloned().flatten().filter(|s| modules::is_container(&s.item)) else {
-        tell(game, "Modification Station: hold a Meka-Tool or a MekaSuit piece".to_owned());
-        return true;
-    };
-    let mut installed = modules_of(&held);
-    let mut kept = match custom_data(&held).and_then(|c| c.get(&JavaString::from(MODULE_ITEMS_KEY))) {
-        Some(Tag::Compound(c)) => c.clone(),
-        _ => Compound::new(),
-    };
-    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
-    if sneaking {
-        for (id, n) in std::mem::take(&mut installed) {
-            let item = kept.get(&JavaString::from(id.as_str())).and_then(horizon_items::item_nbt::item_from_nbt);
-            if let Some(item) = item {
-                game.give_or_drop(ItemStack { count: n, ..item });
-            }
-        }
-        kept = Compound::new();
-    } else {
-        for i in 0..game.inventory.len().min(36) {
-            let Some(s) = game.inventory[i].clone() else {
-                continue;
-            };
-            let Some(id) = module_type(&s) else {
-                continue;
-            };
-            let put = modules::install(&held.item, &mut installed, &id, s.count);
-            if put > 0 {
-                kept.insert(id.as_str().into(), horizon_items::item_nbt::item_to_nbt(&ItemStack { count: 1, ..s.clone() }));
-                game.inventory[i] = (s.count > put).then(|| ItemStack { count: s.count - put, ..s });
-            }
-        }
-    }
-    let mut c = Compound::new();
-    for (id, n) in &installed {
-        c.insert(id.as_str().into(), Tag::Int(*n as i32));
-    }
-    let mut stack = held;
-    let stored = stored_energy(&stack);
-    set_custom_compound(&mut stack, MODULES_KEY, c);
-    set_custom_compound(&mut stack, MODULE_ITEMS_KEY, kept);
-    // Silk touch, fortune and frost walker units are those enchantments on the item.
-    let mut levels: Vec<(Arc<str>, u32)> =
-        stack.enchantments().iter().filter(|(e, _)| !modules::MODULE_ENCHANTMENTS.contains(&&**e)).cloned().collect();
-    levels.extend(modules::enchantments(&installed).into_iter().map(|(e, l)| (Arc::from(e), l)));
-    stack.set_crafting_enchantments(levels);
-    // Fewer energy units hold less (`ModuleEnergyUnit.onRemoved`).
-    let capacity = item_energy_of(&stack).map_or(stored, |e| e.capacity);
-    set_energy(&mut stack, stored.min(capacity));
-    let line = if installed.is_empty() {
-        "No modules installed".to_owned()
-    } else {
-        installed.iter().map(|(id, n)| format!("{} x{n}", module_name(id))).collect::<Vec<_>>().join(", ")
-    };
-    game.inventory[selected] = Some(stack);
-    tell(game, line);
-    true
 }
 
 /// The Meka-Tool's mining speed: its efficiency while it holds the energy for the block.
@@ -16718,6 +16699,270 @@ fn security_desk_wheel(steps: f32) {
     let names = SEC_VIEW.with_borrow(|v| sec_trusted(v).len());
     let hidden = names.saturating_sub(SEC_ROWS);
     SEC_UI.with_borrow_mut(|ui| {
+        let first = ui.scroll.min(hidden);
+        ui.scroll = if steps > 0.0 { first.saturating_sub(1) } else { (first + 1).min(hidden) };
+    });
+}
+
+// --- Modification Station (TileEntityModificationStation, GuiModificationStation) ------------------------------
+
+const STN_CHANNEL: &str = "mekanism:modification_station";
+const STN_LIST: [f32; 4] = [28.0, 20.0, 120.0, 74.0];
+const STN_ROWS: usize = 6;
+const STN_REMOVE: [f32; 4] = [28.0, 96.0, 120.0, 17.0];
+const STN_KEYS: [&str; 2] = ["stn_item", "stn_mods"];
+
+thread_local! {
+    static STN_UI: std::cell::RefCell<StnUi> = std::cell::RefCell::new(StnUi::default());
+}
+
+#[derive(Default)]
+struct StnUi {
+    pos: [i32; 3],
+    selected: Option<String>,
+    scroll: usize,
+}
+
+/// `MachineEnergyContainer`: four ticks of the usage, grown by energy upgrades.
+fn station_capacity(nbt: &Compound) -> u64 {
+    upgrades(nbt).max_energy(machine::STORAGE_MULTIPLIER * modules::STATION_USAGE)
+}
+
+fn module_items_of(stack: &ItemStack) -> Compound {
+    match custom_data(stack).and_then(|c| c.get(&JavaString::from(MODULE_ITEMS_KEY))) {
+        Some(Tag::Compound(c)) => c.clone(),
+        _ => Compound::new(),
+    }
+}
+
+/// An item with `installed` modules (and the module items they came from, for taking them out again): the
+/// enchantments some modules are, and the energy it can hold with its energy units.
+fn write_modules(stack: &mut ItemStack, installed: &modules::Installed, kept: Compound) {
+    let mut c = Compound::new();
+    for (id, n) in installed {
+        c.insert(id.as_str().into(), Tag::Int(*n as i32));
+    }
+    let stored = stored_energy(stack);
+    set_custom_compound(stack, MODULES_KEY, c);
+    set_custom_compound(stack, MODULE_ITEMS_KEY, kept);
+    // Silk touch, fortune and frost walker units are those enchantments on the item.
+    let mut levels: Vec<(Arc<str>, u32)> = stack.enchantments().iter().filter(|(e, _)| !modules::MODULE_ENCHANTMENTS.contains(&&**e)).cloned().collect();
+    levels.extend(modules::enchantments(installed).into_iter().map(|(e, l)| (Arc::from(e), l)));
+    stack.set_crafting_enchantments(levels);
+    // Fewer energy units hold less (`ModuleEnergyUnit.onRemoved`).
+    let capacity = item_energy_of(stack).map_or(stored, |e| e.capacity);
+    set_energy(stack, stored.min(capacity));
+}
+
+/// The station every tick (`onUpdateServer`): a module in its first slot goes into the item in the second,
+/// one install each half second, for 10 FE a tick; the item and its modules go to the viewers.
+fn tick_station(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = station_capacity(&entity.nbt);
+    let (usage, ticks_required) = (upgrades(&entity.nbt).energy_per_tick(modules::STATION_USAGE), upgrades(&entity.nbt).ticks(modules::STATION_TICKS));
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut progress = get_int(&entity.nbt, "progress");
+    let module = entity.items.first().cloned().flatten().and_then(|s| module_type(&s).map(|id| (s, id)));
+    let held = entity.items.get(1).cloned().flatten().filter(|s| modules::is_container(&s.item));
+    let mut active = false;
+    match (module, held) {
+        (Some((slot, id)), Some(mut held)) => {
+            let mut installed = modules_of(&held);
+            let room = modules::max_installed(&held.item, &id).saturating_sub(installed.get(&id).copied().unwrap_or(0));
+            if room > 0 && energy.consume(usage) {
+                active = true;
+                progress += 1;
+                if progress >= ticks_required {
+                    progress = 0;
+                    let put = modules::install(&held.item, &mut installed, &id, slot.count);
+                    if put > 0 {
+                        let mut kept = module_items_of(&held);
+                        kept.insert(id.as_str().into(), horizon_items::item_nbt::item_to_nbt(&ItemStack { count: 1, ..slot.clone() }));
+                        write_modules(&mut held, &installed, kept);
+                        entity.items[1] = Some(held.clone());
+                        entity.items[0] = (slot.count > put).then(|| ItemStack { count: slot.count - put, ..slot });
+                    }
+                }
+            } else {
+                progress = 0;
+            }
+        }
+        _ => progress = 0,
+    }
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "progress", progress);
+    entity.data = vec![(energy.stored * 1000 / capacity) as i32, 1000, progress as i32, ticks_required as i32];
+    let mut client = Compound::new();
+    if let Some(Some(held)) = entity.items.get(1) {
+        client.insert("stn_item".into(), Tag::String(held.item.as_ref().into()));
+        let listed: Vec<String> = modules_of(held).into_iter().map(|(id, n)| format!("{id}={n}")).collect();
+        client.insert("stn_mods".into(), Tag::String(listed.join(";").as_str().into()));
+    }
+    put_client(game, pos, entity, &STN_KEYS, client);
+    Some(active)
+}
+
+/// A press on Remove, on the server (`PacketRemoveModule`): one module of the type goes to the player's
+/// inventory, or all of them.
+fn stn_payload(game: &mut Game<'_>, data: &[u8]) {
+    if data.len() < 14 {
+        return;
+    }
+    let int = |i: usize| i32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+    let (pos, all) = ([int(1), int(5), int(9)], data[0] == 1);
+    let Ok(id) = std::str::from_utf8(&data[13..]) else {
+        return;
+    };
+    let Some(player) = game.native_acting_player() else {
+        return;
+    };
+    let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    if !near || block_name(game, pos) != modules::STATION {
+        return;
+    }
+    let out = game.native_with_mod_block_entity(pos, |m| {
+        let held = m.items.get_mut(1)?.as_mut().filter(|s| modules::is_container(&s.item))?;
+        let mut installed = modules_of(held);
+        let mut kept = module_items_of(held);
+        let item = kept.get(&JavaString::from(id)).and_then(horizon_items::item_nbt::item_from_nbt)?;
+        let took = modules::uninstall(&mut installed, id, if all { u32::MAX } else { 1 });
+        if took == 0 {
+            return None;
+        }
+        if !installed.contains_key(id) {
+            kept.remove(&JavaString::from(id));
+        }
+        write_modules(held, &installed, kept);
+        Some(ItemStack { count: took, ..item })
+    });
+    if let Some(Some(stack)) = out {
+        game.give_or_drop(stack);
+    }
+}
+
+/// The station's installed modules, from its client data: the item in its second slot and what it holds.
+fn stn_view(game: &Game<'_>) -> Option<(Option<String>, modules::Installed)> {
+    let (x, y, z) = game.container?;
+    let (_, c) = game.native_client_block_entity([x, y, z])?;
+    let installed = strings_of_text(&get_string(c, "stn_mods").unwrap_or_default());
+    Some((get_string(c, "stn_item"), installed))
+}
+
+fn strings_of_text(text: &str) -> modules::Installed {
+    text.split(';').filter_map(|e| e.split_once('=')).filter_map(|(id, n)| Some((id.to_owned(), n.parse().ok()?))).collect()
+}
+
+fn stn_row(i: usize) -> [f32; 4] {
+    [STN_LIST[0] + 1.0, STN_LIST[1] + 1.0 + 12.0 * i as f32, STN_LIST[2] - 8.0, 12.0]
+}
+
+fn stn_types(item: &Option<String>) -> Vec<&'static str> {
+    item.as_deref().map(modules::supported).unwrap_or_default()
+}
+
+fn draw_station(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, height: f32, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let at = |r: [f32; 4]| [ox + r[0], oy + r[1], r[2], r[3]];
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    let (item, installed) = stn_view(game).unwrap_or_default();
+    let types = stn_types(&item);
+    let title = game.native_screen_title().unwrap_or_default();
+    centred(game, batch, &title, ox + 24.0, 152.0, oy + 4.0, 0x40_4040);
+    game.native_text(batch, "Inventory", [ox + 8.0, oy + height - 92.0], 0x40_4040, false);
+    sprite(game, batch, "slot/overlay/module", [0.0, 0.0, 16.0, 16.0], [ox + 35.0, oy + 118.0, 16.0, 16.0]);
+    nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, at(STN_LIST), 0xFFFF_FFFF);
+    STN_UI.with_borrow_mut(|ui| {
+        let hidden = types.len().saturating_sub(STN_ROWS);
+        ui.scroll = ui.scroll.min(hidden);
+        if ui.selected.as_deref().is_some_and(|s| !types.contains(&s)) {
+            ui.selected = None;
+        }
+        let [lx, ly, lw, lh] = STN_LIST;
+        if hidden > 0 {
+            let (bar_x, bar_y, bar_max) = (lx + lw - 6.0, ly + 2.0, lh - 4.0);
+            nine_slice_tinted(game, batch, "scroll/list_border", [6.0, 6.0], 2.0, [ox + bar_x - 1.0, oy + bar_y - 1.0, 6.0, bar_max + 2.0], 0xFFFF_FFFF);
+            let thumb = (ui.scroll as f32 / hidden as f32 * (bar_max - 4.0)).round();
+            sprite(game, batch, "scroll/list_bar", [0.0, 0.0, 4.0, 4.0], [ox + bar_x, oy + bar_y + thumb, 4.0, 4.0]);
+        }
+        for (i, id) in types.iter().skip(ui.scroll).take(STN_ROWS).enumerate() {
+            let row = stn_row(i);
+            let chosen = ui.selected.as_deref() == Some(*id);
+            let hovered = inside(mouse, row);
+            let (base, slot) = if chosen {
+                ("list/selected", "list/slot_selected")
+            } else if hovered {
+                ("list/hovered", "list/slot_hovered")
+            } else {
+                ("list/base", "list/slot")
+            };
+            nine_slice_tinted(game, batch, base, [12.0, 12.0], 1.0, at(row), 0xFFFF_FFFF);
+            sprite(game, batch, slot, [0.0, 0.0, 10.0, 10.0], [ox + row[0] + 1.0, oy + row[1] + 1.0, 10.0, 10.0]);
+            game.native_item(batch, modules::MODULE_ITEM, [ox + row[0] + 2.0, oy + row[1] + 2.0], 8.0);
+            if installed.contains_key(*id) {
+                game.native_text_scaled(batch, &module_name(id), [ox + lx + 13.0, oy + ly + 3.0 + 12.0 * i as f32], 0x40_4040, 0.7);
+            }
+        }
+        let can = ui.selected.as_deref().is_some_and(|s| installed.contains_key(s));
+        draw_mek_button(game, batch, at(STN_REMOVE), can, can && inside(mouse, STN_REMOVE));
+        let w = game.native_text_width("Remove");
+        let rgb = if can { 0xFF_FFFF } else { 0xA0_A0A0 };
+        game.native_text(batch, "Remove", [ox + STN_REMOVE[0] + (STN_REMOVE[2] - w) / 2.0, oy + STN_REMOVE[1] + (STN_REMOVE[3] - 8.0) / 2.0], rgb, true);
+    });
+}
+
+fn station_click(game: &Game<'_>, at: [f32; 2], right: bool) {
+    if right {
+        return;
+    }
+    let (item, installed) = stn_view(game).unwrap_or_default();
+    let types = stn_types(&item);
+    STN_UI.with_borrow_mut(|ui| {
+        let hidden = types.len().saturating_sub(STN_ROWS);
+        let [lx, ly, lw, lh] = STN_LIST;
+        if hidden > 0 && inside(at, [lx + lw - 6.0, ly, 6.0, lh]) {
+            let f = ((at[1] - ly - 2.0) / (lh - 4.0)).clamp(0.0, 1.0);
+            ui.scroll = ((hidden as f32 + 0.5) * f) as usize;
+        } else if let Some(i) = (0..STN_ROWS).find(|i| inside(at, stn_row(*i))) {
+            ui.selected = types.get(ui.scroll + i).map(|s| (*s).to_owned());
+        } else if inside(at, STN_REMOVE)
+            && let Some(id) = ui.selected.clone().filter(|s| installed.contains_key(s))
+            && let Some((x, y, z)) = game.container
+        {
+            let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+            let mut out = vec![u8::from(shift)];
+            for c in [x, y, z] {
+                out.extend(c.to_be_bytes());
+            }
+            out.extend(id.as_bytes());
+            game.native_send_to_server(STN_CHANNEL, &out);
+        }
+    });
+}
+
+fn station_tooltip(game: &Game<'_>, at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    if inside(at, STN_REMOVE) {
+        lines.push("Removes a single module, hold shift to remove all.".to_owned());
+        return true;
+    }
+    let (item, installed) = stn_view(game).unwrap_or_default();
+    let types = stn_types(&item);
+    let scroll = STN_UI.with_borrow(|ui| ui.scroll);
+    if let Some(i) = (0..STN_ROWS).find(|i| inside(at, stn_row(*i)))
+        && let Some(id) = types.get(scroll + i)
+        && let Some(n) = installed.get(*id)
+    {
+        let max = modules::max_installed(item.as_deref().unwrap_or(""), id);
+        lines.push(format!("Installed: \u{a7}7{n}/{max}"));
+        return true;
+    }
+    false
+}
+
+fn station_wheel(game: &Game<'_>, steps: f32) {
+    let (item, _) = stn_view(game).unwrap_or_default();
+    let hidden = stn_types(&item).len().saturating_sub(STN_ROWS);
+    STN_UI.with_borrow_mut(|ui| {
         let first = ui.scroll.min(hidden);
         ui.scroll = if steps > 0.0 { first.saturating_sub(1) } else { (first + 1).min(hidden) };
     });
