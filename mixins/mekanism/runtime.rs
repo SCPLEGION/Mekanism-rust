@@ -5735,12 +5735,18 @@ fn draw_upgrade_window(game: &Game<'_>, block: &str, data: &[i32], batch: &mut h
     centred(game, batch, "Uninstall", r[0], r[2], r[1] + 2.0, if active { 0x3C_FE9A } else { 0x78_7878 });
     let [px, py, ..] = screen([176.0, 37.0, 0.0, 0.0]);
     sprite(game, batch, "progress/installing/empty", [0.0, 0.0, 10.0, 14.0], [px, py, 10.0, 14.0]);
+    if let Some((_, _, p)) = upgrade_in_view(game) {
+        let w = (10.0 * p.clamp(0.0, 1.0)).floor();
+        if w > 0.0 {
+            sprite(game, batch, "progress/installing/full", [0.0, 0.0, w, 14.0], [px, py, w, 14.0]);
+        }
+    }
     sprite(game, batch, "progress/uninstalling/empty", [0.0, 0.0, 12.0, 12.0], [px, py + 21.0, 12.0, 12.0]);
     for (sy, output) in [(18.0, false), (72.0, true)] {
         let [sx, sy, ..] = screen([175.0, sy, 0.0, 0.0]);
         sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [sx, sy, 18.0, 18.0]);
-        if output
-            && let Some((id, n)) = upgrade_out_view(game)
+        let shown = if output { upgrade_out_view(game) } else { upgrade_in_view(game).map(|(id, n, _)| (id, n)) };
+        if let Some((id, n)) = shown
             && let Some(stack) = upgrade_stack(game, &id)
         {
             game.native_item_stack(batch, &ItemStack { count: n, ..stack }, [sx + 1.0, sy + 1.0], 16.0);
@@ -5880,6 +5886,7 @@ fn upgrade_slot_button(game: &mut Game<'_>, entity: &mut ModBlockEntity, id: i32
     let (base, right) = match id {
         BUTTON_UPGRADE_INSTALL | BUTTON_UPGRADE_INSTALL_ONE => (BUTTON_UPGRADE_INSTALL, id == BUTTON_UPGRADE_INSTALL_ONE),
         BUTTON_UPGRADE_TAKE | BUTTON_UPGRADE_TAKE_HALF => (BUTTON_UPGRADE_TAKE, id == BUTTON_UPGRADE_TAKE_HALF),
+        BUTTON_UPGRADE_UNSLOT | BUTTON_UPGRADE_UNSLOT_HALF => (BUTTON_UPGRADE_UNSLOT, id == BUTTON_UPGRADE_UNSLOT_HALF),
         _ => return false,
     };
     if tabs(&entity.id) & TAB_UPGRADE == 0 {
@@ -5892,12 +5899,36 @@ fn upgrade_slot_button(game: &mut Game<'_>, entity: &mut ModBlockEntity, id: i32
         let Some(kind) = upgrade_of(&held).filter(|k| supported_upgrades(&entity.id).contains(k)) else {
             return true;
         };
-        let mut u = upgrades(&entity.nbt);
-        let n = u.install(kind, if right { 1 } else { held.count });
-        set_upgrades(&mut entity.nbt, &u);
+        // The upgrade goes into the window's input slot (`getUpgradeSlot`); the machine installs it
+        // after a second (`TileComponentUpgrade.tickServer`).
+        let id = held.item.to_string();
+        let slot = upgrade_in_of(&entity.nbt);
+        if slot.as_ref().is_some_and(|(sid, _)| *sid != id) {
+            return true;
+        }
+        let have = slot.map_or(0, |(_, n)| n);
+        let n = (if right { 1 } else { held.count }).min(max_stack(game, &held.item).saturating_sub(have));
         if n > 0 {
+            set_upgrade_in(&mut entity.nbt, Some((id, have + n)));
+            put_int(&mut entity.nbt, "upgrade_check", 1);
             game.carried = (held.count > n).then(|| ItemStack { count: held.count - n, ..held });
         }
+        return true;
+    }
+    if base == BUTTON_UPGRADE_UNSLOT {
+        if game.carried.is_some() {
+            return true;
+        }
+        let Some((type_id, n)) = upgrade_in_of(&entity.nbt) else {
+            return true;
+        };
+        let Some(stack) = upgrade_stack(game, &type_id) else {
+            return true;
+        };
+        let take = if right { n.div_ceil(2) } else { n };
+        game.carried = Some(ItemStack { count: take, ..stack });
+        set_upgrade_in(&mut entity.nbt, Some((type_id, n - take)));
+        put_int(&mut entity.nbt, "upgrade_check", 1);
         return true;
     }
     if game.carried.is_some() {
@@ -5915,23 +5946,86 @@ fn upgrade_slot_button(game: &mut Game<'_>, entity: &mut ModBlockEntity, id: i32
     true
 }
 
-/// What the upgrade window shows beyond the screen's data: the output slot.
+/// The upgrades waiting in the window's input slot.
+fn upgrade_in_of(nbt: &Compound) -> Option<(String, u32)> {
+    let Some(Tag::Compound(c)) = nbt.get(&JavaString::from("upgrade_in")) else {
+        return None;
+    };
+    let id = get_string(c, "id")?;
+    let n = get_int(c, "n");
+    (n > 0).then_some((id, n))
+}
+
+fn set_upgrade_in(nbt: &mut Compound, slot: Option<(String, u32)>) {
+    match slot {
+        Some((id, n)) if n > 0 => {
+            let mut c = Compound::new();
+            c.insert("id".into(), Tag::String(id.as_str().into()));
+            put_int(&mut c, "n", n);
+            nbt.insert("upgrade_in".into(), Tag::Compound(c));
+        }
+        _ => {
+            nbt.remove(&JavaString::from("upgrade_in"));
+        }
+    }
+}
+
+/// `TileComponentUpgrade.tickServer`: while the input slot changed and holds a supported upgrade that is
+/// not at its maximum, count a second, then install as many as fit.
+fn upgrade_tick(game: &Game<'_>, entity: &mut ModBlockEntity) {
+    if get_int(&entity.nbt, "upgrade_check") == 0 {
+        return;
+    }
+    let mut ticks = get_int(&entity.nbt, "upgrade_ticks");
+    if let Some((id, n)) = upgrade_in_of(&entity.nbt)
+        && let Some(kind) = upgrade_stack(game, &id).and_then(|s| upgrade_of(&s)).filter(|k| supported_upgrades(&entity.id).contains(k))
+    {
+        let mut u = upgrades(&entity.nbt);
+        let mut probe = u.clone();
+        if probe.install(kind, 1) > 0 {
+            if ticks < UPGRADE_TICKS {
+                put_int(&mut entity.nbt, "upgrade_ticks", ticks + 1);
+                return;
+            }
+            let added = u.install(kind, n);
+            if added > 0 {
+                set_upgrades(&mut entity.nbt, &u);
+                set_upgrade_in(&mut entity.nbt, Some((id, n - added)));
+            }
+        }
+    }
+    ticks = 0;
+    put_int(&mut entity.nbt, "upgrade_ticks", ticks);
+    put_int(&mut entity.nbt, "upgrade_check", 0);
+}
+
+/// What the upgrade window shows beyond the screen's data: the slots and the installing progress.
 fn upgrade_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     if tabs(&entity.id) & TAB_UPGRADE == 0 {
         return;
     }
+    upgrade_tick(game, entity);
     let mut client = Compound::new();
+    if let Some((id, n)) = upgrade_in_of(&entity.nbt) {
+        client.insert("upg_in_id".into(), Tag::String(id.as_str().into()));
+        put_int(&mut client, "upg_in_n", n);
+        put_int(&mut client, "upg_ticks", get_int(&entity.nbt, "upgrade_ticks"));
+    }
     if let Some((id, n)) = upgrade_out_of(&entity.nbt) {
         client.insert("upg_id".into(), Tag::String(id.as_str().into()));
         put_int(&mut client, "upg_n", n);
     }
-    put_client(game, pos, entity, &["upg_id", "upg_n"], client);
+    put_client(game, pos, entity, &["upg_id", "upg_n", "upg_in_id", "upg_in_n", "upg_ticks"], client);
 }
 
 const BUTTON_UPGRADE_INSTALL: i32 = 280;
 const BUTTON_UPGRADE_INSTALL_ONE: i32 = 281;
 const BUTTON_UPGRADE_TAKE: i32 = 282;
 const BUTTON_UPGRADE_TAKE_HALF: i32 = 283;
+const BUTTON_UPGRADE_UNSLOT: i32 = 284;
+const BUTTON_UPGRADE_UNSLOT_HALF: i32 = 285;
+/// `TileComponentUpgrade.UPGRADE_TICKS_REQUIRED`: a second.
+const UPGRADE_TICKS: u32 = 20;
 const UPGRADE_IN_SLOT: [f32; 4] = [175.0, 18.0, 18.0, 18.0];
 const UPGRADE_OUT_SLOT: [f32; 4] = [175.0, 72.0, 18.0, 18.0];
 
@@ -5942,6 +6036,15 @@ fn upgrade_out_view(game: &Game<'_>) -> Option<(String, u32)> {
     let id = get_string(c, "upg_id")?;
     let n = get_int(c, "upg_n");
     (n > 0).then_some((id, n))
+}
+
+/// The input slot and the installing progress (0 to 1) as the screen has them.
+fn upgrade_in_view(game: &Game<'_>) -> Option<(String, u32, f32)> {
+    let (x, y, z) = game.container?;
+    let (_, c) = game.native_client_block_entity([x, y, z])?;
+    let id = get_string(c, "upg_in_id")?;
+    let n = get_int(c, "upg_in_n");
+    (n > 0).then(|| (id, n, get_int(c, "upg_ticks") as f32 / UPGRADE_TICKS as f32))
 }
 
 /// A press on the window's virtual slots: a click with an upgrade on the cursor installs it, an empty
@@ -5955,6 +6058,8 @@ fn upgrade_slot_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool, b
     if on(UPGRADE_IN_SLOT) {
         if game.carried.as_ref().is_some_and(|c| upgrade_of(c).is_some()) {
             *button = Some(BUTTON_UPGRADE_INSTALL + i32::from(right));
+        } else if game.carried.is_none() && upgrade_in_view(game).is_some() {
+            *button = Some(BUTTON_UPGRADE_UNSLOT + i32::from(right));
         }
         return true;
     }
