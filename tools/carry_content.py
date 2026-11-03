@@ -466,6 +466,12 @@ def build_module(ns, out):
                 part = {"elements": [e for e in data["elements"] if bool(e.get("light_emission")) == glow]}
                 worn_models.build_element_world_model(ns, name, part, skin, out, report, (8, 0, 8))
     if ns == "mekanism":
+        # The Personal Chest (`RenderPersonalChest`): vanilla's chest parts in Mekanism's skin, the lid turned.
+        chest = next((d / ns / "textures/block/models/personal_chest.png" for d in search
+                      if (d / ns / "textures/block/models/personal_chest.png").is_file()), None)
+        if chest is not None:
+            worn_models.build_vanilla_world_model(ns, "personal_chest", "minecraft:chest#main", (-8, 0, -8), chest, out, report)
+    if ns == "mekanism":
         # Moving parts of machines (`RenderSeismicVibrator`, `RenderPigmentMixer`): their shafts are world models.
         for model_name, name, center in (("vibrator_shaft", "vibrator_shaft", (8, 8, 8)),
                                          ("pigment_mixer_shaft", "pigment_mixer_shaft", (1, 0, 1))):

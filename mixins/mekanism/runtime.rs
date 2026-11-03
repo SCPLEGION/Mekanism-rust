@@ -1339,6 +1339,9 @@ thread_local! {
 }
 
 thread_local! {
+    /// The personal chests this client has heard of: lid openness, the previous tick's, the tick last stepped
+    /// (`TileEntityPersonalStorage` / `ChestLidController`).
+    static PCHESTS: std::cell::RefCell<std::collections::HashMap<[i32; 3], (f32, f32, u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
     /// The fluid tanks this client has heard of.
     static TANKS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
@@ -1349,6 +1352,10 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
     if id == "mekanismgenerators:wind_generator" {
         ROTORS.with_borrow_mut(|r| {
             r.entry(pos).or_insert((0.0, 0));
+        });
+    } else if id == bin::PERSONAL_CHEST {
+        PCHESTS.with_borrow_mut(|c| {
+            c.entry(pos).or_insert((0.0, 0.0, 0));
         });
     } else if matches!(kind(id), Some(Kind::FluidTank(_))) {
         TANKS.with_borrow_mut(|t| {
@@ -1831,6 +1838,64 @@ fn liquifier_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeW
 pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks::NativeWorldModel>) {
     let now = game.ticks as u64;
     let partial = game.clock.fraction() as f32;
+    // The personal chests (`RenderPersonalChest`): vanilla's chest parts, the lid opening while the chest's
+    // screen is open (the nearest chest to the player, which is the one that was clicked).
+    let open_chest = if game.native_open_screen_block().as_deref() == Some(bin::PERSONAL_CHEST) {
+        game.native_player().and_then(|p| {
+            PCHESTS.with_borrow(|c| {
+                c.keys()
+                    .map(|k| {
+                        let d = (f64::from(k[0]) + 0.5 - p.x).powi(2) + (f64::from(k[1]) + 0.5 - p.y).powi(2) + (f64::from(k[2]) + 0.5 - p.z).powi(2);
+                        (d, *k)
+                    })
+                    .filter(|(d, _)| *d < 64.0)
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .map(|(_, k)| k)
+            })
+        })
+    } else {
+        None
+    };
+    PCHESTS.with_borrow_mut(|chests| {
+        chests.retain(|pos, (open, prev, tick)| {
+            if !matches!(game.native_client_block_entity(*pos), Some((id, _)) if id == bin::PERSONAL_CHEST) {
+                return false;
+            }
+            if *tick == 0 {
+                *tick = now;
+            }
+            // `ChestLidController.tickLid`: a tenth per tick toward the target.
+            let target = if open_chest == Some(*pos) { 1.0 } else { 0.0 };
+            for _ in 0..now.saturating_sub(*tick).min(20) {
+                *prev = *open;
+                *open = if target > *open { (*open + 0.1).min(target) } else { (*open - 0.1).max(target) };
+            }
+            *tick = now;
+            let shown = *prev + (*open - *prev) * partial;
+            let eased = 1.0 - (1.0 - shown).powi(3);
+            let lid = -(eased * std::f32::consts::FRAC_PI_2);
+            let yaw = match game.native_block_property(*pos, "facing").as_deref() {
+                Some("west") => -90.0,
+                Some("north") => -180.0,
+                Some("east") => -270.0,
+                _ => 0.0,
+            };
+            models.push(super::native_hooks::NativeWorldModel {
+                model: "mekanism:personal_chest".into(),
+                position: [f64::from(pos[0]) + 0.5, f64::from(pos[1]), f64::from(pos[2]) + 0.5],
+                yaw,
+                pitch: 0.0,
+                roll: 0.0,
+                light_at: *pos,
+                color: 0xFFFF_FFFF,
+                rotation: None,
+                full_bright: false,
+                scale: 1.0,
+                parts: vec![("lid".into(), [lid, 0.0, 0.0]), ("lock".into(), [lid, 0.0, 0.0])],
+            });
+            true
+        });
+    });
     ROTORS.with_borrow_mut(|rotors| {
         rotors.retain(|pos, (angle, tick)| {
             let Some((id, c)) = game.native_client_block_entity(*pos) else {
@@ -1866,6 +1931,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                 rotation: None,
                 full_bright: false,
                 scale: 1.0,
+                parts: Vec::new(),
             });
             true
         });
@@ -1908,6 +1974,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                     rotation: None,
                     full_bright: false,
                     scale: 1.0,
+                    parts: Vec::new(),
                 });
             } else {
                 let (dx, dz) = match game.native_block_property(*pos, "facing").as_deref() {
@@ -1928,6 +1995,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                     rotation: None,
                     full_bright: false,
                     scale: 1.0,
+                    parts: Vec::new(),
                 });
             }
             true
@@ -1967,6 +2035,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                         rotation: Some(q.to_array()),
                         full_bright: true,
                         scale,
+                        parts: Vec::new(),
                     });
                 }
             }
@@ -2011,6 +2080,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                         rotation: None,
                         full_bright: false,
                         scale: 1.0,
+                        parts: Vec::new(),
                     });
                 }
             }
@@ -2036,6 +2106,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                 rotation: None,
                 full_bright,
                 scale: 1.0,
+                parts: Vec::new(),
             });
         }
     }
@@ -2060,6 +2131,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                 rotation: None,
                 full_bright: false,
                 scale: 1.0,
+                parts: Vec::new(),
             });
         }
     });
@@ -2094,6 +2166,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                     rotation: Some(q.to_array()),
                     full_bright: true,
                     scale: 1.0,
+                    parts: Vec::new(),
                 });
             }
             true

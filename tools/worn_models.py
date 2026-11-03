@@ -404,6 +404,18 @@ def build_element_world_model(ns, name, model, texture_png, out, report, center=
     report["world_models"] = report.get("world_models", 0) + 1
 
 
+def build_vanilla_world_model(ns, name, key, offset, texture_png, out, report):
+    """A world model that is one of vanilla's part trees (`minecraft:chest#main`), moved by `offset` px and
+    textured with the mod's own skin: the game loads the parts, the mod turns them (`NativeWorldModel.parts`)."""
+    target = out / "assets" / ns / "horizon" / "world_models" / f"{name}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"vanilla": key, "offset": list(offset)}))
+    sprite = out / "assets" / ns / "textures/entity/equipment/horizon_models" / f"{name}.png"
+    sprite.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(texture_png, sprite)
+    report["world_models"] = report.get("world_models", 0) + 1
+
+
 def _entity_cube(origin, size, tex, tex_size=(16, 16)):
     """The polygons of a vanilla `ModelPart.Cube` (px, y up as the model is drawn unflipped): four points and
     their uv (0..1, v down) per face, in `Cube`'s own vertex order."""
