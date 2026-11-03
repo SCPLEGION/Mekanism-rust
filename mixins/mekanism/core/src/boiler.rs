@@ -77,20 +77,31 @@ impl Boiler {
     /// boiling point, capped by the superheating elements, boils water into steam and takes its heat.
     /// `heat` is the casing's stored heat (temperature × capacity). Returns the mB boiled.
     pub fn boil(&self, heat: &mut f64, water: u64, steam_room: u64) -> u64 {
-        let capacity = self.heat_capacity();
-        if capacity <= 0.0 {
+        if water == 0 {
             return 0;
         }
-        let temperature = *heat / capacity;
-        if temperature < BOIL_TEMP || water == 0 {
-            return 0;
-        }
-        let available = ((*heat - BOIL_TEMP * capacity) * WATER_CONDUCTIVITY)
-            .min(SUPERHEATING_HEAT_TRANSFER * self.elements as f64);
-        let max = (STEAM_EFFICIENCY * available / WATER_ENTHALPY).floor() as u64;
-        let boiled = max.min(steam_room).min(water);
+        let boiled = self.max_boil(*heat).min(steam_room).min(water);
         *heat -= boiled as f64 * WATER_ENTHALPY / STEAM_EFFICIENCY;
         boiled
+    }
+
+    /// `lastMaxBoil`: what the heat above the boiling point could boil this tick.
+    pub fn max_boil(&self, heat: f64) -> u64 {
+        let capacity = self.heat_capacity();
+        if capacity <= 0.0 || heat / capacity < BOIL_TEMP {
+            return 0;
+        }
+        let available = ((heat - BOIL_TEMP * capacity) * WATER_CONDUCTIVITY)
+            .min(SUPERHEATING_HEAT_TRANSFER * self.elements as f64);
+        (STEAM_EFFICIENCY * available / WATER_ENTHALPY).floor() as u64
+    }
+
+    /// The second rate bar's level: the max boil rate over what the elements could carry.
+    pub fn max_boil_level(&self, max: u64) -> f64 {
+        if self.elements == 0 {
+            return 0.0;
+        }
+        (max as f64 * WATER_ENTHALPY / (self.elements as f64 * SUPERHEATING_HEAT_TRANSFER)).min(1.0)
     }
 }
 
