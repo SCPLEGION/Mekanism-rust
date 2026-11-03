@@ -8,7 +8,11 @@ pub const ITEM: &str = "mekanism:robit";
 /// `EntityRobit.MAX_ENERGY`.
 pub const MAX_ENERGY: u64 = 100_000;
 /// `EntityRobit.inventorySlots`: 27 storage slots, the energy slot, the smelting input and output.
-pub const INVENTORY_SLOTS: usize = 40;
+pub const INVENTORY_SLOTS: usize = 43;
+/// The repair window's anvil input, material and result (the result is computed, never stored).
+pub const REPAIR_INPUT: usize = 40;
+pub const REPAIR_ADD: usize = 41;
+pub const REPAIR_RESULT: usize = 42;
 /// The crafting window's 3x3 grid (slots 30 to 38) and its result, which is computed, never stored.
 pub const CRAFT_GRID: usize = 30;
 pub const CRAFT_RESULT: usize = 39;

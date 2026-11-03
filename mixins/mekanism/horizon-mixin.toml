@@ -528,3 +528,17 @@ bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "id", ty = "&str", value = "id" },
 ]
+
+[[injection]]
+id = "ui-key"
+hook = "ui_key"
+hook_version = 1
+kind = "HEAD"
+helper = "ui_key.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "id", ty = "&str", value = "id" },
+  { name = "key", ty = "&str", value = "key" },
+  { name = "text", ty = "Option<&str>", value = "text" },
+  { name = "pressed", ty = "bool", value = "pressed" },
+]

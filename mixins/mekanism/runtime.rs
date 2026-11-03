@@ -17356,6 +17356,39 @@ pub(super) fn ui_click(game: &mut Game<'_>, id: &str, at: [f32; 2], button: u8, 
     }
 }
 
+/// A key on a mod screen: typing into the Robit's repair name box (`GuiTextField`, 50 characters).
+pub(super) fn ui_key(game: &mut Game<'_>, id: &str, key: &str, text: Option<&str>, pressed: bool) {
+    if id != ROBIT_SCREEN || !pressed || ROBIT_TAB.with(std::cell::Cell::get) != RobitTab::Repair {
+        return;
+    }
+    let Some(rid) = ROBIT_UI.with_borrow(|u| *u) else {
+        return;
+    };
+    if ROBIT_SLOTS.with_borrow(|s| s.0.get(robit::REPAIR_INPUT).cloned().flatten()).is_none() {
+        return;
+    }
+    let name = ROBIT_NAME_BOX.with_borrow_mut(|b| {
+        if key == "key.keyboard.backspace" {
+            b.0.pop();
+        } else if let Some(t) = text {
+            for c in t.chars().filter(|c| !c.is_control()) {
+                if b.0.chars().count() < 50 {
+                    b.0.push(c);
+                }
+            }
+        } else {
+            return None;
+        }
+        Some(b.0.clone())
+    });
+    if let Some(name) = name {
+        let mut out = vec![8];
+        out.extend(rid.to_be_bytes());
+        out.extend(name.bytes());
+        game.native_send_to_server(ROBIT_CHANNEL, &out);
+    }
+}
+
 pub(super) fn ui_close_hook(game: &mut Game<'_>, id: &str) {
     ui_closed(game, id);
 }
@@ -17982,14 +18015,25 @@ fn robit_op_payload(game: &mut Game<'_>, data: &[u8]) {
             1 => slot_click::Click::Right,
             _ => slot_click::Click::Shift,
         };
-        let tab = if data[7] == 3 { RobitTab::Crafting } else if data[7] == 2 { RobitTab::Smelting } else if data[7] == 1 { RobitTab::Inventory } else { RobitTab::Main };
+        let tab = if data[7] == 4 { RobitTab::Repair } else if data[7] == 3 { RobitTab::Crafting } else if data[7] == 2 { RobitTab::Smelting } else if data[7] == 1 { RobitTab::Inventory } else { RobitTab::Main };
         robit_inventory_click(game, u32::from_be_bytes([data[1], data[2], data[3], data[4]]), data[5] as usize, how, tab);
+        return;
+    }
+    if data.len() >= 5 && data[0] == 8 {
+        // `ServerboundRenameItemPacket`.
+        if let Some(player) = game.native_acting_player() {
+            let name: String = String::from_utf8_lossy(&data[5..]).chars().take(50).collect();
+            ROBIT_NAME.with_borrow_mut(|n| n.insert(player.name, name));
+        }
         return;
     }
     let [op, a, b, c, d] = data[..] else {
         return;
     };
     let id = u32::from_be_bytes([a, b, c, d]);
+    if op == 5 || op == 7 {
+        robit_flush_grid(game, id);
+    }
     if op == 5 || op == 6 {
         if let Some(player) = game.native_acting_player() {
             if op == 6 {
@@ -18145,12 +18189,18 @@ enum RobitTab {
     Inventory,
     Smelting,
     Crafting,
+    Repair,
 }
 
 thread_local! {
     static ROBIT_TAB: std::cell::Cell<RobitTab> = const { std::cell::Cell::new(RobitTab::Main) };
     /// Client: the Robit's slots and the cursor stack the server reported (item id, count).
     static ROBIT_SLOTS: std::cell::RefCell<(Vec<Option<(String, u32)>>, Option<(String, u32)>)> = const { std::cell::RefCell::new((Vec::new(), None)) };
+    /// Server: the text of each viewer's anvil name box (`AnvilMenu.itemName`).
+    static ROBIT_NAME: std::cell::RefCell<std::collections::HashMap<String, String>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Client: the name box, the item it was last filled for, and the level cost the server reported.
+    static ROBIT_NAME_BOX: std::cell::RefCell<(String, Option<String>)> = const { std::cell::RefCell::new((String::new(), None)) };
+    static ROBIT_COST: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
     /// Server: who has the inventory open, and the stack on their cursor.
     static ROBIT_WATCH: std::cell::RefCell<std::collections::HashMap<String, (u32, Option<ItemStack>)>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
@@ -18217,10 +18267,41 @@ fn robit_inventory_click(game: &mut Game<'_>, id: u32, slot: usize, how: slot_cl
     let allowed = |i: usize, w: &Wrapped| match i {
         robit::ENERGY_SLOT => item_energy_of(&w.stack).is_some_and(|e| e.can_discharge) || REDSTONE_ENERGY.iter().any(|(id, _)| *id == &*w.stack.item),
         robit::SMELT_INPUT => world_recipes!(game).cook("minecraft:smelting", &w.stack).is_some(),
-        robit::SMELT_OUTPUT | robit::CRAFT_RESULT => false,
+        robit::SMELT_OUTPUT | robit::CRAFT_RESULT | robit::REPAIR_RESULT => false,
         _ => true,
     };
-    if slot == robit::CRAFT_RESULT {
+    let input_before = slots[robit::REPAIR_INPUT].as_ref().map(|w| (w.stack.item.to_string(), w.stack.count));
+    if slot == robit::REPAIR_RESULT {
+        // `AnvilMenu.onTake`: the levels, the material used up, then the input.
+        let current: Vec<Option<ItemStack>> = slots.iter().map(|s| s.as_ref().map(|w| w.stack.clone())).collect();
+        let anvil = robit_anvil(game, &current, &ROBIT_NAME.with_borrow(|n| n.get(&name).cloned()).unwrap_or_default());
+        if let Some(result) = anvil.result.clone()
+            && anvil.cost > 0
+            && cursor.is_none()
+            && (game.creative || game.experience.level >= anvil.cost)
+        {
+            if !game.creative {
+                game.give_levels(-anvil.cost);
+            }
+            if anvil.repair_item_count_cost > 0 {
+                if let Some(a) = slots[robit::REPAIR_ADD].as_mut()
+                    && a.stack.count > anvil.repair_item_count_cost
+                {
+                    a.stack.count -= anvil.repair_item_count_cost;
+                } else {
+                    slots[robit::REPAIR_ADD] = None;
+                }
+            } else if !anvil.only_renaming {
+                slots[robit::REPAIR_ADD] = None;
+            }
+            slots[robit::REPAIR_INPUT] = None;
+            if how == slot_click::Click::Shift {
+                game.give_or_drop(result);
+            } else {
+                cursor = Some(max(game, result));
+            }
+        }
+    } else if slot == robit::CRAFT_RESULT {
         // `ResultSlot` and `quickMoveStack`: a shift-click crafts again and again while the result fits
         // the player's inventory; a plain click takes one result onto the cursor.
         let shift = how == slot_click::Click::Shift;
@@ -18288,6 +18369,11 @@ fn robit_inventory_click(game: &mut Game<'_>, id: u32, slot: usize, how: slot_cl
     }
     let mut items: Vec<Option<ItemStack>> = slots[..ROBIT_INV_ROBIT].iter().map(|s| s.as_ref().map(|w| w.stack.clone())).collect();
     items[robit::CRAFT_RESULT] = None;
+    items[robit::REPAIR_RESULT] = None;
+    if slots[robit::REPAIR_INPUT].as_ref().map(|w| (w.stack.item.to_string(), w.stack.count)) != input_before {
+        // `slotsChanged` on a new input: the name box starts again from the item's own name.
+        ROBIT_NAME.with_borrow_mut(|n| n.remove(&name));
+    }
     set_robit_items(&mut data, &items);
     for i in 0..36 {
         let at = player_slot(i);
@@ -18301,6 +18387,41 @@ fn robit_inventory_click(game: &mut Game<'_>, id: u32, slot: usize, how: slot_cl
             e.1 = cursor.map(|w| w.stack);
         }
     });
+}
+
+/// `AnvilMenu.createResult` for the Robit's repair slots; `name` is what its name box holds.
+fn robit_anvil(game: &Game<'_>, items: &[Option<ItemStack>], name: &str) -> horizon_client::stations::AnvilResult {
+    let input = items.get(robit::REPAIR_INPUT).and_then(Option::as_ref);
+    let hover = input.map(|i| horizon_client::stations::hover_name(&|id| game.pack.names.display_item(id), i)).unwrap_or_default();
+    // `AnvilScreen.onNameChanged`: the item's own name sends nothing.
+    let name = if input.is_some_and(|i| i.custom_name().is_none() && name == hover) { "" } else { name };
+    horizon_client::stations::anvil_result(&game.stations().enchantments, game.items(), input, items.get(robit::REPAIR_ADD).and_then(Option::as_ref), Some(name), &hover, game.creative)
+}
+
+/// `CraftingMenu.removed`: what is left in the 3x3 grid goes back to the player when the window closes
+/// or the Robit's screen changes (the original's grid is the menu's, not the Robit's).
+fn robit_flush_grid(game: &mut Game<'_>, id: u32) {
+    let Some(player) = game.native_acting_player() else {
+        return;
+    };
+    let left = game.native_with_mob(id, |m| {
+        let near = (m.position.x - player.position[0]).powi(2) + (m.position.z - player.position[2]).powi(2) <= 256.0;
+        if m.kind.id != robit::TYPE || !near {
+            return vec![];
+        }
+        let mut data = robit_data(m);
+        let mut items = robit_items(&data);
+        let out: Vec<ItemStack> = (robit::CRAFT_GRID..robit::CRAFT_GRID + 9).chain(robit::REPAIR_INPUT..=robit::REPAIR_ADD).filter_map(|i| items[i].take()).collect();
+        if !out.is_empty() {
+            set_robit_items(&mut data, &items);
+            m.extra.mod_data = Some(data);
+        }
+        out
+    });
+    ROBIT_NAME.with_borrow_mut(|n| n.remove(&player.name));
+    for stack in left.unwrap_or_default() {
+        game.give_or_drop(stack);
+    }
 }
 
 /// The inventory screen closed: the cursor stack goes back to the player.
@@ -18339,10 +18460,13 @@ fn send_robit_inventories(game: &mut Game<'_>) {
         let mut shown = robit_items(&data);
         let grid = shown[robit::CRAFT_GRID..robit::CRAFT_GRID + 9].to_vec();
         shown[robit::CRAFT_RESULT] = world_recipes!(game).craft(&grid, 3);
+        let anvil = robit_anvil(game, &shown, &ROBIT_NAME.with_borrow(|n| n.get(&name).cloned()).unwrap_or_default());
+        shown[robit::REPAIR_RESULT] = anvil.result.clone();
         for s in shown.iter().take(ROBIT_INV_ROBIT) {
             put(&mut out, s);
         }
         put(&mut out, &cursor);
+        out.extend(anvil.cost.to_be_bytes());
         game.native_send_to_player(uuid, ROBIT_ITEMS_CHANNEL, &out);
     }
 }
@@ -18364,14 +18488,17 @@ fn robit_items_payload(data: &[u8]) {
         slots.push(s);
     }
     let cursor = read().flatten();
+    if let Some(b) = data.get(at..at + 4) {
+        ROBIT_COST.with(|c| c.set(i32::from_be_bytes([b[0], b[1], b[2], b[3]])));
+    }
     ROBIT_SLOTS.with_borrow_mut(|v| *v = (slots, cursor));
 }
 
-const ROBIT_TABS: [(&str, RobitTab); 4] = [("button/main", RobitTab::Main), ("button/crafting", RobitTab::Crafting), ("button/inventory", RobitTab::Inventory), ("button/smelting", RobitTab::Smelting)];
+const ROBIT_TABS: [(&str, RobitTab); 5] = [("button/main", RobitTab::Main), ("button/crafting", RobitTab::Crafting), ("button/inventory", RobitTab::Inventory), ("button/smelting", RobitTab::Smelting), ("button/repair", RobitTab::Repair)];
 
 fn robit_tab_rect(i: usize, o: [f32; 2]) -> [f32; 4] {
     // The Java order is main, crafting, inventory, smelting, repair, 20 apart.
-    let row = [0.0, 1.0, 2.0, 3.0][i];
+    let row = [0.0, 1.0, 2.0, 3.0, 4.0][i];
     [o[0] + ROBIT_WINDOW[0] + 3.0, o[1] + 10.0 + 20.0 * row, 18.0, 18.0]
 }
 
@@ -18379,6 +18506,7 @@ fn robit_tab_rect(i: usize, o: [f32; 2]) -> [f32; 4] {
 fn robit_visible(tab: RobitTab) -> Vec<(usize, [f32; 2])> {
     match tab {
         RobitTab::Main => vec![(robit::ENERGY_SLOT, [153.0, 17.0])],
+        RobitTab::Repair => vec![(robit::REPAIR_INPUT, [27.0, 47.0]), (robit::REPAIR_ADD, [76.0, 47.0]), (robit::REPAIR_RESULT, [134.0, 47.0])],
         RobitTab::Crafting => {
             let mut v: Vec<(usize, [f32; 2])> = (0..9).map(|i| (robit::CRAFT_GRID + i, [30.0 + 18.0 * (i % 3) as f32, 17.0 + 18.0 * (i / 3) as f32])).collect();
             v.push((robit::CRAFT_RESULT, [124.0, 35.0]));
@@ -18412,14 +18540,61 @@ fn robit_draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o
     }
 }
 
+/// `GuiRobitRepair`: the anvil's name box, its error cross and the level cost.
+fn robit_draw_repair(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2]) {
+    let slots = ROBIT_SLOTS.with_borrow(|s| s.0.clone());
+    let input = slots.get(robit::REPAIR_INPUT).cloned().flatten();
+    let add = slots.get(robit::REPAIR_ADD).cloned().flatten();
+    let result = slots.get(robit::REPAIR_RESULT).cloned().flatten();
+    let field = if input.is_some() { "text_field" } else { "text_field_disabled" };
+    game.native_sprite(batch, &format!("gui/sprites/container/anvil/{field}"), [0.0, 0.0, 110.0, 16.0], [o[0] + 59.0, o[1] + 20.0, 110.0, 16.0]);
+    if (input.is_some() || add.is_some()) && result.is_none() {
+        game.native_sprite(batch, "gui/sprites/container/anvil/error", [0.0, 0.0, 28.0, 21.0], [o[0] + 99.0, o[1] + 45.0, 28.0, 21.0]);
+    }
+    // `slotChanged`: a new input fills the box with its name.
+    let key = input.as_ref().map(|(i, _)| i.clone());
+    let changed = ROBIT_NAME_BOX.with_borrow(|b| b.1 != key);
+    let text = ROBIT_NAME_BOX.with_borrow_mut(|b| {
+        if changed {
+            b.0 = key.as_ref().map(|i| game.pack.names.display_item(i)).unwrap_or_default();
+            b.1 = key.clone();
+        }
+        b.0.clone()
+    });
+    if input.is_some() {
+        let caret = if (game.ticks / 10) % 2 == 0 { "_" } else { "" };
+        game.native_text(batch, &format!("{text}{caret}"), [o[0] + 62.0, o[1] + 24.0], 0xFF_FFFF, true);
+    }
+    let cost = ROBIT_COST.with(std::cell::Cell::get);
+    if cost > 0 {
+        let creative = game.creative;
+        let (line, colour) = if cost >= 40 && !creative {
+            ("Too Expensive!".to_owned(), 0xFF_6060)
+        } else if result.is_none() {
+            (String::new(), 0)
+        } else {
+            (format!("Enchantment Cost: {cost}"), if creative || game.experience.level >= cost { 0x80_FF20 } else { 0xFF_6060 })
+        };
+        if !line.is_empty() {
+            let w = game.native_text_width(&line);
+            let min = (ROBIT_WINDOW[0] - w - 10.0).max(60.0);
+            game.native_fill(batch, [o[0] + min, o[1] + 67.0, ROBIT_WINDOW[0] - 8.0 - min, 12.0], 0x4F00_0000);
+            game.native_text(batch, &line, [o[0] + ROBIT_WINDOW[0] - 8.0 - w - 1.0, o[1] + 69.0], colour, true);
+        }
+    }
+}
+
 fn robit_draw_inventory(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2], tab: RobitTab) {
     nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [o[0] - 3.0, o[1] - 3.0, ROBIT_WINDOW[0] + 6.0, ROBIT_WINDOW[1] + 6.0], 0xBFFF_FFFF);
     nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [o[0], o[1], ROBIT_WINDOW[0], ROBIT_WINDOW[1]], 0xFFFF_FFFF);
     robit_draw_tabs(game, batch, o);
-    centred(game, batch, "Robit", o[0], ROBIT_WINDOW[0], o[1] + 5.0, 0x40_4040);
+    centred(game, batch, if tab == RobitTab::Repair { "Repair" } else { "Robit" }, o[0] + if tab == RobitTab::Repair { 60.0 } else { 0.0 }, if tab == RobitTab::Repair { 107.0 } else { ROBIT_WINDOW[0] }, o[1] + 5.0, 0x40_4040);
     game.native_text(batch, "Inventory", [o[0] + 8.0, o[1] + 73.0], 0x40_4040, false);
     if tab == RobitTab::Crafting {
-        sprite(game, batch, "progress/tall_right/empty", [0.0, 0.0, 22.0, 15.0], [o[0] + 90.0, o[1] + 35.0, 22.0, 15.0]);
+        sprite(game, batch, "arrow/right", [0.0, 0.0, 22.0, 15.0], [o[0] + 90.0, o[1] + 35.0, 22.0, 15.0]);
+    }
+    if tab == RobitTab::Repair {
+        robit_draw_repair(game, batch, o);
     }
     if tab == RobitTab::Smelting {
         let id = ROBIT_UI.with_borrow(|u| *u).unwrap_or(0);
@@ -18486,8 +18661,13 @@ fn robit_inventory_press(game: &mut Game<'_>, at: [f32; 2], button: u8) {
 }
 
 fn robit_set_tab(game: &mut Game<'_>, tab: RobitTab) {
-    ROBIT_TAB.with(|t| t.set(tab));
+    let was = ROBIT_TAB.with(|t| t.replace(tab));
     if let Some(id) = ROBIT_UI.with_borrow(|u| *u) {
+        if matches!(was, RobitTab::Crafting | RobitTab::Repair) && was != tab {
+            let mut out = vec![7];
+            out.extend(id.to_be_bytes());
+            game.native_send_to_server(ROBIT_CHANNEL, &out);
+        }
         let mut out = vec![6];
         out.extend(id.to_be_bytes());
         game.native_send_to_server(ROBIT_CHANNEL, &out);
