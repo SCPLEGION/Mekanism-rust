@@ -440,6 +440,7 @@ def build_module(ns, out):
     report["composite_models"] = flatten_models.flatten_tree(out / "assets" / ns, search)
     report["sps_textures"] = sps_textures(ns, out, search)
     report["sounds"] = sound_files(ns, out)
+    report["hud_sprites"] = hud_sprites(ns, out)
     if ns == "mekanismgenerators":
         # The turbine's blades (`ModelTurbine`): one pair of rings per blade index.
         turbine_png = next((d / ns / "render/turbine.png" for d in search if (d / ns / "render/turbine.png").is_file()), None)
@@ -736,6 +737,21 @@ def sound_files(ns, out):
         shutil.copyfile(src, dst / "sounds" / (f + ".ogg"))
     (dst / "sounds.json").write_text(json.dumps(keep, indent=2))
     return len(files)
+
+
+def hud_sprites(ns, out):
+    """The HUD's icons (`textures/gui/sprites/hud/*`, `HUDRenderer`) as `textures/gui/hud_<name>.png`: Horizon's GUI
+    atlas holds a content mod's `textures/gui` only."""
+    src = SRC / "main/resources/assets/mekanism/textures/gui/sprites/hud"
+    if ns != "mekanism" or not src.is_dir():
+        return 0
+    dst = out / "assets" / ns / "textures/gui"
+    dst.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for icon in sorted(src.glob("*.png")):
+        shutil.copyfile(icon, dst / f"hud_{icon.name}")
+        count += 1
+    return count
 
 
 def gauge_textures(ns, out):

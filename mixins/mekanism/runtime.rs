@@ -5862,6 +5862,41 @@ fn loop_sounds(game: &mut Game<'_>) {
     }
 }
 
+/// `HUDRenderer.renderMekaSuitEnergyIcons`: for each worn MekaSuit piece and each Meka-Tool in a hand, its icon and
+/// the percent of energy left, in the HUD colour (`ClientConfig` defaults: 40 % opacity, `0x40F5F0`, warning
+/// `0xFFDD4F` under 20 %, danger `0xFF383C` under 10 %).
+pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    if !game.native_on(MOD_ID) || !game.native_playing() {
+        return;
+    }
+    let pieces: [(Option<&ItemStack>, &str, &str); 6] = [
+        (game.armor[0].as_ref(), modules::HELMET, "mekasuit_helmet"),
+        (game.armor[1].as_ref(), modules::BODYARMOR, "mekasuit_chest"),
+        (game.armor[2].as_ref(), modules::PANTS, "mekasuit_leggings"),
+        (game.armor[3].as_ref(), modules::BOOTS, "mekasuit_boots"),
+        (game.inventory.get(game.selected).and_then(|s| s.as_ref()), modules::MEKA_TOOL, "mekatool"),
+        (game.offhand.as_ref(), modules::MEKA_TOOL, "mekatool"),
+    ];
+    let shown: Vec<(&str, f64)> = pieces
+        .into_iter()
+        .filter_map(|(stack, item, icon)| {
+            let stack = stack.filter(|s| &*s.item == item)?;
+            let capacity = item_energy_of(stack)?.capacity;
+            let ratio = if capacity == 0 { 0.0 } else { stored_energy(stack) as f64 / capacity as f64 };
+            Some((icon, ratio.clamp(0.0, 1.0)))
+        })
+        .collect();
+    for (n, (icon, ratio)) in shown.into_iter().enumerate() {
+        let rgb: u32 = if ratio > 0.2 { 0x40F5F0 } else if ratio > 0.1 { 0xFFDD4F } else { 0xFF383C };
+        let argb = (0x66u32 << 24) | rgb;
+        let x = 10.0 + 48.0 * n as f32;
+        game.native_sprite_tinted(batch, &format!("mekanism:gui/hud_{icon}"), [0.0, 0.0, 16.0, 16.0], [x, 10.0, 16.0, 16.0], argb);
+        let [_, r, g, b] = rgb.to_be_bytes();
+        let text = horizon_client::text::Text::literal(&format!("{}%", (ratio * 100.0).round() as i64));
+        batch.text_styled(&game.gui.atlas, &text, x + 18.0, 15.0, horizon_client::hud::rgba(r, g, b, 0x66), false);
+    }
+}
+
 /// The window's tick (`CommonPlayerTickHandler.tickEnd` for the local player): holding jump with a
 /// fuelled jetpack on, outside creative flight, thrusts in its normal mode and stops the fall, and tells
 /// the server, which spends the hydrogen.
