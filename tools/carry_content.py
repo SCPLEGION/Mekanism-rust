@@ -700,7 +700,11 @@ def sps_textures(ns, out, search):
         x, y = n % 4 * cell, n // 4 * cell
         image.crop((x, y, x + cell, y + cell)).resize((64, 64), Image.LANCZOS).save(dst / f"sps_core_{n}.png")
     shutil.copyfile(orbit, dst / "sps_orbit.png")
-    return 17
+    # The Flamethrower's flames (`RenderFlame`) draw this sprite.
+    flame = next((d / ns / "render/flame.png" for d in search if (d / ns / "render/flame.png").is_file()), None)
+    if flame is not None:
+        shutil.copyfile(flame, dst / "flame.png")
+    return 18
 
 
 def gauge_textures(ns, out):

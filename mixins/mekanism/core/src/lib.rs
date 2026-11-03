@@ -17,6 +17,7 @@ pub mod entangloporter;
 pub mod evaporation;
 pub mod factory;
 pub mod fission;
+pub mod flamethrower;
 pub mod formulaic;
 pub mod security;
 pub mod stabilizer;
