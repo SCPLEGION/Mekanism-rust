@@ -273,8 +273,8 @@ def shape_names(src, ns):
 def as_shape(value):
     kind, data = value
     if kind == "shape":
-        return {"all": clip(data)}
-    return {"facing": {d: clip(b) for d, b in data.items()}}
+        return {"all": clip(data), "raw_all": [list(b) for b in data]}
+    return {"facing": {d: clip(b) for d, b in data.items()}, "raw": {d: [list(x) for x in b] for d, b in data.items()}}
 
 
 def collect(src):
@@ -383,6 +383,8 @@ def fit(shapes, assets, report):
                         best, best_score = r, score
                 if best is not None:
                     shape["facing"][facing] = turn_boxes(boxes, best)
+                    if "raw" in shape:
+                        shape["raw"][facing] = turn_boxes(shape["raw"][facing], best)
                     report.append(f"{ns}:{block} {facing}: rotated ({base:.2f} -> {best_score:.2f})")
                 elif base < 0.6:
                     report.append(f"{ns}:{block} {facing}: poor overlap {base:.2f}")
