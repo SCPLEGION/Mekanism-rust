@@ -610,6 +610,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     adapter_sync(game, pos, entity);
     upgrade_sync(game, pos, entity);
     sorter_sync(game, pos, entity);
+    miner_sync(game, pos, entity);
     multiblock_data(game, pos, entity);
     if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Pipe(_)) {
         show_connections(game, pos, entity);
@@ -2156,6 +2157,40 @@ const MINER_SLOTS: usize = 27;
 const MINER_IDLE: u32 = 0;
 const MINER_SEARCHING: u32 = 1;
 const MINER_FINISHED: u32 = 2;
+const MINER_CHANNEL: &str = "mekanism:miner";
+
+fn get_i32(nbt: &Compound, key: &str, default: i32) -> i32 {
+    match nbt.get(&JavaString::from(key)) {
+        Some(Tag::Int(v)) => *v,
+        _ => default,
+    }
+}
+
+fn miner_region(nbt: &Compound) -> miner::Region {
+    let d = miner::Region::default();
+    miner::Region { radius: get_i32(nbt, "radius", d.radius), min_y: get_i32(nbt, "min_y", d.min_y), max_y: get_i32(nbt, "max_y", d.max_y) }
+}
+
+fn put_miner_region(nbt: &mut Compound, r: miner::Region) {
+    for (k, v) in [("radius", r.radius), ("min_y", r.min_y), ("max_y", r.max_y)] {
+        nbt.insert(k.into(), Tag::Int(v));
+    }
+}
+
+fn miner_filters(nbt: &Compound) -> Vec<miner::Filter> {
+    strings_of(nbt, "filters").iter().filter_map(|l| miner::Filter::load(l)).collect()
+}
+
+fn put_miner_filters(nbt: &mut Compound, filters: &[miner::Filter]) {
+    let lines: Vec<String> = filters.iter().map(miner::Filter::save).collect();
+    nbt.insert("filters".into(), string_list(&lines));
+}
+
+/// What the miner uses a tick: the upgrades' usage, times silk touch's multiplier and the region's cost.
+fn miner_usage(nbt: &Compound) -> u64 {
+    let base = upgrades(nbt).energy_per_tick(miner::ENERGY_USAGE);
+    miner_region(nbt).energy_per_tick(base, get_int(nbt, "silk") == 1)
+}
 
 fn miner_found(nbt: &Compound) -> Vec<i32> {
     match nbt.get(&JavaString::from("found")) {
@@ -2166,10 +2201,11 @@ fn miner_found(nbt: &Compound) -> Vec<i32> {
 
 /// `TileEntityDigitalMiner.reset`: forgets the search and what it found; the miner stops.
 fn miner_reset(nbt: &mut Compound) {
-    for key in ["mstate", "cursor", "running", "delay"] {
+    for key in ["mstate", "cursor", "running", "delay", "to_mine"] {
         put_int(nbt, key, 0);
     }
     nbt.remove(&JavaString::from("found"));
+    nbt.remove(&JavaString::from("missing"));
 }
 
 /// Puts `stack` into the miner's internal slots (a stack merges into the same item first); `None` when it
@@ -2203,16 +2239,27 @@ fn miner_insert(game: &Game<'_>, items: &mut [Option<ItemStack>], mut stack: Ite
     Some(stack)
 }
 
-/// The Digital Miner (`TileEntityDigitalMiner`): Start searches its 21 x 21 x 61 region for the ores
-/// (`#c:ores`, until the filters are ported) and, once the search is finished, mines them from the highest
-/// index every `ticksPerMine` (speed upgrades shorten it, energy upgrades cut the 40 FE/t). What a block
-/// drops must fit in its 27 slots, else it waits; with Auto-eject on, a stack goes to the container above
-/// it every 10 ticks. Silk touch drops the block itself.
+/// The block ids the miner never breaks (`MekanismTags.Blocks.MINER_BLACKLIST`, `isAir`).
+fn miner_skips(name: &str, hardness: f32) -> bool {
+    hardness < 0.0 || matches!(name, "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air")
+}
+
+/// The back of the miner (`getOppositeDirection`) as a step.
+fn miner_back(game: &Game<'_>, pos: [i32; 3]) -> [i32; 3] {
+    let d = game.native_block_property(pos, "facing").and_then(|f| direction(&f)).unwrap_or([0, 0, 1]);
+    [-d[0], 0, -d[2]]
+}
+
+/// The Digital Miner (`TileEntityDigitalMiner`): Start searches its region for the blocks its filters name
+/// (everything else in inverse mode) and, once the search is finished, mines them from the highest index
+/// every `ticksPerMine` (speed upgrades shorten it, energy upgrades cut the usage). What a block drops must
+/// fit in its 27 slots, else it waits; a filter's replacement block is put where the block was. With
+/// Auto-eject on, a stack goes to the inventory behind it every 10 ticks.
 fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    use mekanism_core::miner;
     let u = upgrades(&entity.nbt);
-    let usage = u.energy_per_tick(miner::ENERGY_USAGE);
+    let usage = miner_usage(&entity.nbt);
     let delay_length = u.ticks(miner::TICKS_PER_MINE).max(1);
+    let region = miner_region(&entity.nbt);
     let mut energy = EnergyContainer::new(miner::STORAGE.max(usage), u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(energy.capacity);
     discharge_slot(entity, 1, &mut energy);
@@ -2220,21 +2267,30 @@ fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
     let mut found = miner_found(&entity.nbt);
     // The searcher thread: a slice of the region a tick, from the top down.
     if state == MINER_SEARCHING {
+        let filters = miner_filters(&entity.nbt);
+        let inverse = get_int(&entity.nbt, "inverse") == 1;
+        let item_tags = world_items!(game).item_tags.clone();
+        let in_tag = |tag: &str, block: &str| item_tags.get(tag).is_some_and(|t| t.contains(block));
         let cursor = get_int(&entity.nbt, "cursor");
-        let end = (cursor + miner::SCAN_LIMIT).min(miner::total_size());
-        for index in cursor..end {
-            let at = miner::position(pos, miner::total_size() - 1 - index);
+        let total = region.total_size();
+        let end = cursor.saturating_add(miner::SCAN_LIMIT).min(total);
+        for index in region.search_order(cursor, miner::SCAN_LIMIT) {
+            let at = region.position(pos, index);
             if at == pos {
                 continue;
             }
             let block = game.world.block(at[0], at[1], at[2]);
             let facts = game.res.facts().get(block);
-            if facts.hardness >= 0.0 && world_items!(game).block_in_tag(miner::ORE_TAG, &facts.name) {
-                found.push((miner::total_size() - 1 - index) as i32);
+            if miner_skips(&facts.name, facts.hardness) {
+                continue;
+            }
+            let matched = miner::matching_filter(&filters, &facts.name, &in_tag).is_some();
+            if inverse != matched {
+                found.push(index as i32);
             }
         }
         put_int(&mut entity.nbt, "cursor", end);
-        if end >= miner::total_size() {
+        if end >= total {
             state = MINER_FINISHED;
             put_int(&mut entity.nbt, "mstate", state);
         }
@@ -2256,12 +2312,14 @@ fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
             }
         }
     }
-    // Auto-eject (`doEject`): a stack to the container above, every 10 ticks.
+    // Auto-eject (`doEject`): a stack to the inventory behind it (one block up and two back), every 10 ticks.
     if get_int(&entity.nbt, "eject") == 1 && game.ticks % 10 == 0 {
-        let above = [pos[0], pos[1] + 1, pos[2]];
+        let back = miner_back(game, pos);
+        let target = [pos[0] + 2 * back[0], pos[1] + 1, pos[2] + 2 * back[2]];
+        let face = horizon_core::geometry::Direction::ALL[face_index([-back[0], 0, -back[2]])];
         if let Some(i) = (MINER_FIRST..MINER_FIRST + MINER_SLOTS).find(|&i| entity.items.get(i).is_some_and(|s| s.is_some())) {
             let stack = entity.items[i].take().unwrap_or_else(|| unreachable!());
-            entity.items[i] = game.native_insert_item(above, horizon_core::geometry::Direction::Down, stack);
+            entity.items[i] = game.native_insert_item(target, face, stack);
         }
     }
     put_long(&mut entity.nbt, "energy", energy.stored);
@@ -2277,20 +2335,30 @@ fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
     Some(active)
 }
 
-/// Mines the highest ore the search found, if its drops fit in the miner's slots.
+/// Mines the highest block the search found, if its drops fit in the miner's slots and its replacement
+/// (`setReplace`) can be had; otherwise it waits (and the missing block shows on the screen).
 fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, found: &mut Vec<i32>) {
-    use mekanism_core::miner;
     let Some(&index) = found.last() else {
         return;
     };
-    let at = miner::position(pos, index as u32);
+    let region = miner_region(&entity.nbt);
+    let at = region.position(pos, index as u32);
     let state = game.world.block(at[0], at[1], at[2]);
     let facts = game.res.facts().get(state);
-    // The block is gone or changed since the search saw it.
-    if facts.hardness < 0.0 || !world_items!(game).block_in_tag(miner::ORE_TAG, &facts.name) {
+    let filters = miner_filters(&entity.nbt);
+    let inverse = get_int(&entity.nbt, "inverse") == 1;
+    let item_tags = world_items!(game).item_tags.clone();
+    let in_tag = |tag: &str, block: &str| item_tags.get(tag).is_some_and(|t| t.contains(block));
+    let matched = miner::matching_filter(&filters, &facts.name, &in_tag);
+    // The block changed since the search saw it: it is no longer a target.
+    if miner_skips(&facts.name, facts.hardness) || inverse == matched.is_some() {
         found.pop();
         return;
     }
+    let (target, requires) = match matched {
+        Some(f) => (f.replace.clone(), f.requires_replacement),
+        None => (get_string(&entity.nbt, "inv_replace").unwrap_or_default(), get_int(&entity.nbt, "inv_require") == 1),
+    };
     let drops = if get_int(&entity.nbt, "silk") == 1 {
         vec![stack_of(&facts.name, 1)]
     } else {
@@ -2309,10 +2377,120 @@ fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fo
             return;
         }
     }
+    // The replacement comes from the miner's own slots first, then the inventory on top with Auto-pull.
+    let mut replacement = false;
+    if !target.is_empty() {
+        if let Some(slot) = slots.iter_mut().skip(MINER_FIRST).take(MINER_SLOTS).find(|s| s.as_ref().is_some_and(|s| *s.item == *target)) {
+            if let Some(have) = slot {
+                have.count -= 1;
+                if have.count == 0 {
+                    *slot = None;
+                }
+            }
+            replacement = true;
+        } else if get_int(&entity.nbt, "pull") == 1 {
+            let wanted = |s: &ItemStack| *s.item == *target;
+            replacement = game.native_extract_item_where([pos[0], pos[1] + 2, pos[2]], horizon_core::geometry::Direction::Down, 1, &wanted).is_some();
+        }
+    }
+    if !target.is_empty() && !replacement && requires {
+        entity.nbt.insert("missing".into(), Tag::String(target.as_str().into()));
+        return;
+    }
+    entity.nbt.remove(&JavaString::from("missing"));
     entity.items = slots;
     found.pop();
     let block = horizon_core::position::BlockPos::new(at[0], at[1], at[2]);
     game.with_level(|b, level, ticks| b.destroy_block(level, ticks, block, false));
+    if replacement && let Some(new) = game.pack.assets.registry.default_state(&target) {
+        game.with_level(|b, level, ticks| b.set_block(level, ticks, block, new, 3));
+    }
+}
+
+/// What the miner's screens read: its settings and filters, and the block it misses, in the `client`
+/// compound.
+fn miner_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    if kind(&entity.id) != Some(Kind::DigitalMiner) {
+        return;
+    }
+    let mut client = Compound::new();
+    put_miner_region(&mut client, miner_region(&entity.nbt));
+    client.insert("filters".into(), string_list(&strings_of(&entity.nbt, "filters")));
+    for key in ["inverse", "inv_require"] {
+        put_int(&mut client, key, get_int(&entity.nbt, key));
+    }
+    for key in ["inv_replace", "missing"] {
+        if let Some(v) = get_string(&entity.nbt, key) {
+            client.insert(key.into(), Tag::String(v.as_str().into()));
+        }
+    }
+    put_client(game, pos, entity, &["radius", "min_y", "max_y", "filters", "inverse", "inv_require", "inv_replace", "missing"], client);
+}
+
+/// A player's press on the miner's config screen: `pos`, an op and its payload. Only within reach.
+/// Ops: 0 radius, 1 min Y, 2 max Y (a number), 3 inverse, 4 inverse requires replacement, 5 inverse
+/// replace target (an item id, empty for none), 6 new filter, 7 replace filter `value`, 8 delete, 9 up,
+/// 10 down, 11 top, 12 bottom, 13 toggle enabled.
+fn miner_payload(game: &mut Game<'_>, data: &[u8]) {
+    let (Some(pos), Some(&op), Some(value), Some(text), Some(player)) = (data.get(..12), data.get(12), data.get(13..17), data.get(17..), game.native_acting_player()) else {
+        return;
+    };
+    let int = |i: usize| i32::from_be_bytes([pos[i], pos[i + 1], pos[i + 2], pos[i + 3]]);
+    let pos = [int(0), int(4), int(8)];
+    let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    if !near || kind(block_name(game, pos)) != Some(Kind::DigitalMiner) {
+        return;
+    }
+    let value = i32::from_be_bytes([value[0], value[1], value[2], value[3]]);
+    let text = String::from_utf8_lossy(text).into_owned();
+    game.native_with_mod_block_entity(pos, |m| {
+        let region = miner_region(&m.nbt);
+        let mut filters = miner_filters(&m.nbt);
+        let index = usize::try_from(value).unwrap_or(usize::MAX);
+        let flip = |nbt: &mut Compound, key: &str| put_int(nbt, key, u32::from(get_int(nbt, key) == 0));
+        match op {
+            0 => put_miner_region(&mut m.nbt, region.with_radius(value)),
+            1 => put_miner_region(&mut m.nbt, region.with_min_y(value)),
+            2 => put_miner_region(&mut m.nbt, region.with_max_y(value)),
+            3 => flip(&mut m.nbt, "inverse"),
+            4 => flip(&mut m.nbt, "inv_require"),
+            5 => {
+                if text.is_empty() {
+                    m.nbt.remove(&JavaString::from("inv_replace"));
+                } else {
+                    m.nbt.insert("inv_replace".into(), Tag::String(text.as_str().into()));
+                }
+            }
+            6 => {
+                if let Some(f) = miner::Filter::load(&text).filter(|f| !f.name.is_empty() && !filters.contains(f)) {
+                    filters.push(f);
+                }
+            }
+            7 => {
+                if let (Some(slot), Some(f)) = (filters.get_mut(index), miner::Filter::load(&text).filter(|f| !f.name.is_empty())) {
+                    *slot = f;
+                }
+            }
+            8 if index < filters.len() => {
+                filters.remove(index);
+            }
+            9 | 11 if index > 0 && index < filters.len() => {
+                let f = filters.remove(index);
+                filters.insert(if op == 9 { index - 1 } else { 0 }, f);
+            }
+            10 | 12 if index + 1 < filters.len() => {
+                let f = filters.remove(index);
+                filters.insert(if op == 10 { index + 1 } else { filters.len() }, f);
+            }
+            13 => {
+                if let Some(f) = filters.get_mut(index) {
+                    f.enabled = !f.enabled;
+                }
+            }
+            _ => {}
+        }
+        put_miner_filters(&mut m.nbt, &filters);
+    });
 }
 
 // --- Transmitter shapes -----------------------------------------------------------------------------
@@ -3289,8 +3467,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         // An SPS port takes energy in input mode (`TileEntitySPSPort`).
         Kind::SpsPort if get_long(nbt, "output") == 0 => Some((sps::PORT_STORAGE, u64::MAX)),
         Kind::DigitalMiner => {
-            let usage = upgrades(nbt).energy_per_tick(mekanism_core::miner::ENERGY_USAGE);
-            Some((mekanism_core::miner::STORAGE.max(usage), u64::MAX))
+            Some((mekanism_core::miner::STORAGE.max(miner_usage(nbt)), u64::MAX))
         }
         _ => None,
     }
@@ -3844,6 +4021,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     }
     if channel == SORTER_CHANNEL && game.native_on(MOD_ID) {
         sorter_payload(game, data);
+        return;
+    }
+    if channel == MINER_CHANNEL && game.native_on(MOD_ID) {
+        miner_payload(game, data);
         return;
     }
     if channel == FREE_RUNNERS_CHANNEL && game.native_on(MOD_ID) {
@@ -5285,7 +5466,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
 /// Auto-eject, Auto-pull and silk touch switches (7-9) and low power (10).
 fn miner_flags(nbt: &Compound) -> u32 {
     let flag = |key: &str, bit: u32| u32::from(get_int(nbt, key) == 1) << bit;
-    let low = u32::from(upgrades(nbt).energy_per_tick(mekanism_core::miner::ENERGY_USAGE) > mekanism_core::miner::STORAGE) << 10;
+    let low = u32::from(miner_usage(nbt) > mekanism_core::miner::STORAGE) << 10;
     get_int(nbt, "warn") & 1 | (get_int(nbt, "mstate") & 3) << 4 | flag("running", 6) | flag("eject", 7) | flag("pull", 8) | flag("silk", 9) | low
 }
 
@@ -5724,6 +5905,10 @@ fn centred(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, text: &st
 /// type tabs, the close button, the title, the eject screen and button, the face buttons with the
 /// block beside each face, the clear button and the "Slots" label.
 pub(super) fn screen_overlay(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    if miner_cfg_open(block) {
+        draw_miner_windows(game, batch, origin);
+        return;
+    }
     if qio_select_open(block) {
         return;
     }
@@ -5833,6 +6018,10 @@ pub(super) fn creative_tabs(tabs: &mut Vec<crate::game::native_hooks::NativeCrea
 /// What Mekanism's own parts cover on a screen (hook point `native_screen_covers`, API 32): its tabs
 /// beside the panel, and the open window with its type tabs.
 pub(super) fn screen_covers(block: &str, at: [f32; 2], covered: &mut bool) {
+    if miner_cfg_open(block) {
+        *covered |= miner_cfg_covers(at);
+        return;
+    }
     if qio_select_open(block) {
         return;
     }
@@ -5972,8 +6161,36 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
     }
 }
 
+/// The wheel on a screen (hook point `native_screen_wheel`): it scrolls the filter list of the sorter, the
+/// QIO importer and exporter and the miner's config screen (`GuiFilterHolder.mouseScrolled`), a row a notch.
+pub(super) fn screen_wheel(game: &Game<'_>, block: &str, steps: f32, taken: &mut bool) {
+    let notch = |first: usize, count: usize| {
+        let hidden = count.saturating_sub(SORTER_ROWS);
+        if steps > 0.0 { first.min(hidden).saturating_sub(1) } else { (first + 1).min(hidden) }
+    };
+    if miner_cfg_open(block) {
+        if let Some(c) = miner_cfg(game)
+            && MINER_UI.with_borrow(|ui| !ui.select && ui.edit.is_none())
+        {
+            MINER_UI.with_borrow_mut(|ui| ui.scroll = notch(ui.scroll, c.filters.len()));
+            *taken = true;
+        }
+    } else if is_filter_screen(block)
+        && FILTER_EDIT.with_borrow(|e| e.is_none())
+        && FILTER_SELECT.get().is_none()
+        && let Some((pos, view)) = sorter_view(game)
+    {
+        SORTER_SCROLL.set((pos, notch(sorter_scroll(pos), view.filters.len())));
+        *taken = true;
+    }
+}
+
 /// Escape on a screen (hook point `native_screen_escape`): it closes the open window and not the screen.
 pub(super) fn screen_escape(block: &str, consumed: &mut bool) {
+    if miner_cfg_open(block) {
+        miner_cfg_escape(consumed);
+        return;
+    }
     if is_filter_screen(block) {
         if FILTER_EDIT.with_borrow(|e| e.is_some()) {
             close_filter_window();
@@ -6926,6 +7143,17 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
 
 /// A press on a reactor's button (hook point `native_screen_click`, API 20).
 pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
+    if miner_cfg_open(block) {
+        miner_cfg_click(game, at, right);
+        return;
+    }
+    // Config opens the filter screen while the miner is idle.
+    if kind(block) == Some(Kind::DigitalMiner) && !right && inside(at, [87.0, 53.0, 61.0, 18.0]) {
+        if miner_view(block, data).state == 0 && let Some((x, y, z)) = game.container {
+            MINER_VIEW.set(Some(([x, y, z], game.ticks as u64)));
+        }
+        return;
+    }
     if kind(block) == Some(Kind::FusionPort) && fusion_click(game, block, at, right) {
         return;
     }
@@ -7114,6 +7342,18 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
             slots: vec![None; s.slots.len()],
             inventory_y: 4000.0,
             inventory_x: 0.0,
+            own_labels: true,
+            alt: None,
+        }));
+    }
+    if kind(block) == Some(Kind::DigitalMiner) && let Some(s) = screen.as_mut() {
+        // `GuiDigitalMinerConfig`: the filter holder's 276 x 254, none of the miner's slots.
+        s.alt = Some(Box::new(super::native_hooks::NativeScreen {
+            width: 276.0,
+            height: 254.0,
+            slots: vec![None; s.slots.len()],
+            inventory_y: 172.0,
+            inventory_x: 58.0,
             own_labels: true,
             alt: None,
         }));
@@ -8144,6 +8384,10 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
 /// Mekanism's screen for a block: the base panel, its slots and the player's, its gauges, its power
 /// bar or energy gauge, its progress bar, and the energy tab on the left.
 pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    if miner_cfg_open(block) {
+        draw_miner_config(game, batch, origin);
+        return;
+    }
     if fission_stats_open(block) {
         draw_fission_stats(game, batch, data, origin);
         return;
@@ -8523,6 +8767,10 @@ fn warning_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<Stri
 }
 
 pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
+    if miner_cfg_open(block) {
+        miner_cfg_tooltip(game, at, lines);
+        return;
+    }
     if !qio_select_open(block) && warning_tooltip(block, data, at, lines) {
         return;
     }
@@ -11097,6 +11345,10 @@ pub(super) fn screen_alt(game: &Game<'_>, block: &str, alt: &mut bool) {
         }
         return;
     }
+    if kind(block) == Some(Kind::DigitalMiner) {
+        miner_screen_alt(game, alt);
+        return;
+    }
     if matches!(kind(block), Some(Kind::FissionPort | Kind::BoilerValve | Kind::TurbineValve)) {
         if let Some((pos, seen)) = STATS_VIEW.get() {
             let here = game.container.map(|(x, y, z)| [x, y, z]);
@@ -11566,6 +11818,10 @@ fn frequency_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool) -> b
 
 /// Whether the selector's text box has focus (hook point `native_screen_typing`).
 pub(super) fn screen_typing(block: &str, typing: &mut bool) {
+    if miner_cfg_open(block) {
+        *typing |= miner_cfg_typing();
+        return;
+    }
     if freq_open(block) {
         *typing |= FREQ_UI.with_borrow(|ui| ui.text.focused);
     }
@@ -11583,6 +11839,10 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
 /// A key on the selector's focused text box (hook point `native_screen_key`): Enter sets the name as
 /// a new frequency (`setEnterHandler`).
 pub(super) fn screen_key(game: &mut Game<'_>, block: &str, key: &str, text: Option<&str>) {
+    if miner_cfg_open(block) {
+        miner_cfg_key(game, key, text);
+        return;
+    }
     if fission_stats_open(block) {
         fission_stats_key(game, key, text);
         return;
@@ -12859,6 +13119,562 @@ fn filter_key(key: &str, text: Option<&str>) {
             t.key(key, text, |c| c.is_ascii_digit(), 2);
         }
     });
+}
+
+// --- Digital Miner config screen (GuiDigitalMinerConfig, GuiMinerFilerSelect, GuiMinerItemStackFilter...) -----
+
+const MCFG_BACK: [f32; 4] = [5.0, 5.0, 11.0, 11.0];
+const MCFG_SWITCH: [f32; 4] = [10.0, 115.0, 30.0, 16.0];
+const MCFG_SLOT: [f32; 4] = [13.0, 135.0, 18.0, 18.0];
+const MCFG_REQUIRE: [f32; 4] = [35.0, 137.0, 14.0, 14.0];
+/// The radius, min Y and max Y fields (`GuiTextField`, digital border).
+const MCFG_FIELDS: [[f32; 4]; 3] = [[13.0, 45.0, 38.0, 11.0], [13.0, 71.0, 38.0, 11.0], [13.0, 98.0, 38.0, 11.0]];
+/// The filter window (`MINER_FILTER_WIDTH` 173 wide, centred on 276, 30 down) and what is in it.
+const MWIN: [f32; 4] = [51.0, 30.0, 173.0, 90.0];
+const MWIN_DELETE: [f32; 4] = [25.0, 62.0, 60.0, 20.0];
+const MWIN_SAVE: [f32; 4] = [87.0, 62.0, 60.0, 20.0];
+const MWIN_REPLACE: [f32; 4] = [148.0, 18.0, 18.0, 18.0];
+const MWIN_REQUIRE: [f32; 4] = [148.0, 45.0, 14.0, 14.0];
+
+thread_local! {
+    static MINER_VIEW: std::cell::Cell<Option<([i32; 3], u64)>> = const { std::cell::Cell::new(None) };
+    static MINER_UI: std::cell::RefCell<MinerUi> = std::cell::RefCell::new(MinerUi::default());
+}
+
+#[derive(Default)]
+struct MinerUi {
+    scroll: usize,
+    select: bool,
+    edit: Option<MinerEdit>,
+    fields: [freq::TextBox; 3],
+}
+
+/// A filter window being edited: an existing filter (`index`) or a new one not sent until Save.
+struct MinerEdit {
+    index: Option<usize>,
+    filter: miner::Filter,
+    name: freq::TextBox,
+    status: String,
+    ticker: u64,
+}
+
+struct MinerCfg {
+    pos: [i32; 3],
+    region: miner::Region,
+    filters: Vec<miner::Filter>,
+    inverse: bool,
+    inv_replace: String,
+    inv_require: bool,
+}
+
+fn miner_cfg_open(block: &str) -> bool {
+    kind(block) == Some(Kind::DigitalMiner) && MINER_VIEW.get().is_some()
+}
+
+fn miner_cfg(game: &Game<'_>) -> Option<MinerCfg> {
+    let (x, y, z) = game.container?;
+    let (_, c) = game.native_client_block_entity([x, y, z])?;
+    Some(MinerCfg {
+        pos: [x, y, z],
+        region: miner_region(c),
+        filters: miner_filters(c),
+        inverse: get_int(c, "inverse") == 1,
+        inv_replace: get_string(c, "inv_replace").unwrap_or_default(),
+        inv_require: get_int(c, "inv_require") == 1,
+    })
+}
+
+fn send_miner(game: &Game<'_>, pos: [i32; 3], op: u8, value: i32, text: &str) {
+    let mut data = Vec::new();
+    for c in pos {
+        data.extend(c.to_be_bytes());
+    }
+    data.push(op);
+    data.extend(value.to_be_bytes());
+    data.extend(text.as_bytes());
+    game.native_send_to_server(MINER_CHANNEL, &data);
+}
+
+/// Opens the config screen from the main one, and keeps it open while the screen is.
+fn miner_screen_alt(game: &Game<'_>, alt: &mut bool) {
+    if let Some((pos, seen)) = MINER_VIEW.get() {
+        let now = game.ticks as u64;
+        if game.container.map(|(x, y, z)| [x, y, z]) != Some(pos) || now.saturating_sub(seen) > 10 {
+            MINER_VIEW.set(None);
+            MINER_UI.with_borrow_mut(|u| *u = MinerUi::default());
+        } else {
+            MINER_VIEW.set(Some((pos, now)));
+            *alt = true;
+        }
+    }
+}
+
+fn miner_item_name(id: &str) -> String {
+    if id.is_empty() { "No item".to_owned() } else { filter_name(id) }
+}
+
+fn miner_filter_name(f: &miner::Filter) -> String {
+    match f.kind {
+        miner::FilterKind::Item => miner_item_name(&f.name),
+        _ => f.name.clone(),
+    }
+}
+
+fn mcfg_value(r: miner::Region, i: usize) -> i32 {
+    [r.radius, r.min_y, r.max_y][i]
+}
+
+fn draw_text_field(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, b: [f32; 4], t: &freq::TextBox) {
+    let screen = 0xFF3C_FE9A_u32;
+    game.native_fill(batch, [b[0] - 1.0, b[1] - 1.0, b[2] + 2.0, b[3] + 2.0], if t.focused { screen } else { 0xFF24_985C });
+    game.native_fill(batch, b, 0xFF00_0000);
+    game.native_text_scaled(batch, &t.value, [b[0] + 2.0, b[1] + 2.0], screen & 0xFF_FFFF, 0.8);
+    if t.focused && (game.ticks / 6) % 2 == 0 {
+        let before: String = t.value.chars().take(t.cursor).collect();
+        game.native_text_scaled(batch, "_", [b[0] + 2.0 + game.native_text_width(&before) * 0.8, b[1] + 2.0], screen & 0xFF_FFFF, 0.8);
+    }
+}
+
+fn draw_miner_config(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let at = |r: [f32; 4]| [ox + r[0], oy + r[1], r[2], r[3]];
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 276.0, 254.0]);
+    for row in 0..4 {
+        let y = if row < 3 { 172.0 + 18.0 * row as f32 } else { 230.0 };
+        for col in 0..9 {
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 57.0 + 18.0 * col as f32, oy + y - 1.0, 18.0, 18.0]);
+        }
+    }
+    // `renderTitleTextWithOffset(14)`: centred right of the back button.
+    let title = "Digital Miner Config";
+    centred(game, batch, title, ox + 14.0, 262.0, oy + 4.0, 0x40_4040);
+    game.native_text(batch, "Inventory", [ox + 58.0, oy + 161.0], 0x40_4040, false);
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, at(SORTER_INFO), 0xFFFF_FFFF);
+    nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, at(SORTER_HOLDER), 0xFFFF_FFFF);
+    nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, at(SORTER_NEW_HOLDER), 0xFFFF_FFFF);
+    nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, at(SORTER_BAR), 0xFFFF_FFFF);
+    let Some(c) = miner_cfg(game) else {
+        return;
+    };
+    let small = |batch: &mut horizon_client::hud::HudBatch, text: &str, y: f32| {
+        game.native_text_scaled(batch, text, [ox + 9.0 + 1.0, oy + 17.0 + y + 3.0], 0x3C_FE9A, 0.8);
+    };
+    small(batch, &format!("Filters: {}", c.filters.len()), 5.0);
+    small(batch, &format!("Block radius: {}", c.region.radius), 18.0);
+    small(batch, &format!("Min Y level: {}", c.region.min_y), 44.0);
+    small(batch, &format!("Max Y level: {}", c.region.max_y), 71.0);
+    draw_button(game, batch, at(MCFG_BACK), inside(mouse, MCFG_BACK), true, 0xFFFF_FFFF, Some(("button/back", 14.0)));
+    // The inverse switch (`GuiDigitalSwitch`, `LEFT_ICON`).
+    let (sx, sy) = (ox + MCFG_SWITCH[0] + 15.0, oy + MCFG_SWITCH[1]);
+    let (top, bottom) = if c.inverse { ("switch/selected", "switch/unselected") } else { ("switch/unselected", "switch/selected") };
+    sprite(game, batch, top, [0.0, 0.0, 15.0, 8.0], [sx, sy, 15.0, 8.0]);
+    sprite(game, batch, bottom, [0.0, 0.0, 15.0, 8.0], [sx, sy + 9.0, 15.0, 8.0]);
+    sprite(game, batch, "switch/inverse", [0.0, 0.0, 5.0, 5.0], [ox + MCFG_SWITCH[0] + 5.0, oy + MCFG_SWITCH[1] + 6.0, 5.0, 5.0]);
+    for (j, text) in ["On", "Off"].into_iter().enumerate() {
+        let tw = game.native_text_width(text) * 0.6;
+        game.native_text_scaled(batch, text, [sx + (15.0 - tw) / 2.0, sy + 9.0 * j as f32 + 1.0], 0xFF10_1010, 0.6);
+    }
+    // The inverse replace target slot, and whether inverse mode requires the replacement.
+    sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], at(MCFG_SLOT));
+    if !c.inv_replace.is_empty() {
+        game.native_item(batch, &c.inv_replace, [ox + MCFG_SLOT[0] + 1.0, oy + MCFG_SLOT[1] + 1.0], 16.0);
+    }
+    if inside(mouse, MCFG_SLOT) {
+        game.native_fill(batch, [ox + MCFG_SLOT[0] + 1.0, oy + MCFG_SLOT[1] + 1.0, 16.0, 16.0], 0x80FF_FFFF);
+    }
+    draw_button(game, batch, at(MCFG_REQUIRE), inside(mouse, MCFG_REQUIRE), true, 0xFFFF_FFFF, Some(("button/exclamation", 16.0)));
+    MINER_UI.with_borrow(|ui| {
+        for (i, r) in MCFG_FIELDS.iter().enumerate() {
+            let b = at(*r);
+            draw_text_field(game, batch, b, &ui.fields[i]);
+            let ready = !ui.fields[i].value.is_empty();
+            let mark = [b[0] + b[2] - 12.0, b[1] - 1.0, 12.0, 12.0];
+            game.native_sprite_tinted(batch, &format!("{SPRITES}button/checkmark_digital"), [0.0, 0.0, 12.0, 12.0], mark, if ready { 0xFFFF_FFFF } else { 0x60FF_FFFF });
+        }
+        // The list.
+        let hidden = c.filters.len().saturating_sub(SORTER_ROWS);
+        let first = ui.scroll.min(hidden);
+        let thumb = if hidden > 0 { (first as f32 / hidden as f32 * (SORTER_BAR[3] - 2.0 - 15.0)).round() } else { 0.0 };
+        let bar = if hidden > 0 { "scroll/bar" } else { "scroll/bar_inactive" };
+        sprite(game, batch, bar, [0.0, 0.0, 12.0, 15.0], [ox + SORTER_BAR[0] + 1.0, oy + SORTER_BAR[1] + 1.0 + thumb, 12.0, 15.0]);
+        for (i, f) in c.filters.iter().skip(first).take(SORTER_ROWS).enumerate() {
+            let index = first + i;
+            let row = sorter_row(i);
+            let [rx, ry] = [ox + row[0], oy + row[1]];
+            nine_slice(game, batch, if inside(mouse, row) { "list/filter/hovered" } else { "list/filter/base" }, 156.0, 1.0, [rx, ry, 156.0, 29.0]);
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [rx + 2.0, ry + 2.0, 18.0, 18.0]);
+            if f.kind == miner::FilterKind::Item && !f.name.is_empty() {
+                game.native_item(batch, &f.name, [rx + 3.0, ry + 3.0], 16.0);
+            }
+            game.native_text(batch, &miner_filter_name(f), [rx + 22.0, ry + 3.0], 0x40_4040, false);
+            let (up, down, radio) = sorter_row_parts(i);
+            if index > 0 {
+                let name = if inside(mouse, up) { "button/filter_arrow/up_hovered" } else { "button/filter_arrow/up" };
+                sprite(game, batch, name, [0.0, 0.0, 11.0, 7.0], at(up));
+            }
+            if index + 1 < c.filters.len() {
+                let name = if inside(mouse, down) { "button/filter_arrow/down_hovered" } else { "button/filter_arrow/down" };
+                sprite(game, batch, name, [0.0, 0.0, 11.0, 7.0], at(down));
+            }
+            let name = if f.enabled {
+                "button/radio/selected"
+            } else if inside(mouse, radio) {
+                "button/radio/hovered"
+            } else {
+                "button/radio/base"
+            };
+            sprite(game, batch, name, [0.0, 0.0, 8.0, 8.0], at(radio));
+        }
+    });
+    draw_mek_button(game, batch, at(SORTER_NEW), true, inside(mouse, SORTER_NEW));
+    let w = game.native_text_width("New Filter");
+    game.native_text(batch, "New Filter", [ox + 96.0 + (156.0 - w) / 2.0, oy + 142.0], 0xFF_FFFF, true);
+}
+
+/// The windows over the config screen (hook point `native_screen_overlay`): the select window and the
+/// item, tag and mod id filter windows.
+fn draw_miner_windows(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let at = [cursor[0] - ox, cursor[1] - oy];
+    MINER_UI.with_borrow(|ui| {
+        if ui.select {
+            let sc = |r: [f32; 4]| {
+                let [x, y, w, h] = select_rect(r);
+                [ox + x, oy + y, w, h]
+            };
+            let [x, y, w, h] = sc([0.0, 0.0, SELECT_WINDOW[2], SELECT_WINDOW[3]]);
+            nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
+            nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
+            draw_button(game, batch, sc(FILTER_CLOSE), inside(at, select_rect(FILTER_CLOSE)), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+            centred(game, batch, "Create New Filter", x, w, y + 6.0, 0x40_4040);
+            nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, sc([11.0, 18.0, 130.0, 62.0]), 0xFFFF_FFFF);
+            for (k, label) in ["ItemStack", "Tag", "Mod ID"].iter().enumerate() {
+                let b = sc(select_button(k));
+                draw_button(game, batch, b, inside(at, select_rect(select_button(k))), true, 0xFFFF_FFFF, None);
+                centred(game, batch, label, b[0], b[2], b[1] + 6.0, 0xFF_FFFF);
+            }
+            return;
+        }
+        let Some(e) = ui.edit.as_ref() else {
+            return;
+        };
+        let win = |r: [f32; 4]| [ox + MWIN[0] + r[0], oy + MWIN[1] + r[1], r[2], r[3]];
+        let hover = |r: [f32; 4]| inside(at, [MWIN[0] + r[0], MWIN[1] + r[1], r[2], r[3]]);
+        let [x, y, w, h] = win([0.0, 0.0, MWIN[2], MWIN[3]]);
+        nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
+        nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
+        let what = match e.filter.kind {
+            miner::FilterKind::Item => "Item Filter",
+            miner::FilterKind::Tag => "Tag Filter",
+            miner::FilterKind::Mod => "Mod ID Filter",
+        };
+        let new = e.index.is_none();
+        if new {
+            draw_button(game, batch, win(MCFG_BACK_WIN), hover(MCFG_BACK_WIN), true, 0xFFFF_FFFF, Some(("button/back", 14.0)));
+        } else {
+            draw_button(game, batch, win(FILTER_CLOSE), hover(FILTER_CLOSE), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+        }
+        let title = if new { format!("New: {what}") } else { format!("Edit: {what}") };
+        let pad = if new { 3.0 } else { 0.0 };
+        centred(game, batch, &title, x + pad, w - pad, y + 5.0, 0x40_4040);
+        sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], win(FILTER_SLOT));
+        if e.filter.kind == miner::FilterKind::Item && !e.filter.name.is_empty() {
+            game.native_item(batch, &e.filter.name, [x + 8.0, y + 19.0], 16.0);
+        }
+        let s = win(FILTER_SCREEN);
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, s, 0xFFFF_FFFF);
+        let ok = e.status.is_empty() || game.ticks as u64 >= e.ticker;
+        game.native_text(batch, &format!("Status: {}", if ok { "\u{a7}2OK" } else { &e.status }), [s[0] + 3.0, s[1] + 3.0], 0x3C_FE9A, false);
+        match e.filter.kind {
+            miner::FilterKind::Item => game.native_text_scaled(batch, &miner_item_name(&e.filter.name), [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8),
+            _ => {
+                let b = win(FILTER_NAME);
+                let t = &e.name;
+                game.native_fill(batch, [b[0] - 1.0, b[1] - 1.0, b[2] + 2.0, b[3] + 2.0], if t.focused { 0xFFFF_FFFF } else { 0xFFA0_A0A0 });
+                game.native_fill(batch, b, 0xFF00_0000);
+                game.native_text_scaled(batch, &t.value, [b[0] + 2.0, b[1] + 2.0], 0xE0_E0E0, 0.8);
+                if t.focused && (game.ticks / 6) % 2 == 0 {
+                    let before: String = t.value.chars().take(t.cursor).collect();
+                    game.native_text_scaled(batch, "_", [b[0] + 2.0 + game.native_text_width(&before) * 0.8, b[1] + 2.0], 0xE0_E0E0, 0.8);
+                }
+                let hint = if e.filter.kind == miner::FilterKind::Tag { "Tag: " } else { "ID: " };
+                game.native_text_scaled(batch, &format!("{hint}{}", e.filter.name), [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8);
+            }
+        }
+        // `addMinerDefaults`: the replace target slot and the require-replacement toggle.
+        sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], win(MWIN_REPLACE));
+        if !e.filter.replace.is_empty() {
+            game.native_item(batch, &e.filter.replace, [x + MWIN_REPLACE[0] + 1.0, y + MWIN_REPLACE[1] + 1.0], 16.0);
+        }
+        draw_button(game, batch, win(MWIN_REQUIRE), hover(MWIN_REQUIRE), true, 0xFFFF_FFFF, Some(("button/exclamation", 16.0)));
+        for (r, label) in [(MWIN_DELETE, if new { "Cancel" } else { "Delete" }), (MWIN_SAVE, "Save")] {
+            let b = win(r);
+            draw_button(game, batch, b, hover(r), true, 0xFFFF_FFFF, None);
+            centred(game, batch, label, b[0], b[2], b[1] + 6.0, 0xFF_FFFF);
+        }
+    });
+}
+
+const MCFG_BACK_WIN: [f32; 4] = [6.0, 6.0, 11.0, 11.0];
+
+/// A press on the config screen (hook point `native_screen_click`).
+fn miner_cfg_click(game: &Game<'_>, at: [f32; 2], right: bool) {
+    let Some(c) = miner_cfg(game) else {
+        return;
+    };
+    let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);
+    let held = game.inventory.get(game.selected).cloned().flatten().map(|h| h.item.to_string());
+    let is_block = |id: &str| game.pack.assets.registry.default_state(id).is_some();
+    // The windows take every press while one is open.
+    if MINER_UI.with_borrow(|ui| ui.select) {
+        let on = |r: [f32; 4]| inside(at, select_rect(r));
+        if on(FILTER_CLOSE) {
+            MINER_UI.with_borrow_mut(|ui| ui.select = false);
+        } else if let Some(k) = (0..3).find(|k| on(select_button(*k))) {
+            MINER_UI.with_borrow_mut(|ui| {
+                ui.select = false;
+                let kind = miner::FilterKind::from_index(k as u32);
+                ui.edit = Some(MinerEdit {
+                    index: None,
+                    filter: miner::Filter::new(kind, ""),
+                    name: freq::TextBox { focused: kind != miner::FilterKind::Item, ..Default::default() },
+                    status: String::new(),
+                    ticker: 0,
+                });
+            });
+        }
+        return;
+    }
+    if MINER_UI.with_borrow(|ui| ui.edit.is_some()) {
+        let on = |r: [f32; 4]| inside(at, [MWIN[0] + r[0], MWIN[1] + r[1], r[2], r[3]]);
+        let (index, kind) = MINER_UI.with_borrow(|ui| ui.edit.as_ref().map(|e| (e.index, e.filter.kind))).unwrap_or((None, miner::FilterKind::Item));
+        let edit = |change: &dyn Fn(&mut MinerEdit)| {
+            MINER_UI.with_borrow_mut(|ui| {
+                if let Some(e) = ui.edit.as_mut() {
+                    change(e);
+                }
+            });
+        };
+        edit(&|e| e.name.focused = e.filter.kind != miner::FilterKind::Item && on(FILTER_NAME));
+        if index.is_none() && on(MCFG_BACK_WIN) {
+            MINER_UI.with_borrow_mut(|ui| {
+                ui.edit = None;
+                ui.select = true;
+            });
+        } else if index.is_some() && on(FILTER_CLOSE) {
+            MINER_UI.with_borrow_mut(|ui| ui.edit = None);
+        } else if on(FILTER_SLOT) && kind == miner::FilterKind::Item {
+            if let Some(h) = held.filter(|h| is_block(h)) {
+                edit(&|e| e.filter.name = h.clone());
+            }
+        } else if on(MWIN_REPLACE) {
+            if shift {
+                edit(&|e| e.filter.replace.clear());
+            } else if let Some(h) = held.filter(|h| is_block(h)) {
+                edit(&|e| e.filter.replace = h.clone());
+            }
+        } else if on(MWIN_REQUIRE) {
+            edit(&|e| e.filter.requires_replacement = !e.filter.requires_replacement);
+        } else if on(MWIN_DELETE) {
+            if let Some(i) = index {
+                send_miner(game, c.pos, 8, i as i32, "");
+            }
+            MINER_UI.with_borrow_mut(|ui| ui.edit = None);
+        } else if on(MWIN_SAVE) {
+            miner_save_filter(game, c.pos);
+        }
+        return;
+    }
+    if inside(at, MCFG_BACK) {
+        MINER_VIEW.set(None);
+        MINER_UI.with_borrow_mut(|ui| *ui = MinerUi::default());
+        return;
+    }
+    if inside(at, MCFG_SWITCH) {
+        send_miner(game, c.pos, 3, 0, "");
+        return;
+    }
+    if inside(at, MCFG_REQUIRE) {
+        send_miner(game, c.pos, 4, 0, "");
+        return;
+    }
+    if inside(at, MCFG_SLOT) {
+        if shift {
+            send_miner(game, c.pos, 5, 0, "");
+        } else if let Some(h) = held.filter(|h| is_block(h)) {
+            send_miner(game, c.pos, 5, 0, &h);
+        }
+        return;
+    }
+    for (i, r) in MCFG_FIELDS.iter().enumerate() {
+        let focus = inside(at, *r);
+        let mark = inside(at, [r[0] + r[2] - 12.0, r[1] - 1.0, 12.0, 12.0]);
+        MINER_UI.with_borrow_mut(|ui| ui.fields[i].focused = focus && !mark);
+        if mark {
+            miner_set_field(game, c.pos, i);
+            return;
+        }
+        if focus {
+            return;
+        }
+    }
+    if inside(at, SORTER_NEW) {
+        MINER_UI.with_borrow_mut(|ui| ui.select = true);
+        return;
+    }
+    let (first, hidden) = (MINER_UI.with_borrow(|ui| ui.scroll), c.filters.len().saturating_sub(SORTER_ROWS));
+    if inside(at, SORTER_BAR) {
+        let f = ((at[1] - SORTER_BAR[1] - 8.0) / (SORTER_BAR[3] - 16.0)).clamp(0.0, 1.0);
+        MINER_UI.with_borrow_mut(|ui| ui.scroll = ((hidden as f32 + 0.5) * f) as usize);
+        return;
+    }
+    let first = first.min(hidden);
+    for i in 0..SORTER_ROWS.min(c.filters.len().saturating_sub(first)) {
+        let index = first + i;
+        let (up, down, radio) = sorter_row_parts(i);
+        if !inside(at, sorter_row(i)) {
+            continue;
+        }
+        if inside(at, up) && index > 0 {
+            send_miner(game, c.pos, if shift { 11 } else { 9 }, index as i32, "");
+        } else if inside(at, down) && index + 1 < c.filters.len() {
+            send_miner(game, c.pos, if shift { 12 } else { 10 }, index as i32, "");
+        } else if inside(at, radio) {
+            send_miner(game, c.pos, 13, index as i32, "");
+        } else if !right {
+            let filter = c.filters[index].clone();
+            MINER_UI.with_borrow_mut(|ui| {
+                let name = freq::TextBox { value: filter.name.clone(), cursor: filter.name.len(), focused: false };
+                ui.edit = Some(MinerEdit { index: Some(index), filter, name, status: String::new(), ticker: 0 });
+            });
+        }
+        return;
+    }
+}
+
+/// The field's Enter (`setText`): the number goes to the server and the box empties.
+fn miner_set_field(game: &Game<'_>, pos: [i32; 3], field: usize) {
+    let value = MINER_UI.with_borrow_mut(|ui| std::mem::take(&mut ui.fields[field]).value);
+    if let Ok(n) = value.parse::<i32>() {
+        send_miner(game, pos, field as u8, n, "");
+    }
+}
+
+/// Save (`validateAndSave`): a filter that names nothing keeps the window open with the reason.
+fn miner_save_filter(game: &Game<'_>, pos: [i32; 3]) {
+    let fail = MINER_UI.with_borrow_mut(|ui| {
+        let e = ui.edit.as_mut()?;
+        if e.filter.kind != miner::FilterKind::Item {
+            e.filter.name = e.name.value.clone();
+        }
+        if e.filter.name.is_empty() {
+            e.status = match e.filter.kind {
+                miner::FilterKind::Item => "\u{a7}4No item",
+                miner::FilterKind::Tag => "\u{a7}4No tag",
+                miner::FilterKind::Mod => "\u{a7}4No ID",
+            }
+            .to_owned();
+            e.ticker = game.ticks as u64 + 100;
+            return Some(());
+        }
+        let (index, line) = (e.index, e.filter.save());
+        ui.edit = None;
+        match index {
+            Some(i) => send_miner(game, pos, 7, i as i32, &line),
+            None => send_miner(game, pos, 6, 0, &line),
+        }
+        None
+    });
+    let _ = fail;
+}
+
+fn miner_cfg_tooltip(game: &Game<'_>, at: [f32; 2], lines: &mut Vec<String>) {
+    let Some(c) = miner_cfg(game) else {
+        return;
+    };
+    if MINER_UI.with_borrow(|ui| ui.select) {
+        return;
+    }
+    if let Some(e) = MINER_UI.with_borrow(|ui| ui.edit.as_ref().map(|e| (e.index.is_none(), e.filter.requires_replacement))) {
+        let on = |r: [f32; 4]| inside(at, [MWIN[0] + r[0], MWIN[1] + r[1], r[2], r[3]]);
+        if e.0 && on(MCFG_BACK_WIN) {
+            lines.push("Back".to_owned());
+        } else if on(MWIN_REQUIRE) {
+            lines.push(format!("Require replace: {}", if e.1 { "Yes" } else { "No" }));
+        }
+        return;
+    }
+    if inside(at, MCFG_BACK) {
+        lines.push("Back".to_owned());
+    } else if inside(at, MCFG_SWITCH) {
+        lines.push("Inverse mode".to_owned());
+    } else if inside(at, MCFG_REQUIRE) {
+        lines.push(format!("Inverse mode requires replacement: {}", if c.inv_require { "Yes" } else { "No" }));
+    }
+    let first = MINER_UI.with_borrow(|ui| ui.scroll).min(c.filters.len().saturating_sub(SORTER_ROWS));
+    for i in 0..SORTER_ROWS.min(c.filters.len().saturating_sub(first)) {
+        let (up, down, radio) = sorter_row_parts(i);
+        if inside(at, up) {
+            lines.push("Move Up".to_owned());
+            lines.push("Hold shift to move to top".to_owned());
+        } else if inside(at, down) {
+            lines.push("Move Down".to_owned());
+            lines.push("Hold shift to move to bottom".to_owned());
+        } else if inside(at, radio) {
+            lines.push(if c.filters[first + i].enabled { "Filter: \u{a7}aenabled".to_owned() } else { "Filter: \u{a7}cdisabled".to_owned() });
+        }
+    }
+}
+
+fn miner_cfg_covers(at: [f32; 2]) -> bool {
+    MINER_UI.with_borrow(|ui| (ui.select && inside(at, select_window())) || (ui.edit.is_some() && inside(at, MWIN)))
+}
+
+fn miner_cfg_typing() -> bool {
+    MINER_UI.with_borrow(|ui| ui.fields.iter().any(|f| f.focused) || ui.edit.as_ref().is_some_and(|e| e.name.focused))
+}
+
+/// A key in a focused field: digits (a minus for the Y fields); Enter sends a setting.
+fn miner_cfg_key(game: &Game<'_>, key: &str, text: Option<&str>) {
+    let Some(c) = miner_cfg(game) else {
+        return;
+    };
+    MINER_UI.with_borrow_mut(|ui| {
+        if let Some(e) = ui.edit.as_mut().filter(|e| e.name.focused) {
+            e.name.key(key, text, |c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-./:#@".contains(c), 64);
+            return;
+        }
+        let Some(i) = ui.fields.iter().position(|f| f.focused) else {
+            return;
+        };
+        let negative = i > 0;
+        let max = if i == 0 { 2 } else { 4 };
+        if ui.fields[i].key(key, text, |c| c.is_ascii_digit() || (negative && c == '-'), max) == freq::Typed::Enter {
+            let value = std::mem::take(&mut ui.fields[i]).value;
+            ui.fields[i].focused = true;
+            if let Ok(n) = value.parse::<i32>() {
+                send_miner(game, c.pos, i as u8, n, "");
+            }
+        }
+    });
+}
+
+fn miner_cfg_escape(consumed: &mut bool) {
+    let closed = MINER_UI.with_borrow_mut(|ui| {
+        if ui.edit.is_some() {
+            ui.edit = None;
+            true
+        } else if ui.select {
+            ui.select = false;
+            true
+        } else {
+            false
+        }
+    });
+    *consumed |= closed;
 }
 
 // --- Transporter configuration window (GuiTransporterConfig) ---------------------------------------------

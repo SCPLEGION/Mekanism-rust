@@ -342,6 +342,19 @@ bindings = [
 ]
 
 [[injection]]
+id = "screen-wheel"
+hook = "screen_wheel"
+hook_version = 1
+kind = "HEAD"
+helper = "screen_wheel.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "block", ty = "&str", value = "block" },
+  { name = "steps", ty = "f32", value = "steps" },
+  { name = "taken", ty = "&mut bool", value = "&mut *taken" },
+]
+
+[[injection]]
 id = "slot-rules"
 hook = "slot_rules"
 hook_version = 1
