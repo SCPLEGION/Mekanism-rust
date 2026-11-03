@@ -551,6 +551,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     screen_data(entity, facing);
     frequency_tick(game, pos, entity);
     adapter_sync(game, pos, entity);
+    upgrade_sync(game, pos, entity);
     sorter_sync(game, pos, entity);
     multiblock_data(game, pos, entity);
     if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Pipe(_)) {
@@ -5722,9 +5723,19 @@ fn draw_upgrade_window(game: &Game<'_>, block: &str, data: &[i32], batch: &mut h
     let [px, py, ..] = screen([176.0, 37.0, 0.0, 0.0]);
     sprite(game, batch, "progress/installing/empty", [0.0, 0.0, 10.0, 14.0], [px, py, 10.0, 14.0]);
     sprite(game, batch, "progress/uninstalling/empty", [0.0, 0.0, 12.0, 12.0], [px, py + 21.0, 12.0, 12.0]);
-    for sy in [18.0, 72.0] {
+    for (sy, output) in [(18.0, false), (72.0, true)] {
         let [sx, sy, ..] = screen([175.0, sy, 0.0, 0.0]);
         sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [sx, sy, 18.0, 18.0]);
+        if output
+            && let Some((id, n)) = upgrade_out_view(game)
+            && let Some(stack) = upgrade_stack(game, &id)
+        {
+            game.native_item_stack(batch, &ItemStack { count: n, ..stack }, [sx + 1.0, sy + 1.0], 16.0);
+            if n > 1 {
+                let label = n.to_string();
+                game.native_text(batch, &label, [sx + 17.0 - game.native_text_width(&label), sy + 9.0], 0xFF_FFFF, true);
+            }
+        }
     }
     // The supported upgrades (`GuiSupportedUpgrades`), the others faded.
     let sup = screen(UPGRADE_SUPPORTED);
@@ -5809,12 +5820,142 @@ fn upgrade_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     if *field == 0 {
         return true;
     }
+    // It goes to the window's output slot, which must take it (`getUpgradeOutputSlot`).
+    let out = upgrade_out_of(&entity.nbt);
+    let max = upgrade_stack(game, type_id).map_or(64, |s| max_stack(game, &s.item));
+    let fits = match &out {
+        None => true,
+        Some((id, n)) => id == type_id && *n < max,
+    };
+    if !fits {
+        return true;
+    }
     *field -= 1;
     set_upgrades(&mut entity.nbt, &u);
-    if let Some(stack) = upgrade_stack(game, type_id) {
-        game.pop_resource([pos[0], pos[1] + 1, pos[2]], stack);
-    }
+    set_upgrade_out(&mut entity.nbt, Some((type_id.to_owned(), out.map_or(0, |(_, n)| n) + 1)));
+    let _ = pos;
     true
+}
+
+/// The uninstalled upgrades waiting in the window's output slot: the type's id and how many.
+fn upgrade_out_of(nbt: &Compound) -> Option<(String, u32)> {
+    let Some(Tag::Compound(c)) = nbt.get(&JavaString::from("upgrade_out")) else {
+        return None;
+    };
+    let id = get_string(c, "id")?;
+    let n = get_int(c, "n");
+    (n > 0).then_some((id, n))
+}
+
+fn set_upgrade_out(nbt: &mut Compound, out: Option<(String, u32)>) {
+    match out {
+        Some((id, n)) if n > 0 => {
+            let mut c = Compound::new();
+            c.insert("id".into(), Tag::String(id.as_str().into()));
+            put_int(&mut c, "n", n);
+            nbt.insert("upgrade_out".into(), Tag::Compound(c));
+        }
+        _ => {
+            nbt.remove(&JavaString::from("upgrade_out"));
+        }
+    }
+}
+
+/// The window's virtual slots on the server (`getUpgradeSlot`, `getUpgradeOutputSlot`): the upgrade on the
+/// cursor goes in (one on a right click), and the output takes out (half on a right click).
+fn upgrade_slot_button(game: &mut Game<'_>, entity: &mut ModBlockEntity, id: i32) -> bool {
+    let (base, right) = match id {
+        BUTTON_UPGRADE_INSTALL | BUTTON_UPGRADE_INSTALL_ONE => (BUTTON_UPGRADE_INSTALL, id == BUTTON_UPGRADE_INSTALL_ONE),
+        BUTTON_UPGRADE_TAKE | BUTTON_UPGRADE_TAKE_HALF => (BUTTON_UPGRADE_TAKE, id == BUTTON_UPGRADE_TAKE_HALF),
+        _ => return false,
+    };
+    if tabs(&entity.id) & TAB_UPGRADE == 0 {
+        return true;
+    }
+    if base == BUTTON_UPGRADE_INSTALL {
+        let Some(held) = game.carried.clone() else {
+            return true;
+        };
+        let Some(kind) = upgrade_of(&held).filter(|k| supported_upgrades(&entity.id).contains(k)) else {
+            return true;
+        };
+        let mut u = upgrades(&entity.nbt);
+        let n = u.install(kind, if right { 1 } else { held.count });
+        set_upgrades(&mut entity.nbt, &u);
+        if n > 0 {
+            game.carried = (held.count > n).then(|| ItemStack { count: held.count - n, ..held });
+        }
+        return true;
+    }
+    if game.carried.is_some() {
+        return true;
+    }
+    let Some((type_id, n)) = upgrade_out_of(&entity.nbt) else {
+        return true;
+    };
+    let Some(stack) = upgrade_stack(game, &type_id) else {
+        return true;
+    };
+    let take = if right { n.div_ceil(2) } else { n };
+    game.carried = Some(ItemStack { count: take, ..stack });
+    set_upgrade_out(&mut entity.nbt, Some((type_id, n - take)));
+    true
+}
+
+/// What the upgrade window shows beyond the screen's data: the output slot.
+fn upgrade_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    if tabs(&entity.id) & TAB_UPGRADE == 0 {
+        return;
+    }
+    let mut client = Compound::new();
+    if let Some((id, n)) = upgrade_out_of(&entity.nbt) {
+        client.insert("id".into(), Tag::String(id.as_str().into()));
+        put_int(&mut client, "n", n);
+    }
+    let same = matches!(entity.nbt.get(&JavaString::from("client")), Some(Tag::Compound(c)) if *c == client);
+    if !same {
+        entity.nbt.insert("client".into(), Tag::Compound(client));
+        game.native_sync_block_entity(pos);
+    }
+}
+
+const BUTTON_UPGRADE_INSTALL: i32 = 280;
+const BUTTON_UPGRADE_INSTALL_ONE: i32 = 281;
+const BUTTON_UPGRADE_TAKE: i32 = 282;
+const BUTTON_UPGRADE_TAKE_HALF: i32 = 283;
+const UPGRADE_IN_SLOT: [f32; 4] = [175.0, 18.0, 18.0, 18.0];
+const UPGRADE_OUT_SLOT: [f32; 4] = [175.0, 72.0, 18.0, 18.0];
+
+/// The output slot as the screen has it, from the machine's `client` compound.
+fn upgrade_out_view(game: &Game<'_>) -> Option<(String, u32)> {
+    let (x, y, z) = game.container?;
+    let (_, c) = game.native_client_block_entity([x, y, z])?;
+    let id = get_string(c, "id")?;
+    let n = get_int(c, "n");
+    (n > 0).then_some((id, n))
+}
+
+/// A press on the window's virtual slots: a click with an upgrade on the cursor installs it, an empty
+/// cursor takes from the output.
+fn upgrade_slot_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool, button: &mut Option<i32>) -> bool {
+    if !matches!(window(block), Some(Window::Upgrades(_))) {
+        return false;
+    }
+    let wat = window_at(block, at);
+    let on = |r: [f32; 4]| inside(wat, in_upgrades(r));
+    if on(UPGRADE_IN_SLOT) {
+        if game.carried.as_ref().is_some_and(|c| upgrade_of(c).is_some()) {
+            *button = Some(BUTTON_UPGRADE_INSTALL + i32::from(right));
+        }
+        return true;
+    }
+    if on(UPGRADE_OUT_SLOT) {
+        if game.carried.is_none() && upgrade_out_view(game).is_some() {
+            *button = Some(BUTTON_UPGRADE_TAKE + i32::from(right));
+        }
+        return true;
+    }
+    false
 }
 
 /// The menu buttons the redstone tab sends: the next mode (left click), the previous (right).
@@ -5997,6 +6138,9 @@ pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32;
         adapter_click(game, at);
         return;
     }
+    if upgrade_slot_click(game, block, at, right, button) {
+        return;
+    }
     if windowed_click(block, data, at, right, button) {
         return;
     }
@@ -6037,7 +6181,7 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         put_int(&mut entity.nbt, "sorting", u32::from(on));
         return;
     }
-    if transporter_button(entity, id) || window_button(game, pos, entity, id) || upgrade_button(game, pos, entity, id) {
+    if transporter_button(entity, id) || window_button(game, pos, entity, id) || upgrade_slot_button(game, entity, id) || upgrade_button(game, pos, entity, id) {
         return;
     }
     let Some(Some(master)) = multiblock_master(entity, pos) else {
