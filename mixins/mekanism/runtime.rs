@@ -1524,6 +1524,8 @@ fn tick_washer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
     let mut output = get_tank(&entity.nbt, "output", nuclear::WASHER_TANK);
     let mut active = false;
     drain_tank_into_item(entity, 1, &mut output);
+    // `FluidInventorySlot.fill`: a water bucket empties into the tank, the empty one goes to the last slot.
+    fill_tank_from_bucket(game, entity, 3, Some(4), &mut water, |f| f == "minecraft:water");
     if let Some(r) = input.chemical.as_deref().and_then(nuclear::find_washing)
         && input.amount >= r.input_amount
         && water.chemical.as_deref() == Some("minecraft:water")
@@ -5177,6 +5179,8 @@ fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
         Some(Kind::Separator) => vec![([59.0, 52.0], "slot/normal"), ([101.0, 52.0], "slot/normal")],
         // The chemical side's drain slot and the output it moves a full item to.
         Some(Kind::Rotary) => vec![([5.0, 25.0], "slot/normal"), ([5.0, 56.0], "slot/output")],
+        // The washer's fluid slots on the holder at the right: the bucket to fill the water tank and its empty one.
+        Some(Kind::Washer) => vec![([180.0, 71.0], "slot/normal"), ([180.0, 102.0], "slot/output")],
         _ => vec![],
     }
 }
@@ -5804,7 +5808,9 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
         let extra = extra_slots(block);
         if !extra.is_empty() {
             rules.resize(3, SlotRule::Any);
+            let chemical = kind(block) != Some(Kind::Washer);
             rules.extend(extra.iter().map(|(_, sprite)| match *sprite {
+                "slot/normal" if !chemical => SlotRule::Any,
                 "slot/normal" => SlotRule::Items(chemical_item_ids()),
                 "slot/output" => SlotRule::Refuse,
                 _ => energy(),
@@ -7060,12 +7066,14 @@ fn extras(block: &str) -> Extras {
     let none = Extras { active_progress: vec![], screen: None, arrows: vec![] };
     let large = |x, y| ([x, y], "progress/large_right", [48.0, 8.0]);
     match kind(block) {
-        Some(Kind::Activator | Kind::Centrifuge | Kind::Washer) => Extras { active_progress: vec![large(64.0, 39.0)], ..none },
+        Some(Kind::Activator | Kind::Centrifuge) => Extras { active_progress: vec![large(64.0, 39.0)], ..none },
         Some(Kind::ChemicalInfuser) => Extras {
             active_progress: vec![([47.0, 39.0], "progress/small_right", [28.0, 8.0]), ([101.0, 39.0], "progress/small_left", [28.0, 8.0])],
             ..none
         },
         Some(Kind::Pump | Kind::Plenisher) => Extras { screen: Some([54.0, 23.0, 80.0, 42.0]), arrows: vec![[32.0, 39.0]], ..none },
+        // `GuiTexturedElement.downArrow(imageWidth + 8, 91)` between the washer's two fluid slots.
+        Some(Kind::Washer) => Extras { active_progress: vec![large(64.0, 39.0)], arrows: vec![[184.0, 91.0]], ..none },
         Some(Kind::Heater) => Extras { screen: Some([48.0, 23.0, 80.0, 42.0]), ..none },
         // `GuiThermalEvaporationController`: the screen between the gauges and the arrows under the buckets.
         Some(Kind::BoilerValve) => Extras { screen: Some([54.0, 23.0, 110.0, 40.0]), ..none },
@@ -7937,6 +7945,10 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, width, height]);
     if let Some(Kind::Factory(n, ..)) = kind(block) {
         draw_factory_slots(game, batch, block, n, &l, data, origin);
+    }
+    // `GuiSideHolder.create(imageWidth, 66, 57, false, true, ...)`: the washer's holder for its fluid slots.
+    if kind(block) == Some(Kind::Washer) {
+        nine_slice_tinted(game, batch, "holder_right", [26.0, 9.0], 4.0, [ox + 176.0, oy + 66.0, 26.0, 57.0], 0xFFFF_FFFF);
     }
     let warn = warning_bits(block, &l, data);
     let extra = extra_slots(block);
