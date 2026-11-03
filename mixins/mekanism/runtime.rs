@@ -5417,7 +5417,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
     if tabs(&entity.id) & TAB_REDSTONE != 0 {
         entity.data.resize(DATA_GAUGES + l.gauges.len() * GAUGE_SLOTS, 0);
         let signal = get_int(&entity.nbt, "powered") & 3;
-        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2 | (if matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) { get_int(&entity.nbt, "dump") % 3 } else if kind(&entity.id) == Some(Kind::DigitalMiner) { miner_flags(&entity.nbt) } else { get_int(&entity.nbt, "warn") & 15 }) << 4) as i32);
+        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2 | (if matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) { get_int(&entity.nbt, "dump") % 3 } else if kind(&entity.id) == Some(Kind::DigitalMiner) { miner_flags(&entity.nbt) } else { get_int(&entity.nbt, "warn") & 15 | energy_warn(&entity.id, &entity.nbt) }) << 4) as i32);
         // Then, for the side configuration window, each type's faces in relative-side order and
         // which types' auto-eject is off.
         if tabs(&entity.id) & TAB_SIDES != 0 {
@@ -5468,6 +5468,35 @@ fn miner_flags(nbt: &Compound) -> u32 {
     let flag = |key: &str, bit: u32| u32::from(get_int(nbt, key) == 1) << bit;
     let low = u32::from(miner_usage(nbt) > mekanism_core::miner::STORAGE) << 10;
     get_int(nbt, "warn") & 1 | (get_int(nbt, "mstate") & 3) << 4 | flag("running", 6) | flag("eject", 7) | flag("pull", 8) | flag("silk", 9) | low
+}
+
+/// What a machine takes a tick before upgrades (its `getEnergyPerTick`), for the machines whose bar warns.
+fn base_usage(k: Kind) -> Option<u64> {
+    Some(match k {
+        Kind::Oxidizer => chem::OXIDIZER_USAGE,
+        Kind::Dissolution => nuclear::DISSOLUTION_USAGE,
+        Kind::Centrifuge => nuclear::CENTRIFUGE_USAGE,
+        Kind::Washer => nuclear::WASHER_USAGE,
+        Kind::Crystallizer => nuclear::CRYSTALLIZER_USAGE,
+        Kind::Separator => chem::SEPARATOR_USAGE,
+        Kind::Nucleosynthesizer => chem::NUCLEOSYNTHESIZER_USAGE,
+        Kind::ChemicalInfuser => chem::CHEMICAL_INFUSER_USAGE,
+        Kind::Rotary => chem::ROTARY_USAGE,
+        Kind::Infuser => chem::INFUSER_USAGE,
+        Kind::Advanced(m) => m.usage,
+        Kind::Pump => isotopes::PUMP_USAGE,
+        Kind::Plenisher => plenisher::PLENISHER_USAGE,
+        _ => return None,
+    })
+}
+
+/// `WarningType.NOT_ENOUGH_ENERGY` on a machine's power bar: the energy it holds is under its usage a tick
+/// (bit 0 of the warning field).
+fn energy_warn(id: &str, nbt: &Compound) -> u32 {
+    let Some(base) = kind(id).and_then(base_usage) else {
+        return 0;
+    };
+    u32::from(get_long(nbt, "energy") < upgrades(nbt).energy_per_tick(base))
 }
 
 /// A machine screen's height: the nucleosynthesizer's is 27 taller (`DEFAULT_IMAGE_HEIGHT + 27`).
@@ -8551,6 +8580,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         Some(p @ PowerBar::Horizontal(_)) => {
             let [x, y, w, h] = power_rect(p);
             nine_slice(game, batch, "bar/base", 5.0, 1.0, [ox + x, oy + y, w, h]);
+            if warn & 1 != 0 {
+                fill_tiled(game, batch, &format!("{SPRITES}warning_background"), [ox + x + 1.0, oy + y + 1.0, w - 2.0, h - 2.0], 0xFFFF_FFFF);
+            }
             let filled = energy * (w - 2.0);
             if filled > 0.0 {
                 sprite(game, batch, "bar/horizontal_power", [0.0, 0.0, 2.0, 2.0], [ox + x + 1.0, oy + y + 1.0, filled, h - 2.0]);
@@ -8705,6 +8737,9 @@ fn warning_bits(block: &str, l: &Layout, data: &[i32]) -> u32 {
     }
     if kind(block) == Some(Kind::DigitalMiner) {
         return (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 15;
+    }
+    if kind(block).is_some_and(|k| base_usage(k).is_some()) {
+        return (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 1;
     }
     if !matches!(kind(block), Some(Kind::Machine(..))) {
         return 0;
