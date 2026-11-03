@@ -23,6 +23,7 @@ use mekanism_core::sorter::{self, Sorter};
 use mekanism_core::oredictionificator as od;
 use mekanism_core::formulaic as fa;
 use mekanism_core::stabilizer as st;
+use mekanism_core::security as sec;
 use mekanism_core::plenisher::{self, Plenisher, Spot};
 use mekanism_core::fission;
 use mekanism_core::frequency as freq;
@@ -123,6 +124,8 @@ enum Kind {
     Assemblicator,
     /// The Dimensional Stabilizer: keeps a grid of chunks loaded for energy.
     Stabilizer,
+    /// The Security Desk: its owner's trusted players and default mode, and the items it locks.
+    SecurityDesk,
     /// The Chargepad: charges an item of the player standing on it.
     Chargepad,
     /// The Quantum Entangloporter: shares energy, fluid and chemicals across its frequency.
@@ -209,6 +212,7 @@ fn kind(id: &str) -> Option<Kind> {
         chem::LIQUIFIER => return Some(Kind::Liquifier),
         fa::BLOCK => return Some(Kind::Assemblicator),
         st::BLOCK => return Some(Kind::Stabilizer),
+        sec::DESK => return Some(Kind::SecurityDesk),
         "mekanism:chemical_infuser" => return Some(Kind::ChemicalInfuser),
         "mekanism:antiprotonic_nucleosynthesizer" => return Some(Kind::Nucleosynthesizer),
         teleporter::TELEPORTER => return Some(Kind::Teleporter),
@@ -400,6 +404,17 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         });
         return;
     }
+    // The desk's unlock and lock slots.
+    if kind(block) == Some(Kind::SecurityDesk) {
+        *container = Some(ModContainer {
+            slots: 3,
+            faces: std::array::from_fn(|_| vec![0, 1]),
+            inputs: vec![0, 1],
+            outputs: vec![0, 1],
+            menu: Some("minecraft:furnace".into()),
+        });
+        return;
+    }
     // The input in the first slot (the furnace menu's), the result out of the last.
     if kind(block) == Some(Kind::Oredictionificator) {
         *container = Some(ModContainer {
@@ -560,6 +575,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             Kind::Liquifier => tick_liquifier(game, pos, entity),
             Kind::Assemblicator => tick_assemblicator(game, pos, entity),
             Kind::Stabilizer => tick_stabilizer(game, pos, entity),
+            Kind::SecurityDesk => tick_security_desk(entity),
             Kind::Dissolution => tick_dissolution(game, pos, entity),
             Kind::Centrifuge => tick_centrifuge(game, pos, entity),
             Kind::FissionPort => {
@@ -672,6 +688,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     sorter_sync(game, pos, entity);
     od_sync(game, pos, entity);
     miner_sync(game, pos, entity);
+    security_sync(game, pos, entity);
     multiblock_data(game, pos, entity);
     if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Pipe(_)) {
         show_connections(game, pos, entity);
@@ -4149,7 +4166,7 @@ pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         let stack = match k {
             Kind::EnergyCube(_) => {
                 let energy = get_long(&m.nbt, "energy");
-                (energy > 0).then(|| with_energy(&m.id, energy))?
+                if energy > 0 { with_energy(&m.id, energy) } else if get_string(&m.nbt, "owner").is_some() { stack_of(&m.id, 1) } else { return None }
             }
             // A bin keeps its items and lock (`BinUpgradeData` through its item's components).
             Kind::Bin(t) => {
@@ -4178,6 +4195,7 @@ pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
                 m.items.iter_mut().for_each(|i| *i = None);
                 stack
             }
+            _ if kept_tank(k).is_none() && has_security(&m.id) && get_string(&m.nbt, "owner").is_some() => stack_of(&m.id, 1),
             _ => {
                 let (key, item_key, _) = kept_tank(k)?;
                 let Some(Tag::Compound(tank)) = m.nbt.get(&JavaString::from(key)) else {
@@ -4188,6 +4206,8 @@ pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
                 stack
             }
         };
+        let mut stack = stack;
+        stamp_security(&mut stack, &m.nbt);
         Some((stack, m.items.clone()))
     });
     let Some(Some((stack, items))) = held else {
@@ -4297,6 +4317,7 @@ pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
     if !game.native_on(MOD_ID) {
         return;
     }
+    sec_placed(game, stack, pos);
     // Personal storage belongs to whoever placed it, unless its item names an owner already.
     if bin::is_personal(&stack.item) {
         let kept = custom_data(stack).and_then(|c| match c.get(&JavaString::from(PERSONAL_KEY)) {
@@ -4488,6 +4509,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     }
     if channel == ST_CHANNEL && game.native_on(MOD_ID) {
         st_payload(game, data);
+        return;
+    }
+    if channel == SEC_CHANNEL && game.native_on(MOD_ID) {
+        sec_payload(game, data);
         return;
     }
     if channel == ASM_CHANNEL && game.native_on(MOD_ID) {
@@ -5533,6 +5558,13 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
         },
+        // TileEntitySecurityDesk and GuiSecurityDesk: the unlock slot above the lock slot, on their holder.
+        Kind::SecurityDesk => Layout {
+            slots: [Some(([146.0, 18.0], "slot/inner_holder_slot")), Some(([146.0, 97.0], "slot/inner_holder_slot")), None],
+            gauges: vec![],
+            power: None,
+            progress: None,
+        },
         // TileEntityFormulaicAssemblicator and GuiFormulaicAssemblicator: the formula slot and the first two stock
         // slots; the rest are `extra_slots`.
         Kind::Assemblicator => Layout {
@@ -6072,7 +6104,7 @@ fn screen_height(block: &str) -> f32 {
         // `DEFAULT_IMAGE_HEIGHT + 64`.
         Some(Kind::Assemblicator) => 230.0,
         // `DEFAULT_IMAGE_HEIGHT + 64`.
-        Some(Kind::Oredictionificator) => 230.0,
+        Some(Kind::Oredictionificator | Kind::SecurityDesk) => 230.0,
         _ => 166.0,
     }
 }
@@ -6274,7 +6306,7 @@ fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
         out.push(Tab { at: [right, 6.0], icon: "button/upgrade", argb: 0xFFFF_FFFF, what: TabKind::Upgrade });
     }
     if t & TAB_SECURITY != 0 {
-        out.push(Tab { at: [right, 34.0], icon: "security/public", argb: 0xFFFF_A160, what: TabKind::Security });
+        out.push(Tab { at: [right, 34.0], icon: sec_tab_icon(), argb: 0xFFFF_A160, what: TabKind::Security });
     }
     if t & TAB_REDSTONE != 0 {
         let icon = redstone_of(l, data).0.sprite();
@@ -6349,10 +6381,7 @@ fn tab_tooltip(block: &str, l: &Layout, data: &[i32], at: [f32; 2], lines: &mut 
         TabKind::Sides => lines.push("Side Config".into()),
         TabKind::Transporter => lines.push("Transporter Config".into()),
         TabKind::Upgrade => lines.push("Upgrades".into()),
-        TabKind::Security => {
-            lines.push("§7Security: Public".into());
-            lines.push("No Owner".into());
-        }
+        TabKind::Security => sec_tab_tooltip(lines),
         TabKind::Redstone => lines.push(redstone_of(l, data).0.name().into()),
         TabKind::Sort => lines.push("Auto-Sort".into()),
         TabKind::Visuals => {
@@ -6809,7 +6838,10 @@ pub(super) fn screen_wheel(game: &Game<'_>, block: &str, steps: f32, taken: &mut
         let hidden = count.saturating_sub(SORTER_ROWS);
         if steps > 0.0 { first.min(hidden).saturating_sub(1) } else { (first + 1).min(hidden) }
     };
-    if miner_cfg_open(block) {
+    if kind(block) == Some(Kind::SecurityDesk) {
+        security_desk_wheel(steps);
+        *taken = true;
+    } else if miner_cfg_open(block) {
         if let Some(c) = miner_cfg(game)
             && MINER_UI.with_borrow(|ui| !ui.select && ui.edit.is_none())
         {
@@ -7800,6 +7832,10 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
 
 /// A press on a reactor's button (hook point `native_screen_click`, API 20).
 pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
+    if kind(block) == Some(Kind::SecurityDesk) {
+        security_desk_click(game, at, right);
+        return;
+    }
     if miner_cfg_open(block) {
         miner_cfg_click(game, at, right);
         return;
@@ -7890,6 +7926,7 @@ fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], r
     };
     match screen_tabs(block, &l, data).iter().find(|t| inside(at, tab_button(t))).map(|t| t.what) {
         Some(TabKind::Redstone) => *button = Some(if right { BUTTON_REDSTONE_PREVIOUS } else { BUTTON_REDSTONE_NEXT }),
+        Some(TabKind::Security) => *button = Some(if right { BUTTON_SECURITY_PREVIOUS } else { BUTTON_SECURITY_NEXT }),
         // The side configuration tab opens its window on the first type (`GuiWindowCreatorTab`).
         Some(TabKind::Sides) if !right => set_window(block, Some(Window::Sides(0))),
         Some(TabKind::Upgrade) if !right => set_window(block, Some(Window::Upgrades(None))),
@@ -7912,6 +7949,11 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         let now = RedstoneControl::from_ordinal(get_int(&entity.nbt, "control"));
         let next = if id == BUTTON_REDSTONE_NEXT { now.next() } else { now.previous() };
         put_int(&mut entity.nbt, "control", next.ordinal());
+        return;
+    }
+    // The security tab (`GuiInteraction.NEXT_SECURITY_MODE` / `PREVIOUS_SECURITY_MODE`).
+    if matches!(id, BUTTON_SECURITY_NEXT | BUTTON_SECURITY_PREVIOUS) && tabs(&entity.id) & TAB_SECURITY != 0 {
+        sec_step(game, entity, id == BUTTON_SECURITY_NEXT);
         return;
     }
     // `GasMode.getNext` on the chemical tank's button.
@@ -8147,7 +8189,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         slots,
         inventory_y: h - 82.0,
         inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(),
-        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort | Kind::FusionPort)),
+        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort | Kind::FusionPort | Kind::SecurityDesk)),
         alt: None,
         ..Default::default()
     });
@@ -9108,6 +9150,7 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
         draw_qio_select(game, batch, block, origin);
         return;
     }
+    sec_refresh(game, block);
     screen_draw_base(game, block, data, batch, origin);
     if is_qio_tile(block) {
         draw_qio_tab(game, batch, origin);
@@ -9148,6 +9191,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     let inv_dx = ((width - 176.0) / 2.0).floor();
     let height = screen_height(block);
     nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, width, height]);
+    if kind(block) == Some(Kind::SecurityDesk) {
+        draw_security_desk_back(game, batch, origin);
+    }
     if let Some(Kind::Factory(n, ..)) = kind(block) {
         draw_factory_slots(game, batch, block, n, &l, data, origin);
     }
@@ -9303,6 +9349,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     }
     if kind(block) == Some(Kind::Stabilizer) {
         draw_stabilizer(game, batch, origin);
+    }
+    if kind(block) == Some(Kind::SecurityDesk) {
+        draw_security_desk(game, batch, height, origin);
     }
     if let Some(Kind::ChemicalTank(t)) = kind(block) {
         draw_tank_screen(game, batch, &l, data, origin, t == BaseTier::Creative);
@@ -9586,6 +9635,9 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         return;
     }
     if kind(block) == Some(Kind::Stabilizer) && st_tooltip(game, at, lines) {
+        return;
+    }
+    if kind(block) == Some(Kind::SecurityDesk) && security_desk_tooltip(at, lines) {
         return;
     }
     if is_qio_screen(block) {
@@ -10717,7 +10769,7 @@ pub(super) fn use_personal_storage(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 
 /// Only its owner breaks a personal chest or barrel.
 pub(super) fn protect_personal(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
-    use_personal_storage(game, pos)
+    use_personal_storage(game, pos) || sec_denied(game, pos)
 }
 
 // --- QIO --------------------------------------------------------------------------------------------
@@ -12584,6 +12636,9 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
     if is_od(block) {
         *typing |= OD_EDIT.with_borrow(|e| e.as_ref().is_some_and(|e| e.text.focused));
     }
+    if kind(block) == Some(Kind::SecurityDesk) {
+        *typing |= SEC_UI.with_borrow(|ui| ui.text.focused);
+    }
     if fission_stats_open(block) {
         *typing |= STATS_TEXT.with_borrow(|t| t.focused);
     }
@@ -12595,6 +12650,10 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
 /// A key on the selector's focused text box (hook point `native_screen_key`): Enter sets the name as
 /// a new frequency (`setEnterHandler`).
 pub(super) fn screen_key(game: &mut Game<'_>, block: &str, key: &str, text: Option<&str>) {
+    if kind(block) == Some(Kind::SecurityDesk) {
+        security_desk_key(game, key, text);
+        return;
+    }
     if miner_cfg_open(block) {
         miner_cfg_key(game, key, text);
         return;
@@ -16142,4 +16201,524 @@ fn stabilizer_boxes(game: &Game<'_>, pos: [i32; 3], c: &Compound, boxes: &mut Ve
             });
         }
     }
+}
+
+// --- Security (SecurityFrequency, TileEntitySecurityDesk, GuiSecurityDesk, GuiSecurityTab) -------------------
+//
+// A block's owner and mode live in its NBT ("owner", "owner_name", "sec_mode"); the owner's default mode,
+// override and trusted players are one `sec::Data` per owner, kept by their Security Desk (its "sec") and
+// shared through `SEC_DATA`. The desk locks and unlocks the items in its slots.
+
+const SEC_CHANNEL: &str = "mekanism:security";
+const BUTTON_SECURITY_NEXT: i32 = 330;
+const BUTTON_SECURITY_PREVIOUS: i32 = 331;
+
+/// The security data of each owner (uuid text), as their desk last had it.
+static SEC_DATA: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, sec::Data>>> = std::sync::LazyLock::new(Default::default);
+
+fn sec_data(owner: &str) -> Option<sec::Data> {
+    SEC_DATA.lock().ok()?.get(owner).cloned()
+}
+
+/// Whether a block carries security: its screen has the tab, or it is the desk.
+fn has_security(block: &str) -> bool {
+    tabs(block) & TAB_SECURITY != 0 || block == sec::DESK
+}
+
+fn sec_mode_of(nbt: &Compound) -> sec::Mode {
+    sec::Mode::from_ordinal(i64::from(get_int(nbt, "sec_mode")))
+}
+
+/// A block's mode as `SecurityUtils.getEffectiveSecurityMode` has it, and whether its owner's override set it.
+fn sec_effective_of(nbt: &Compound) -> (sec::Mode, bool) {
+    let data = get_string(nbt, "owner").and_then(|o| sec_data(&o));
+    sec::effective(sec_mode_of(nbt), data.as_ref())
+}
+
+/// The security an item carries in its custom data: owner uuid, owner name and mode.
+fn item_security(stack: &ItemStack) -> Option<(String, String, sec::Mode)> {
+    let Some(Tag::Compound(c)) = custom_data(stack)?.get(&JavaString::from(sec::KEY)) else {
+        return None;
+    };
+    Some((get_string(c, "owner")?, get_string(c, "owner_name").unwrap_or_default(), sec::Mode::from_ordinal(i64::from(get_int(c, "mode")))))
+}
+
+fn set_item_security(stack: &mut ItemStack, owner: &str, name: &str, mode: sec::Mode) {
+    let mut c = Compound::new();
+    c.insert("owner".into(), Tag::String(owner.into()));
+    c.insert("owner_name".into(), Tag::String(name.into()));
+    put_int(&mut c, "mode", u32::from(mode.ordinal()));
+    set_custom_compound(stack, sec::KEY, c);
+}
+
+/// An item without its security; its custom data goes when nothing else is in it.
+fn clear_item_security(stack: &mut ItemStack) {
+    let Some(extra) = stack.extra.as_mut() else {
+        return;
+    };
+    for (key, data) in extra.other.iter_mut() {
+        if key == "minecraft:custom_data"
+            && let Tag::Compound(c) = data
+        {
+            c.remove(&JavaString::from(sec::KEY));
+        }
+    }
+    extra.other.retain(|(key, data)| key != "minecraft:custom_data" || !matches!(data, Tag::Compound(c) if c.is_empty()));
+}
+
+/// Gives the stack the owner and mode of the block it comes from.
+fn stamp_security(stack: &mut ItemStack, nbt: &Compound) {
+    if !has_security(&stack.item)
+        && !matches!(kind(&stack.item), Some(Kind::EnergyCube(_)))
+    {
+        return;
+    }
+    if let Some(owner) = get_string(nbt, "owner") {
+        set_item_security(stack, &owner, &get_string(nbt, "owner_name").unwrap_or_default(), sec_mode_of(nbt));
+    }
+}
+
+/// A block placed: its owner is the player who placed it, or the one its item was locked to (`SecurityUtils`
+/// through `BlockSecurityUtils.claimOwnership`).
+pub(super) fn sec_placed(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
+    if !has_security(&stack.item) {
+        return;
+    }
+    let kept = item_security(stack);
+    let player = game.native_acting_player();
+    game.native_with_mod_block_entity(pos, |m| {
+        let owner = match kept {
+            Some((uuid, name, mode)) => Some((uuid, name, Some(mode))),
+            None => player.map(|p| (uuid_text(p.uuid), p.name, None)),
+        };
+        if let Some((uuid, name, mode)) = owner {
+            m.nbt.insert("owner".into(), Tag::String(uuid.as_str().into()));
+            m.nbt.insert("owner_name".into(), Tag::String(name.as_str().into()));
+            if let Some(mode) = mode {
+                put_int(&mut m.nbt, "sec_mode", u32::from(mode.ordinal()));
+            }
+        }
+    });
+}
+
+/// Whether the acting player may not use the block at `pos` (`SecurityUtils.canAccess`): it is private or
+/// trusted-only, and they are not its owner (nor, for trusted, on the owner's list).
+fn sec_denied(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || !has_security(block_name(game, pos)) {
+        return false;
+    }
+    let Some(player) = game.native_acting_player() else {
+        return false;
+    };
+    let me = uuid_text(player.uuid);
+    let verdict = game.native_with_mod_block_entity(pos, |m| {
+        let owner = get_string(&m.nbt, "owner")?;
+        let (mode, _) = sec_effective_of(&m.nbt);
+        let data = sec_data(&owner);
+        (!sec::can_access(mode, &owner, &me, data.as_ref())).then(|| get_string(&m.nbt, "owner_name").unwrap_or_default())
+    });
+    match verdict.flatten() {
+        Some(_) => {
+            tell(game, "You don't have access.".to_owned());
+            true
+        }
+        None => false,
+    }
+}
+
+/// A right click or a break by someone the block's security shuts out.
+pub(super) fn protect_security(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    sec_denied(game, pos)
+}
+
+/// The security tab's press, on the server (`GuiInteraction.NEXT_SECURITY_MODE` and `PREVIOUS_SECURITY_MODE`):
+/// the owner steps the block's mode.
+fn sec_step(game: &mut Game<'_>, entity: &mut ModBlockEntity, forward: bool) {
+    let (Some(player), Some(owner)) = (game.native_acting_player(), get_string(&entity.nbt, "owner")) else {
+        return;
+    };
+    if owner == uuid_text(player.uuid) {
+        let next = sec::step(sec_mode_of(&entity.nbt), forward).ordinal();
+        put_int(&mut entity.nbt, "sec_mode", u32::from(next));
+    }
+}
+
+const SEC_KEYS: [&str; 7] = ["sec_name", "sec_eff", "sec_ovr", "sec_fmode", "sec_fovr", "sec_trusted", "sec_online"];
+
+/// What the screens need of a block's security, sent with its other client data.
+fn security_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    if !has_security(&entity.id) {
+        return;
+    }
+    let mut client = Compound::new();
+    if let Some(name) = get_string(&entity.nbt, "owner_name") {
+        client.insert("sec_name".into(), Tag::String(name.as_str().into()));
+    }
+    let (mode, overridden) = sec_effective_of(&entity.nbt);
+    put_int(&mut client, "sec_eff", u32::from(mode.ordinal()));
+    put_int(&mut client, "sec_ovr", u32::from(overridden));
+    if entity.id == sec::DESK
+        && let Some(data) = get_string(&entity.nbt, "owner").and_then(|o| sec_data(&o))
+    {
+        put_int(&mut client, "sec_fmode", u32::from(data.mode.ordinal()));
+        put_int(&mut client, "sec_fovr", u32::from(data.overridden));
+        put_int(&mut client, "sec_online", 1);
+        client.insert("sec_trusted".into(), string_list(&data.names()));
+    }
+    put_client(game, pos, entity, &SEC_KEYS, client);
+}
+
+fn is_secure_item(item: &str) -> bool {
+    has_security(item) || matches!(kind(item), Some(Kind::EnergyCube(_)))
+}
+
+/// The desk every tick (`TileEntitySecurityDesk.onUpdateServer`): its owner's data is kept (made when there is
+/// none), the item in the lock slot takes the owner and their mode, the one in the unlock slot loses its
+/// security when it is theirs.
+fn tick_security_desk(entity: &mut ModBlockEntity) -> Option<bool> {
+    let (Some(owner), name) = (get_string(&entity.nbt, "owner"), get_string(&entity.nbt, "owner_name").unwrap_or_default()) else {
+        return None;
+    };
+    let data = {
+        let Ok(mut all) = SEC_DATA.lock() else {
+            return None;
+        };
+        let loaded = get_string(&entity.nbt, "sec").map(|t| sec::Data::load(&t));
+        let data = all.entry(owner.clone()).or_insert_with(|| loaded.unwrap_or_default());
+        entity.nbt.insert("sec".into(), Tag::String(data.save().as_str().into()));
+        data.clone()
+    };
+    if let Some(stack) = entity.items.get_mut(0).and_then(Option::as_mut)
+        && item_security(stack).is_some_and(|(o, ..)| o == owner)
+    {
+        clear_item_security(stack);
+    }
+    if let Some(stack) = entity.items.get_mut(1).and_then(Option::as_mut)
+        && is_secure_item(&stack.item)
+    {
+        match item_security(stack) {
+            None => set_item_security(stack, &owner, &name, data.mode),
+            Some((o, _, mode)) if o == owner && mode != data.mode => set_item_security(stack, &owner, &name, data.mode),
+            Some(_) => {}
+        }
+    }
+    None
+}
+
+/// A press on the desk's screen, on the server (`PacketGuiInteract.SECURITY_DESK_MODE`, `OVERRIDE_BUTTON`,
+/// `REMOVE_TRUSTED`, `PacketAddTrusted`): only its owner, and only within reach.
+fn sec_payload(game: &mut Game<'_>, data: &[u8]) {
+    let (Some((op, pos)), Some(player)) = (sec::decode_request(data), game.native_acting_player()) else {
+        return;
+    };
+    let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    if !near || block_name(game, pos) != sec::DESK {
+        return;
+    }
+    let me = uuid_text(player.uuid);
+    // A name is looked up among the players online, else by the offline id its server would give it.
+    let trusted = match &op {
+        sec::Op::Add(name) if sec::valid_name(name) => {
+            let found = game.native_server_players().into_iter().find(|p| p.name.eq_ignore_ascii_case(name));
+            Some(found.map_or_else(|| (uuid_text(horizon_protocol::crypto::offline_uuid(name)), name.clone()), |p| (uuid_text(p.uuid), p.name)))
+        }
+        _ => None,
+    };
+    game.native_with_mod_block_entity(pos, |m| {
+        let Some(owner) = get_string(&m.nbt, "owner").filter(|o| *o == me) else {
+            return;
+        };
+        let Ok(mut all) = SEC_DATA.lock() else {
+            return;
+        };
+        let data = all.entry(owner).or_insert_with(|| get_string(&m.nbt, "sec").map(|t| sec::Data::load(&t)).unwrap_or_default());
+        match op {
+            sec::Op::SetMode(mode) => data.mode = mode,
+            sec::Op::ToggleOverride => data.overridden = !data.overridden,
+            sec::Op::Remove(i) => {
+                data.remove_trusted(usize::from(i));
+            }
+            sec::Op::Add(_) => {
+                if let Some((uuid, name)) = &trusted {
+                    data.add_trusted(uuid, name);
+                }
+            }
+        }
+        m.nbt.insert("sec".into(), Tag::String(data.save().as_str().into()));
+    });
+}
+
+fn sec_send(game: &Game<'_>, op: &sec::Op) {
+    if let Some((x, y, z)) = game.container {
+        game.native_send_to_server(SEC_CHANNEL, &sec::encode_request(op, [x, y, z]));
+    }
+}
+
+/// What the open screen shows of its block's security.
+#[derive(Clone, Default)]
+struct SecView {
+    /// The owner's name, if the block has one.
+    name: Option<String>,
+    /// Whether the viewer is the owner.
+    mine: bool,
+    mode: u8,
+    overridden: bool,
+    /// The desk's frequency: its mode, override and trusted names; None while offline.
+    freq: Option<(u8, bool, Vec<String>)>,
+}
+
+thread_local! {
+    static SEC_VIEW: std::cell::RefCell<SecView> = std::cell::RefCell::new(SecView::default());
+    static SEC_UI: std::cell::RefCell<SecUi> = std::cell::RefCell::new(SecUi::default());
+}
+
+#[derive(Default)]
+struct SecUi {
+    pos: [i32; 3],
+    text: freq::TextBox,
+    selected: Option<usize>,
+    scroll: usize,
+}
+
+/// Reads the block's security from its client data, once a frame, for the tab and the desk.
+fn sec_refresh(game: &Game<'_>, block: &str) {
+    if !has_security(block) {
+        return;
+    }
+    let Some((x, y, z)) = game.container else {
+        return;
+    };
+    let view = game.native_client_block_entity([x, y, z]).map(|(_, c)| {
+        let name = get_string(c, "sec_name");
+        let freq = (get_int(c, "sec_online") == 1).then(|| (get_int(c, "sec_fmode") as u8, get_int(c, "sec_fovr") == 1, strings_of(c, "sec_trusted")));
+        SecView {
+            mine: name.as_deref().is_some_and(|n| n == game.options.player_name()),
+            name,
+            mode: get_int(c, "sec_eff") as u8,
+            overridden: get_int(c, "sec_ovr") == 1,
+            freq,
+        }
+    });
+    SEC_VIEW.set(view.unwrap_or_default());
+    SEC_UI.with_borrow_mut(|ui| {
+        if ui.pos != [x, y, z] {
+            *ui = SecUi { pos: [x, y, z], ..Default::default() };
+        }
+    });
+}
+
+/// The overlay of a security tab, by the mode it shows (`GuiSecurityTab.getOverlay`).
+fn sec_tab_icon() -> &'static str {
+    match SEC_VIEW.with_borrow(|v| v.mode) {
+        1 => "security/private",
+        2 => "security/protected",
+        _ => "security/public",
+    }
+}
+
+/// `OwnerDisplay`: "Owner: name", or "No Owner" in red.
+fn owner_line(view: &SecView, coloured: bool) -> String {
+    match &view.name {
+        None => "\u{a7}cNo Owner".to_owned(),
+        Some(n) if coloured => format!("\u{a7}8Owner: {}{n}", if view.mine { "\u{a7}a" } else { "\u{a7}c" }),
+        Some(n) => format!("\u{a7}8Owner: {n}"),
+    }
+}
+
+/// The security tab's tooltip (`GuiSecurityTab.updateTooltip`).
+fn sec_tab_tooltip(lines: &mut Vec<String>) {
+    let view = SEC_VIEW.with_borrow(Clone::clone);
+    lines.push(format!("\u{a7}7Security: {}", sec::Mode::from_ordinal(i64::from(view.mode)).name()));
+    lines.push(owner_line(&view, true));
+    if view.overridden {
+        lines.push("\u{a7}c(Overridden)".to_owned());
+    }
+}
+
+// The desk's screen, from `GuiSecurityDesk`.
+const SEC_LIST: [f32; 4] = [13.0, 13.0, 122.0, 42.0];
+const SEC_ROWS: usize = 4;
+const SEC_REMOVE: [f32; 4] = [13.0, 81.0, 122.0, 20.0];
+const SEC_FIELD: [f32; 4] = [35.0, 68.0, 99.0, 11.0];
+const SEC_CHECK: [f32; 4] = [123.0, 68.0, 11.0, 11.0];
+const SEC_MODES: [[f32; 4]; 3] = [[13.0, 113.0, 40.0, 16.0], [54.0, 113.0, 40.0, 16.0], [95.0, 113.0, 40.0, 16.0]];
+const SEC_OVERRIDE: [f32; 4] = [146.0, 59.0, 16.0, 16.0];
+
+fn sec_trusted(view: &SecView) -> &[String] {
+    view.freq.as_ref().map_or(&[], |f| f.2.as_slice())
+}
+
+fn draw_security_desk_back(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    for r in [[141.0, 13.0, 26.0, 37.0], [141.0, 54.0, 26.0, 34.0], [141.0, 92.0, 26.0, 37.0]] {
+        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, [ox + r[0], oy + r[1], r[2], r[3]], 0xFFFF_FFFF);
+    }
+}
+
+fn draw_security_desk(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, height: f32, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let at = |r: [f32; 4]| [ox + r[0], oy + r[1], r[2], r[3]];
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    let view = SEC_VIEW.with_borrow(Clone::clone);
+    let owned = view.name.is_some();
+    let title = game.native_screen_title().unwrap_or_default();
+    centred(game, batch, &title, ox, 176.0, oy + 4.0, 0x40_4040);
+    // `renderInventoryTextAndOther`: the label, and the owner at its right.
+    let label_y = oy + height - 94.0;
+    game.native_text(batch, "Inventory", [ox + 8.0, label_y], 0x40_4040, false);
+    let owner = owner_line(&view, false);
+    let w = game.native_text_width(&owner);
+    game.native_text(batch, &owner, [ox + 170.0 - w, label_y], 0x40_4040, false);
+    sprite(game, batch, "security/public", [0.0, 0.0, 18.0, 18.0], at([145.0, 32.0, 18.0, 18.0]));
+    sprite(game, batch, "security/private", [0.0, 0.0, 18.0, 18.0], at([145.0, 111.0, 18.0, 18.0]));
+    // The light: on while the override is, off when it is not, nothing for those who are not the owner.
+    let light = if view.mine && view.freq.is_some() { if view.freq.as_ref().is_some_and(|f| f.1) { "enabled" } else { "disabled" } } else { "not_applicable" };
+    sprite(game, batch, &format!("light/security/{light}"), [0.0, 0.0, 6.0, 6.0], at([144.0, 77.0, 6.0, 6.0]));
+    // Trusted Players, over the list.
+    centred(game, batch, "Trusted Players", ox + 13.0, 122.0, oy + 57.0, 0x40_4040);
+    let (mode_text, red) = match &view.freq {
+        Some((m, ..)) => (format!("Security: {}", sec::Mode::from_ordinal(i64::from(*m)).name()), false),
+        None => ("Security Offline".to_owned(), true),
+    };
+    game.native_text(batch, &mode_text, [ox + 13.0, oy + 103.0], if red { 0xFF_5555 } else { 0x40_4040 }, false);
+    let add_w = game.native_text_width("Add:");
+    game.native_text(batch, "Add:", [ox + 34.0 - add_w, oy + 70.0], 0x40_4040, false);
+    // The list (`GuiTextScrollList`).
+    let names = sec_trusted(&view);
+    SEC_UI.with_borrow_mut(|ui| {
+        let hidden = names.len().saturating_sub(SEC_ROWS);
+        ui.scroll = ui.scroll.min(hidden);
+        if ui.selected.is_some_and(|s| s >= names.len()) {
+            ui.selected = None;
+        }
+        let [lx, ly, lw, lh] = SEC_LIST;
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, at(SEC_LIST), 0xFFFF_FFFF);
+        if hidden > 0 {
+            let (bar_x, bar_y, bar_max) = (lx + lw - 6.0, ly + 2.0, lh - 4.0);
+            nine_slice_tinted(game, batch, "scroll/list_border", [6.0, 6.0], 2.0, [ox + bar_x - 1.0, oy + bar_y - 1.0, 6.0, bar_max + 2.0], 0xFFFF_FFFF);
+            let thumb = (ui.scroll as f32 / hidden as f32 * (bar_max - 4.0)).round();
+            sprite(game, batch, "scroll/list_bar", [0.0, 0.0, 4.0, 4.0], [ox + bar_x, oy + bar_y + thumb, 4.0, 4.0]);
+        }
+        if let Some(sel) = ui.selected.filter(|s| (ui.scroll..ui.scroll + SEC_ROWS).contains(s)) {
+            let y = ly + 1.0 + (sel - ui.scroll) as f32 * 10.0;
+            sprite(game, batch, "scroll/list_selection", [0.0, 0.0, 2.0, 2.0], [ox + lx + 1.0, oy + y, lw - 8.0, 10.0]);
+        }
+        for (i, n) in names.iter().skip(ui.scroll).take(SEC_ROWS).enumerate() {
+            game.native_text_scaled(batch, n, [ox + lx + 2.0, oy + ly + 2.0 + 10.0 * i as f32], 0x3C_FE9A, 0.8);
+        }
+        // Remove, active with a selection.
+        let can_remove = ui.selected.is_some() && view.mine;
+        draw_mek_button(game, batch, at(SEC_REMOVE), can_remove, can_remove && inside(mouse, SEC_REMOVE));
+        let w = game.native_text_width("Remove");
+        let rgb = if can_remove { 0xFF_FFFF } else { 0xA0_A0A0 };
+        game.native_text(batch, "Remove", [ox + SEC_REMOVE[0] + (SEC_REMOVE[2] - w) / 2.0, oy + SEC_REMOVE[1] + (SEC_REMOVE[3] - 8.0) / 2.0], rgb, true);
+        // The name field over an inner screen, with its caret and its checkmark.
+        let [fx, fy, fw, fh] = SEC_FIELD;
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, [ox + fx - 1.0, oy + fy - 1.0, fw + 2.0, fh + 2.0], 0xFFFF_FFFF);
+        let text_at = [ox + fx + 2.0, oy + fy + 2.0];
+        game.native_text_scaled(batch, &ui.text.value, text_at, 0xE0_E0E0, 0.8);
+        if ui.text.focused && (game.ticks / 6) % 2 == 0 {
+            let before: String = ui.text.value.chars().take(ui.text.cursor).collect();
+            game.native_text_scaled(batch, "_", [text_at[0] + game.native_text_width(&before) * 0.8, text_at[1]], 0xE0_E0E0, 0.8);
+        }
+        let typed = !ui.text.value.is_empty();
+        draw_mek_button(game, batch, at(SEC_CHECK), typed, typed && inside(mouse, SEC_CHECK));
+        sprite(game, batch, "button/checkmark", [0.0, 0.0, 12.0, 12.0], at(SEC_CHECK));
+    });
+    // The mode buttons: the frequency's mode is inactive, as everything is for a viewer who is not the owner.
+    let current = view.freq.as_ref().map(|f| f.0);
+    for (i, (mode, r)) in sec::Mode::ALL.into_iter().zip(SEC_MODES).enumerate() {
+        let active = owned && view.mine && view.freq.is_some() && current != Some(i as u8);
+        draw_mek_button(game, batch, at(r), active, active && inside(mouse, r));
+        sprite(game, batch, &format!("security/button_{}", mode.name().to_lowercase()), [0.0, 0.0, 40.0, 16.0], at(r));
+    }
+    draw_mek_button(game, batch, at(SEC_OVERRIDE), view.mine, view.mine && inside(mouse, SEC_OVERRIDE));
+    sprite(game, batch, "button/exclamation", [0.0, 0.0, 16.0, 16.0], at(SEC_OVERRIDE));
+}
+
+fn security_desk_click(game: &Game<'_>, at: [f32; 2], right: bool) {
+    let view = SEC_VIEW.with_borrow(Clone::clone);
+    let names = sec_trusted(&view).len();
+    SEC_UI.with_borrow_mut(|ui| {
+        ui.text.focused = inside(at, SEC_FIELD) && !inside(at, SEC_CHECK);
+        if right {
+            return;
+        }
+        let [lx, ly, lw, lh] = SEC_LIST;
+        if names > SEC_ROWS && inside(at, [lx + lw - 6.0, ly, 6.0, lh]) {
+            let hidden = names - SEC_ROWS;
+            let f = ((at[1] - ly - 2.0) / (lh - 4.0)).clamp(0.0, 1.0);
+            ui.scroll = ((hidden as f32 + 0.5) * f) as usize;
+        } else if inside(at, [lx + 1.0, ly + 1.0, lw - 8.0, lh - 2.0]) {
+            let row = ui.scroll + ((at[1] - ly - 1.0) / 10.0) as usize;
+            ui.selected = (row < names).then_some(row);
+        } else if inside(at, SEC_REMOVE) {
+            if let (Some(i), true) = (ui.selected, view.mine) {
+                sec_send(game, &sec::Op::Remove(i as u8));
+                ui.selected = None;
+            }
+        } else if inside(at, SEC_CHECK) {
+            sec_submit(game, ui, &view);
+        }
+    });
+    if right {
+        return;
+    }
+    if view.mine && view.freq.is_some() {
+        for (i, r) in SEC_MODES.into_iter().enumerate() {
+            if inside(at, r) && view.freq.as_ref().map(|f| f.0) != Some(i as u8) {
+                sec_send(game, &sec::Op::SetMode(sec::Mode::from_ordinal(i as i64)));
+            }
+        }
+    }
+    if view.mine && inside(at, SEC_OVERRIDE) {
+        sec_send(game, &sec::Op::ToggleOverride);
+    }
+}
+
+/// The name in the field is added (`GuiSecurityDesk.setTrusted`): the owner's, and a valid player name.
+fn sec_submit(game: &Game<'_>, ui: &mut SecUi, view: &SecView) {
+    let name = ui.text.value.trim().to_owned();
+    if view.mine {
+        if sec::valid_name(&name) {
+            sec_send(game, &sec::Op::Add(name));
+        }
+        ui.text = freq::TextBox { focused: ui.text.focused, ..Default::default() };
+    }
+}
+
+fn security_desk_tooltip(at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    let view = SEC_VIEW.with_borrow(Clone::clone);
+    if let Some(i) = SEC_MODES.iter().position(|r| inside(at, *r)) {
+        lines.push(["Public Mode", "Private Mode", "Trusted Mode"][i].to_owned());
+        return true;
+    }
+    if inside(at, SEC_OVERRIDE) {
+        let on = view.freq.as_ref().is_some_and(|f| f.1);
+        lines.push(format!("Security Override: {}", if on { "On" } else { "Off" }));
+        return true;
+    }
+    false
+}
+
+fn security_desk_key(game: &Game<'_>, key: &str, text: Option<&str>) {
+    let view = SEC_VIEW.with_borrow(Clone::clone);
+    SEC_UI.with_borrow_mut(|ui| {
+        if !ui.text.focused {
+            return;
+        }
+        if ui.text.key(key, text, sec::valid_char, sec::MAX_NAME) == freq::Typed::Enter {
+            sec_submit(game, ui, &view);
+        }
+    });
+}
+
+fn security_desk_wheel(steps: f32) {
+    let names = SEC_VIEW.with_borrow(|v| sec_trusted(v).len());
+    let hidden = names.saturating_sub(SEC_ROWS);
+    SEC_UI.with_borrow_mut(|ui| {
+        let first = ui.scroll.min(hidden);
+        ui.scroll = if steps > 0.0 { first.saturating_sub(1) } else { (first + 1).min(hidden) };
+    });
 }
