@@ -7370,6 +7370,11 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
         return;
     }
     screen_base(block, screen);
+    // `armorSideBar`: the player's armor slots and the off hand on the screen's side.
+    if let (Some(s), Some((_, _, at))) = (screen.as_mut(), armor_sidebar(block)) {
+        s.armor = Some(at);
+        s.offhand = Some([at[0], at[1] + 72.0]);
+    }
     // The QIO blocks swap to the selector's layout while their tab's screen is open: 176 x 155, none
     // of the inventory (it is moved out of the way).
     if matches!(kind(block), Some(Kind::FissionPort | Kind::FusionPort | Kind::BoilerValve | Kind::TurbineValve)) && let Some(s) = screen.as_mut() {
@@ -7386,6 +7391,7 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
             inventory_x: 0.0,
             own_labels: true,
             alt: None,
+            ..Default::default(),
         }));
     }
     if kind(block) == Some(Kind::DigitalMiner) && let Some(s) = screen.as_mut() {
@@ -7398,6 +7404,7 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
             inventory_x: 58.0,
             own_labels: true,
             alt: None,
+            ..Default::default(),
         }));
     }
     if is_qio_tile(block) && let Some(s) = screen.as_mut() {
@@ -7409,7 +7416,22 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
             inventory_x: 0.0,
             own_labels: true,
             alt: None,
+            ..Default::default(),
         }));
+    }
+}
+
+/// The screens with an armor sidebar (`ContainerBuilder.armorSideBar` and `GuiSideHolder`): the holder's
+/// top left and side, and the first armor slot (the off hand sits 72 below, `offhandOffset` 0).
+fn armor_sidebar(block: &str) -> Option<([f32; 2], bool, [f32; 2])> {
+    match kind(block)? {
+        // `armorHolder` (-26, 62), `armorSideBar()` (-20, 67).
+        Kind::FluidTank(_) | Kind::ChemicalTank(_) | Kind::DynamicValve => Some(([-26.0, 62.0], true, [-20.0, 67.0])),
+        // `GuiSideHolder.create(imageWidth, 36, ...)`, `armorSideBar(180, 41, 0)`.
+        Kind::EnergyCube(_) => Some(([176.0, 36.0], false, [180.0, 41.0])),
+        // `GuiSideHolder.create(-26, 36, ...)`, `armorSideBar(-20, 41, 0)`.
+        Kind::InductionPort => Some(([-26.0, 36.0], true, [-20.0, 41.0])),
+        _ => None,
     }
 }
 
@@ -7419,13 +7441,13 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
     }
     // `GuiQIORedstoneAdapter`: 26 px taller than a machine's, no slots of its own.
     if kind(block) == Some(Kind::QioRedstoneAdapter) {
-        *screen = Some(super::native_hooks::NativeScreen { width: 176.0, height: 192.0, slots: vec![None; 3], inventory_y: 110.0, inventory_x: 8.0, own_labels: true, alt: None });
+        *screen = Some(super::native_hooks::NativeScreen { width: 176.0, height: 192.0, slots: vec![None; 3], inventory_y: 110.0, inventory_x: 8.0, own_labels: true, alt: None, ..Default::default() });
         return;
     }
     // `GuiPersonalStorageTile`: six rows of nine over the inventory, 56 px taller than a machine's.
     if kind(block) == Some(Kind::PersonalStorage) {
         let slots = (0..bin::PERSONAL_SLOTS).map(|i| Some([8.0 + 18.0 * (i % 9) as f32, 18.0 + 18.0 * (i / 9) as f32])).collect();
-        *screen = Some(super::native_hooks::NativeScreen { width: 176.0, height: 222.0, slots, inventory_y: 140.0, inventory_x: 8.0, own_labels: true, alt: None });
+        *screen = Some(super::native_hooks::NativeScreen { width: 176.0, height: 222.0, slots, inventory_y: 140.0, inventory_x: 8.0, own_labels: true, alt: None, ..Default::default() });
         return;
     }
     // `GuiQIODriveArray` and `GuiQIODashboard`.
@@ -7435,7 +7457,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
     }
     // `GuiQIOFilterHandler`: 60 wider and 74 taller than a machine's, no slots of its own.
     if is_qio_filter(block) {
-        *screen = Some(super::native_hooks::NativeScreen { width: 236.0, height: 240.0, slots: vec![None; 3], inventory_y: 158.0, inventory_x: 38.0, own_labels: true, alt: None });
+        *screen = Some(super::native_hooks::NativeScreen { width: 236.0, height: 240.0, slots: vec![None; 3], inventory_y: 158.0, inventory_x: 38.0, own_labels: true, alt: None, ..Default::default() });
         return;
     }
     // `GuiLogisticalSorter`: 100 wider and 88 taller than a machine's, no slots of its own.
@@ -7448,6 +7470,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
             inventory_x: 58.0,
             own_labels: true,
             alt: None,
+            ..Default::default(),
         });
         return;
     }
@@ -7462,6 +7485,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
             inventory_x: 8.0,
             own_labels: true,
             alt: None,
+            ..Default::default(),
         });
         return;
     }
@@ -7476,7 +7500,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
             slots[FACTORY_ROW + i] = Some(output);
         }
         let w = screen_width(block);
-        *screen = Some(super::native_hooks::NativeScreen { width: w, height: 166.0, slots, inventory_y: 84.0, inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(), own_labels: false, alt: None });
+        *screen = Some(super::native_hooks::NativeScreen { width: w, height: 166.0, slots, inventory_y: 84.0, inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(), own_labels: false, alt: None, ..Default::default() });
         return;
     }
     let (w, h) = (screen_width(block), screen_height(block));
@@ -7496,6 +7520,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(),
         own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort | Kind::FusionPort)),
         alt: None,
+        ..Default::default(),
     });
 }
 
@@ -8498,6 +8523,15 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     // `GuiSideHolder.create(imageWidth, 66, 57, false, true, ...)`: the washer's holder for its fluid slots.
     if kind(block) == Some(Kind::Washer) {
         nine_slice_tinted(game, batch, "holder_right", [26.0, 9.0], 4.0, [ox + 176.0, oy + 66.0, 26.0, 57.0], 0xFFFF_FFFF);
+    }
+    // The armor holder is drawn behind its slots (`GuiSideHolder`, slot holder): 26 wide, 98 tall, and a slot
+    // frame for each armor slot and the off hand (`GuiSlot` NORMAL at the slot's position less one).
+    if let Some((at, left, first)) = armor_sidebar(block) {
+        let holder = if left { "holder_left" } else { "holder_right" };
+        nine_slice_tinted(game, batch, holder, [26.0, 9.0], 4.0, [ox + at[0], oy + at[1], 26.0, 98.0], 0xFFFF_FFFF);
+        for i in 0..5 {
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + first[0] - 1.0, oy + first[1] + 18.0 * i as f32 - 1.0, 18.0, 18.0]);
+        }
     }
     let warn = warning_bits(block, &l, data);
     let extra = extra_slots(block);
@@ -12645,7 +12679,7 @@ fn qio_slots(block: &str) -> Vec<Option<[f32; 2]>> {
 
 fn qio_screen(block: &str) -> super::native_hooks::NativeScreen {
     if kind(block) == Some(Kind::QioDriveArray) {
-        super::native_hooks::NativeScreen { width: 176.0, height: 206.0, slots: qio_slots(block), inventory_y: 124.0, inventory_x: 8.0, own_labels: true, alt: None }
+        super::native_hooks::NativeScreen { width: 176.0, height: 206.0, slots: qio_slots(block), inventory_y: 124.0, inventory_x: 8.0, own_labels: true, alt: None, ..Default::default() }
     } else {
         super::native_hooks::NativeScreen {
             width: QIO_WIDTH,
@@ -12655,6 +12689,7 @@ fn qio_screen(block: &str) -> super::native_hooks::NativeScreen {
             inventory_x: 8.0 + (QIO_WIDTH - 176.0) / 2.0,
             own_labels: true,
             alt: None,
+            ..Default::default(),
         }
     }
 }
