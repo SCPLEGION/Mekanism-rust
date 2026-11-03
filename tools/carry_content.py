@@ -415,6 +415,9 @@ def build_module(ns, out):
         for item in worn_models.WORN:
             if worn_models.build(ns, item, search, out, search, report):
                 worn.add(item)
+        for item in worn_models.MEKASUIT:
+            if worn_models.build_mekasuit(ns, item, search, out, search, report):
+                worn.add(item)
     report["component_items"] = component_items(ns, out)
     report["component_recipes"] = component_recipes(out / "data" / ns / "recipe")
 
