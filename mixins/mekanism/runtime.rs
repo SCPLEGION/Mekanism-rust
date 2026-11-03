@@ -1420,18 +1420,128 @@ fn put_fills(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fi
         }
         let Some(f) = fills.get(i) else {
             put_int(&mut shown, &format!("f{i}_on"), 0);
+            entity.nbt.remove(&JavaString::from(format!("pscale{i}").as_str()));
             continue;
         };
+        // `MekanismUtils.getScale`: the drawn level eases towards the real one, a tenth of the way a tick.
+        let prev = get_int(&entity.nbt, &format!("pscale{i}")) as f32 / 1_000_000.0;
+        let target = f.scale as f32;
+        let (empty, full) = (target <= 0.0, target >= 1.0);
+        let difference = (prev - target).abs();
+        let eased = if difference > 0.01 {
+            (9.0 * prev + target) / 10.0
+        } else if (!empty && full && difference > 0.0) || (!empty && prev == 0.0) {
+            target
+        } else if empty && prev < 0.01 {
+            0.0
+        } else {
+            prev
+        };
+        put_int(&mut entity.nbt, &format!("pscale{i}"), (eased * 1_000_000.0) as u32);
         for (k, v) in FILL_KEYS.iter().zip([f.at[0], f.at[1], f.at[2], f.size[0], f.size[1], f.size[2]]) {
             put_int(&mut shown, &format!("f{i}_{k}"), v as u32);
         }
-        put_int(&mut shown, &format!("f{i}_scale"), (f.scale * 1_000_000.0) as u32);
+        put_int(&mut shown, &format!("f{i}_scale"), (eased * 1_000_000.0) as u32);
         put_int(&mut shown, &format!("f{i}_chem"), chemical_index(f.chemical.as_deref()) as u32);
         put_int(&mut shown, &format!("f{i}_on"), 1);
         put_int(&mut shown, &format!("f{i}_shrunk"), u32::from(f.shrunk));
     }
     let owned: Vec<&str> = owned.iter().map(String::as_str).collect();
     put_client(game, pos, entity, &owned, shown);
+}
+
+/// `ValveData.onTransfer` and `tick`: a valve that took fluid in stays active for 30 ticks. Each master keeps
+/// `vact` ([x, y, z, ticks] a valve); this counts it down, marks the `touched` valves and gives the active ones.
+fn valves_active(entity: &mut ModBlockEntity, touched: &[[i32; 3]]) -> Vec<[i32; 3]> {
+    let mut valves: Vec<[i32; 4]> = match entity.nbt.get(&JavaString::from("vact")) {
+        Some(Tag::IntArray(v)) => v.chunks(4).filter(|c| c.len() == 4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
+        _ => Vec::new(),
+    };
+    for v in &mut valves {
+        v[3] -= 1;
+    }
+    for t in touched {
+        match valves.iter_mut().find(|v| v[..3] == t[..]) {
+            Some(v) => v[3] = 30,
+            None => valves.push([t[0], t[1], t[2], 30]),
+        }
+    }
+    valves.retain(|v| v[3] > 0);
+    if valves.is_empty() {
+        entity.nbt.remove(&JavaString::from("vact"));
+    } else {
+        entity.nbt.insert("vact".into(), Tag::IntArray(valves.concat()));
+    }
+    valves.iter().map(|v| [v[0], v[1], v[2]]).collect()
+}
+
+/// Tells clients which valves of the multiblock (corners `lo` and `hi` of its casing) run, with the side of the
+/// casing each is on (`Direction` ordinals), for the first fill to draw as `ValveRenderData`.
+fn put_valves(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, active: &[[i32; 3]], lo: [i32; 3], hi: [i32; 3]) {
+    let mut list = Vec::new();
+    for v in active {
+        let side = if v[0] == lo[0] {
+            4
+        } else if v[0] == hi[0] {
+            5
+        } else if v[1] == lo[1] {
+            0
+        } else if v[1] == hi[1] {
+            1
+        } else if v[2] == lo[2] {
+            2
+        } else {
+            3
+        };
+        list.extend([v[0], v[1], v[2], side]);
+    }
+    let mut shown = Compound::new();
+    if !list.is_empty() {
+        shown.insert("vlv".into(), Tag::IntArray(list));
+    }
+    put_client(game, pos, entity, &["vlv"], shown);
+}
+
+/// One running valve (`ValveRenderData.get`, `ModelRenderer.shouldSkipValveRender`): a column of the fluid in the
+/// casing beside the valve, still on the up and down faces and flowing on the sides.
+#[allow(clippy::too_many_arguments)]
+fn valve_boxes(
+    boxes: &mut Vec<super::native_hooks::NativeWorldBox>,
+    valve: [i32; 3],
+    side: i32,
+    main: f32,
+    floor: i32,
+    height: i32,
+    argb: u32,
+    still: &str,
+    flowing: &str,
+) {
+    let level = valve[1] - floor;
+    let skip = match side {
+        0 => main >= 0.49,
+        1 => main >= height as f32,
+        _ => main - level as f32 >= 0.69,
+    };
+    if skip {
+        return;
+    }
+    let (mut min_x, mut max_x, mut min_z, mut max_z) = (0.3_f32, 0.7_f32, 0.3_f32, 0.7_f32);
+    let (mut min_y, mut max_y) = (main - level as f32 + 0.01, 0.7_f32);
+    match side {
+        0 => (min_y, max_y) = (main + 1.01, 1.5),
+        1 => (min_y, max_y) = (main - height as f32 - 0.01, -0.01),
+        2 => (min_z, max_z) = (1.02, 1.4),
+        3 => (min_z, max_z) = (-0.4, -0.03),
+        4 => (min_x, max_x) = (1.02, 1.4),
+        _ => (min_x, max_x) = (-0.4, -0.03),
+    }
+    let (x, y, z) = (f64::from(valve[0]), f64::from(valve[1]), f64::from(valve[2]));
+    let min = [x + f64::from(min_x), y + f64::from(min_y), z + f64::from(min_z)];
+    let max = [x + f64::from(max_x), y + f64::from(max_y), z + f64::from(max_z)];
+    // [east, west, up, down, south, north]; with the fluid at the floor there is no face to look up at.
+    let down = if main == 0.0 { 0 } else { argb };
+    boxes.push(super::native_hooks::NativeWorldBox { min, max, colors: [0, 0, argb, down, 0, 0], sprite: Some(still.to_string()) });
+    boxes.push(super::native_hooks::NativeWorldBox { min, max, colors: [argb, argb, 0, 0, argb, argb], sprite: Some(flowing.to_string()) });
 }
 
 /// The fills each formed multiblock's master tells (`RenderDynamicTank`, `RenderThermoelectricBoiler`...): a
@@ -1478,8 +1588,22 @@ fn big_tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWo
                     min: [x + lo, y + lo, z + lo],
                     max: [x + f64::from(length) - hi, y + max_y, z + f64::from(width) - hi],
                     colors: [argb; 6],
-                    sprite: Some(sprite),
+                    sprite: Some(sprite.clone()),
                 });
+                // `RenderResizableCuboid.renderValves`: the first fill (a fluid) shows its running valves.
+                if i == 0
+                    && let Some(Tag::IntArray(list)) = c.get(&JavaString::from("vlv"))
+                {
+                    let flowing = match sprite.as_str() {
+                        "block/water_still" => "block/water_flow".to_string(),
+                        "block/lava_still" => "block/lava_flow".to_string(),
+                        _ => sprite.clone(),
+                    };
+                    let main = (max_y - 0.01) as f32;
+                    for v in list.chunks(4).filter(|v| v.len() == 4) {
+                        valve_boxes(boxes, [v[0], v[1], v[2]], v[3], main, y as i32, height, argb, &sprite, &flowing);
+                    }
+                }
             }
             // The fuel assemblies of a burning reactor glow: a translucent box round each column, a bit taller than
             // the stack to take in the control rod under it, with no top or bottom.
@@ -4116,10 +4240,15 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     // A tower that is not making brine may take brine in, to make lithium.
     let takes_brine = water.chemical.as_deref() == Some("mekanism:brine")
         || (water.amount == 0 && brine.chemical.as_deref() != Some("mekanism:brine"));
+    let mut touched = Vec::new();
     for valve in valves {
+        let before = water.amount;
         pull_fluid(game, valve, &mut water, "minecraft:water");
         if takes_brine {
             pull_fluid(game, valve, &mut water, "mekanism:brine");
+        }
+        if water.amount > before {
+            touched.push(valve);
         }
         if brine.amount > 0 {
             push_chemical(game, valve, &mut brine, None, u64::MAX, false);
@@ -4141,6 +4270,13 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         Vec::new()
     };
     put_fills(game, pos, entity, &fills);
+    let active = valves_active(entity, &touched);
+    if fills.is_empty() {
+        put_valves(game, pos, entity, &[], [0; 3], [0; 3]);
+    } else {
+        let o = tower.origin;
+        put_valves(game, pos, entity, &active, o, [o[0] + 3, o[1] + tower.height as i32 - 1, o[2] + 3]);
+    }
     entity.nbt.insert("temperature".into(), Tag::Double(temperature.to_bits()));
     // `lastGain` (what the screen shows, in hundredths) and `lastEnvironmentLoss` (heat units, in hundredths of a kelvin).
     let multiplier = evap::temp_multiplier(temperature, tower.height);
@@ -4265,12 +4401,13 @@ fn pull_fluid(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTank, fluid
 
 /// Fills `into` with `id` from the carriers and tanks of its kind beside `pos`: pipes and fluid tanks
 /// for a fluid, tubes and chemical tanks for a chemical.
-fn pull_from_carriers(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTank, fluid: &str) {
+fn pull_from_carriers(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTank, fluid: &str) -> u64 {
     let is_fluid = FLUIDS.contains(&fluid);
+    let mut gained = 0;
     for (_, d) in DIRECTIONS {
         let room = into.capacity - into.amount;
         if room == 0 || !into.accepts(fluid) {
-            return;
+            return gained;
         }
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
         let taken = game.native_with_mod_block_entity(at, |m| {
@@ -4291,8 +4428,10 @@ fn pull_from_carriers(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTan
         });
         if let Some(Some(n)) = taken {
             into.insert(fluid, n);
+            gained += n;
         }
     }
+    gained
 }
 
 // --- Fluid tanks ------------------------------------------------------------------------------------
@@ -10836,12 +10975,17 @@ fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
         get_long(nbt, "output") == 1
     };
     let mut outputs = Vec::new();
+    let mut touched = Vec::new();
     for p in positions(&entity.nbt, "valves") {
+        let before = tank.amount;
         let out = if p == pos {
             drain(&mut entity.nbt, &mut tank)
         } else {
             game.native_with_mod_block_entity(p, |m| drain(&mut m.nbt, &mut tank)).unwrap_or(false)
         };
+        if tank.amount > before {
+            touched.push(p);
+        }
         if out {
             outputs.push(p);
         }
@@ -10864,6 +11008,16 @@ fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
         _ => Vec::new(),
     };
     put_fills(game, pos, entity, &fills);
+    // `RenderDynamicTank`: a fluid (not a chemical) shows its running valves.
+    let active = valves_active(entity, &touched);
+    let fluid = !fills.is_empty() && tank.chemical.as_deref().is_some_and(|c| FLUIDS.contains(&c));
+    if let (true, Some(Tag::IntArray(b))) = (fluid, entity.nbt.get(&JavaString::from("box")).cloned())
+        && b.len() == 6
+    {
+        put_valves(game, pos, entity, &active, [b[0], b[1], b[2]], [b[0] + b[3] - 1, b[1] + b[4] - 1, b[2] + b[5] - 1]);
+    } else {
+        put_valves(game, pos, entity, &[], [0; 3], [0; 3]);
+    }
 }
 
 /// A sneaking right click with an empty hand on a dynamic valve switches it between filling the tank
@@ -11160,8 +11314,11 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     }
     let mut water = get_tank(&entity.nbt, "water", b.water_capacity());
     let mut steam = get_tank(&entity.nbt, "steam", b.steam_capacity());
+    let mut touched = Vec::new();
     for &v in &positions(&entity.nbt, "valves") {
-        pull_from_carriers(game, v, &mut water, "minecraft:water");
+        if pull_from_carriers(game, v, &mut water, "minecraft:water") > 0 {
+            touched.push(v);
+        }
     }
     let mut casing = mekanism_core::heat::HeatCapacitor::new(
         b.heat_capacity(),
@@ -11221,6 +11378,14 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
         }
     }
     put_fills(game, pos, entity, &fills);
+    // `RenderThermoelectricBoiler`: running valves show while there is water.
+    let active = valves_active(entity, &touched);
+    match entity.nbt.get(&JavaString::from("box")).cloned() {
+        Some(Tag::IntArray(bx)) if bx.len() == 7 && water.amount > 0 => {
+            put_valves(game, pos, entity, &active, [bx[0], bx[1], bx[2]], [bx[3], bx[4], bx[5]]);
+        }
+        _ => put_valves(game, pos, entity, &[], [0; 3], [0; 3]),
+    }
     Some(boiled > 0)
 }
 
