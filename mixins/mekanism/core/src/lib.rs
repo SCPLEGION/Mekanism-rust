@@ -32,6 +32,7 @@ pub mod matrix;
 pub mod miner;
 pub mod module_config;
 pub mod modules;
+pub mod radial;
 pub mod nuclear;
 pub mod oredictionificator;
 pub mod plenisher;
