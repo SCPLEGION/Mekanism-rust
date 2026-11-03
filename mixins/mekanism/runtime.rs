@@ -618,7 +618,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::Bin(t) => {
-                tick_bin(game, entity, t);
+                tick_bin(game, pos, entity, t);
                 None
             }
             Kind::PersonalStorage => None,
@@ -1206,9 +1206,14 @@ fn wind_rotor_speed(game: &Game<'_>, pos: [i32; 3]) -> f32 {
     SPEED * height / (game.world.top_y() - min) as f32
 }
 
-/// The rotors this client has heard of: the angle they have turned to and the tick it was worked out at.
+// The rotors this client has heard of: the angle they have turned to and the tick it was worked out at.
 thread_local! {
     static ROTORS: std::cell::RefCell<std::collections::HashMap<[i32; 3], (f32, u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+thread_local! {
+    /// The bins this client has heard of.
+    static BINS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 thread_local! {
@@ -1230,6 +1235,10 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
         });
     } else if matches!(kind(id), Some(Kind::FluidTank(_))) {
         TANKS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    } else if matches!(kind(id), Some(Kind::Bin(_))) {
+        BINS.with_borrow_mut(|t| {
             t.insert(pos);
         });
     } else if matches!(kind(id), Some(Kind::EnergyCube(_))) {
@@ -1356,6 +1365,113 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
             true
         });
     });
+}
+
+/// What `RenderBin` draws for one bin: its pose is the facing's, the item and the count's text hang from it.
+struct BinFace {
+    item: String,
+    count: String,
+    locked: bool,
+    pos: [i32; 3],
+    cover: [i32; 3],
+    item_pose: glam::DMat4,
+    text_pose: glam::DMat4,
+}
+
+/// The bins with something to show and nothing solid over their front (`RenderBin.extractRenderState`).
+fn bin_faces(game: &Game<'_>) -> Vec<BinFace> {
+    use glam::{DMat4, DVec3};
+    use std::f64::consts::{FRAC_PI_2, PI};
+    let mut faces = Vec::new();
+    BINS.with_borrow_mut(|bins| {
+        bins.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            let Some(Kind::Bin(tier)) = kind(id) else {
+                return false;
+            };
+            let item = get_string(c, "bin_item").unwrap_or_default();
+            let locked = get_int(c, "bin_lock") != 0;
+            if item.is_empty() || (get_int(c, "bin_count") == 0 && !locked) {
+                return true;
+            }
+            let Some(front) = game.native_block_property(*pos, "facing") else {
+                return true;
+            };
+            let Some(d) = direction(&front) else {
+                return true;
+            };
+            let cover = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+            let opposite = horizon_core::geometry::Direction::ALL[face_index([-d[0], -d[1], -d[2]])];
+            if game.native_face_sturdy(cover, opposite) {
+                return true;
+            }
+            let count = if tier == BaseTier::Creative { "Infinite".to_owned() } else { get_int(c, "bin_count").to_string() };
+            let origin = DMat4::from_translation(DVec3::new(f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])));
+            let t = |x: f64, y: f64, z: f64| DMat4::from_translation(DVec3::new(x, y, z));
+            let (ry, rx) = (DMat4::from_rotation_y, DMat4::from_rotation_x);
+            let mut item_pose = origin
+                * match front.as_str() {
+                    "north" => t(0.71, 0.8, -0.0001) * ry(PI),
+                    "south" => t(0.29, 0.8, 1.0001),
+                    "west" => t(-0.0001, 0.8, 0.29) * ry(-FRAC_PI_2),
+                    _ => t(1.0001, 0.8, 0.71) * ry(FRAC_PI_2),
+                };
+            item_pose = item_pose
+                * DMat4::from_scale(DVec3::new(0.025, 0.025, 0.0001))
+                * t(8.0, -8.0, 8.0)
+                * DMat4::from_scale(DVec3::splat(16.0));
+            let text_pose = origin
+                * t(0.0, -0.25, 0.0)
+                * match front.as_str() {
+                    "south" => t(0.0, 1.0, 0.0) * rx(FRAC_PI_2),
+                    "north" => t(1.0, 1.0, 1.0) * ry(PI) * rx(FRAC_PI_2),
+                    "east" => t(0.0, 1.0, 1.0) * ry(FRAC_PI_2) * rx(FRAC_PI_2),
+                    _ => t(1.0, 1.0, 0.0) * ry(-FRAC_PI_2) * rx(FRAC_PI_2),
+                }
+                * t(0.5, 1.0, 0.5)
+                * rx(-FRAC_PI_2);
+            faces.push(BinFace { item, count, locked, pos: *pos, cover, item_pose, text_pose });
+            true
+        });
+    });
+    faces
+}
+
+/// The items on the bins' fronts (hook point `native_world_items`, API 44).
+pub(super) fn world_items(game: &Game<'_>, items: &mut Vec<super::native_hooks::NativeWorldItem>) {
+    for f in bin_faces(game) {
+        items.push(super::native_hooks::NativeWorldItem {
+            item: f.item,
+            matrix: f.item_pose.to_cols_array(),
+            light_at: f.cover,
+            seed: (i64::from(f.pos[0]) * 3129871 ^ i64::from(f.pos[2]) * 116129781 ^ i64::from(f.pos[1])) as i32,
+        });
+    }
+}
+
+/// The counts under them (hook point `native_world_texts`, API 44): `RenderBin` scales the text to fit the
+/// block's width, at most 0.02, and centres it.
+pub(super) fn world_texts(game: &Game<'_>, texts: &mut Vec<super::native_hooks::NativeWorldText>) {
+    for f in bin_faces(game) {
+        let required_width = game.native_text_width(&f.count).max(1.0) as i32;
+        let required_height = 9 + 2;
+        let scale = (0.4 / required_width as f32).min(0.02);
+        let real_height = (1.0 / scale).floor() as i32;
+        let real_width = (1.0 / scale).floor() as i32;
+        let offset_x = (real_width - required_width) / 2;
+        let offset_y = (real_height - required_height) / 2;
+        let s = f64::from(scale);
+        texts.push(super::native_hooks::NativeWorldText {
+            text: f.count,
+            matrix: (f.text_pose * glam::DMat4::from_scale(glam::DVec3::new(s, -s, s))).to_cols_array(),
+            x: (offset_x - real_width / 2) as f32,
+            y: (1 + offset_y - real_height / 2) as f32,
+            color: if f.locked { 0xFF30_FFF9 } else { 0xFFFF_FFFF },
+            light_at: f.cover,
+        });
+    }
 }
 
 // --- Energy cubes -----------------------------------------------------------------------------------
@@ -10566,7 +10682,7 @@ fn settle_bin(entity: &mut ModBlockEntity, tier: BaseTier) -> Bin {
 
 /// A bin's tick: what hoppers put in the input slot goes in, and the output slot shows a stack of it for
 /// hoppers below to take (`BinInventorySlot` through the item handler).
-fn tick_bin(game: &mut Game<'_>, entity: &mut ModBlockEntity, tier: BaseTier) {
+fn tick_bin(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, tier: BaseTier) {
     let mut b = settle_bin(entity, tier);
     if let Some(s) = entity.items[0].clone().filter(plain) {
         let took = b.insert(tier, &s.item, u64::from(s.count), false) as u32;
@@ -10585,6 +10701,12 @@ fn tick_bin(game: &mut Game<'_>, entity: &mut ModBlockEntity, tier: BaseTier) {
     let ticks = get_int(&entity.nbt, "add_ticks");
     put_int(&mut entity.nbt, "add_ticks", ticks.saturating_sub(1));
     put_bin(&mut entity.nbt, &b);
+    // What `RenderBin` shows on the front: the item (the locked one when empty), how many, and the lock.
+    let mut shown = Compound::new();
+    shown.insert("bin_item".into(), Tag::String(b.item_type().unwrap_or_default().into()));
+    put_int(&mut shown, "bin_count", b.count.min(u64::from(u32::MAX)) as u32);
+    put_int(&mut shown, "bin_lock", u32::from(b.lock.is_some()));
+    put_client(game, pos, entity, &["bin_item", "bin_count", "bin_lock"], shown);
 }
 
 fn bin_line(tier: BaseTier, b: &Bin) -> String {
