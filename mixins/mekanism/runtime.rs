@@ -22,6 +22,7 @@ use mekanism_core::entangloporter::{self as qe, Frequency};
 use mekanism_core::sorter::{self, Sorter};
 use mekanism_core::oredictionificator as od;
 use mekanism_core::formulaic as fa;
+use mekanism_core::stabilizer as st;
 use mekanism_core::plenisher::{self, Plenisher, Spot};
 use mekanism_core::fission;
 use mekanism_core::frequency as freq;
@@ -120,6 +121,8 @@ enum Kind {
     Liquifier,
     /// The Formulaic Assemblicator: crafts from its stock by an encoded formula.
     Assemblicator,
+    /// The Dimensional Stabilizer: keeps a grid of chunks loaded for energy.
+    Stabilizer,
     /// The Chargepad: charges an item of the player standing on it.
     Chargepad,
     /// The Quantum Entangloporter: shares energy, fluid and chemicals across its frequency.
@@ -205,6 +208,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:painting_machine" => return Some(Kind::Painting),
         chem::LIQUIFIER => return Some(Kind::Liquifier),
         fa::BLOCK => return Some(Kind::Assemblicator),
+        st::BLOCK => return Some(Kind::Stabilizer),
         "mekanism:chemical_infuser" => return Some(Kind::ChemicalInfuser),
         "mekanism:antiprotonic_nucleosynthesizer" => return Some(Kind::Nucleosynthesizer),
         teleporter::TELEPORTER => return Some(Kind::Teleporter),
@@ -370,7 +374,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         return;
     }
     // The machines whose only slot is the energy slot (`EnergyInventorySlot`), which automation fills.
-    if matches!(kind(block), Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::PigmentMixer | Kind::Washer)) {
+    if matches!(kind(block), Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::PigmentMixer | Kind::Washer | Kind::Stabilizer)) {
         // Their energy slot and chemical slots: a hopper's five slots, which the furnace's roles would spoil.
         let used: Vec<usize> = (0..3).filter(|&i| layout(block).is_some_and(|l| l.slots[i].is_some())).chain(3..3 + extra_slots(block).len()).collect();
         *container = Some(ModContainer {
@@ -555,6 +559,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             Kind::PigmentExtractor => tick_oxidizer(game, pos, entity, true),
             Kind::Liquifier => tick_liquifier(game, pos, entity),
             Kind::Assemblicator => tick_assemblicator(game, pos, entity),
+            Kind::Stabilizer => tick_stabilizer(game, pos, entity),
             Kind::Dissolution => tick_dissolution(game, pos, entity),
             Kind::Centrifuge => tick_centrifuge(game, pos, entity),
             Kind::FissionPort => {
@@ -696,6 +701,7 @@ fn discharge_energy_slot(entity: &mut ModBlockEntity) {
         Some(Kind::Machine("combining", _) | Kind::Advanced(_) | Kind::Infuser | Kind::Painting | Kind::Nucleosynthesizer) => 3,
         Some(Kind::Pump | Kind::Plenisher) => 2,
         Some(Kind::Assemblicator) => fa::ENERGY_SLOT,
+        Some(Kind::Stabilizer) => 0,
         Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::PigmentMixer | Kind::Washer | Kind::Heater | Kind::Vibrator) => 0,
         _ => return,
     };
@@ -1208,7 +1214,77 @@ fn tick_wind(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) ->
     push_energy(game, pos, &mut energy, None, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
     entity.data = vec![(energy.stored * 1000 / g::WIND_STORAGE) as i32, 1000, produced as i32, g::WIND_GENERATION_MAX as i32];
+    // What the rotor needs in the world: whether it turns and how fast (`getHeightSpeedRatio`, in thousandths).
+    let mut client = Compound::new();
+    put_int(&mut client, "rotor_active", u32::from(produced > 0));
+    put_int(&mut client, "rotor_speed", (wind_rotor_speed(game, pos) * 1000.0) as u32);
+    put_client(game, pos, entity, &["rotor_active", "rotor_speed"], client);
     Some(produced > 0)
+}
+
+/// `TileEntityWindGenerator.getHeightSpeedRatio`: degrees per tick, from the height of the rotor.
+fn wind_rotor_speed(game: &Game<'_>, pos: [i32; 3]) -> f32 {
+    const SPEED: f32 = 32.0;
+    let min = game.world.bottom_y();
+    let height = (pos[1] + 4 - min) as f32;
+    SPEED * height / (game.world.top_y() - min) as f32
+}
+
+/// The rotors this client has heard of: the angle they have turned to and the tick it was worked out at.
+thread_local! {
+    static ROTORS: std::cell::RefCell<std::collections::HashMap<[i32; 3], (f32, u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A block entity's client view arrived (`native_client_block_entity_changed`): a wind generator's rotor.
+pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
+    if id == "mekanismgenerators:wind_generator" {
+        ROTORS.with_borrow_mut(|r| {
+            r.entry(pos).or_insert((0.0, 0));
+        });
+    }
+}
+
+/// The rotors that turn (hook point `native_world_models`, API 43): `RenderWindGenerator` puts the blades 4.5 up,
+/// turns them with the facing and spins them by the angle, which `onUpdateClient` advances each tick while
+/// the generator is active.
+pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks::NativeWorldModel>) {
+    let now = game.ticks as u64;
+    let partial = game.clock.fraction() as f32;
+    ROTORS.with_borrow_mut(|rotors| {
+        rotors.retain(|pos, (angle, tick)| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if id != "mekanismgenerators:wind_generator" {
+                return false;
+            }
+            let active = get_int(c, "rotor_active") != 0;
+            let speed = get_int(c, "rotor_speed") as f32 / 1000.0;
+            if *tick == 0 {
+                *tick = now;
+            }
+            if active {
+                *angle = (*angle + speed * now.saturating_sub(*tick) as f32) % 360.0;
+            }
+            *tick = now;
+            let roll = if active { (*angle + speed * partial) % 360.0 } else { *angle };
+            let yaw = match game.native_block_property(*pos, "facing").as_deref() {
+                Some("south") => 180.0,
+                Some("west") => 90.0,
+                Some("east") => 270.0,
+                _ => 0.0,
+            };
+            models.push(super::native_hooks::NativeWorldModel {
+                model: "mekanismgenerators:wind_generator_rotor".into(),
+                position: [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 4.5, f64::from(pos[2]) + 0.5],
+                yaw,
+                pitch: 0.0,
+                roll,
+                light_at: [pos[0], pos[1] + 4, pos[2]],
+            });
+            true
+        });
+    });
 }
 
 // --- Energy cubes -----------------------------------------------------------------------------------
@@ -3734,6 +3810,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::PigmentMixer => Some((machine::STORAGE_MULTIPLIER * chem::PIGMENT_MIXER_USAGE, u64::MAX)),
         Kind::Liquifier => Some((chem::LIQUIFIER_USAGE * u64::from(chem::LIQUIFIER_TICKS), u64::MAX)),
         Kind::Assemblicator => Some((asm_capacity(nbt), u64::MAX)),
+        Kind::Stabilizer => Some((st_capacity(nbt), u64::MAX)),
         Kind::Dissolution => Some((machine::STORAGE_MULTIPLIER * nuclear::DISSOLUTION_USAGE, u64::MAX)),
         Kind::Centrifuge => Some((machine::STORAGE_MULTIPLIER * nuclear::CENTRIFUGE_USAGE, u64::MAX)),
         Kind::Washer => Some((machine::STORAGE_MULTIPLIER * nuclear::WASHER_USAGE, u64::MAX)),
@@ -4407,6 +4484,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     }
     if channel == SORTER_CHANNEL && game.native_on(MOD_ID) {
         sorter_payload(game, data);
+        return;
+    }
+    if channel == ST_CHANNEL && game.native_on(MOD_ID) {
+        st_payload(game, data);
         return;
     }
     if channel == ASM_CHANNEL && game.native_on(MOD_ID) {
@@ -5445,6 +5526,13 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Horizontal([115.0, 75.0])),
             progress: large_right(64.0, 40.0),
         },
+        // TileEntityDimensionalStabilizer and GuiDimensionalStabilizer: the energy slot and the power bar.
+        Kind::Stabilizer => Layout {
+            slots: [Some(([143.0, 35.0], "slot/power")), None, None],
+            gauges: vec![],
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
+            progress: None,
+        },
         // TileEntityFormulaicAssemblicator and GuiFormulaicAssemblicator: the formula slot and the first two stock
         // slots; the rest are `extra_slots`.
         Kind::Assemblicator => Layout {
@@ -5786,6 +5874,7 @@ fn energy_capacity(entity: &ModBlockEntity) -> u64 {
     match kind(&entity.id) {
         Some(Kind::HeatGenerator) => HeatGenerator::new().energy.capacity,
         Some(Kind::Wind) => mekanism_core::generator::WIND_STORAGE,
+        Some(Kind::Stabilizer) => st_capacity(&entity.nbt),
         Some(Kind::BioGenerator) => mekanism_core::generator::BIO_STORAGE,
         Some(Kind::GasGenerator) => chem::GAS_GENERATOR_STORAGE,
         Some(Kind::Solar(_, storage)) => storage,
@@ -6133,7 +6222,7 @@ fn tabs(block: &str) -> u8 {
             | Kind::Centrifuge,
         ) => all,
         Some(
-            Kind::HeatGenerator | Kind::BioGenerator | Kind::GasGenerator | Kind::Wind | Kind::Solar(..) | Kind::DigitalMiner | Kind::Pump | Kind::Plenisher,
+            Kind::HeatGenerator | Kind::BioGenerator | Kind::GasGenerator | Kind::Wind | Kind::Solar(..) | Kind::DigitalMiner | Kind::Pump | Kind::Plenisher | Kind::Stabilizer,
         ) => {
             TAB_UPGRADE | TAB_REDSTONE | TAB_SECURITY
         }
@@ -6178,7 +6267,7 @@ fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
     if matches!(kind(block), Some(Kind::Factory(..))) {
         out.push(Tab { at: [-26.0, 62.0], icon: "button/sorting", argb: 0xFFFF_FFFF, what: TabKind::Sort });
     }
-    if kind(block) == Some(Kind::DigitalMiner) {
+    if matches!(kind(block), Some(Kind::DigitalMiner | Kind::Stabilizer)) {
         out.push(Tab { at: [-26.0, 6.0], icon: "button/visuals", argb: 0xFFFF_FFFF, what: TabKind::Visuals });
     }
     if t & TAB_UPGRADE != 0 {
@@ -6267,7 +6356,7 @@ fn tab_tooltip(block: &str, l: &Layout, data: &[i32], at: [f32; 2], lines: &mut 
         TabKind::Redstone => lines.push(redstone_of(l, data).0.name().into()),
         TabKind::Sort => lines.push("Auto-Sort".into()),
         TabKind::Visuals => {
-            let (shown, too_big) = (miner_visuals_on(data), miner_view(block, data).radius > 64);
+            let (shown, too_big) = (miner_visuals_on(data), kind(block) == Some(Kind::DigitalMiner) && miner_view(block, data).radius > 64);
             lines.push(format!("Visuals: {}", if shown { "On" } else { "Off" }));
             if too_big {
                 lines.push("\u{a7}cArea too large to display visuals.".into());
@@ -7775,6 +7864,9 @@ fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], r
     if is_asm(block) && open_window_id(block).is_none() && asm_click(game, at) {
         return;
     }
+    if kind(block) == Some(Kind::Stabilizer) && st_click(game, at, right) {
+        return;
+    }
     if is_qio_screen(block) {
         qio_click(game, block, at);
         return;
@@ -9209,6 +9301,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     if is_asm(block) {
         draw_asm(game, batch, origin);
     }
+    if kind(block) == Some(Kind::Stabilizer) {
+        draw_stabilizer(game, batch, origin);
+    }
     if let Some(Kind::ChemicalTank(t)) = kind(block) {
         draw_tank_screen(game, batch, &l, data, origin, t == BaseTier::Creative);
     }
@@ -9488,6 +9583,9 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         return;
     }
     if is_asm(block) && open_window_id(block).is_none() && asm_tooltip(game, at, lines) {
+        return;
+    }
+    if kind(block) == Some(Kind::Stabilizer) && st_tooltip(game, at, lines) {
         return;
     }
     if is_qio_screen(block) {
@@ -11991,6 +12089,12 @@ pub(super) fn screen_alt(game: &Game<'_>, block: &str, alt: &mut bool) {
         }
         return;
     }
+    if kind(block) == Some(Kind::Stabilizer) {
+        if let Some((x, y, z)) = game.container {
+            MINER_OPEN.set([x, y, z]);
+        }
+        return;
+    }
     if kind(block) == Some(Kind::DigitalMiner) {
         if let Some((x, y, z)) = game.container {
             MINER_OPEN.set([x, y, z]);
@@ -13882,6 +13986,10 @@ pub(super) fn world_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::
         let Some((id, c)) = game.native_client_block_entity(pos) else {
             continue;
         };
+        if kind(&id) == Some(Kind::Stabilizer) {
+            stabilizer_boxes(game, pos, c, boxes);
+            continue;
+        }
         if kind(&id) != Some(Kind::DigitalMiner) {
             continue;
         }
@@ -15854,5 +15962,184 @@ fn draw_asm(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: 
             fa::Op::Auto => "button/auto_toggle",
         };
         draw_button(game, batch, [ox + r[0], oy + r[1], r[2], r[3]], inside(mouse, r), active, 0xFFFF_FFFF, Some((icon, r[2])));
+    }
+}
+
+// --- Dimensional Stabilizer (TileEntityDimensionalStabilizer, GuiDimensionalStabilizer) ----------------------
+
+const ST_CHANNEL: &str = "mekanism:stabilizer";
+
+/// `UpgradeUtils.getMaxEnergy` of a chunk's usage times the storage multiplier; energy upgrades only add storage.
+fn st_capacity(nbt: &Compound) -> u64 {
+    upgrades(nbt).max_energy(st::STORAGE).max(st::USAGE)
+}
+
+fn st_grid(nbt: &Compound) -> st::Grid {
+    st::decode(&get_string(nbt, "st_grid").unwrap_or_default())
+}
+
+/// A player's click, on the server: a chunk toggled, or a ring enabled or disabled (`PacketGuiInteract`).
+fn st_payload(game: &mut Game<'_>, data: &[u8]) {
+    let (Some((op, pos)), Some(player)) = (st::decode_request(data), game.native_acting_player()) else {
+        return;
+    };
+    let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    if !near || kind(block_name(game, pos)) != Some(Kind::Stabilizer) {
+        return;
+    }
+    game.native_with_mod_block_entity(pos, |m| {
+        let mut grid = st_grid(&m.nbt);
+        let changed = match op {
+            st::Op::Toggle(i) => st::toggle(&mut grid, usize::from(i)),
+            st::Op::Enable(r) => st::adjust_radius(&mut grid, i32::from(r), true),
+            st::Op::Disable(r) => st::adjust_radius(&mut grid, i32::from(r), false),
+        };
+        if changed {
+            m.nbt.insert("st_grid".into(), Tag::String(st::encode(&grid).as_str().into()));
+        }
+    });
+}
+
+fn st_send(game: &Game<'_>, op: st::Op) {
+    if let Some((x, y, z)) = game.container {
+        game.native_send_to_server(ST_CHANNEL, &st::encode_request(op, [x, y, z]));
+    }
+}
+
+/// The stabilizer every tick: it takes the energy for its chunks (`onUpdateServer`), and the grid goes to the viewers.
+fn tick_stabilizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = st_capacity(&entity.nbt);
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let grid = st_grid(&entity.nbt);
+    let per_tick = st::energy_per_tick(&grid);
+    // The chunks stay loaded only while the whole usage can be paid.
+    let active = energy.consume(per_tick);
+    put_int(&mut entity.nbt, "warn", u32::from(per_tick > energy.stored + if active { per_tick } else { 0 }));
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    entity.data = vec![(energy.stored * 1000 / capacity) as i32, 1000, 0, 0];
+    let mut client = Compound::new();
+    client.insert("st_grid".into(), Tag::String(st::encode(&grid).as_str().into()));
+    put_client(game, pos, entity, &["st_grid"], client);
+    Some(active)
+}
+
+fn st_client_grid(game: &Game<'_>) -> Option<st::Grid> {
+    let (x, y, z) = game.container?;
+    let (_, c) = game.native_client_block_entity([x, y, z])?;
+    Some(st::decode(&get_string(c, "st_grid").unwrap_or_default()))
+}
+
+/// The chunk buttons: a 10 px square at (63, 19) for each cell.
+fn st_cell(x: usize, z: usize) -> [f32; 4] {
+    [63.0 + 10.0 * x as f32, 19.0 + 10.0 * z as f32, 10.0, 10.0]
+}
+
+fn st_cell_at(at: [f32; 2]) -> Option<(usize, usize)> {
+    (0..st::DIAMETER).flat_map(|x| (0..st::DIAMETER).map(move |z| (x, z))).find(|&(x, z)| inside(at, st_cell(x, z)))
+}
+
+fn st_click(game: &Game<'_>, at: [f32; 2], right: bool) -> bool {
+    let Some((x, z)) = st_cell_at(at) else {
+        return false;
+    };
+    let Some(grid) = st_client_grid(game) else {
+        return true;
+    };
+    let centre = st::MAX_LOAD_RADIUS as usize;
+    if (x, z) == (centre, centre) {
+        // Left click enables the next ring, right click disables the outermost loaded one.
+        let op = if right { st::next_to_disable(&grid).map(|r| st::Op::Disable(r as u8)) } else { st::next_to_enable(&grid).map(|r| st::Op::Enable(r as u8)) };
+        if let Some(op) = op {
+            st_send(game, op);
+        }
+    } else {
+        st_send(game, st::Op::Toggle((x * st::DIAMETER + z) as u8));
+    }
+    true
+}
+
+/// The chunk's own coordinates for the tooltips: the block's chunk plus the cell's offset.
+fn st_chunk(game: &Game<'_>, x: usize, z: usize) -> Option<(i32, i32)> {
+    let (bx, _, bz) = game.container?;
+    let r = st::MAX_LOAD_RADIUS;
+    Some((bx.div_euclid(16) + x as i32 - r, bz.div_euclid(16) + z as i32 - r))
+}
+
+fn st_tooltip(game: &Game<'_>, at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    let Some((x, z)) = st_cell_at(at) else {
+        return false;
+    };
+    let (Some(grid), Some((cx, cz))) = (st_client_grid(game), st_chunk(game, x, z)) else {
+        return true;
+    };
+    let centre = st::MAX_LOAD_RADIUS as usize;
+    if (x, z) == (centre, centre) {
+        lines.push(format!("Chunk at (\u{a7}9{cx}\u{a7}7, \u{a7}9{cz}\u{a7}7) is always loaded."));
+        if let Some(r) = st::next_to_enable(&grid) {
+            lines.push(" ".into());
+            lines.push(format!("Left click to enable chunk loading for all chunks with a radius of \u{a7}9{r}\u{a7}7 around (\u{a7}9{cx}\u{a7}7, \u{a7}9{cz}\u{a7}7)."));
+        }
+        if let Some(r) = st::next_to_disable(&grid) {
+            lines.push(" ".into());
+            lines.push(format!("Right click to disable chunk loading for all chunks with a radius of \u{a7}9{r}\u{a7}7 around (\u{a7}9{cx}\u{a7}7, \u{a7}9{cz}\u{a7}7)."));
+        }
+    } else {
+        let on = grid[x * st::DIAMETER + z];
+        lines.push(format!(
+            "Toggle chunk loading {} at (\u{a7}9{cx}\u{a7}7, \u{a7}9{cz}\u{a7}7)",
+            if on { "\u{a7}aOn" } else { "\u{a7}cOff" }
+        ));
+    }
+    true
+}
+
+/// The chunk buttons (`TooltipColorButton`, dark blue when loaded), the up arrow and the north mark.
+fn draw_stabilizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    let grid = st_client_grid(game).unwrap_or_else(st::new_grid);
+    for x in 0..st::DIAMETER {
+        for z in 0..st::DIAMETER {
+            let r = st_cell(x, z);
+            let rect = [ox + r[0], oy + r[1], r[2], r[3]];
+            let on = grid[x * st::DIAMETER + z];
+            draw_button(game, batch, rect, inside(mouse, r), true, if on { 0xFF6F_97E0 } else { 0xFFFF_FFFF }, None);
+            if on {
+                game.native_fill(batch, [rect[0] + 1.0, rect[1] + 1.0, rect[2] - 2.0, rect[3] - 2.0], 0xFF36_6BD0);
+            }
+        }
+    }
+    sprite(game, batch, "arrow/up", [0.0, 0.0, 8.0, 10.0], [ox + 52.0, oy + 28.0, 8.0, 10.0]);
+    let w = game.native_text_width("N");
+    game.native_text(batch, "N", [ox + 49.0 - w / 2.0, oy + 41.0], 0x40_4040, false);
+}
+
+/// The loaded chunks as translucent columns (`RenderDimensionalStabilizer`): a wall wherever no loaded chunk
+/// stands beside, the whole height of the world, none on top or below.
+fn stabilizer_boxes(game: &Game<'_>, pos: [i32; 3], c: &Compound, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    let grid = st::decode(&get_string(c, "st_grid").unwrap_or_default());
+    let r = st::MAX_LOAD_RADIUS;
+    // `ARGB.white(0.78)` for east and west, `0.82` for north and south.
+    let (east_west, north_south) = (0xC7FF_FFFF, 0xD1FF_FFFF);
+    let (min_y, max_y) = (f64::from(game.world.bottom_y()), f64::from(game.world.top_y()));
+    for x in 0..st::DIAMETER {
+        for z in 0..st::DIAMETER {
+            if !grid[x * st::DIAMETER + z] {
+                continue;
+            }
+            let [east, west, south, north] = st::exposed(&grid, x, z);
+            let side = |shown: bool, colour: u32| if shown { colour } else { 0 };
+            let chunk_x = pos[0].div_euclid(16) + x as i32 - r;
+            let chunk_z = pos[2].div_euclid(16) + z as i32 - r;
+            let min = [f64::from(chunk_x * 16) + 0.01, min_y, f64::from(chunk_z * 16) + 0.01];
+            let max = [min[0] + 15.98, max_y, min[2] + 15.98];
+            boxes.push(super::native_hooks::NativeWorldBox {
+                min,
+                max,
+                colors: [side(east, east_west), side(west, east_west), 0, 0, side(south, north_south), side(north, north_south)],
+            });
+        }
     }
 }

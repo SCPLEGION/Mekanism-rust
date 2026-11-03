@@ -14,6 +14,7 @@ import shutil
 from pathlib import Path
 
 import flatten_models
+import obj_models
 
 DIRECTIONS = {  # FaceInfo vertex selectors: 0 = from, 1 = to
     "down": [[0, 0, 1], [0, 0, 0], [1, 0, 0], [1, 0, 1]],
@@ -190,4 +191,109 @@ def build(ns, item, assets, out, textures_dirs, report):
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps({"layers": {"horizon_models": layers}}, indent=1) + "\n")
     report["worn_items"] = report.get("worn_items", 0) + 1
+    return True
+
+
+# ---- the MekaSuit: one OBJ model, parts picked per armour piece (`MekaSuitArmor`) ----------------------------
+MEKASUIT = {"mekasuit_helmet": ("helmet", "head"), "mekasuit_bodyarmor": ("chest", "chest"),
+            "mekasuit_pants": ("leggings", "legs"), "mekasuit_boots": ("boots", "feet")}
+SLOT.update({item: slot for item, (_, slot) in MEKASUIT.items()})
+# The bone each part name belongs to (`ModelPos`, in this order) and that bone's pivot in the player model, pixels.
+BONES = (("head", "head", (0, 0, 0)), ("body", "body", (0, 0, 0)), ("left_arm", "left_arm", (5, 2, 0)),
+         ("right_arm", "right_arm", (-5, 2, 0)), ("left_leg", "left_leg", (1.9, 12, 0)),
+         ("right_leg", "right_leg", (-1.9, 12, 0)))
+
+
+def mekasuit_points(point, pivot):
+    """A vertex of the OBJ (a standing player in blocks, y up, left arm at -x) in the bone's space (blocks, y down)."""
+    x, y, z = point
+    return [-x - pivot[0] / 16, 1.5 - y - pivot[1] / 16, z - pivot[2] / 16]
+
+
+def build_mekasuit(ns, item, assets, out, textures_dirs, report):
+    """Write the worn model and equipment asset of one MekaSuit piece; exclusive (`excl_`) parts, which show only
+    while the neighbouring piece is not worn, are left out; shared parts are drawn by every piece that owns them."""
+    keyword, _ = MEKASUIT[item]
+    root = next((d / ns / "models/entity" for d in assets if (d / ns / "models/entity/mekasuit.obj").is_file()), None)
+    if root is None:
+        return False
+    objs = obj_models.parse((root / "mekasuit.obj").read_text())
+    mtl = obj_models.parse_mtl((root / "mekasuit.mtl").read_text())
+    textures = json.loads((root / "mekasuit.json").read_text())["textures"]
+    per_texture = {}
+    for obj in objs:
+        name = obj["name"]
+        if name.startswith("excl_") or keyword not in name:
+            continue
+        bone = next((b for key, b, _ in BONES if key in name), None)
+        pivot = next((p for key, _, p in BONES if key in name), None)
+        if bone is None:
+            report.setdefault("mekasuit_unplaced", []).append(name)
+            continue
+        for quad, material in zip(obj["faces"], obj["materials"]):
+            var = mtl.get(material, ("#" + str(material), False))[0][1:]
+            texture = textures.get(var)
+            if texture is None or len(quad) != 4:
+                continue
+            pts = [mekasuit_points(p, pivot) for p, _ in quad]
+            uvs = [[uv[0], 1 - uv[1]] for _, uv in quad]
+            poly, normal = polygon(pts, uvs)
+            per_texture.setdefault(texture, {}).setdefault(bone, []).append((poly, normal))
+    return write_layers(ns, item, per_texture, out, textures_dirs, report)
+
+
+def write_layers(ns, item, per_texture, out, textures_dirs, report):
+    layers = []
+    for n, (texture, bones) in enumerate(sorted(per_texture.items())):
+        tns, _, tpath = texture.partition(":")
+        name = f"{item}_{n}"
+        children = {bone: {"pose": [0, 0, 0, 0, 0, 0, 1, 1, 1], "polygons": [p for p, _ in quads],
+                           "normals": [n_ for _, n_ in quads]} for bone, quads in sorted(bones.items())}
+        target = out / "assets" / ns / "horizon" / "worn_models" / f"{name}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"pose": [0, 0, 0, 0, 0, 0, 1, 1, 1], "polygons": [], "children": children}))
+        source = next((d / tns / "textures" / f"{tpath}.png" for d in textures_dirs
+                       if (d / tns / "textures" / f"{tpath}.png").is_file()), None)
+        if source is None:
+            report.setdefault("worn_missing_textures", []).append(texture)
+            continue
+        sprite = out / "assets" / ns / "textures/entity/equipment/horizon_models" / f"{name}.png"
+        sprite.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, sprite)
+        layers.append({"model": f"{ns}:{name}", "texture": f"{ns}:{name}"})
+    if not layers:
+        return False
+    target = out / "assets" / ns / "equipment" / f"{item}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"layers": {"horizon_models": layers}}, indent=1) + "\n")
+    report["worn_items"] = report.get("worn_items", 0) + 1
+    return True
+
+
+def build_world_model(ns, name, obj_file, texture, out, textures_dirs, report):
+    """A part tree for `native_world_models`: the OBJ as it stands (pixels, y up), its texture beside it."""
+    objs = obj_models.parse(obj_file.read_text())
+    mtl_file = obj_file.with_suffix(".mtl")
+    mtl = obj_models.parse_mtl(mtl_file.read_text() if mtl_file.is_file() else "")
+    polygons, normals = [], []
+    for obj in objs:
+        for quad in obj["faces"]:
+            if len(quad) != 4:
+                continue
+            poly, normal = polygon([list(p) for p, _ in quad], [[uv[0], 1 - uv[1]] for _, uv in quad])
+            polygons.append(poly)
+            normals.append(normal)
+    tns, _, tpath = texture.partition(":")
+    source = next((d / tns / "textures" / f"{tpath}.png" for d in textures_dirs
+                   if (d / tns / "textures" / f"{tpath}.png").is_file()), None)
+    if source is None or not polygons:
+        report.setdefault("worn_missing_textures", []).append(texture)
+        return False
+    target = out / "assets" / ns / "horizon" / "world_models" / f"{name}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"pose": [0, 0, 0, 0, 0, 0, 1, 1, 1], "polygons": polygons, "normals": normals}))
+    sprite = out / "assets" / ns / "textures/entity/equipment/horizon_models" / f"{name}.png"
+    sprite.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, sprite)
+    report["world_models"] = report.get("world_models", 0) + 1
     return True
