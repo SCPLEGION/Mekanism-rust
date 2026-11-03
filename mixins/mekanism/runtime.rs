@@ -714,7 +714,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::Alarm => {
-                tick_alarm(game, pos);
+                tick_alarm(game, pos, entity);
                 None
             }
             Kind::Laser | Kind::LaserAmplifier | Kind::TractorBeam => tick_laser(game, pos, entity),
@@ -12641,13 +12641,22 @@ fn tick_redstone_adapter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlo
     }
 }
 
-/// `TileEntityIndustrialAlarm.onPowerChange`: the alarm is active while redstone powers it.
-fn tick_alarm(game: &mut Game<'_>, pos: [i32; 3]) {
+/// `TileEntityIndustrialAlarm.onPowerChange`: the alarm is active while redstone powers it, three ticks after
+/// the power changes (`delaySupplier = () -> 3`).
+fn tick_alarm(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     let at = horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]);
     let powered = game.with_level(|b, level, ticks| b.has_neighbor_signal(level, ticks, at));
     let active = game.native_block_property(pos, "active").as_deref() == Some("true");
-    if powered != active {
+    if powered == active {
+        put_int(&mut entity.nbt, "alarm_wait", 0);
+        return;
+    }
+    let waited = get_int(&entity.nbt, "alarm_wait") + 1;
+    if waited >= 3 {
+        put_int(&mut entity.nbt, "alarm_wait", 0);
         game.native_set_block_property(pos, "active", if powered { "true" } else { "false" });
+    } else {
+        put_int(&mut entity.nbt, "alarm_wait", waited);
     }
 }
 
