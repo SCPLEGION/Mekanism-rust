@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "3cf02648f92cd87855d22d565d24a6419c8edb17"
+horizon_revision = "3a4bc25409cc8e4b2a647eff5af997684fdacdae"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -516,6 +516,31 @@ helper = "client_payload.rs"
 bindings = [
   { name = "channel", ty = "&str", value = "channel" },
   { name = "data", ty = "&[u8]", value = "data" },
+]
+
+[[injection]]
+id = "ui-closed"
+hook = "ui_closed"
+hook_version = 1
+kind = "HEAD"
+helper = "ui_closed.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "id", ty = "&str", value = "id" },
+]
+
+[[injection]]
+id = "ui-key"
+hook = "ui_key"
+hook_version = 1
+kind = "HEAD"
+helper = "ui_key.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "id", ty = "&str", value = "id" },
+  { name = "key", ty = "&str", value = "key" },
+  { name = "text", ty = "Option<&str>", value = "text" },
+  { name = "pressed", ty = "bool", value = "pressed" },
 ]
 
 [[injection]]

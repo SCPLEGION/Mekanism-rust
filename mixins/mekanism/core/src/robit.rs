@@ -7,8 +7,22 @@ pub const ITEM: &str = "mekanism:robit";
 
 /// `EntityRobit.MAX_ENERGY`.
 pub const MAX_ENERGY: u64 = 100_000;
-/// `ItemRobit`'s inventory (`EntityRobit.inventorySlots`: 30 slots in the inventory screen).
-pub const INVENTORY_SLOTS: usize = 30;
+/// `EntityRobit.inventorySlots`: 27 storage slots, the energy slot, the smelting input and output.
+pub const INVENTORY_SLOTS: usize = 43;
+/// The repair window's anvil input, material and result (the result is computed, never stored).
+pub const REPAIR_INPUT: usize = 40;
+pub const REPAIR_ADD: usize = 41;
+pub const REPAIR_RESULT: usize = 42;
+/// The crafting window's 3x3 grid (slots 30 to 38) and its result, which is computed, never stored.
+pub const CRAFT_GRID: usize = 30;
+pub const CRAFT_RESULT: usize = 39;
+/// The slots after the 27 of storage (`EntityRobit`'s constructor).
+pub const ENERGY_SLOT: usize = 27;
+pub const SMELT_INPUT: usize = 28;
+pub const SMELT_OUTPUT: usize = 29;
+/// `ticksRequired`: five seconds, at `usage.energizedSmelter`'s 5 FE a tick.
+pub const SMELT_TICKS: u32 = 100;
+pub const SMELT_USAGE: u64 = 5;
 /// `DISTANCE_MULTIPLIER`: energy per block walked.
 const DISTANCE_MULTIPLIER: f64 = 1.5;
 /// `RobitAIFollow(this, 1, 4, 2)`: starts walking from 4 blocks, stops at 2.
