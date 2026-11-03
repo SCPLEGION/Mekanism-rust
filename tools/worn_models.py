@@ -184,10 +184,7 @@ def build(ns, item, assets, out, textures_dirs, report):
         sprite = out / "assets" / ns / "textures/entity/equipment/horizon_models" / f"{name}.png"
         sprite.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, sprite)
-        layer = {"model": f"{ns}:{name}", "texture": f"{ns}:{name}"}
-        if exclusive and hide:
-            layer["hide_with"] = hide[True]
-        layers.append(layer)
+        layers.append({"model": f"{ns}:{name}", "texture": f"{ns}:{name}"})
     if not layers:
         return False
     target = out / "assets" / ns / "equipment" / f"{item}.json"
@@ -271,7 +268,10 @@ def write_layers(ns, item, per_texture, out, textures_dirs, report, hide=None):
         sprite = out / "assets" / ns / "textures/entity/equipment/horizon_models" / f"{name}.png"
         sprite.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, sprite)
-        layers.append({"model": f"{ns}:{name}", "texture": f"{ns}:{name}"})
+        layer = {"model": f"{ns}:{name}", "texture": f"{ns}:{name}"}
+        if exclusive and hide:
+            layer["hide_with"] = hide[True]
+        layers.append(layer)
     if not layers:
         return False
     target = out / "assets" / ns / "equipment" / f"{item}.json"
