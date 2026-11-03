@@ -624,3 +624,14 @@ bindings = [
   { name = "steps", ty = "f32", value = "steps" },
   { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
 ]
+
+[[injection]]
+id = "player-immunities"
+hook = "player_immunities"
+hook_version = 1
+kind = "HEAD"
+helper = "player_immunities.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "immune", ty = "&mut Vec<String>", value = "&mut *immune" },
+]
