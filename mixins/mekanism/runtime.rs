@@ -4787,10 +4787,10 @@ fn layout(block: &str) -> Option<Layout> {
         Kind::FissionPort => Layout {
             slots: [None; 3],
             gauges: vec![
-                gauge("fuel", 0, 7.0, 13.0, STANDARD),
-                gauge("water", 0, 27.0, 13.0, STANDARD),
-                gauge("steam", 0, 131.0, 13.0, STANDARD),
-                gauge("waste", 0, 151.0, 13.0, STANDARD),
+                gauge("fuel", 0, 25.0, 13.0, STANDARD),
+                gauge("water", 0, 6.0, 13.0, STANDARD),
+                gauge("steam", 0, 152.0, 13.0, STANDARD),
+                gauge("waste", 0, 171.0, 13.0, STANDARD),
             ],
             power: None,
             progress: None,
@@ -5070,6 +5070,8 @@ fn screen_height(block: &str) -> f32 {
         Some(Kind::Reaction) => 171.0,
         // `DEFAULT_IMAGE_HEIGHT + 16`.
         Some(Kind::SpsPort) => 182.0,
+        // `DEFAULT_IMAGE_HEIGHT + 89`.
+        Some(Kind::FissionPort) => 255.0,
         _ => 166.0,
     }
 }
@@ -5105,6 +5107,8 @@ fn screen_width(block: &str) -> f32 {
         Some(Kind::BoilerValve) => 218.0,
         // `DEFAULT_IMAGE_WIDTH + 14`.
         Some(Kind::TurbineValve) => 190.0,
+        // `DEFAULT_IMAGE_WIDTH + 19`.
+        Some(Kind::FissionPort) => 195.0,
         _ => 176.0,
     }
 }
@@ -6621,10 +6625,8 @@ fn multiblock_lines(block: &str, data: &[i32]) -> Vec<String> {
     let usage = read_wide(data, DATA_USAGE);
     let fe = mekanism_core::energy::format_fe;
     match kind(block) {
-        Some(Kind::FissionPort) => vec![
-            format!("Status: {}", ["Off", "Active", "SCRAM"][get(1).min(2) as usize]),
-            format!("Burn: {:.1}/{:.1} mB/t", get(2) as f64 / 10.0, get(3) as f64 / 10.0),
-        ],
+        // The fission screen draws its own inner screen (`GuiFissionReactor`).
+        Some(Kind::FissionPort) => vec![],
         Some(Kind::FusionPort) => vec![
             if get(1) == 1 { "Burning".to_owned() } else { "Not burning".to_owned() },
             format!("Injection: {}", get(2)),
@@ -6647,7 +6649,7 @@ fn multiblock_lines(block: &str, data: &[i32]) -> Vec<String> {
 /// The reactors' buttons: [x, y, w, h] on the screen, label, and the menu button id.
 fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
     match kind(block) {
-        Some(Kind::FissionPort) => &[([50.0, 56.0, 38.0, 16.0], "On/Off"), ([90.0, 56.0, 38.0, 16.0], "Burn+")],
+        Some(Kind::FissionPort) => &[([6.0, 75.0, 81.0, 16.0], "Activate"), ([89.0, 75.0, 81.0, 16.0], "SCRAM")],
         Some(Kind::FusionPort) => &[([50.0, 56.0, 38.0, 16.0], "Ignite"), ([90.0, 56.0, 38.0, 16.0], "Inject+")],
         // `GuiGasMode`: the steam dump mode, a 10 px image button.
         Some(Kind::TurbineValve) => &[([173.0, 72.0, 10.0, 10.0], "")],
@@ -6738,15 +6740,14 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         return;
     };
     let press = |m: &mut ModBlockEntity| match (kind(&m.id), id) {
+        // Activate (0) and SCRAM (1): `FISSION_ACTIVE` with 1 and 0.
         (Some(Kind::FissionPort), 0) => {
-            let on = get_long(&m.nbt, "active") == 0;
-            put_long(&mut m.nbt, "active", u64::from(on));
+            put_long(&mut m.nbt, "active", 1);
             put_long(&mut m.nbt, "scram", 0);
         }
         (Some(Kind::FissionPort), 1) => {
-            let r = fission::Reactor { assemblies: get_long(&m.nbt, "assemblies"), volume: get_long(&m.nbt, "volume") };
-            let burn = get_long(&m.nbt, "burn").clamp(1, r.max_burn_tenths().max(1));
-            put_long(&mut m.nbt, "burn", fission::next_burn(burn, r.max_burn_tenths()));
+            put_long(&mut m.nbt, "active", 0);
+            put_long(&mut m.nbt, "scram", 0);
         }
         // `GasMode.getNext`: idle, dumping excess, dumping.
         (Some(Kind::TurbineValve), 0) => put_int(&mut m.nbt, "dump", (get_int(&m.nbt, "dump") + 1) % 3),
@@ -6851,7 +6852,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
             slots[FACTORY_ROW + i] = Some(output);
         }
         let w = screen_width(block);
-        *screen = Some(super::native_hooks::NativeScreen { width: w, height: 166.0, slots, inventory_y: 84.0, inventory_x: 8.0 + (w - 176.0) / 2.0, own_labels: false, alt: None });
+        *screen = Some(super::native_hooks::NativeScreen { width: w, height: 166.0, slots, inventory_y: 84.0, inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(), own_labels: false, alt: None });
         return;
     }
     let (w, h) = (screen_width(block), screen_height(block));
@@ -6868,8 +6869,8 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         height: h,
         slots,
         inventory_y: h - 82.0,
-        inventory_x: 8.0 + (w - 176.0) / 2.0,
-        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort)),
+        inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(),
+        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort)),
         alt: None,
     });
 }
@@ -7067,6 +7068,77 @@ fn draw_nucleosynthesizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudB
 
 /// `GuiDynamicHorizontalRateBar`: the dynamic-rate sprite multiplied by a colour that runs from
 /// (60, 45, 74) to (100, 30, 170) along the bar.
+thread_local! {
+    /// The fission reactor's temperature, one sample per client tick (`GuiDoubleGraph`).
+    static FISSION_TEMPS: std::cell::RefCell<(u64, Vec<f64>)> = const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+/// A coloured value after its label, at the screen's 0.8 text scale.
+fn labelled(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, label: &str, value: &str, at: [f32; 2], argb: u32) {
+    game.native_text_scaled(batch, label, at, 0x3C_FE9A, 0.8);
+    game.native_text_scaled(batch, value, [at[0] + game.native_text_width(label) * 0.8, at[1]], argb, 0.8);
+}
+
+/// `GuiFissionReactor`'s elements past the gauges: the inner screen, the two buttons and the big light,
+/// the temperature bar and graph. The port keeps no heat model, so the reactor sits at the ambient 300 K
+/// with no damage.
+fn draw_fission(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0);
+    let status = get(1);
+    let active = status == 1;
+    let burn = f64::from(get(2)) / 10.0;
+    let temperature = 300.0;
+    // The inner screen (45, 17, 105, 56): five lines, 1 px of spacing, centred, 0.8 scale.
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + 45.0, oy + 17.0, 105.0, 56.0], 0xFFFF_FFFF);
+    let line = |i: usize| [ox + 50.0, oy + 20.0 + 10.0 * i as f32];
+    let (state, color) = if active { ("Active", 0xFF55_FF55) } else { ("Disabled", 0xFFFF_5555) };
+    labelled(game, batch, "Status: ", state, line(0), color);
+    game.native_text_scaled(batch, &format!("Burn Rate: {} mB/t", java_double(if active { burn } else { 0.0 })), line(1), 0x3C_FE9A, 0.8);
+    let heating = if active { get(2) as u64 * fission::STEAM_PER_TENTH } else { 0 };
+    game.native_text_scaled(batch, &format!("Heating Rate: {heating} mB/t"), line(2), 0x3C_FE9A, 0.8);
+    labelled(game, batch, "Temp: ", &mekanism_core::energy::format_unit(temperature, "K"), line(3), 0xFF55_FF55);
+    labelled(game, batch, "Damage: ", "0%", line(4), 0xFF55_FF55);
+    // The buttons: `TranslationButton`s tinted dark green and dark red, active only when pressing them changes something.
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    for (i, (rect, label)) in buttons("mekanismgenerators:fission_reactor_port").iter().enumerate() {
+        let enabled = if i == 0 { !active } else { active };
+        let tint = if i == 0 { 0xFF00_AA00 } else { 0xFFAA_0000 };
+        draw_button(game, batch, [ox + rect[0], oy + rect[1], rect[2], rect[3]], inside(mouse, *rect), enabled, tint, None);
+        let tw = game.native_text_width(label);
+        let rgb = if enabled { 0xFF_FFFF } else { 0xA0_A0A0 };
+        game.native_text(batch, label, [ox + rect[0] + (rect[2] - tw) / 2.0, oy + rect[1] + (rect[3] - 8.0) / 2.0], rgb, true);
+    }
+    // `GuiBigLight` (173, 76).
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + 173.0, oy + 76.0, 14.0, 14.0], 0xFFFF_FFFF);
+    let light = if active { "light/big/enabled" } else { "light/big/disabled" };
+    sprite(game, batch, light, [0.0, 0.0, 12.0, 12.0], [ox + 174.0, oy + 77.0, 12.0, 12.0]);
+    // The temperature over `MAX_DAMAGE_TEMPERATURE` (1,800 K) and its graph.
+    draw_dynamic_rate_bar(game, batch, [ox + 5.0, oy + 102.0], 183.0, (temperature / 1_800.0).min(1.0) as f32);
+    let samples = FISSION_TEMPS.with_borrow_mut(|(last, v)| {
+        if *last != game.ticks as u64 {
+            *last = game.ticks as u64;
+            if v.len() >= 183 {
+                v.remove(0);
+            }
+            v.push(temperature);
+        }
+        v.clone()
+    });
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + 5.0, oy + 123.0, 185.0, 38.0], 0xFFFF_FFFF);
+    let scale = samples.iter().copied().fold(1_600.0_f64, f64::max);
+    for (i, value) in samples.iter().enumerate() {
+        let h = (value.min(scale) * 36.0 / scale) as f32;
+        let (x, y) = (ox + 6.0 + i as f32, oy + 124.0 + 36.0 - h);
+        game.native_fill(batch, [x, y, 1.0, h.max(1.0)], {
+            let alpha = ((0.2 + 0.8 * i as f32 / samples.len() as f32) * 255.0) as u32;
+            alpha << 24 | 0x24AF5A
+        });
+        game.native_fill(batch, [x, y, 1.0, 1.0], 0xFF28_FF74);
+    }
+}
+
 fn draw_dynamic_rate_bar(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, at: [f32; 2], width: f32, progress: f32) {
     let [x, y] = at;
     nine_slice(game, batch, "bar/base", 5.0, 1.0, [x, y, width, 8.0]);
@@ -7160,7 +7232,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     let [ox, oy] = origin;
     let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0) as f32;
     let width = screen_width(block);
-    let inv_dx = (width - 176.0) / 2.0;
+    let inv_dx = ((width - 176.0) / 2.0).floor();
     let height = screen_height(block);
     nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, width, height]);
     if let Some(Kind::Factory(n, ..)) = kind(block) {
@@ -7173,6 +7245,14 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         let title = game.native_screen_title().unwrap_or_default();
         centred(game, batch, &title, ox, width, oy + 4.0, 0x40_4040);
         game.native_text(batch, "Inventory", [ox + 8.0, oy + height - 93.0], 0x40_4040, false);
+    }
+    if kind(block) == Some(Kind::FissionPort) {
+        // `inventoryLabelX -= 2`, `inventoryLabelY += 2`, `titleLabelY -= 1`.
+        let title = game.native_screen_title().unwrap_or_default();
+        centred(game, batch, &title, ox, width, oy + 3.0, 0x40_4040);
+        game.native_text(batch, "Inventory", [ox + 6.0, oy + height - 92.0], 0x40_4040, false);
+        game.native_text(batch, "Temperature:", [ox + 5.0, oy + 93.0], 0x40_4040, false);
+        game.native_text(batch, "Heat Graph:", [ox + 5.0, oy + 114.0], 0x40_4040, false);
     }
     if kind(block) == Some(Kind::SpsPort) {
         // `inventoryLabelY += 2`.
@@ -7273,6 +7353,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
     }
     draw_extras(game, batch, block, data, origin);
+    if kind(block) == Some(Kind::FissionPort) && get(0) > 0.0 {
+        draw_fission(game, batch, data, origin);
+    }
     if kind(block) == Some(Kind::SpsPort) && get(0) > 0.0 {
         draw_dynamic_rate_bar(game, batch, [ox + 7.0, oy + 79.0], 160.0, (get(2) / 1000.0).clamp(0.0, 1.0));
     }
@@ -7329,7 +7412,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         game.native_text(batch, text, [ox + 171.0 - tw, oy + 73.0], 0x40_4040, false);
     }
     for ([x, y, w, h], label) in buttons(block) {
-        if kind(block) == Some(Kind::TurbineValve) {
+        if matches!(kind(block), Some(Kind::TurbineValve | Kind::FissionPort)) {
             continue;
         }
         game.native_fill(batch, [ox + x, oy + y, *w, *h], 0xFF00_0000);
