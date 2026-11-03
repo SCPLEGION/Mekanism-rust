@@ -5875,13 +5875,128 @@ fn loop_sounds(game: &mut Game<'_>) {
     }
 }
 
-/// `HUDRenderer.renderMekaSuitEnergyIcons`: for each worn MekaSuit piece and each Meka-Tool in a hand, its icon and
-/// the percent of energy left, in the HUD colour (`ClientConfig` defaults: 40 % opacity, `0x40F5F0`, warning
-/// `0xFFDD4F` under 20 %, danger `0xFF383C` under 10 %).
+thread_local! {
+    /// `HUDRenderer.prevRotationYaw` and `prevRotationPitch` (the HUD lags a turning head), and the last frame.
+    static HUD_LAG: std::cell::Cell<Option<(f32, f32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// `MekanismHUD.render`: the text of the items worn and held (bottom left, at the HUD scale 0.6), then, with a
+/// MekaSuit helmet, `HUDRenderer.renderHUD`: compass, energy of the suit, icons of its modules, all lagging the
+/// head's turn a little. Colours: `ClientConfig` defaults (opacity 0.4, `0x40F5F0`).
 pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
-    if !game.native_on(MOD_ID) || !game.native_playing() {
+    if !game.native_on(MOD_ID) || !game.native_playing() || game.spectator() {
         return;
     }
+    let (width, height) = (batch.width, batch.height);
+    let gray = 0xCFCFCF;
+    let dark = 0x7A7A7A;
+    let orange = 0xFFA160;
+    let held = game.inventory.get(game.selected).cloned().flatten();
+    let slots: [Option<ItemStack>; 6] = [game.armor[0].clone(), game.armor[1].clone(), game.armor[2].clone(), game.armor[3].clone(), held, game.offhand.clone()];
+    // Each line is a list of (text, rgb) pieces.
+    type Line = Vec<(String, u32)>;
+    let mut groups: Vec<Vec<Line>> = Vec::new();
+    for (slot, stack) in slots.iter().enumerate() {
+        let Some(stack) = stack else {
+            continue;
+        };
+        let item: &str = &stack.item;
+        let mut lines: Vec<Line> = Vec::new();
+        if JETPACKS.contains(&item) && slot == 1 {
+            let (stored, capacity) = (jetpack_fuel(stack), jetpack_capacity(stack));
+            lines.push(vec![("Jetpack Mode: Regular".into(), dark)]);
+            lines.push(vec![
+                ("Jetpack Fuel: ".into(), dark),
+                (stored.to_string(), orange),
+                (" (".into(), dark),
+                (format!("{:.0}", 100.0 * stored as f64 / capacity as f64), orange),
+                ("%)".into(), dark),
+            ]);
+        } else if item == SCUBA_TANK && slot == 1 {
+            let on = scuba_flowing(stack);
+            lines.push(vec![("Scuba Tank: ".into(), dark), (if on { "On" } else { "Off" }.into(), if on { 0x75FF89 } else { 0xFF5555 })]);
+            lines.push(vec![("Oxygen: ".into(), dark), (jetpack_fuel(stack).to_string(), orange)]);
+        } else if FREE_RUNNERS.contains(&item) && slot == 3 {
+            lines.push(vec![(format!("Runners Mode: {}", free_runner_mode(stack).label()), gray)]);
+            lines.push(vec![("Runners Energy: ".into(), 0x75FF89), (mekanism_core::energy::format_fe(stored_energy(stack)), gray)]);
+        } else if item == flamethrower::ITEM {
+            let stored = jetpack_fuel(stack);
+            lines.push(vec![("Flamethrower: ".into(), gray), if stored > 0 { (stored.to_string(), orange) } else { ("No chemicals stored.".into(), orange) }]);
+            lines.push(vec![(format!("Mode: {}", flamethrower_mode(stack).label()), 0xFFFFFF)]);
+        } else if item == DISASSEMBLER {
+            let mode = disassembler_mode(stack);
+            lines.push(vec![("Mode: ".into(), gray), (mode.label().into(), 0x559EFF)]);
+            lines.push(vec![("Efficiency: ".into(), gray), (mode.efficiency().to_string(), 0x559EFF)]);
+        } else if item == CONFIGURATOR {
+            lines.push(vec![(format!("Mode: {}", configurator_mode(stack).name()), 0xD55ECB)]);
+        }
+        if !lines.is_empty() {
+            groups.push(lines);
+        }
+    }
+    let count: usize = groups.iter().map(Vec::len).sum();
+    let scale = 0.6f32;
+    let mut text_top = height;
+    if count > 0 {
+        let y_scale = (height / scale) as i32;
+        let start = (groups.len() * 2 + count * 9) as i32;
+        let mut y = (y_scale - start) as f32;
+        text_top = (y * scale).trunc();
+        let first = batch.vertices.len();
+        for group in &groups {
+            for line in group {
+                let mut x = 2.0;
+                for (text, rgb) in line {
+                    let [_, r, g, b] = rgb.to_be_bytes();
+                    x += batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(text), x, y, horizon_client::hud::rgba(r, g, b, 0xFF), false);
+                }
+                y += 9.0;
+            }
+            y += 2.0;
+        }
+        batch.scale_since(first, 0.0, 0.0, scale, scale);
+    }
+    if !game.armor[0].as_ref().is_some_and(|s| &*s.item == modules::HELMET) {
+        return;
+    }
+    let Some(me) = game.native_player() else {
+        return;
+    };
+    // `HUDRenderer.update`, then the jitter: the HUD slips against a turning head by the root of the lag.
+    let (prev_yaw, prev_pitch) = HUD_LAG.get().unwrap_or((me.yaw, me.pitch));
+    let jitter = 6.0;
+    let (prev_yaw, prev_pitch) = (prev_yaw + (me.yaw - prev_yaw) / jitter, prev_pitch + (me.pitch - prev_pitch) / jitter);
+    HUD_LAG.set(Some((prev_yaw, prev_pitch)));
+    let abs_sqrt = |v: f32| if v < 0.0 { -v.abs().sqrt() } else { v.sqrt() };
+    let (jx, jy) = (-abs_sqrt(me.yaw - prev_yaw), -abs_sqrt(me.pitch - prev_pitch));
+    let alpha = 0x66u32;
+    let regular = 0x40F5F0u32;
+    let colour = |rgb: u32| {
+        let [_, r, g, b] = rgb.to_be_bytes();
+        horizon_client::hud::rgba(r, g, b, alpha as u8)
+    };
+    // The compass (`CompassPiP`): the plate turned with the head, tilted 60 degrees, N, E, S, W on its rim.
+    let (cx, cy) = (25.0 + 50.0 + jx, (height - 20.0).min(text_top as f32) - 80.0 + 50.0 + jy);
+    let angle = std::f32::consts::PI - me.yaw.to_radians();
+    let (sin, cos) = angle.sin_cos();
+    let tilt = |u: f32, v: f32| [cx + u * cos - v * sin, cy + 0.5 * (u * sin + v * cos)];
+    if let Some(r) = game.gui.atlas.sprites.get("mekanism:gui/hud_compass").copied() {
+        let corners = [tilt(-50.0, -50.0), tilt(-50.0, 50.0), tilt(50.0, 50.0), tilt(50.0, -50.0)];
+        batch.quad(corners, [[r.u0, r.v0], [r.u0, r.v1], [r.u1, r.v1], [r.u1, r.v0]], colour(regular));
+    }
+    let coords = format!("{}, {}, {}", me.x.floor() as i32, me.y.floor() as i32, me.z.floor() as i32);
+    let first = batch.vertices.len();
+    let w = game.native_text_width(&coords);
+    batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(&coords), cx - w / 2.0, cy - 4.0, colour(regular), false);
+    batch.scale_since(first, cx, cy, 0.7, 0.7);
+    for (letter, shift) in [("N", 0.0f32), ("E", std::f32::consts::FRAC_PI_2), ("S", std::f32::consts::PI), ("W", -std::f32::consts::FRAC_PI_2)] {
+        let (s, c) = (angle + shift).sin_cos();
+        let (ax, ay) = (cx + 50.0 * s, cy - 50.0 * c);
+        let first = batch.vertices.len();
+        batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(letter), ax - 2.5, ay - 4.0, colour(regular), false);
+        batch.scale_since(first, cx, cy, 1.0, 0.5);
+    }
+    // `renderMekaSuitEnergyIcons`: each worn piece and each Meka-Tool in hand, its icon and percent of energy.
     let pieces: [(Option<&ItemStack>, &str, &str); 6] = [
         (game.armor[0].as_ref(), modules::HELMET, "mekasuit_helmet"),
         (game.armor[1].as_ref(), modules::BODYARMOR, "mekasuit_chest"),
@@ -5900,21 +6015,19 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch
         })
         .collect();
     for (n, (icon, ratio)) in shown.into_iter().enumerate() {
-        let rgb: u32 = if ratio > 0.2 { 0x40F5F0 } else if ratio > 0.1 { 0xFFDD4F } else { 0xFF383C };
-        let argb = (0x66u32 << 24) | rgb;
-        let x = 10.0 + 48.0 * n as f32;
-        game.native_sprite_tinted(batch, &format!("mekanism:gui/hud_{icon}"), [0.0, 0.0, 16.0, 16.0], [x, 10.0, 16.0, 16.0], argb);
-        let [_, r, g, b] = rgb.to_be_bytes();
+        let rgb: u32 = if ratio > 0.2 { regular } else if ratio > 0.1 { 0xFFDD4F } else { 0xFF383C };
+        let x = 10.0 + 48.0 * n as f32 + jx;
+        game.native_sprite_tinted(batch, &format!("mekanism:gui/hud_{icon}"), [0.0, 0.0, 16.0, 16.0], [x, 10.0 + jy, 16.0, 16.0], (alpha << 24) | rgb);
         let text = horizon_client::text::Text::literal(&format!("{}%", (ratio * 100.0).round() as i64));
-        batch.text_styled(&game.gui.atlas, &text, x + 18.0, 15.0, horizon_client::hud::rgba(r, g, b, 0x66), false);
+        batch.text_styled(&game.gui.atlas, &text, x + 18.0, 15.0 + jy, colour(rgb), false);
     }
-    module_icons(game, batch);
+    module_icons(game, batch, jx, jy);
 }
 
 /// `HUDRenderer.renderMekaSuitModuleIcons`: the elements of the modules in the worn suit and held Meka-Tools, stacked up
 /// from the bottom right (text, then icon). Shown: the Jetpack Unit (mode and hydrogen), the Gravitational Modulating
 /// Unit and the Vision Enhancement Unit (on or off); the radiation readouts need the radiation system.
-fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, jx: f32, jy: f32) {
     const REGULAR: u32 = 0x40F5F0;
     let stacks: Vec<ItemStack> = [game.armor[0].clone(), game.armor[1].clone(), game.armor[2].clone(), game.armor[3].clone(), game.inventory.get(game.selected).cloned().flatten(), game.offhand.clone()]
         .into_iter()
@@ -5944,12 +6057,12 @@ fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch) 
             }
         }
     }
-    let (width, height) = game.gui_size();
-    let mut y = height - 10.0;
+    let (width, height) = (batch.width, batch.height);
+    let mut y = height - 10.0 + jy;
     for (icon, text, rgb) in elements {
         y -= 18.0;
         let text_width = game.native_text_width(&text);
-        let x = width - 10.0 - (24.0 + text_width);
+        let x = width - 10.0 - (24.0 + text_width) + jx;
         let argb = (0x66u32 << 24) | rgb;
         let [_, r, g, b] = rgb.to_be_bytes();
         batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(&text), x, y + 5.0, horizon_client::hud::rgba(r, g, b, 0x66), false);
