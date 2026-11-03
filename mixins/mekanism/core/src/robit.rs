@@ -8,7 +8,10 @@ pub const ITEM: &str = "mekanism:robit";
 /// `EntityRobit.MAX_ENERGY`.
 pub const MAX_ENERGY: u64 = 100_000;
 /// `EntityRobit.inventorySlots`: 27 storage slots, the energy slot, the smelting input and output.
-pub const INVENTORY_SLOTS: usize = 30;
+pub const INVENTORY_SLOTS: usize = 40;
+/// The crafting window's 3x3 grid (slots 30 to 38) and its result, which is computed, never stored.
+pub const CRAFT_GRID: usize = 30;
+pub const CRAFT_RESULT: usize = 39;
 /// The slots after the 27 of storage (`EntityRobit`'s constructor).
 pub const ENERGY_SLOT: usize = 27;
 pub const SMELT_INPUT: usize = 28;

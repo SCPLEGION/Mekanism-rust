@@ -17982,7 +17982,7 @@ fn robit_op_payload(game: &mut Game<'_>, data: &[u8]) {
             1 => slot_click::Click::Right,
             _ => slot_click::Click::Shift,
         };
-        let tab = if data[7] == 2 { RobitTab::Smelting } else if data[7] == 1 { RobitTab::Inventory } else { RobitTab::Main };
+        let tab = if data[7] == 3 { RobitTab::Crafting } else if data[7] == 2 { RobitTab::Smelting } else if data[7] == 1 { RobitTab::Inventory } else { RobitTab::Main };
         robit_inventory_click(game, u32::from_be_bytes([data[1], data[2], data[3], data[4]]), data[5] as usize, how, tab);
         return;
     }
@@ -18133,7 +18133,7 @@ thread_local! {
 
 // --- The Robit's inventory screen (GuiRobitInventory) ------------------------------------------------------
 
-const ROBIT_INV_ROBIT: usize = 30;
+const ROBIT_INV_ROBIT: usize = robit::INVENTORY_SLOTS;
 /// The screen's list: the Robit's 27 slots, then the player's inventory (rows from the top, then the hotbar).
 const ROBIT_INV_ALL: usize = ROBIT_INV_ROBIT + 36;
 const ROBIT_ITEMS_CHANNEL: &str = "mekanism:robit_items";
@@ -18144,6 +18144,7 @@ enum RobitTab {
     Main,
     Inventory,
     Smelting,
+    Crafting,
 }
 
 thread_local! {
@@ -18216,11 +18217,51 @@ fn robit_inventory_click(game: &mut Game<'_>, id: u32, slot: usize, how: slot_cl
     let allowed = |i: usize, w: &Wrapped| match i {
         robit::ENERGY_SLOT => item_energy_of(&w.stack).is_some_and(|e| e.can_discharge) || REDSTONE_ENERGY.iter().any(|(id, _)| *id == &*w.stack.item),
         robit::SMELT_INPUT => world_recipes!(game).cook("minecraft:smelting", &w.stack).is_some(),
-        robit::SMELT_OUTPUT => false,
+        robit::SMELT_OUTPUT | robit::CRAFT_RESULT => false,
         _ => true,
     };
-    slot_click::click(&mut slots, &mut cursor, slot, how, &allowed, &other);
-    let items: Vec<Option<ItemStack>> = slots[..ROBIT_INV_ROBIT].iter().map(|s| s.as_ref().map(|w| w.stack.clone())).collect();
+    if slot == robit::CRAFT_RESULT {
+        // `ResultSlot`: taking the result uses up one of each ingredient and leaves the remainders.
+        let grid: Vec<Option<ItemStack>> = (0..9).map(|i| slots[robit::CRAFT_GRID + i].as_ref().map(|w| w.stack.clone())).collect();
+        let found = world_recipes!(game).find(&grid, 3).map(|(rid, res)| (rid.to_owned(), res));
+        if let Some((rid, result)) = found {
+            let left = world_recipes!(game).remainders(&rid, &grid, 3);
+            let fits = match (&cursor, how) {
+                (_, slot_click::Click::Shift) => true,
+                (None, _) => true,
+                (Some(c), _) => c.stack.item == result.item && c.stack.count + result.count <= c.max,
+            };
+            if fits {
+                if how == slot_click::Click::Shift {
+                    game.give_or_drop(result.clone());
+                } else if let Some(c) = cursor.as_mut() {
+                    c.stack.count += result.count;
+                } else {
+                    cursor = Some(max(game, result.clone()));
+                }
+                for i in 0..9 {
+                    let cell = &mut slots[robit::CRAFT_GRID + i];
+                    if let Some(w) = cell.as_mut() {
+                        w.stack.count -= 1;
+                        if w.stack.count == 0 {
+                            *cell = None;
+                        }
+                    }
+                    if let Some(rem) = left.get(i).cloned().flatten() {
+                        match cell {
+                            None => *cell = Some(max(game, rem)),
+                            Some(w) if w.stack.item == rem.item => w.stack.count += rem.count,
+                            Some(_) => game.give_or_drop(rem),
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        slot_click::click(&mut slots, &mut cursor, slot, how, &allowed, &other);
+    }
+    let mut items: Vec<Option<ItemStack>> = slots[..ROBIT_INV_ROBIT].iter().map(|s| s.as_ref().map(|w| w.stack.clone())).collect();
+    items[robit::CRAFT_RESULT] = None;
     set_robit_items(&mut data, &items);
     for i in 0..36 {
         let at = player_slot(i);
@@ -18269,7 +18310,10 @@ fn send_robit_inventories(game: &mut Game<'_>) {
             None => out.extend([0, 0, 0]),
         };
         let mut out = id.to_be_bytes().to_vec();
-        for s in robit_items(&data).iter().take(ROBIT_INV_ROBIT) {
+        let mut shown = robit_items(&data);
+        let grid = shown[robit::CRAFT_GRID..robit::CRAFT_GRID + 9].to_vec();
+        shown[robit::CRAFT_RESULT] = world_recipes!(game).craft(&grid, 3);
+        for s in shown.iter().take(ROBIT_INV_ROBIT) {
             put(&mut out, s);
         }
         put(&mut out, &cursor);
@@ -18297,11 +18341,11 @@ fn robit_items_payload(data: &[u8]) {
     ROBIT_SLOTS.with_borrow_mut(|v| *v = (slots, cursor));
 }
 
-const ROBIT_TABS: [(&str, RobitTab); 3] = [("button/main", RobitTab::Main), ("button/inventory", RobitTab::Inventory), ("button/smelting", RobitTab::Smelting)];
+const ROBIT_TABS: [(&str, RobitTab); 4] = [("button/main", RobitTab::Main), ("button/crafting", RobitTab::Crafting), ("button/inventory", RobitTab::Inventory), ("button/smelting", RobitTab::Smelting)];
 
 fn robit_tab_rect(i: usize, o: [f32; 2]) -> [f32; 4] {
     // The Java order is main, crafting, inventory, smelting, repair, 20 apart.
-    let row = [0.0, 2.0, 3.0][i];
+    let row = [0.0, 1.0, 2.0, 3.0][i];
     [o[0] + ROBIT_WINDOW[0] + 3.0, o[1] + 10.0 + 20.0 * row, 18.0, 18.0]
 }
 
@@ -18309,7 +18353,12 @@ fn robit_tab_rect(i: usize, o: [f32; 2]) -> [f32; 4] {
 fn robit_visible(tab: RobitTab) -> Vec<(usize, [f32; 2])> {
     match tab {
         RobitTab::Main => vec![(robit::ENERGY_SLOT, [153.0, 17.0])],
-        RobitTab::Inventory => (0..ROBIT_INV_ROBIT - 3).map(|i| (i, [8.0 + 18.0 * (i % 9) as f32, 18.0 + 18.0 * (i / 9) as f32])).collect(),
+        RobitTab::Crafting => {
+            let mut v: Vec<(usize, [f32; 2])> = (0..9).map(|i| (robit::CRAFT_GRID + i, [30.0 + 18.0 * (i % 3) as f32, 17.0 + 18.0 * (i / 3) as f32])).collect();
+            v.push((robit::CRAFT_RESULT, [124.0, 35.0]));
+            v
+        }
+        RobitTab::Inventory => (0..robit::ENERGY_SLOT).map(|i| (i, [8.0 + 18.0 * (i % 9) as f32, 18.0 + 18.0 * (i / 9) as f32])).collect(),
         RobitTab::Smelting => vec![(robit::SMELT_INPUT, [51.0, 35.0]), (robit::SMELT_OUTPUT, [116.0, 35.0])],
     }
 }
