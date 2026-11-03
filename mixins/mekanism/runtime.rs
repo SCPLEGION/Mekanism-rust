@@ -8723,7 +8723,11 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     }
     if let Some((at, name, [w, h])) = l.progress {
         sprite(game, batch, &format!("{name}/empty"), [0.0, 0.0, w, h], [ox + at[0], oy + at[1], w, h]);
-        let done = (get(2) / get(3).max(1.0)).clamp(0.0, 1.0) * w;
+        // `GuiProgress`: with `INPUT_DOESNT_PRODUCE_OUTPUT` it draws its warning texture, full.
+        if warning_bits(block, &l, data) & 8 != 0 {
+            sprite(game, batch, &format!("{name}/warning"), [0.0, 0.0, w, h], [ox + at[0], oy + at[1], w, h]);
+        }
+        let done = if warning_bits(block, &l, data) & 8 != 0 { 0.0 } else { (get(2) / get(3).max(1.0)).clamp(0.0, 1.0) * w };
         if done > 0.0 {
             sprite(game, batch, &format!("{name}/full"), [0.0, 0.0, done, h], [ox + at[0], oy + at[1], done, h]);
         }
