@@ -6,6 +6,7 @@
 
 pub mod bin;
 pub mod boiler;
+pub mod bolt;
 pub mod chargepad;
 pub mod chemical;
 pub mod creative_tabs;
