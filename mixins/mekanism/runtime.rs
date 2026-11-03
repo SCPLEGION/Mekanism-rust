@@ -4621,11 +4621,9 @@ fn tick_induction_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlock
         }
         // A new master starts counting from what it holds; an unformed port reports nothing.
         if rate == 0 || (master == pos && !was_master) {
-            let held = get_long(&entity.nbt, "energy");
             for key in ["acc_in", "acc_out", "last_in", "last_out"] {
                 put_long(&mut entity.nbt, key, 0);
             }
-            put_long(&mut entity.nbt, "prev_e", held);
         }
     }
     let rate = get_long(&entity.nbt, "rate");
@@ -4657,18 +4655,15 @@ fn tick_induction_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlock
             put_long(&mut entity.nbt, "energy", mine - taken);
         }
     }
-    // What came in and went out since the master last ticked, outside of its own work: the difference of what it
-    // holds from what it held, once the ports' hand-offs are taken off.
+    // What came in and went out since the master last ticked: every insert into it or hand-off from a port, and
+    // every draw out of a face (`queuedInput`, `queuedOutput`).
     let (mut queued_in, mut queued_out) = (0, 0);
     if is_master {
         if entity.items.len() < 2 {
             entity.items.resize(2, None);
         }
-        let held = get_long(&entity.nbt, "energy").min(capacity);
-        let external = i128::from(held) - i128::from(get_long(&entity.nbt, "prev_e")) - i128::from(get_long(&entity.nbt, "acc_in"))
-            + i128::from(get_long(&entity.nbt, "acc_out"));
-        queued_in = get_long(&entity.nbt, "acc_in") + external.max(0) as u64;
-        queued_out = get_long(&entity.nbt, "acc_out") + (-external).max(0) as u64;
+        queued_in = get_long(&entity.nbt, "acc_in");
+        queued_out = get_long(&entity.nbt, "acc_out");
     }
     let sides = sides_of(&entity.nbt, Transmission::Energy);
     let outputs = DIRECTIONS.into_iter().enumerate().filter(|(i, _)| sides.get(*i) == mekanism_core::sides::SideMode::Output).count();
@@ -4730,12 +4725,10 @@ fn tick_induction_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlock
         }
     }
     if is_master {
-        let held = get_long(&entity.nbt, "energy").min(capacity);
         put_long(&mut entity.nbt, "last_in", queued_in);
         put_long(&mut entity.nbt, "last_out", queued_out);
         put_long(&mut entity.nbt, "acc_in", 0);
         put_long(&mut entity.nbt, "acc_out", 0);
-        put_long(&mut entity.nbt, "prev_e", held);
     }
 }
 
@@ -5298,13 +5291,22 @@ fn push_energy(
             if !takes_in(&m.nbt, back, Transmission::Energy) {
                 return 0;
             }
-            let Some((capacity, rate)) = receiver(&m.id, &m.nbt, accepted, from_cable) else {
+            let Some((capacity, mut rate)) = receiver(&m.id, &m.nbt, accepted, from_cable) else {
                 return 0;
             };
+            // The matrix's first port counts every insert (`queuedInput`) and takes no more than what is left of
+            // the rate this tick.
+            let matrix = kind(&m.id) == Some(Kind::InductionPort) && get_long(&m.nbt, "master") == 1;
+            if matrix {
+                rate = rate.saturating_sub(get_long(&m.nbt, "acc_in"));
+            }
             let mut to = EnergyContainer::new(capacity, rate);
             to.stored = get_long(&m.nbt, "energy").min(capacity);
             let refused = to.insert(offer, Action::Execute);
             put_long(&mut m.nbt, "energy", to.stored);
+            if matrix {
+                add_count(&mut m.nbt, "acc_in", offer - refused);
+            }
             offer - refused
         });
         if let Some(taken) = taken {
