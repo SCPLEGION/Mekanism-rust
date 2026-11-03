@@ -1208,7 +1208,77 @@ fn tick_wind(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) ->
     push_energy(game, pos, &mut energy, None, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
     entity.data = vec![(energy.stored * 1000 / g::WIND_STORAGE) as i32, 1000, produced as i32, g::WIND_GENERATION_MAX as i32];
+    // What the rotor needs in the world: whether it turns and how fast (`getHeightSpeedRatio`, in thousandths).
+    let mut client = Compound::new();
+    put_int(&mut client, "rotor_active", u32::from(produced > 0));
+    put_int(&mut client, "rotor_speed", (wind_rotor_speed(game, pos) * 1000.0) as u32);
+    put_client(game, pos, entity, &["rotor_active", "rotor_speed"], client);
     Some(produced > 0)
+}
+
+/// `TileEntityWindGenerator.getHeightSpeedRatio`: degrees per tick, from the height of the rotor.
+fn wind_rotor_speed(game: &Game<'_>, pos: [i32; 3]) -> f32 {
+    const SPEED: f32 = 32.0;
+    let min = game.world.bottom_y();
+    let height = (pos[1] + 4 - min) as f32;
+    SPEED * height / (game.world.top_y() - min) as f32
+}
+
+/// The rotors this client has heard of: the angle they have turned to and the tick it was worked out at.
+thread_local! {
+    static ROTORS: std::cell::RefCell<std::collections::HashMap<[i32; 3], (f32, u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A block entity's client view arrived (`native_client_block_entity_changed`): a wind generator's rotor.
+pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
+    if id == "mekanismgenerators:wind_generator" {
+        ROTORS.with_borrow_mut(|r| {
+            r.entry(pos).or_insert((0.0, 0));
+        });
+    }
+}
+
+/// The rotors that turn (hook point `native_world_models`, API 43): `RenderWindGenerator` puts the blades 4.5 up,
+/// turns them with the facing and spins them by the angle, which `onUpdateClient` advances each tick while
+/// the generator is active.
+pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks::NativeWorldModel>) {
+    let now = game.ticks as u64;
+    let partial = game.clock.fraction() as f32;
+    ROTORS.with_borrow_mut(|rotors| {
+        rotors.retain(|pos, (angle, tick)| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if id != "mekanismgenerators:wind_generator" {
+                return false;
+            }
+            let active = get_int(c, "rotor_active") != 0;
+            let speed = get_int(c, "rotor_speed") as f32 / 1000.0;
+            if *tick == 0 {
+                *tick = now;
+            }
+            if active {
+                *angle = (*angle + speed * now.saturating_sub(*tick) as f32) % 360.0;
+            }
+            *tick = now;
+            let roll = if active { (*angle + speed * partial) % 360.0 } else { *angle };
+            let yaw = match game.native_block_property(*pos, "facing").as_deref() {
+                Some("south") => 180.0,
+                Some("west") => 90.0,
+                Some("east") => 270.0,
+                _ => 0.0,
+            };
+            models.push(super::native_hooks::NativeWorldModel {
+                model: "mekanismgenerators:wind_generator_rotor".into(),
+                position: [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 4.5, f64::from(pos[2]) + 0.5],
+                yaw,
+                pitch: 0.0,
+                roll,
+                light_at: [pos[0], pos[1] + 4, pos[2]],
+            });
+            true
+        });
+    });
 }
 
 // --- Energy cubes -----------------------------------------------------------------------------------

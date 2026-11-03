@@ -169,27 +169,6 @@ def see_through(name):
     return name in SEE_THROUGH or name.endswith("glass") or "_transparent" in name or "_glass_" in name
 
 
-def wind_generator_blades(model_file, search):
-    """The rotor at rest, in the wind generator's model: Mekanism draws it with a block entity renderer (RenderWindGenerator:
-    translated by BLADE_OFFSET, turned with the facing, spun by the angle), which Horizon has no hook for yet."""
-    blades = {"model": "mekanismgenerators:models/block/wind_generator_blades.obj", "flip_v": True,
-              "textures": {"wind_generator": "mekanismgenerators:block/model/wind_generator"},
-              "transform": {"translation": [0.5, 4.5, 0.5]}}
-    elements, textures, problems = flatten_models.obj_model(search, blades)
-    if problems or not model_file.is_file():
-        return 0
-    model = json.loads(model_file.read_text())
-    for key, value in textures.items():
-        model["textures"]["blades__" + key] = value
-    for element in elements:
-        for face in element["faces"].values():
-            face["texture"] = "#blades__" + face["texture"][1:]
-        element["name"] = "blades/" + element["name"]
-        model["elements"].append(element)
-    model_file.write_text(json.dumps(model, indent=1) + "\n")
-    return len(elements)
-
-
 def shape_declaration(ns, name, declaration, report):
     """`declaration` with the block's outline and collision shape from Mekanism's Java, and `occludes: false` where
     Mekanism calls noOcclusion()."""
@@ -417,11 +396,19 @@ def build_module(ns, out):
     search += [SRC / "datagen" / "generated" / n / "assets" for n in NAMESPACES]
     report["composite_models"] = flatten_models.flatten_tree(out / "assets" / ns, search)
     if ns == "mekanismgenerators":
-        report["wind_generator_blades"] = wind_generator_blades(out / "assets" / ns / "models/block/wind_generator.json", search)
+        # The rotor spins, so the native code draws it (`native_world_models`): the OBJ as a world model.
+        rotor = next((d / ns / "models/block/wind_generator_blades.obj" for d in search
+                      if (d / ns / "models/block/wind_generator_blades.obj").is_file()), None)
+        if rotor is not None:
+            worn_models.build_world_model(ns, "wind_generator_rotor", rotor, "mekanismgenerators:block/model/wind_generator",
+                                          out, search, report)
     worn = set()
     if ns == "mekanism":
         for item in worn_models.WORN:
             if worn_models.build(ns, item, search, out, search, report):
+                worn.add(item)
+        for item in worn_models.MEKASUIT:
+            if worn_models.build_mekasuit(ns, item, search, out, search, report):
                 worn.add(item)
     report["component_items"] = component_items(ns, out)
     report["component_recipes"] = component_recipes(out / "data" / ns / "recipe")
