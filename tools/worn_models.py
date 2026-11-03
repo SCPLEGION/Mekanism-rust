@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Mekanism's worn models (free runners, jetpacks, scuba gear) for Horizon's `layers.horizon_models`.
+
+Mekanism draws these from its item models, placed on the wearer's model parts by `FreeRunnerArmor`,
+`ChestArmor` and the head-item layer.  Here each item model is baked to quads (FaceBakery's vertex order and
+UV rotation), moved by the same transforms into the part's local space (pixels, y down) and written as an
+entity-model part tree: `assets/<ns>/horizon/worn_models/<name>.json`, one file per texture, with an
+equipment asset `assets/<ns>/equipment/<item>.json` naming them and the texture copied to
+`textures/entity/equipment/horizon_models/`.
+"""
+import json
+import math
+import shutil
+from pathlib import Path
+
+import flatten_models
+
+DIRECTIONS = {  # FaceInfo vertex selectors: 0 = from, 1 = to
+    "down": [[0, 0, 1], [0, 0, 0], [1, 0, 0], [1, 0, 1]],
+    "up": [[0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0]],
+    "north": [[1, 1, 0], [1, 0, 0], [0, 0, 0], [0, 1, 0]],
+    "south": [[0, 1, 1], [0, 0, 1], [1, 0, 1], [1, 1, 1]],
+    "west": [[0, 1, 0], [0, 0, 0], [0, 0, 1], [0, 1, 1]],
+    "east": [[1, 1, 1], [1, 0, 1], [1, 0, 0], [1, 1, 0]],
+}
+
+
+def default_uv(f, t, d):
+    return {"down": [f[0], 16 - t[2], t[0], 16 - f[2]], "up": [f[0], f[2], t[0], t[2]],
+            "north": [16 - t[0], 16 - t[1], 16 - f[0], 16 - f[1]], "south": [f[0], 16 - t[1], t[0], 16 - f[1]],
+            "west": [f[2], 16 - t[1], t[2], 16 - f[1]], "east": [16 - t[2], 16 - t[1], 16 - f[2], 16 - f[1]]}[d]
+
+
+def mat_mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def element_matrix(rot):
+    rad = math.pi / 180
+    if "angle" in rot:
+        s, c = math.sin(rot["angle"] * rad), math.cos(rot["angle"] * rad)
+        m = {"x": [[1, 0, 0], [0, c, -s], [0, s, c]], "y": [[c, 0, s], [0, 1, 0], [-s, 0, c]],
+             "z": [[c, -s, 0], [s, c, 0], [0, 0, 1]]}[rot["axis"]]
+    else:
+        rx, ry, rz = (rot.get(k, 0) * rad for k in "xyz")
+        mx = [[1, 0, 0], [0, math.cos(rx), -math.sin(rx)], [0, math.sin(rx), math.cos(rx)]]
+        my = [[math.cos(ry), 0, math.sin(ry)], [0, 1, 0], [-math.sin(ry), 0, math.cos(ry)]]
+        mz = [[math.cos(rz), -math.sin(rz), 0], [math.sin(rz), math.cos(rz), 0], [0, 0, 1]]
+        m = mat_mul(mz, mat_mul(my, mx))
+    if rot.get("rescale"):
+        for axis in range(3):
+            column = [m[r][axis] for r in range(3)]
+            k = 1 / max(abs(v) for v in column)
+            for r in range(3):
+                m[r][axis] *= k
+    return m
+
+
+def resolve_textures(assets, model_id, seen=()):
+    """The element list and the resolved texture table of a (flattened) model."""
+    data = flatten_models.flatten_file(assets, model_id)
+    chain = [data]
+    node = data
+    while node.get("parent") and not node["parent"].startswith("minecraft:") \
+            and node["parent"] not in ("block/block", "item/generated"):
+        node = flatten_models.flatten_file(assets, node["parent"])
+        chain.append(node)
+    textures, elements = {}, None
+    for node in reversed(chain):
+        textures.update(node.get("textures", {}))
+    for node in chain:
+        if elements is None and node.get("elements") is not None:
+            elements = node["elements"]
+    return elements or [], textures
+
+
+def lookup(textures, ref):
+    for _ in range(16):
+        if not ref.startswith("#"):
+            return ref
+        ref = textures.get(ref[1:], "")
+    return None
+
+
+def bake(assets, model_id):
+    """Quads of a model: (texture id, 4 positions in blocks, 4 uv pairs in 0..1)."""
+    elements, textures = resolve_textures(assets, model_id)
+    quads = []
+    for e in elements:
+        f, t = e["from"], e["to"]
+        matrix = element_matrix(e["rotation"]) if e.get("rotation") else None
+        origin = [v for v in e["rotation"].get("origin", [8, 8, 8])] if matrix else None
+        for d, face in e["faces"].items():
+            texture = lookup(textures, face.get("texture", ""))
+            if texture is None:
+                continue
+            uv = face.get("uv") or default_uv(f, t, d)
+            shift = face.get("rotation", 0) // 90
+            pts, uvs = [], []
+            for i, sel in enumerate(DIRECTIONS[d]):
+                p = [t[a] if sel[a] else f[a] for a in range(3)]
+                if matrix:
+                    q = [p[a] - origin[a] for a in range(3)]
+                    p = [sum(matrix[r][c] * q[c] for c in range(3)) + origin[r] for r in range(3)]
+                j = (i + shift) % 4
+                uvs.append([(uv[0] if j in (0, 1) else uv[2]) / 16, (uv[1] if j in (0, 3) else uv[3]) / 16])
+                pts.append([v / 16 for v in p])
+            quads.append((texture, pts, uvs))
+    return quads
+
+
+def transform(ops):
+    """Compose [("t", x, y, z) | ("s", x, y, z) | ("ry", degrees)] applied outermost first into a point map."""
+    def apply(p):
+        for op in reversed(ops):
+            if op[0] == "t":
+                p = [p[i] + op[1 + i] for i in range(3)]
+            elif op[0] == "s":
+                p = [p[i] * op[1 + i] for i in range(3)]
+            elif op[0] == "ry":
+                c, s = math.cos(math.radians(op[1])), math.sin(math.radians(op[1]))
+                p = [c * p[0] + s * p[2], p[1], -s * p[0] + c * p[2]]
+            elif op[0] == "rxyz":
+                rx, ry, rz = (math.radians(v) for v in op[1:4])
+                m = mat_mul([[math.cos(rz), -math.sin(rz), 0], [math.sin(rz), math.cos(rz), 0], [0, 0, 1]],
+                            mat_mul([[math.cos(ry), 0, math.sin(ry)], [0, 1, 0], [-math.sin(ry), 0, math.cos(ry)]],
+                                    [[1, 0, 0], [0, math.cos(rx), -math.sin(rx)], [0, math.sin(rx), math.cos(rx)]]))
+                p = [sum(m[r][c] * p[c] for c in range(3)) for r in range(3)]
+        return p
+    return apply
+
+
+def polygon(pts, uvs):
+    a = [pts[1][i] - pts[0][i] for i in range(3)]
+    b = [pts[2][i] - pts[0][i] for i in range(3)]
+    n = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+    length = math.sqrt(sum(v * v for v in n)) or 1
+    return ([[round(p[0] * 16, 4), round(p[1] * 16, 4), round(p[2] * 16, 4), round(u[0], 6), round(u[1], 6)]
+             for p, u in zip(pts, uvs)], [round(v / length, 6) for v in n])
+
+
+HEAD = [("t", 0, -0.25, 0), ("ry", 180), ("s", 0.625, -0.625, -0.625)]
+FLIP = ("s", 1.02, -1.02, -1.02)
+# item -> [(bone, item model, transform ops from the bone's origin)]; Mekanism's FreeRunnerArmor, ChestArmor
+# and the head-item layer (with the scuba mask's own "head" display transform).
+WORN = {
+    "free_runners": [("left_leg", "item/left_free_runner", [("t", -0.65, 1, 0.525), FLIP]),
+                     ("right_leg", "item/right_free_runner", [("t", -0.375, 1, 0.525), FLIP])],
+    "free_runners_armored": [("left_leg", "item/left_free_runner_armored", [("t", -0.65, 1, 0.525), FLIP]),
+                             ("right_leg", "item/right_free_runner_armored", [("t", -0.375, 1, 0.525), FLIP])],
+    "jetpack": [("body", "item/jetpack", [("t", 0, 0.3, 0.145), FLIP, ("t", -0.5, -0.5, -0.5)])],
+    "jetpack_armored": [("body", "item/jetpack_armored", [("t", 0, 0.3, 0.145), FLIP, ("t", -0.5, -0.5, -0.5)])],
+    "scuba_tank": [("body", "item/scuba_tank", [("t", 0, 0.41, 0.28), ("s", 1, -1, -1), ("t", -0.5, -0.5, -0.5)])],
+    "scuba_mask": [("head", "item/scuba_mask",
+                    HEAD + [("ry", -180), ("s", 1.75, 1.75, 1.75), ("t", -0.5, -0.5, -0.5)])],
+}
+SLOT = {"free_runners": "feet", "free_runners_armored": "feet", "jetpack": "chest", "jetpack_armored": "chest",
+        "scuba_tank": "chest", "scuba_mask": "head"}
+
+
+def build(ns, item, assets, out, textures_dirs, report):
+    """Write the worn models and equipment asset of `item`; returns True when it has any."""
+    per_texture = {}
+    for bone, model_id, ops in WORN[item]:
+        fn = transform(ops)
+        for texture, pts, uvs in bake(assets, f"{ns}:{model_id}"):
+            poly, normal = polygon([fn(p) for p in pts], uvs)
+            per_texture.setdefault(texture, {}).setdefault(bone, []).append((poly, normal))
+    layers = []
+    for n, (texture, bones) in enumerate(sorted(per_texture.items())):
+        tns, _, tpath = texture.partition(":")
+        name = f"{item}_{n}"
+        children = {bone: {"pose": [0, 0, 0, 0, 0, 0, 1, 1, 1], "polygons": [p for p, _ in quads],
+                           "normals": [n_ for _, n_ in quads]} for bone, quads in sorted(bones.items())}
+        target = out / "assets" / ns / "horizon" / "worn_models" / f"{name}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"pose": [0, 0, 0, 0, 0, 0, 1, 1, 1], "polygons": [], "children": children}))
+        source = next((d / tns / "textures" / f"{tpath}.png" for d in textures_dirs
+                       if (d / tns / "textures" / f"{tpath}.png").is_file()), None)
+        if source is None:
+            report.setdefault("worn_missing_textures", []).append(texture)
+            continue
+        sprite = out / "assets" / ns / "textures/entity/equipment/horizon_models" / f"{name}.png"
+        sprite.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, sprite)
+        layers.append({"model": f"{ns}:{name}", "texture": f"{ns}:{name}"})
+    if not layers:
+        return False
+    target = out / "assets" / ns / "equipment" / f"{item}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"layers": {"horizon_models": layers}}, indent=1) + "\n")
+    report["worn_items"] = report.get("worn_items", 0) + 1
+    return True

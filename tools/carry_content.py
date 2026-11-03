@@ -30,6 +30,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import block_shapes  # noqa: E402
+import flatten_models  # noqa: E402
+import worn_models  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -380,6 +382,15 @@ def build_module(ns, out):
     # the type goes in vanilla's custom_data, the model is chosen by custom_model_data, and the name is
     # spelled out with item_name.
     report["gauge_textures"] = gauge_textures(ns, out)
+    # NeoForge composite models (factories, jetpack...) become plain element models.
+    search = [d for m in MODULE_OF.values() for d in (SRC / m / "resources" / "assets",)]
+    search += [SRC / "datagen" / "generated" / n / "assets" for n in NAMESPACES]
+    report["composite_models"] = flatten_models.flatten_tree(out / "assets" / ns, search)
+    worn = set()
+    if ns == "mekanism":
+        for item in worn_models.WORN:
+            if worn_models.build(ns, item, search, out, search, report):
+                worn.add(item)
     report["component_items"] = component_items(ns, out)
     report["component_recipes"] = component_recipes(out / "data" / ns / "recipe")
 
@@ -446,6 +457,14 @@ def build_module(ns, out):
                 "mekasuit_boots": "boots"}
         if path.stem in suit:
             item["template"] = f"minecraft:netherite_{suit[path.stem]}"
+        if path.stem in worn:
+            # Worn: the slot, and the equipment asset that draws the item's own model on the wearer.
+            equippable = item.setdefault("components", {}).setdefault("minecraft:equippable", {})
+            equippable["slot"] = worn_models.SLOT[path.stem]
+            equippable["asset_id"] = f"{ns}:{path.stem}"
+            if path.stem == "scuba_mask":
+                item["template"] = "minecraft:iron_helmet"
+                item["components"]["minecraft:attribute_modifiers"] = []
         write_json(declared / "item" / f"{path.stem}.json", item)
         items += 1
     report["blocks"] = len(blocks)
