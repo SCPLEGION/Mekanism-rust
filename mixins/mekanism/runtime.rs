@@ -2836,7 +2836,23 @@ fn tick_gas_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
 fn tick_chemical_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, tier: BaseTier) {
     let (capacity, rate) = chem::chemical_tank(tier);
     let mut tank = get_tank(&entity.nbt, "chemical", capacity);
-    if tank.amount > 0 {
+    let dumping = get_int(&entity.nbt, "dump") % 3;
+    let creative = tier == BaseTier::Creative;
+    // `ChemicalUtils.dump(tank, mode, capacity / 400, transfer rate)`: dumping removes a share, dumping excess
+    // what is over 85% of the tank.
+    if dumping != 0 && !creative && tank.amount > 0 {
+        let stored = tank.amount;
+        let to_dump = if dumping == 2 {
+            capacity / 400
+        } else {
+            let keep = (capacity as f64 * 0.85) as u64;
+            if keep < stored { (stored - keep).min(rate) } else { 0 }
+        };
+        tank.extract(to_dump);
+        put_tank(&mut entity.nbt, "chemical", &tank);
+    }
+    // Dumping does not eject (`setCanEject`).
+    if tank.amount > 0 && (creative || dumping != 2) {
         push_chemical(game, pos, &mut tank, Some([0, -1, 0]), rate, false);
         put_tank(&mut entity.nbt, "chemical", &tank);
     }
@@ -4814,7 +4830,8 @@ fn layout(block: &str) -> Option<Layout> {
         // A tank's one big gauge.
         Kind::ChemicalTank(t) => Layout {
             slots: [None; 3],
-            gauges: vec![gauge("chemical", chem::chemical_tank(t).0, 79.0, 13.0, STANDARD)],
+            // `GuiChemicalBar`: a horizontal bar of 116 x 10 (drawn by `draw_tank_screen`).
+            gauges: vec![gauge("chemical", chem::chemical_tank(t).0, 42.0, 16.0, [116.0, 10.0])],
             power: None,
             progress: None,
         },
@@ -5094,7 +5111,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
     if tabs(&entity.id) & TAB_REDSTONE != 0 {
         entity.data.resize(DATA_GAUGES + l.gauges.len() * GAUGE_SLOTS, 0);
         let signal = get_int(&entity.nbt, "powered") & 3;
-        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2 | (get_int(&entity.nbt, "warn") & 15) << 4) as i32);
+        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2 | (if matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) { get_int(&entity.nbt, "dump") % 3 } else { get_int(&entity.nbt, "warn") & 15 }) << 4) as i32);
         // Then, for the side configuration window, each type's faces in relative-side order and
         // which types' auto-eject is off.
         if tabs(&entity.id) & TAB_SIDES != 0 {
@@ -6733,6 +6750,7 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
         Some(Kind::FusionPort) => &[([63.0, 36.0, 60.0, 16.0], "Ignite")],
         // `GuiGasMode`: the steam dump mode, a 10 px image button.
         Some(Kind::TurbineValve) => &[([173.0, 72.0, 10.0, 10.0], "")],
+        Some(Kind::ChemicalTank(_)) => &[([159.0, 72.0, 10.0, 10.0], "")],
         _ => &[],
     }
 }
@@ -6830,6 +6848,11 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         let now = RedstoneControl::from_ordinal(get_int(&entity.nbt, "control"));
         let next = if id == BUTTON_REDSTONE_NEXT { now.next() } else { now.previous() };
         put_int(&mut entity.nbt, "control", next.ordinal());
+        return;
+    }
+    // `GasMode.getNext` on the chemical tank's button.
+    if id == 0 && matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) {
+        put_int(&mut entity.nbt, "dump", (get_int(&entity.nbt, "dump") + 1) % 3);
         return;
     }
     if id == BUTTON_SORT && matches!(kind(&entity.id), Some(Kind::Factory(..))) {
@@ -7981,7 +8004,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         };
         sprite(game, batch, &format!("gauge/overlay/{overlay}"), [0.0, 0.0, size[0] - 2.0, size[1] - 2.0], [x + 1.0, y + 1.0, size[0] - 2.0, size[1] - 2.0]);
     };
-    for (i, g) in l.gauges.iter().enumerate().filter(|(_, g)| kind(block) != Some(Kind::FusionPort) && !g.key.starts_with("stats_")) {
+    for (i, g) in l.gauges.iter().enumerate().filter(|(_, g)| !matches!(kind(block), Some(Kind::FusionPort | Kind::ChemicalTank(_))) && !g.key.starts_with("stats_")) {
         let at = DATA_GAUGES + i * GAUGE_SLOTS;
         let (amount, capacity) = (read_wide(data, at), read_wide(data, at + 4).max(1));
         let chemical = usize::try_from(data.get(at + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c));
@@ -8039,6 +8062,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
     }
     draw_extras(game, batch, block, data, origin);
+    if let Some(Kind::ChemicalTank(t)) = kind(block) {
+        draw_tank_screen(game, batch, &l, data, origin, t == BaseTier::Creative);
+    }
     draw_warning_tab(game, batch, block, &l, data, origin, width);
     if kind(block) == Some(Kind::FissionPort) && get(0) > 0.0 {
         draw_fission(game, batch, data, origin);
@@ -8104,7 +8130,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         game.native_text(batch, text, [ox + 171.0 - tw, oy + 73.0], 0x40_4040, false);
     }
     for ([x, y, w, h], label) in buttons(block) {
-        if matches!(kind(block), Some(Kind::TurbineValve | Kind::FissionPort)) {
+        if matches!(kind(block), Some(Kind::TurbineValve | Kind::FissionPort | Kind::ChemicalTank(_))) {
             continue;
         }
         game.native_fill(batch, [ox + x, oy + y, *w, *h], 0xFF00_0000);
@@ -8120,6 +8146,35 @@ fn inside(at: [f32; 2], rect: [f32; 4]) -> bool {
 
 /// The tooltips: a gauge's chemical and amount, the power bar's stored and maximum energy, the
 /// progress bar's percent, and the energy tab's usage and upgrades.
+/// `GuiChemicalTank`: the horizontal bar, the inner screen with the chemical and the amount, and the dump mode
+/// button with its name.
+fn draw_tank_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, l: &Layout, data: &[i32], origin: [f32; 2], creative: bool) {
+    let [ox, oy] = origin;
+    let (amount, capacity, chemical) = fusion_gauge(data, 0);
+    nine_slice(game, batch, "bar/base", 5.0, 1.0, [ox + 42.0, oy + 16.0, 116.0, 10.0]);
+    let filled = (amount as f64 / capacity as f64 * 114.0).floor() as f32;
+    if filled > 0.0 {
+        let (texture, argb) = gauge_texture(chemical);
+        fill_tiled(game, batch, &texture, [ox + 43.0, oy + 17.0, filled, 8.0], argb);
+    }
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + 42.0, oy + 37.0, 118.0, 28.0], 0xFFFF_FFFF);
+    let name = if amount == 0 { "None" } else { chemical.map_or("None", |c| c.1) };
+    let total = if creative { "Infinite".to_owned() } else { thousands(capacity) };
+    let count = if amount == 0 { "0".to_owned() } else { thousands(amount) };
+    let lines = [format!("Chemical: {name}"), if creative && amount > 0 { "Infinite".to_owned() } else { format!("{count}/{total}") }];
+    for (i, line) in lines.iter().enumerate() {
+        game.native_text_scaled(batch, line, [ox + 47.0, oy + 41.0 + 11.0 * i as f32], 0x3C_FE9A, 0.8);
+    }
+    let mode = (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) >> 4) & 3;
+    let (icon, text) = match mode {
+        1 => ("chemical_mode/dump_excess", "Dumping Excess"),
+        2 => ("chemical_mode/dump", "Dumping"),
+        _ => ("chemical_mode/idle", "Idle"),
+    };
+    sprite(game, batch, icon, [0.0, 0.0, 10.0, 10.0], [ox + 159.0, oy + 72.0, 10.0, 10.0]);
+    game.native_text(batch, text, [ox + 157.0 - game.native_text_width(text), oy + 73.0], 0x40_4040, false);
+}
+
 /// The machine's issue bits (`RecipeError`s) from its data: 0 energy, 1 input, 2 output room, 3 no recipe.
 fn warning_bits(block: &str, l: &Layout, data: &[i32]) -> u32 {
     if tabs(block) & TAB_REDSTONE == 0 || !matches!(kind(block), Some(Kind::Machine(..))) {
