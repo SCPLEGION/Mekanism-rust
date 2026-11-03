@@ -2208,9 +2208,26 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
             continue;
         };
         let light_at = [at[0].floor() as i32, at[1].floor() as i32 + 1, at[2].floor() as i32];
-        for (name, full_bright) in [("mekanism:robit_body", false), ("mekanism:robit_glow", true)] {
+        // The skin's own model, and its second texture every third tick that the Robit has moved.
+        let prefix = match ROBIT_SKINS.with_borrow(|m| m.get(&id).cloned()).as_deref() {
+            Some("mekanism:allay" | "allay") => "allay",
+            _ => "robit",
+        };
+        let frame = ROBIT_FRAMES.with_borrow_mut(|f| {
+            let e = f.entry(id).or_insert((0, at, now));
+            while e.2 < now {
+                e.2 += 1;
+                if (e.1[0] - at[0]).abs() + (e.1[2] - at[2]).abs() > 0.001 && e.2 % 3 == 0 {
+                    e.0 = (e.0 + 1) % 2;
+                }
+            }
+            e.1 = at;
+            e.0
+        });
+        let suffix = if frame == 0 { "" } else { "2" };
+        for (name, full_bright) in [(format!("mekanism:{prefix}_body{suffix}"), false), (format!("mekanism:{prefix}_glow{suffix}"), true)] {
             models.push(super::native_hooks::NativeWorldModel {
-                model: name.into(),
+                model: name,
                 position: at,
                 yaw: -body,
                 pitch: 0.0,
@@ -19245,7 +19262,14 @@ pub(super) fn mobs_tick(game: &mut Game<'_>) {
     }
     // The clients learn which of the mobs they see are Robits (a Robit is its base type to them).
     if game.ticks % 20 == 0 {
-        let list: Vec<u8> = ids.iter().copied().flat_map(u32::to_be_bytes).collect();
+        // Each Robit's id and its skin (`EntityRobit.getSkinId`), as a length and the key's bytes.
+        let mut list = Vec::new();
+        for id in &ids {
+            let skin = game.native_with_mob(*id, |m| get_string(&robit_data(m), "skin")).flatten().unwrap_or_default();
+            list.extend(id.to_be_bytes());
+            list.push(skin.len().min(255) as u8);
+            list.extend(skin.bytes().take(255));
+        }
         for p in &players {
             game.native_send_to_player(p.uuid, ROBIT_LIST_CHANNEL, &list);
         }
@@ -19259,6 +19283,10 @@ const ROBIT_LIST_CHANNEL: &str = "mekanism:robits";
 
 thread_local! {
     static ROBITS: std::cell::RefCell<std::collections::HashSet<u32>> = std::cell::RefCell::new(std::collections::HashSet::new());
+    /// The skin key of each Robit, and its texture index with where it stood and the tick it last moved on
+    /// (`EntityRobit.getModelTexture`).
+    static ROBIT_SKINS: std::cell::RefCell<std::collections::HashMap<u32, String>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    static ROBIT_FRAMES: std::cell::RefCell<std::collections::HashMap<u32, (u32, [f64; 3], u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// A player a Robit can follow: the server's players, or the one in this window.
@@ -19352,8 +19380,21 @@ pub(super) fn client_payload(channel: &str, data: &[u8]) {
         robit_state_payload(data);
     }
     if channel == ROBIT_LIST_CHANNEL {
-        let ids = data.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let mut ids = std::collections::HashSet::new();
+        let mut skins = std::collections::HashMap::new();
+        let mut rest = data;
+        while rest.len() >= 5 {
+            let id = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+            let len = usize::from(rest[4]);
+            if rest.len() < 5 + len {
+                break;
+            }
+            skins.insert(id, String::from_utf8_lossy(&rest[5..5 + len]).into_owned());
+            ids.insert(id);
+            rest = &rest[5 + len..];
+        }
         ROBITS.with_borrow_mut(|set| *set = ids);
+        ROBIT_SKINS.with_borrow_mut(|m| *m = skins);
     }
 }
 

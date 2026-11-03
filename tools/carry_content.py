@@ -469,14 +469,23 @@ def build_module(ns, out):
             worn_models.build_element_world_model(ns, "liquifier_blade", json.loads(blade.read_text()), texture, out, report)
     if ns == "mekanism":
         # The Robit (`RenderRobit`): its element model, the glowing eyes and back light apart from the body.
-        robit = next((d / ns / "models/robit/robit.json" for d in search if (d / ns / "models/robit/robit.json").is_file()), None)
-        skin = next((d / ns / "textures/entity/robit/robit.png" for d in search
-                     if (d / ns / "textures/entity/robit/robit.png").is_file()), None)
-        if robit is not None and skin is not None:
+        # Skins (`MekanismRobitSkins`): the base skin and the allay's own model, each with its two textures (the
+        # texture index moves while the Robit walks).
+        for prefix, model_file, skin_names in (("robit", "robit", ("robit", "robit2")), ("allay", "robit_allay", ("allay", "allay2"))):
+            robit = next((d / ns / f"models/robit/{model_file}.json" for d in search
+                          if (d / ns / f"models/robit/{model_file}.json").is_file()), None)
+            if robit is None:
+                continue
             data = json.loads(robit.read_text())
-            for name, glow in (("robit_body", False), ("robit_glow", True)):
-                part = {"elements": [e for e in data["elements"] if bool(e.get("light_emission")) == glow]}
-                worn_models.build_element_world_model(ns, name, part, skin, out, report, (8, 0, 8))
+            for index, skin_name in enumerate(skin_names):
+                skin = next((d / ns / f"textures/entity/robit/{skin_name}.png" for d in search
+                             if (d / ns / f"textures/entity/robit/{skin_name}.png").is_file()), None)
+                if skin is None:
+                    continue
+                for part_name, glow in (("body", False), ("glow", True)):
+                    part = {"elements": [e for e in data["elements"] if bool(e.get("light_emission")) == glow]}
+                    suffix = "" if index == 0 else str(index + 1)
+                    worn_models.build_element_world_model(ns, f"{prefix}_{part_name}{suffix}", part, skin, out, report, (8, 0, 8))
     if ns == "mekanism":
         # The Personal Chest (`RenderPersonalChest`): vanilla's chest parts in Mekanism's skin, the lid turned.
         chest = next((d / ns / "textures/block/models/personal_chest.png" for d in search
