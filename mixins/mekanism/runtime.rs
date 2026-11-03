@@ -108,6 +108,8 @@ enum Kind {
     Sorter,
     /// The Oredictionificator: turns an item of a tag into the item its filter selects.
     Oredictionificator,
+    /// The Nutritional Liquifier: food becomes nutritional paste.
+    Liquifier,
     /// The Chargepad: charges an item of the player standing on it.
     Chargepad,
     /// The Quantum Entangloporter: shares energy, fluid and chemicals across its frequency.
@@ -188,6 +190,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanismgenerators:wind_generator" => return Some(Kind::Wind),
         "mekanismgenerators:gas_burning_generator" => return Some(Kind::GasGenerator),
         "mekanism:chemical_oxidizer" => return Some(Kind::Oxidizer),
+        chem::LIQUIFIER => return Some(Kind::Liquifier),
         "mekanism:chemical_infuser" => return Some(Kind::ChemicalInfuser),
         "mekanism:antiprotonic_nucleosynthesizer" => return Some(Kind::Nucleosynthesizer),
         teleporter::TELEPORTER => return Some(Kind::Teleporter),
@@ -398,6 +401,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         // The oxidizer's item goes in the first slot; the separator takes water buckets there and gives
         // the empty buckets back in the last.
         Some(Kind::Oxidizer | Kind::Dissolution) => (vec![0, 1], vec![]),
+        // The food in the first slot, the energy slot, the item it leaves in the last (and a bucket's two slots after).
+        Some(Kind::Liquifier) => (vec![0, 1], vec![2]),
         // The crystallizer's crystals come out of the last slot.
         Some(Kind::Crystallizer) => (vec![1], vec![2]),
         Some(Kind::Separator) => (vec![0, 1], vec![2]),
@@ -519,6 +524,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::Oxidizer => tick_oxidizer(game, pos, entity),
+            Kind::Liquifier => tick_liquifier(game, pos, entity),
             Kind::Dissolution => tick_dissolution(game, pos, entity),
             Kind::Centrifuge => tick_centrifuge(game, pos, entity),
             Kind::FissionPort => {
@@ -648,7 +654,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
 /// item in it: the item gives its energy to the machine's buffer before the machine runs.
 fn discharge_energy_slot(entity: &mut ModBlockEntity) {
     let index = match kind(&entity.id) {
-        Some(Kind::Oxidizer | Kind::Dissolution | Kind::Crystallizer | Kind::Separator | Kind::Rotary) => 1,
+        Some(Kind::Oxidizer | Kind::Dissolution | Kind::Crystallizer | Kind::Separator | Kind::Rotary | Kind::Liquifier) => 1,
         Some(Kind::Machine("combining", _) | Kind::Advanced(_) | Kind::Infuser | Kind::Nucleosynthesizer) => 3,
         Some(Kind::Pump | Kind::Plenisher) => 2,
         Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer | Kind::Heater | Kind::Vibrator) => 0,
@@ -1481,6 +1487,71 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
         1000,
         progress as i32,
         chem::OXIDIZER_TICKS as i32,
+    ];
+    Some(active)
+}
+
+/// The Nutritional Liquifier: food becomes nutritional paste (50 mB a point of nutrition) over 100 ticks at
+/// 8 FE a tick. Foods with a use remainder (a stew's bowl) leave it in the output slot.
+fn tick_liquifier(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = chem::LIQUIFIER_USAGE * u64::from(chem::LIQUIFIER_TICKS);
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut tank = get_tank(&entity.nbt, "output", chem::LIQUIFIER_TANK);
+    let mut progress = get_int(&entity.nbt, "progress");
+    let mut active = false;
+    drain_tank_into_bucket(game, entity, 3, Some(4), &mut tank);
+    let items = world_items!(game);
+    // `createDynamicRecipe`: food that heals gives paste, and what is left of it after eating.
+    let recipe = entity.items.first().cloned().flatten().and_then(|stack| {
+        let info = items.get(&stack.item)?;
+        let nutrition = info.food.map(|(n, _)| n).filter(|n| *n > 0)?;
+        Some((stack, u64::from(nutrition) * chem::PASTE_PER_NUTRITION, info.use_remainder.clone()))
+    });
+    let out = entity.items.get(2).cloned().flatten();
+    let fits = |paste: u64, remainder: &Option<String>| {
+        tank.accepts(chem::NUTRITIONAL_PASTE)
+            && tank.amount + paste <= tank.capacity
+            && remainder.as_ref().is_none_or(|r| {
+                let max = items.get(r).map_or(64, |i| i.max_stack);
+                out.as_ref().is_none_or(|o| *o.item == **r && o.count < max)
+            })
+    };
+    let warn = match &recipe {
+        None if entity.items.first().is_some_and(|s| s.is_some()) => 8,
+        Some((_, paste, remainder)) if !fits(*paste, remainder) => 4,
+        _ => 0,
+    };
+    put_int(&mut entity.nbt, "warn", warn);
+    match recipe {
+        Some((stack, paste, remainder)) if fits(paste, &remainder) => {
+            if energy.consume(chem::LIQUIFIER_USAGE) {
+                active = true;
+                progress += 1;
+                if progress >= chem::LIQUIFIER_TICKS {
+                    progress = 0;
+                    tank.insert(chem::NUTRITIONAL_PASTE, paste);
+                    entity.items[0] = (stack.count > 1).then(|| ItemStack { count: stack.count - 1, ..stack });
+                    if let Some(r) = remainder {
+                        entity.items[2] = Some(match out {
+                            Some(o) => ItemStack { count: o.count + 1, ..o },
+                            None => stack_of(&r, 1),
+                        });
+                    }
+                }
+            }
+        }
+        _ => progress = 0,
+    }
+    push_chemical(game, pos, &mut tank, None, u64::MAX, false);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "progress", progress);
+    put_tank(&mut entity.nbt, "output", &tank);
+    entity.data = vec![
+        (energy.stored * 1000 / capacity) as i32,
+        1000,
+        progress as i32,
+        chem::LIQUIFIER_TICKS as i32,
     ];
     Some(active)
 }
@@ -2628,6 +2699,7 @@ fn serves(family: &str, kind: Kind) -> bool {
             kind,
             Kind::Reaction
                 | Kind::BioGenerator
+                | Kind::Liquifier
                 | Kind::FluidTank(_)
                 | Kind::Separator
                 | Kind::Rotary
@@ -2673,6 +2745,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Factory(..)
                 | Kind::HeatGenerator
                 | Kind::Oxidizer
+                | Kind::Liquifier
                 | Kind::Dissolution
                 | Kind::Crystallizer
                 | Kind::Separator
@@ -3517,6 +3590,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::EnergyCube(t) if facing_away => Some(tier::energy_cube(t)),
         Kind::Cable(rate) if !from_cable => Some((rate, rate)),
         Kind::Oxidizer => Some((chem::OXIDIZER_USAGE * u64::from(chem::OXIDIZER_TICKS), u64::MAX)),
+        Kind::Liquifier => Some((chem::LIQUIFIER_USAGE * u64::from(chem::LIQUIFIER_TICKS), u64::MAX)),
         Kind::Dissolution => Some((machine::STORAGE_MULTIPLIER * nuclear::DISSOLUTION_USAGE, u64::MAX)),
         Kind::Centrifuge => Some((machine::STORAGE_MULTIPLIER * nuclear::CENTRIFUGE_USAGE, u64::MAX)),
         Kind::Washer => Some((machine::STORAGE_MULTIPLIER * nuclear::WASHER_USAGE, u64::MAX)),
@@ -5030,6 +5104,7 @@ const CHEMICALS: &[(&str, &str, u32)] = &[
     ("mekanism:hydrogen", "Hydrogen", 0xFFFFFF),
     ("mekanism:oxygen", "Oxygen", 0x6CE2FF),
     ("mekanism:steam", "Steam", 0xC4C4C4),
+    ("mekanism:nutritional_paste", "Nutritional Paste", 0xEB6CA3),
     ("mekanism:chlorine", "Chlorine", 0xCFE800),
     ("mekanism:sodium", "Sodium", 0xE9FEF4),
     ("mekanism:hydrogen_chloride", "Hydrogen Chloride", 0xA8F1E9),
@@ -5130,6 +5205,13 @@ fn layout(block: &str) -> Option<Layout> {
             gauges: vec![gauge("output", chem::OXIDIZER_TANK, 131.0, 13.0, STANDARD)],
             power: Some(PowerBar::Horizontal([115.0, 75.0])),
             progress: large_right(64.0, 40.0),
+        },
+        // TileEntityNutritionalLiquifier and GuiNutritionalLiquifier.
+        Kind::Liquifier => Layout {
+            slots: [Some(([26.0, 36.0], "slot/normal")), Some(([155.0, 5.0], "slot/power")), Some(([110.0, 36.0], "slot/output"))],
+            gauges: vec![gauge("output", chem::LIQUIFIER_TANK, 133.0, 13.0, STANDARD)],
+            power: Some(PowerBar::Horizontal([115.0, 75.0])),
+            progress: large_right(54.0, 40.0),
         },
         // TileEntityChemicalDissolutionChamber and its screen.
         Kind::Dissolution => Layout {
@@ -5592,6 +5674,7 @@ fn miner_flags(nbt: &Compound) -> u32 {
 fn base_usage(k: Kind) -> Option<u64> {
     Some(match k {
         Kind::Oxidizer => chem::OXIDIZER_USAGE,
+        Kind::Liquifier => chem::LIQUIFIER_USAGE,
         Kind::Dissolution => nuclear::DISSOLUTION_USAGE,
         Kind::Centrifuge => nuclear::CENTRIFUGE_USAGE,
         Kind::Washer => nuclear::WASHER_USAGE,
@@ -5646,6 +5729,8 @@ fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
         Some(Kind::Evaporation) => vec![([28.0, 51.0], "slot/output")],
         // `ChemicalInventorySlot`s: the output's drain slot, the input's fill slot (`TileEntityChemical*`).
         Some(Kind::Oxidizer) => vec![([152.0, 55.0], "slot/normal")],
+        // `FluidInventorySlot.drain` (the bucket to fill) and the filled container's output slot.
+        Some(Kind::Liquifier) => vec![([155.0, 25.0], "slot/normal"), ([155.0, 56.0], "slot/output")],
         Some(Kind::Dissolution) => vec![([8.0, 65.0], "slot/normal"), ([152.0, 55.0], "slot/normal")],
         Some(Kind::Crystallizer) => vec![([8.0, 65.0], "slot/normal")],
         Some(Kind::ChemicalInfuser) => vec![([80.0, 65.0], "slot/normal")],
@@ -5753,6 +5838,7 @@ fn tabs(block: &str) -> u8 {
             Kind::Machine(..)
             | Kind::Factory(..)
             | Kind::Oxidizer
+            | Kind::Liquifier
             | Kind::Dissolution
             | Kind::Crystallizer
             | Kind::Separator
@@ -7793,6 +7879,8 @@ fn extras(block: &str) -> Extras {
             ..none
         },
         Some(Kind::Pump | Kind::Plenisher) => Extras { screen: Some([54.0, 23.0, 80.0, 42.0]), arrows: vec![[32.0, 39.0]], ..none },
+        // `GuiTexturedElement.downArrow(159, 44)` between the bucket slots.
+        Some(Kind::Liquifier) => Extras { arrows: vec![[159.0, 44.0]], ..none },
         // `GuiTexturedElement.downArrow(imageWidth + 8, 91)` between the washer's two fluid slots.
         Some(Kind::Washer) => Extras { active_progress: vec![large(64.0, 39.0)], arrows: vec![[184.0, 91.0]], ..none },
         Some(Kind::Heater) => Extras { screen: Some([48.0, 23.0, 80.0, 42.0]), ..none },

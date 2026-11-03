@@ -182,6 +182,15 @@ pub const OXIDIZER_USAGE: u64 = 15;
 pub const OXIDIZER_TICKS: u32 = 100;
 pub const OXIDIZER_TANK: u64 = 10_000;
 
+/// `TileEntityNutritionalLiquifier`: 8 FE a tick for 100 ticks, into a 10,000 mB tank; food gives 50 mB of
+/// paste a point of nutrition.
+pub const LIQUIFIER: &str = "mekanism:nutritional_liquifier";
+pub const LIQUIFIER_USAGE: u64 = 8;
+pub const LIQUIFIER_TICKS: u32 = 100;
+pub const LIQUIFIER_TANK: u64 = 10_000;
+pub const PASTE_PER_NUTRITION: u64 = 50;
+pub const NUTRITIONAL_PASTE: &str = "mekanism:nutritional_paste";
+
 /// An advanced electric machine (`TileEntityAdvancedElectricMachine`): an item and a chemical used each
 /// tick, 200 ticks, a 210 mB tank (`MAX_GAS`); its energy per tick is `UsageConfig`'s.
 #[derive(Debug, PartialEq, Eq)]
