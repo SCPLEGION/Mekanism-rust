@@ -42,6 +42,7 @@ use mekanism_core::generator::HeatGenerator;
 use mekanism_core::machine::{self, ElectricMachine, Operation, Slot};
 use mekanism_core::module_config;
 use mekanism_core::modules;
+use mekanism_core::radial;
 use mekanism_core::tier::{self, BaseTier};
 use mekanism_core::upgrades::{Upgrade, Upgrades};
 use std::sync::Arc;
@@ -4478,6 +4479,7 @@ fn set_jetpack_fuel(stack: &mut ItemStack, amount: u64) {
 pub(super) fn client_tick(game: &mut Game<'_>) {
     if game.native_window() && game.native_on(MOD_ID) {
         tweaker_key(game);
+        radial_key(game);
     }
     if !game.native_window() || !game.native_on(MOD_ID) || !game.native_playing() {
         return;
@@ -17263,17 +17265,244 @@ fn tweaker_payload(game: &mut Game<'_>, data: &[u8]) {
 pub(super) fn ui_draw(game: &Game<'_>, id: &str, batch: &mut horizon_client::hud::HudBatch) {
     if id == TW_ID {
         tweaker_draw(game, batch);
+    } else if id == RADIAL_ID {
+        radial_draw(game, batch);
     }
 }
 
 pub(super) fn ui_click(game: &mut Game<'_>, id: &str, at: [f32; 2], button: u8, pressed: bool) {
     if id == TW_ID {
         tweaker_click(game, at, button, pressed);
+    } else if id == RADIAL_ID && pressed {
+        radial_update(game);
     }
 }
 
-pub(super) fn ui_wheel(game: &Game<'_>, id: &str, steps: f32) {
+pub(super) fn ui_wheel(game: &mut Game<'_>, id: &str, steps: f32) {
     if id == TW_ID {
         tweaker_wheel(game.native_cursor(), steps);
+    } else if id == RADIAL_ID {
+        radial_scroll(game, steps);
+    }
+}
+
+// --- Radial Selector (GuiRadialSelector) ---------------------------------------------------------------------
+
+const RADIAL_ID: &str = "mekanism:radial_selector";
+const RADIAL_INNER: f32 = 40.0;
+const RADIAL_OUTER: f32 = 100.0;
+const RADIAL_SELECT: f32 = 10.0;
+const RADIAL_SELECT_PARENT: f32 = 20.0;
+
+#[derive(Default)]
+struct RadialUi {
+    /// The slot of the item (`tw_stack` numbering).
+    slot: usize,
+    /// The module whose options show, or None at the root.
+    module: Option<&'static str>,
+    /// Whether a root above this one exists (the back button).
+    has_parent: bool,
+    selection: Option<usize>,
+    over_back: bool,
+    /// Whether the screen is open (the key closes it).
+    open: bool,
+}
+
+thread_local! {
+    static RADIAL_UI: std::cell::RefCell<RadialUi> = std::cell::RefCell::new(RadialUi::default());
+}
+
+static RADIAL_KEY_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The root slices an item offers: its enabled modules that handle the radial.
+fn radial_roots(stack: &ItemStack) -> Vec<radial::Nested> {
+    let installed = modules_of(stack);
+    installed
+        .iter()
+        .filter_map(|(id, n)| {
+            let nested = radial::nested(id)?;
+            let handles = module_config::settings(id, *n).into_iter().find(|s| s.key == "handle_mode_change").is_none_or(|s| module_setting(stack, id, &s, *n) == 1);
+            handles.then_some(nested)
+        })
+        .collect()
+}
+
+/// The current option of a nested module's radial.
+fn radial_current(stack: &ItemStack, module: &str) -> Option<u32> {
+    let n = *modules_of(stack).get(module)?;
+    let key = radial::nested(module)?.key;
+    let s = module_config::settings(module, n).into_iter().find(|s| s.key == key)?;
+    Some(module_setting(stack, module, &s, n))
+}
+
+/// Opens while the hand mode key is held and closes, applying the selection, when it is let go.
+fn radial_key(game: &mut Game<'_>) {
+    let down = game.keys.contains(&winit::keyboard::KeyCode::KeyN);
+    let was = RADIAL_KEY_DOWN.swap(down, std::sync::atomic::Ordering::Relaxed);
+    let open = RADIAL_UI.with_borrow(|ui| ui.open) && game.native_ui_open() == Some(RADIAL_ID);
+    if !down && open {
+        radial_update(game);
+        RADIAL_UI.with_borrow_mut(|ui| ui.open = false);
+        game.native_close_ui();
+        return;
+    }
+    if !(down && !was) || !game.native_playing() || game.native_ui_open().is_some() {
+        return;
+    }
+    let hand = 4 + game.selected;
+    let Some(slot) = [hand, 13].into_iter().find(|s| tw_stack(game, *s).is_some_and(|st| !radial_roots(st).is_empty())) else {
+        return;
+    };
+    let roots = tw_stack(game, slot).map(radial_roots).unwrap_or_default();
+    RADIAL_UI.with_borrow_mut(|ui| {
+        *ui = RadialUi { slot, open: true, ..RadialUi::default() };
+        if roots.len() == 1 {
+            ui.module = Some(roots[0].module);
+        }
+    });
+    game.native_open_ui(RADIAL_ID);
+}
+
+/// The slices on screen: the root's, or the open module's options.
+fn radial_slices(stack: &ItemStack, module: Option<&'static str>) -> Vec<radial::Slice> {
+    match module {
+        Some(m) => radial::modes(m, modules_of(stack).get(m).copied().unwrap_or(0)),
+        None => radial_roots(stack).into_iter().map(|r| r.slice).collect(),
+    }
+}
+
+/// `drawTorus`: the ring section as rows of runs.
+#[allow(clippy::too_many_arguments)]
+fn torus(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, centre: [f32; 2], start: f32, size: f32, inner: f32, outer: f32, argb: u32) {
+    let r = outer.ceil() as i32;
+    for row in -r..r {
+        let dy = row as f32 + 0.5;
+        if dy.abs() > outer {
+            continue;
+        }
+        let mut run: Option<i32> = None;
+        for col in -r..=r {
+            let on = col < r && radial::in_section(col as f32 + 0.5, dy, start, size, inner, outer);
+            match (on, run) {
+                (true, None) => run = Some(col),
+                (false, Some(from)) => {
+                    game.native_fill(batch, [centre[0] + from as f32, centre[1] + row as f32, (col - from) as f32, 1.0], argb);
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn radial_argb(color: u32, alpha: f32) -> u32 {
+    (((alpha * 255.0) as u32) << 24) | color
+}
+
+fn radial_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    let centre = [(batch.width / 2.0).floor(), (batch.height / 2.0).floor()];
+    let cursor = game.native_cursor();
+    RADIAL_UI.with_borrow_mut(|ui| {
+        let Some(stack) = tw_stack(game, ui.slot) else {
+            return;
+        };
+        let slices = radial_slices(stack, ui.module);
+        let n = slices.len();
+        if n == 0 {
+            return;
+        }
+        let size = 360.0 / n as f32;
+        torus(game, batch, centre, 0.0, 360.0, RADIAL_INNER, RADIAL_OUTER, 0x80_4D4D4D);
+        let current = ui.module.and_then(|m| radial_current(stack, m));
+        if let Some(i) = current.and_then(|v| slices.iter().position(|s| s.value == v)) {
+            torus(game, batch, centre, radial::start_angle(i, n), size, RADIAL_INNER, RADIAL_OUTER, radial_argb(slices[i].color, 0.3));
+        }
+        let (dx, dy) = (cursor[0] - centre[0], cursor[1] - centre[1]);
+        let hole = if ui.has_parent { RADIAL_SELECT_PARENT } else { RADIAL_SELECT };
+        ui.selection = radial::slice_at(dx, dy, n, hole);
+        if let Some(i) = ui.selection {
+            let angle = dy.atan2(dx).to_degrees();
+            torus(game, batch, centre, angle - 180.0 / n as f32, size, RADIAL_INNER, RADIAL_OUTER, 0x4D_CCCCCC);
+            torus(game, batch, centre, radial::start_angle(i, n), size, RADIAL_INNER, RADIAL_OUTER, 0xB3_999999);
+        }
+        let mut labels: Vec<([f32; 2], String, u32)> = vec![];
+        ui.over_back = false;
+        if ui.has_parent {
+            ui.over_back = dx.hypot(dy) <= RADIAL_SELECT_PARENT;
+            let argb = if ui.over_back { 0x4D_CCCCCC } else { 0x80_4D4D4D };
+            torus(game, batch, centre, 0.0, 360.0, 0.0, RADIAL_SELECT_PARENT, argb);
+            sprite(game, batch, "radial/back", [0.0, 0.0, 18.0, 18.0], [centre[0] - 12.0, centre[1] - 18.0, 24.0, 24.0]);
+            labels.push(([0.0, 0.0], "Back".to_owned(), 0xFF_FFFF));
+        }
+        for (i, slice) in slices.iter().enumerate() {
+            let [x, y] = radial::icon_centre(i, n, RADIAL_INNER, RADIAL_OUTER);
+            sprite(game, batch, &format!("radial/{}", slice.icon), [0.0, 0.0, 18.0, 18.0], [(centre[0] + x - 12.0).round(), (centre[1] + y - 20.0).round(), 24.0, 24.0]);
+            labels.push(([x, y], slice.name.to_owned(), slice.color));
+        }
+        for ([x, y], text, rgb) in labels {
+            let w = game.native_text_width(&text) * 0.8;
+            game.native_text_scaled(batch, &text, [centre[0] + x - w / 2.0, centre[1] + y + 7.0], rgb, 0.8);
+        }
+    });
+}
+
+/// `updateSelection`: a nested slice opens, a mode is sent to the server, the back button goes up.
+fn radial_update(game: &mut Game<'_>) {
+    let mut send = None;
+    RADIAL_UI.with_borrow_mut(|ui| {
+        let Some(stack) = tw_stack(game, ui.slot) else {
+            return;
+        };
+        if let Some(i) = ui.selection {
+            let slices = radial_slices(stack, ui.module);
+            let Some(slice) = slices.get(i) else {
+                return;
+            };
+            match ui.module {
+                None => {
+                    if let Some(root) = radial_roots(stack).get(i) {
+                        ui.module = Some(root.module);
+                        ui.has_parent = true;
+                        ui.selection = None;
+                    }
+                }
+                Some(m) => {
+                    if radial_current(stack, m) != Some(slice.value)
+                        && let Some(nested) = radial::nested(m)
+                    {
+                        send = Some(format!("{}|{m}|{}|{}", ui.slot, nested.key, slice.value));
+                    }
+                }
+            }
+        } else if ui.over_back {
+            ui.over_back = false;
+            ui.module = None;
+            ui.has_parent = false;
+        }
+    });
+    if let Some(text) = send {
+        game.native_send_to_server(TW_CHANNEL, text.as_bytes());
+    }
+}
+
+/// The wheel steps the mode (`mouseScrolled`): wraps around, only inside a module's options.
+fn radial_scroll(game: &mut Game<'_>, steps: f32) {
+    let shift: i32 = if steps > 0.0 { 1 } else if steps < 0.0 { -1 } else { return };
+    let mut send = None;
+    RADIAL_UI.with_borrow(|ui| {
+        let (Some(m), Some(stack)) = (ui.module, tw_stack(game, ui.slot)) else {
+            return;
+        };
+        let slices = radial_slices(stack, Some(m));
+        let Some(index) = radial_current(stack, m).and_then(|v| slices.iter().position(|s| s.value == v)) else {
+            return;
+        };
+        let next = &slices[(index as i32 + shift).rem_euclid(slices.len() as i32) as usize];
+        if let Some(nested) = radial::nested(m) {
+            send = Some(format!("{}|{m}|{}|{}", ui.slot, nested.key, next.value));
+        }
+    });
+    if let Some(text) = send {
+        game.native_send_to_server(TW_CHANNEL, text.as_bytes());
     }
 }

@@ -457,7 +457,7 @@ hook_version = 1
 kind = "HEAD"
 helper = "ui_wheel.rs"
 bindings = [
-  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "id", ty = "&str", value = "id" },
   { name = "steps", ty = "f32", value = "steps" },
 ]
