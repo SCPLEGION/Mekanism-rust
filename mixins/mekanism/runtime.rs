@@ -5895,6 +5895,53 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch
         let text = horizon_client::text::Text::literal(&format!("{}%", (ratio * 100.0).round() as i64));
         batch.text_styled(&game.gui.atlas, &text, x + 18.0, 15.0, horizon_client::hud::rgba(r, g, b, 0x66), false);
     }
+    module_icons(game, batch);
+}
+
+/// `HUDRenderer.renderMekaSuitModuleIcons`: the elements of the modules in the worn suit and held Meka-Tools, stacked up
+/// from the bottom right (text, then icon). Shown: the Jetpack Unit (mode and hydrogen), the Gravitational Modulating
+/// Unit and the Vision Enhancement Unit (on or off); the radiation readouts need the radiation system.
+fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    const REGULAR: u32 = 0x40F5F0;
+    let stacks: Vec<ItemStack> = [game.armor[0].clone(), game.armor[1].clone(), game.armor[2].clone(), game.armor[3].clone(), game.inventory.get(game.selected).cloned().flatten(), game.offhand.clone()]
+        .into_iter()
+        .flatten()
+        .filter(|s| modules::is_container(&s.item))
+        .collect();
+    let flag = |stack: &ItemStack, module: &str, key: &str| -> Option<u32> {
+        let n = installed_modules(stack).get(module).copied().filter(|n| *n > 0)?;
+        let setting = module_config::settings(module, n).into_iter().find(|s| s.key == key)?;
+        Some(module_setting(stack, module, &setting, n))
+    };
+    let mut elements: Vec<(&'static str, String, u32)> = Vec::new();
+    for stack in &stacks {
+        if let Some(mode) = flag(stack, "mekanism:jetpack_unit", "jetpack_mode") {
+            if flag(stack, "mekanism:jetpack_unit", "enabled") == Some(1) && flag(stack, "mekanism:jetpack_unit", "render_hud") != Some(0) {
+                let capacity = jetpack_capacity(stack);
+                let ratio = if capacity == 0 { 1.0 } else { jetpack_fuel(stack) as f64 / capacity as f64 };
+                let icon = ["jetpack_normal", "jetpack_hover", "jetpack_vector", "jetpack_off"][mode.min(3) as usize];
+                let color = if ratio > 0.2 { REGULAR } else if ratio > 0.1 { 0xFFDD4F } else { 0xFF383C };
+                elements.push((icon, format!("{}%", (ratio * 100.0).round() as i64), color));
+            }
+        }
+        for (module, icon) in [("mekanism:gravitational_modulating_unit", "gravitational_modulation_unit"), ("mekanism:vision_enhancement_unit", "vision_enhancement_unit")] {
+            if installed_modules(stack).get(module).copied().unwrap_or(0) > 0 && flag(stack, module, "render_hud") != Some(0) {
+                let on = flag(stack, module, "enabled") == Some(1);
+                elements.push((icon, if on { "On" } else { "Off" }.to_owned(), if on { REGULAR } else { 0x207A78 }));
+            }
+        }
+    }
+    let (width, height) = game.gui_size();
+    let mut y = height - 10.0;
+    for (icon, text, rgb) in elements {
+        y -= 18.0;
+        let text_width = game.native_text_width(&text);
+        let x = width - 10.0 - (24.0 + text_width);
+        let argb = (0x66u32 << 24) | rgb;
+        let [_, r, g, b] = rgb.to_be_bytes();
+        batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(&text), x, y + 5.0, horizon_client::hud::rgba(r, g, b, 0x66), false);
+        game.native_sprite_tinted(batch, &format!("mekanism:gui/hud_{icon}"), [0.0, 0.0, 16.0, 16.0], [x + text_width + 2.0, y, 16.0, 16.0], argb);
+    }
 }
 
 /// The window's tick (`CommonPlayerTickHandler.tickEnd` for the local player): holding jump with a
