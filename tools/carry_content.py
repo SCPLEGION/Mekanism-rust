@@ -94,10 +94,10 @@ def pipe_declaration(size):
             "shapes": {"property": "up", "values": {"true": box, "false": box}}}
 
 
-def pipe_models(ns, out, name, blockstate):
+def pipe_models(ns, out, name, blockstate, report=None):
     """Vanilla element models for a transmitter whose blockstate uses Mekanism's OBJ model, taken from the OBJ
     itself: per side the arm of `<side>NORMAL` and the centre face of `<side>NONE`, as a multipart blockstate.
-    Returns its size, or None. (The push and pull arms need the connection modes, which are not synced.)"""
+    Returns its size, or None."""
     try:
         model_id = blockstate["variants"][""]["model"]
     except (KeyError, TypeError):
@@ -142,6 +142,18 @@ def pipe_models(ns, out, name, blockstate):
         for f in el["faces"].values():
             f["texture"] = "#center" if f["texture"].startswith("#center") else "#side"
         return el
+
+    # The push and pull arms (`<side>PUSH`, `<side>PULL`) are not boxes: the game draws their quads as world models
+    # (north's, turned to each side by the bundle) where a side is set to push or pull.
+    side_png = next(iter(SRC.glob(f"**/textures/{side.split(':', 1)[1]}.png")), None)
+    if side_png is not None:
+        for mode in ("PUSH", "PULL"):
+            obj = next((o for o in obj_models.parse(text) if o["name"] == "north" + mode), None)
+            if obj is None:
+                continue
+            quads = [([(p[0] - 0.5, p[1] - 0.5, p[2] - 0.5) for p, _ in quad], [(uv[0], 1 - uv[1]) for _, uv in quad])
+                     for quad in obj["faces"] if len(quad) == 4]
+            worn_models.build_quads_world_model(ns, f"{name}_{mode.lower()}", quads, side_png, out, report if report is not None else {})
 
     tex = {"particle": center, "center": center, "side": side}
     base = f"{ns}:block/transmitter/horizon/{name}"
@@ -527,7 +539,7 @@ def build_module(ns, out):
             path.write_text(json.dumps(lever_blockstate(name, blockstate, ns), indent=2) + "\n")
         declaration = {"template": template}
         if template == PIPE_TEMPLATE:
-            size = pipe_models(ns, out, name, blockstate)
+            size = pipe_models(ns, out, name, blockstate, report)
             if size:
                 declaration = pipe_declaration(size)
                 report["pipes"] = report.get("pipes", 0) + 1

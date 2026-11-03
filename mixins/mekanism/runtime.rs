@@ -571,7 +571,16 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     // A type whose auto-eject is off gives out through no face (the window's eject button): as if
     // every face were Input (0b10 each), which `gives_out` reads.
     let no_eject = get_int(&entity.nbt, "no_eject");
-    let ticking = Transmission::ALL.map(|t| if no_eject & (1 << t as u32) != 0 { Sides(0xAAA) } else { sides_of(&entity.nbt, t) });
+    let transmitter = pipe_family(&entity.id).is_some();
+    let ticking = Transmission::ALL.map(|t| {
+        if transmitter {
+            connection_sides(&entity.nbt)
+        } else if no_eject & (1 << t as u32) != 0 {
+            Sides(0xAAA)
+        } else {
+            sides_of(&entity.nbt, t)
+        }
+    });
     TICKING.set(Some((pos, ticking)));
     let facing = game.native_block_property(pos, "facing").and_then(|f| direction(&f)).map_or(2, face_index);
     // A machine its redstone control holds back does nothing this tick and goes dark.
@@ -1353,6 +1362,8 @@ thread_local! {
     /// (`TileEntityPersonalStorage` / `ChestLidController`).
     /// The industrial alarms this client has heard of.
     static ALARMS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+    /// The transmitters whose faces are set to push or pull, as `conn_show` says (two bits a face).
+    static CONNS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
     static PCHESTS: std::cell::RefCell<std::collections::HashMap<[i32; 3], (f32, f32, u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
     /// The fluid tanks this client has heard of.
     static TANKS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
@@ -1364,6 +1375,10 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
     if id == "mekanismgenerators:wind_generator" {
         ROTORS.with_borrow_mut(|r| {
             r.entry(pos).or_insert((0.0, 0));
+        });
+    } else if pipe_family(id).is_some() {
+        CONNS.with_borrow_mut(|c| {
+            c.insert(pos);
         });
     } else if id == "mekanism:industrial_alarm" {
         ALARMS.with_borrow_mut(|a| {
@@ -1874,6 +1889,52 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
     };
     // The industrial alarms (`RenderIndustrialAlarm`): the bulb and its aura turn about the facing axis, their
     // alpha pulsing with the turn, while the alarm is active.
+    // The push and pull arms of the transmitters (`TransmitterModelData`): where a face is set to push or pull
+    // beside a machine, its arm is drawn in the quads of `<side>PUSH` / `<side>PULL`.
+    CONNS.with_borrow_mut(|conns| {
+        conns.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if pipe_family(id).is_none() {
+                return false;
+            }
+            let shown = get_int(c, "conn_show");
+            if shown == 0 {
+                return true;
+            }
+            let pi = std::f32::consts::PI;
+            for face in 0..6 {
+                let mode = (shown >> (2 * face)) & 3;
+                if mode != 1 && mode != 2 {
+                    continue;
+                }
+                // The arms are modelled pointing north; down, up, north, south, west, east.
+                let q = match face {
+                    0 => glam::Quat::from_rotation_x(-pi / 2.0),
+                    1 => glam::Quat::from_rotation_x(pi / 2.0),
+                    2 => glam::Quat::IDENTITY,
+                    3 => glam::Quat::from_rotation_y(pi),
+                    4 => glam::Quat::from_rotation_y(pi / 2.0),
+                    _ => glam::Quat::from_rotation_y(-pi / 2.0),
+                };
+                models.push(super::native_hooks::NativeWorldModel {
+                    model: format!("{id}_{}", if mode == 1 { "push" } else { "pull" }),
+                    position: [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5],
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    roll: 0.0,
+                    light_at: *pos,
+                    color: 0xFFFF_FFFF,
+                    rotation: Some(q.to_array()),
+                    full_bright: false,
+                    scale: 1.0,
+                    parts: Vec::new(),
+                });
+            }
+            true
+        });
+    });
     ALARMS.with_borrow_mut(|alarms| {
         alarms.retain(|pos| {
             if !matches!(game.native_client_block_entity(*pos), Some((id, _)) if id == "mekanism:industrial_alarm") {
@@ -2391,19 +2452,49 @@ fn tick_cube(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, ti
 fn tick_cable(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, rate: u64) {
     let mut energy = EnergyContainer::new(rate, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(rate);
+    // A pull face takes energy out of the energy cube beside it (`ConnectionType.PULL`).
+    for (face, (_, d)) in DIRECTIONS.into_iter().enumerate() {
+        if conn_of(&entity.nbt, face) != 2 {
+            continue;
+        }
+        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        let back = face_index([-d[0], -d[1], -d[2]]);
+        let room = rate.saturating_sub(energy.stored);
+        let taken = game.native_with_mod_block_entity(at, |m| {
+            let Some(Kind::EnergyCube(t)) = kind(&m.id) else {
+                return 0;
+            };
+            if !sides_of(&m.nbt, Transmission::Energy).get(back).gives_out() {
+                return 0;
+            }
+            let stored = get_long(&m.nbt, "energy");
+            let give = stored.min(tier::energy_cube(t).1).min(room);
+            put_long(&mut m.nbt, "energy", stored - give);
+            give
+        });
+        energy.stored += taken.unwrap_or(0);
+    }
     if energy.stored > 0 {
         push_energy(game, pos, &mut energy, None, true);
     }
-    for (_, d) in DIRECTIONS {
+    for (face, (_, d)) in DIRECTIONS.into_iter().enumerate() {
         if energy.stored == 0 {
             break;
         }
+        // A disabled face passes nothing on, nor does the cable beside it when it is that one's.
+        if conn_of(&entity.nbt, face) == 3 {
+            continue;
+        }
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        let back = face_index([-d[0], -d[1], -d[2]]);
         let mine = energy.stored;
         let given = game.native_with_mod_block_entity(at, |m| {
             let Some(Kind::Cable(their_rate)) = kind(&m.id) else {
                 return 0;
             };
+            if conn_of(&m.nbt, back) == 3 {
+                return 0;
+            }
             let theirs = get_long(&m.nbt, "energy");
             let give = tier::cable_share(mine, theirs).min(their_rate.saturating_sub(theirs));
             put_long(&mut m.nbt, "energy", theirs + give);
@@ -2533,6 +2624,32 @@ fn sides_of(nbt: &Compound, t: Transmission) -> Sides {
     Sides(get_long(nbt, t.key()) as u32)
 }
 
+/// A transmitter's connection on one face (`ConnectionType`): 0 normal, 1 push, 2 pull, 3 none; two bits a face
+/// in `conn`.
+fn conn_of(nbt: &Compound, face: usize) -> u32 {
+    (get_int(nbt, "conn") >> (2 * face)) & 3
+}
+
+const CONNECTION_NAMES: [&str; 4] = ["Normal", "Push", "Pull", "None"];
+
+/// What a transmitter's connections allow, as the side modes the pushing code reads: a pull face takes in
+/// only, a push face gives out only, a disabled face neither (`ConnectionType.canAccept` / `canSendTo`).
+fn connection_sides(nbt: &Compound) -> Sides {
+    let mut sides = Sides::default();
+    for face in 0..6 {
+        sides.set(
+            face,
+            match conn_of(nbt, face) {
+                0 => SideMode::Default,
+                1 => SideMode::Output,
+                2 => SideMode::Input,
+                _ => SideMode::Off,
+            },
+        );
+    }
+    sides
+}
+
 fn face_index(d: [i32; 3]) -> usize {
     DIRECTIONS.iter().position(|(_, v)| *v == d).unwrap_or(0)
 }
@@ -2561,6 +2678,23 @@ pub(super) fn configure_side(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3])
         return false;
     };
     let t = configurator_mode(&held);
+    // Sneaking on a transmitter cycles the connection of the face (`TileEntityTransmitter.onSneakRightClick`).
+    if game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+        let changed = game.native_with_mod_block_entity(pos, |m| {
+            pipe_family(&m.id)?;
+            let face_at = face_index(face);
+            let next = (conn_of(&m.nbt, face_at) + 1) & 3;
+            let all = (get_int(&m.nbt, "conn") & !(3 << (2 * face_at))) | (next << (2 * face_at));
+            put_int(&mut m.nbt, "conn", all);
+            // The shape and the arms are worked out again at once.
+            put_int(&mut m.nbt, "shape_ticker", 0);
+            Some(next)
+        });
+        if let Some(Some(next)) = changed {
+            game.system_message(horizon_client::text::Text::literal(format!("Connection type: {}", CONNECTION_NAMES[next as usize])));
+            return true;
+        }
+    }
     let mode = game.native_with_mod_block_entity(pos, |m| {
         kind(&m.id)?;
         let mut sides = sides_of(&m.nbt, t);
@@ -4085,18 +4219,39 @@ fn show_connections(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     let Some(family) = pipe_family(&entity.id).or_else(|| pipe_family(block_name(game, pos))) else {
         return;
     };
-    for (side, d) in DIRECTIONS {
+    let mut shown = 0u32;
+    for (face, (side, d)) in DIRECTIONS.into_iter().enumerate() {
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
         let name = block_name(game, at).to_owned();
-        let joined = pipe_family(&name) == Some(family)
+        let transmitter = pipe_family(&name) == Some(family);
+        let mut joined = transmitter
             || (family == "transporter" && vanilla_container(&name))
             || (family == "pipe" && name == EVAPORATION_VALVE)
             || game
                 .native_with_mod_block_entity(at, |m| kind(&m.id))
                 .flatten()
                 .is_some_and(|k| serves(family, k));
+        let mode = conn_of(&entity.nbt, face);
+        // A disabled face joins nothing, from either side (`Transmitter.canConnectMutual`).
+        if mode == 3 {
+            joined = false;
+        } else if transmitter && joined {
+            let back = face_index([-d[0], -d[1], -d[2]]);
+            if game.native_with_mod_block_entity(at, |m| conn_of(&m.nbt, back)) == Some(3) {
+                joined = false;
+            }
+        }
+        // Between transmitters the connection is normal; push and pull show on the arm to a machine.
+        if joined && !transmitter && (mode == 1 || mode == 2) {
+            shown |= mode << (2 * face);
+        }
         game.native_set_block_property(pos, side, if joined { "false" } else { "true" });
     }
+    let mut client = Compound::new();
+    if shown != 0 {
+        put_int(&mut client, "conn_show", shown);
+    }
+    put_client(game, pos, entity, &["conn_show"], client);
 }
 
 // --- Logistical transporters ------------------------------------------------------------------------
