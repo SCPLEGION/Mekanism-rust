@@ -18609,20 +18609,9 @@ pub(super) fn ui_key(game: &mut Game<'_>, id: &str, key: &str, text: Option<&str
     if ROBIT_SLOTS.with_borrow(|s| s.0.get(robit::REPAIR_INPUT).cloned().flatten()).is_none() {
         return;
     }
-    let name = ROBIT_NAME_BOX.with_borrow_mut(|b| {
-        if key == "key.keyboard.backspace" {
-            b.0.pop();
-        } else if let Some(t) = text {
-            for c in t.chars().filter(|c| !c.is_control()) {
-                if b.0.chars().count() < 50 {
-                    b.0.push(c);
-                }
-            }
-        } else {
-            return None;
-        }
-        Some(b.0.clone())
-    });
+    let mut edit = ROBIT_NAME_BOX.with_borrow_mut(|b| b.take());
+    let name = edit.as_mut().and_then(|(e, _)| field_key(game, e, key, text).then(|| e.value.clone()));
+    ROBIT_NAME_BOX.with_borrow_mut(|b| *b = edit);
     if let Some(name) = name {
         let mut out = vec![8];
         out.extend(rid.to_be_bytes());
@@ -19394,6 +19383,17 @@ fn robit_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
             return;
         }
     }
+    if button == 0 && ROBIT_TAB.with(std::cell::Cell::get) == RobitTab::Repair && inside(at, [o[0] + 60.0, o[1] + 21.0, ROBIT_NAME_WIDTH, 12.0]) {
+        let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);
+        let now = std::time::Instant::now();
+        let double = ROBIT_LAST_CLICK.with(|c| c.replace(Some(now))).is_some_and(|t| now.duration_since(t).as_millis() < 250);
+        ROBIT_NAME_BOX.with_borrow_mut(|b| {
+            if let Some((e, _)) = b {
+                e.click(&game.gui.atlas, at[0], shift, double);
+            }
+        });
+        return;
+    }
     if ROBIT_TAB.with(std::cell::Cell::get) != RobitTab::Main
         || robit_inv_cell(RobitTab::Main, robit::ENERGY_SLOT, o).is_some_and(|r| inside(at, r))
         || (0..36).any(|i| robit_inv_cell(RobitTab::Main, ROBIT_INV_ROBIT + i, o).is_some_and(|r| inside(at, r)))
@@ -19448,7 +19448,10 @@ thread_local! {
     /// Server: the text of each viewer's anvil name box (`AnvilMenu.itemName`).
     static ROBIT_NAME: std::cell::RefCell<std::collections::HashMap<String, String>> = std::cell::RefCell::new(std::collections::HashMap::new());
     /// Client: the name box, the item it was last filled for, and the level cost the server reported.
-    static ROBIT_NAME_BOX: std::cell::RefCell<(String, Option<String>)> = const { std::cell::RefCell::new((String::new(), None)) };
+    static ROBIT_NAME_BOX: std::cell::RefCell<Option<(horizon_client::ui::EditBox, Option<String>)>> = const { std::cell::RefCell::new(None) };
+    /// Client: the repair input's `getHoverName` the server reported (a custom name included).
+    static ROBIT_HOVER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static ROBIT_LAST_CLICK: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
     static ROBIT_COST: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
     /// Server: who has the inventory open, and the stack on their cursor.
     static ROBIT_WATCH: std::cell::RefCell<std::collections::HashMap<String, (u32, Option<ItemStack>)>> = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -19716,6 +19719,9 @@ fn send_robit_inventories(game: &mut Game<'_>) {
         }
         put(&mut out, &cursor);
         out.extend(anvil.cost.to_be_bytes());
+        let hover = shown[robit::REPAIR_INPUT].as_ref().map(|i| horizon_client::stations::hover_name(&|id| game.pack.names.display_item(id), i)).unwrap_or_default();
+        out.extend((hover.len() as u16).to_be_bytes());
+        out.extend(hover.bytes());
         game.native_send_to_player(uuid, ROBIT_ITEMS_CHANNEL, &out);
     }
 }
@@ -19739,6 +19745,12 @@ fn robit_items_payload(data: &[u8]) {
     let cursor = read().flatten();
     if let Some(b) = data.get(at..at + 4) {
         ROBIT_COST.with(|c| c.set(i32::from_be_bytes([b[0], b[1], b[2], b[3]])));
+        if let Some(l) = data.get(at + 4..at + 6) {
+            let len = usize::from(u16::from_be_bytes([l[0], l[1]]));
+            if let Some(s) = data.get(at + 6..at + 6 + len) {
+                ROBIT_HOVER.with_borrow_mut(|h| *h = String::from_utf8_lossy(s).into_owned());
+            }
+        }
     }
     ROBIT_SLOTS.with_borrow_mut(|v| *v = (slots, cursor));
 }
@@ -19790,6 +19802,47 @@ fn robit_draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o
 }
 
 /// `GuiRobitRepair`: the anvil's name box, its error cross and the level cost.
+const ROBIT_NAME_WIDTH: f32 = 103.0;
+
+/// `GuiTextField` of the repair window: borderless, white, `AnvilMenu.MAX_NAME_LENGTH` characters.
+fn robit_name_field() -> horizon_client::ui::EditBox {
+    let mut edit = horizon_client::ui::EditBox::new(0.0, 0.0, ROBIT_NAME_WIDTH, 12.0);
+    edit.bordered = false;
+    edit.max_length = 50;
+    edit.text_color = u32::MAX;
+    edit.focused = true;
+    edit
+}
+
+/// The keys of an `EditBox` for a mod screen's field: Ctrl+A/C/X/V through the clipboard, cursor and
+/// selection keys, typed text. True when the value changed.
+fn field_key(game: &mut Game<'_>, e: &mut horizon_client::ui::EditBox, key: &str, text: Option<&str>) -> bool {
+    use horizon_client::clipboard::EditShortcut;
+    use winit::keyboard::KeyCode as K;
+    let held = |a: K, b: K| game.keys.contains(&a) || game.keys.contains(&b);
+    let (ctrl, shift) = (held(K::ControlLeft, K::ControlRight), held(K::ShiftLeft, K::ShiftRight));
+    let before = e.value.clone();
+    if ctrl {
+        let shortcut = match key {
+            "key.keyboard.a" => Some(EditShortcut::SelectAll),
+            "key.keyboard.c" => Some(EditShortcut::Copy),
+            "key.keyboard.x" => Some(EditShortcut::Cut),
+            "key.keyboard.v" => Some(EditShortcut::Paste),
+            _ => None,
+        };
+        if let Some(s) = shortcut {
+            e.shortcut(s, &mut game.clipboard);
+            return e.value != before;
+        }
+    }
+    let handled = horizon_client::keybinds::key_code(key).is_some_and(|code| e.key(code, ctrl, shift));
+    if !handled && let Some(t) = text {
+        e.insert_text(t);
+    }
+    e.reset_blink();
+    e.value != before
+}
+
 fn robit_draw_repair(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2]) {
     let slots = ROBIT_SLOTS.with_borrow(|s| s.0.clone());
     let input = slots.get(robit::REPAIR_INPUT).cloned().flatten();
@@ -19800,20 +19853,20 @@ fn robit_draw_repair(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch,
     if (input.is_some() || add.is_some()) && result.is_none() {
         game.native_sprite(batch, "gui/sprites/container/anvil/error", [0.0, 0.0, 28.0, 21.0], [o[0] + 99.0, o[1] + 45.0, 28.0, 21.0]);
     }
-    // `slotChanged`: a new input fills the box with its name.
-    let key = input.as_ref().map(|(i, _)| i.clone());
-    let changed = ROBIT_NAME_BOX.with_borrow(|b| b.1 != key);
-    let text = ROBIT_NAME_BOX.with_borrow_mut(|b| {
-        if changed {
-            b.0 = key.as_ref().map(|i| game.pack.names.display_item(i)).unwrap_or_default();
-            b.1 = key.clone();
+    // `slotChanged`: a new input fills the box with its name (`setText`).
+    let key = input.as_ref().map(|(i, c)| format!("{i}/{c}"));
+    let hover = ROBIT_HOVER.with_borrow(Clone::clone);
+    ROBIT_NAME_BOX.with_borrow_mut(|b| {
+        let (edit, last) = b.get_or_insert_with(|| (robit_name_field(), None));
+        if *last != key || (key.is_some() && edit.value.is_empty() && last.is_none()) {
+            edit.set_value(if key.is_some() { &hover } else { "" });
+            edit.move_cursor_to_end(false);
+            *last = key.clone();
         }
-        b.0.clone()
+        [edit.x, edit.y, edit.width, edit.height] = [o[0] + 60.0, o[1] + 21.0, ROBIT_NAME_WIDTH, 12.0];
+        edit.focused = input.is_some();
+        edit.draw(batch, &game.gui.atlas, None);
     });
-    if input.is_some() {
-        let caret = if (game.ticks / 10) % 2 == 0 { "_" } else { "" };
-        game.native_text(batch, &format!("{text}{caret}"), [o[0] + 62.0, o[1] + 24.0], 0xFF_FFFF, true);
-    }
     let cost = ROBIT_COST.with(std::cell::Cell::get);
     if cost > 0 {
         let creative = game.creative;
@@ -19843,6 +19896,8 @@ fn robit_draw_inventory(game: &Game<'_>, batch: &mut horizon_client::hud::HudBat
         sprite(game, batch, "arrow/right", [0.0, 0.0, 22.0, 15.0], [o[0] + 90.0, o[1] + 35.0, 22.0, 15.0]);
     }
     if tab == RobitTab::Repair {
+        // `blit(ANVIL_LOCATION, ..)`: the vanilla anvil window (slots, the plus and the arrow) over the base.
+        game.native_sprite(batch, "gui/container/anvil", [0.0, 0.0, 176.0, 166.0], [o[0], o[1], 176.0, 166.0]);
         robit_draw_repair(game, batch, o);
     }
     if tab == RobitTab::Smelting {
@@ -19862,7 +19917,9 @@ fn robit_draw_inventory(game: &Game<'_>, batch: &mut horizon_client::hud::HudBat
         let Some(r) = robit_inv_cell(tab, slot, o) else {
             continue;
         };
-        sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], r);
+        if tab != RobitTab::Repair {
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], r);
+        }
         let stack = if slot < ROBIT_INV_ROBIT {
             slots.get(slot).cloned().flatten()
         } else {
