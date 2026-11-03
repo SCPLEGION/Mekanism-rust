@@ -418,12 +418,16 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
     // output between two inputs), open a hopper's five-slot menu.
     if !extra_slots(block).is_empty() || matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_))) {
         let mut inputs = inputs;
+        let mut side = vec![1];
         if !matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_) | Kind::Evaporation)) {
-            inputs.push(3);
+            for i in 0..extra_slots(block).len() {
+                inputs.push(3 + i);
+                side.push(3 + i);
+            }
         }
         *container = Some(ModContainer {
             slots: 5,
-            faces: [vec![2], vec![0], vec![1, 3], vec![1, 3], vec![1, 3], vec![1, 3]],
+            faces: [vec![2], vec![0], side.clone(), side.clone(), side.clone(), side],
             inputs,
             outputs,
             menu: Some("minecraft:hopper".into()),
@@ -1351,6 +1355,7 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     let mut tank = get_tank(&entity.nbt, "output", chem::OXIDIZER_TANK);
     let mut progress = get_int(&entity.nbt, "progress");
     let mut active = false;
+    drain_tank_into_item(entity, 3, &mut tank);
     let recipe = entity.items.first().cloned().flatten().and_then(|stack| {
         let items = world_items!(game);
         let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
@@ -1394,6 +1399,8 @@ fn tick_dissolution(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     let mut output = get_tank(&entity.nbt, "output", nuclear::DISSOLUTION_TANK);
     let mut progress = get_int(&entity.nbt, "progress");
     let mut active = false;
+    fill_tank_from_item(entity, 3, &mut input, nuclear::dissolves_with);
+    drain_tank_into_item(entity, 4, &mut output);
     let recipe = entity.items.first().cloned().flatten().and_then(|stack| {
         let items = world_items!(game);
         let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
@@ -1507,6 +1514,7 @@ fn tick_crystallizer(entity: &mut ModBlockEntity) -> Option<bool> {
     let mut input = get_tank(&entity.nbt, "input", nuclear::CRYSTALLIZER_TANK);
     let mut progress = get_int(&entity.nbt, "progress");
     let mut active = false;
+    fill_tank_from_item(entity, 3, &mut input, |c| nuclear::find_crystallizing(c).is_some());
     let out = entity.items.get(2).cloned().flatten();
     match input.chemical.as_deref().and_then(nuclear::find_crystallizing) {
         Some(r)
@@ -1961,6 +1969,83 @@ fn drain_tank_into_bucket(game: &Game<'_>, entity: &mut ModBlockEntity, from: us
         None => return false,
     }
     tank.extract(1_000);
+    true
+}
+
+/// The capacity of a chemical tank item (`Capabilities.CHEMICAL.item()`): the tiers of chemical tank.
+fn chemical_item_capacity(item: &str) -> Option<u64> {
+    match kind(item)? {
+        Kind::ChemicalTank(t) => Some(chem::chemical_tank(t).0),
+        _ => None,
+    }
+}
+
+/// The ids of the items a chemical slot takes: the chemical tanks.
+fn chemical_item_ids() -> Vec<String> {
+    BaseTier::ALL.into_iter().map(|t| format!("mekanism:{}_chemical_tank", t.name())).collect()
+}
+
+/// Writes `tank` as the chemical an item holds (its custom data under `CHEMICAL_KEY`).
+fn set_item_tank(stack: &mut ItemStack, tank: &ChemicalTank) {
+    let mut c = Compound::new();
+    put_tank(&mut c, "t", tank);
+    let value = match c.get(&JavaString::from("t")) {
+        Some(Tag::Compound(t)) => t.clone(),
+        _ => Compound::new(),
+    };
+    set_custom_compound(stack, CHEMICAL_KEY, value);
+}
+
+/// `ChemicalInventorySlot.fill` (`fillTankFromSlot`): a chemical tank item in slot `from` gives what it holds
+/// to `tank` while the tank takes it (`accepts`) and has room.
+fn fill_tank_from_item(entity: &mut ModBlockEntity, from: usize, tank: &mut ChemicalTank, accepts: impl Fn(&str) -> bool) -> bool {
+    let Some(Some(mut stack)) = entity.items.get(from).cloned() else {
+        return false;
+    };
+    let Some(capacity) = chemical_item_capacity(&stack.item) else {
+        return false;
+    };
+    let Some(mut held) = item_tank(&stack, CHEMICAL_KEY, capacity) else {
+        return false;
+    };
+    let Some(chemical) = held.chemical.clone() else {
+        return false;
+    };
+    if !accepts(&chemical) || !tank.accepts(&chemical) {
+        return false;
+    }
+    let moved = held.amount.min(tank.capacity - tank.amount);
+    if moved == 0 {
+        return false;
+    }
+    tank.insert(&chemical, moved);
+    held.extract(moved);
+    set_item_tank(&mut stack, &held);
+    entity.items[from] = Some(stack);
+    true
+}
+
+/// `ChemicalInventorySlot.drain` (`drainTankIntoSlot`): `tank`'s chemical goes into a chemical tank item in
+/// slot `from` that is empty or holds the same chemical, while it has room.
+fn drain_tank_into_item(entity: &mut ModBlockEntity, from: usize, tank: &mut ChemicalTank) -> bool {
+    let Some(Some(mut stack)) = entity.items.get(from).cloned() else {
+        return false;
+    };
+    let (Some(capacity), Some(chemical)) = (chemical_item_capacity(&stack.item), tank.chemical.clone()) else {
+        return false;
+    };
+    let mut held = item_tank(&stack, CHEMICAL_KEY, capacity).unwrap_or_else(|| ChemicalTank::new(capacity));
+    if !held.accepts(&chemical) {
+        return false;
+    }
+    let moved = tank.amount.min(held.capacity - held.amount);
+    if moved == 0 {
+        return false;
+    }
+    held.insert(&chemical, moved);
+    tank.extract(moved);
+    set_item_tank(&mut stack, &held);
+    entity.items[from] = Some(stack);
     true
 }
 
@@ -4931,6 +5016,10 @@ fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
         Some(Kind::Nucleosynthesizer) => vec![([173.0, 69.0], "slot/power")],
         // The bucket slot under the water slot (`outputInputSlot`).
         Some(Kind::Evaporation) => vec![([28.0, 51.0], "slot/output")],
+        // `ChemicalInventorySlot`s: the output's drain slot, the input's fill slot (`TileEntityChemical*`).
+        Some(Kind::Oxidizer) => vec![([152.0, 55.0], "slot/normal")],
+        Some(Kind::Dissolution) => vec![([8.0, 65.0], "slot/normal"), ([152.0, 55.0], "slot/normal")],
+        Some(Kind::Crystallizer) => vec![([8.0, 65.0], "slot/normal")],
         _ => vec![],
     }
 }
@@ -5537,7 +5626,11 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
         let extra = extra_slots(block);
         if !extra.is_empty() {
             rules.resize(3, SlotRule::Any);
-            rules.extend(extra.iter().map(|_| energy()));
+            rules.extend(extra.iter().map(|(_, sprite)| match *sprite {
+                "slot/normal" => SlotRule::Items(chemical_item_ids()),
+                "slot/output" => SlotRule::Refuse,
+                _ => energy(),
+            }));
         }
     }
 }
