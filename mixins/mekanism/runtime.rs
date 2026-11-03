@@ -411,6 +411,19 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         }
         _ => return,
     };
+    // The machines with a fourth slot (energy) open a hopper's five-slot menu.
+    if !extra_slots(block).is_empty() {
+        let mut inputs = inputs;
+        inputs.push(3);
+        *container = Some(ModContainer {
+            slots: 5,
+            faces: [vec![2], vec![0], vec![1, 3], vec![1, 3], vec![1, 3], vec![1, 3]],
+            inputs,
+            outputs,
+            menu: Some("minecraft:hopper".into()),
+        });
+        return;
+    }
     *container = Some(ModContainer {
         slots: 3,
         faces: [vec![2], vec![0], vec![1], vec![1], vec![1], vec![1]],
@@ -581,6 +594,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
 fn discharge_energy_slot(entity: &mut ModBlockEntity) {
     let index = match kind(&entity.id) {
         Some(Kind::Oxidizer | Kind::Dissolution | Kind::Crystallizer | Kind::Separator | Kind::Rotary) => 1,
+        Some(Kind::Machine("combining", _) | Kind::Advanced(_) | Kind::Infuser | Kind::Nucleosynthesizer) => 3,
         Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer | Kind::Pump | Kind::Plenisher | Kind::Heater | Kind::Vibrator) => 0,
         _ => return,
     };
@@ -4384,6 +4398,8 @@ struct Gauge {
 const STANDARD: [f32; 2] = [18.0, 60.0];
 const SMALL: [f32; 2] = [18.0, 30.0];
 const WIDE: [f32; 2] = [66.0, 50.0];
+/// `GaugeType.SMALL_MED`: 16 x 46 inside the frame.
+const SMALL_MED: [f32; 2] = [18.0, 48.0];
 
 /// The power bar a screen has: vertical (6×54) or horizontal (54×6), at its Gui class's position.
 #[derive(Clone, Copy)]
@@ -4392,6 +4408,8 @@ enum PowerBar {
     Horizontal([f32; 2]),
     /// The energy cube's wide energy gauge.
     Gauge([f32; 2]),
+    /// A small-medium energy gauge (`GuiEnergyGauge` with `GaugeType.SMALL_MED`).
+    SmallGauge([f32; 2]),
 }
 
 /// Everything a Mekanism screen draws for a block: its slots (None hides one the block does not use),
@@ -4620,13 +4638,13 @@ fn layout(block: &str) -> Option<Layout> {
         },
         Kind::Nucleosynthesizer => Layout {
             slots: [
-                Some(([64.0, 17.0], "slot/normal")),
-                Some(([64.0, 53.0], "slot/normal")),
-                Some(([116.0, 35.0], "slot/output")),
+                Some(([26.0, 40.0], "slot/normal")),
+                Some(([6.0, 69.0], "slot/normal")),
+                Some(([152.0, 40.0], "slot/output")),
             ],
-            gauges: vec![gauge("chemical", chem::NUCLEOSYNTHESIZER_TANK, 7.0, 13.0, STANDARD)],
-            power: Some(PowerBar::Vertical([164.0, 15.0])),
-            progress: Some(([86.0, 38.0], "progress/bar", [25.0, 9.0])),
+            gauges: vec![gauge("chemical", chem::NUCLEOSYNTHESIZER_TANK, 5.0, 18.0, SMALL_MED)],
+            power: Some(PowerBar::SmallGauge([172.0, 18.0])),
+            progress: None,
         },
         Kind::DynamicValve => Layout {
             slots: [None; 3],
@@ -4825,9 +4843,30 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
     }
 }
 
+/// A machine screen's height: the nucleosynthesizer's is 27 taller (`DEFAULT_IMAGE_HEIGHT + 27`).
+fn screen_height(block: &str) -> f32 {
+    if kind(block) == Some(Kind::Nucleosynthesizer) { 193.0 } else { 166.0 }
+}
+
+/// The item slots past the three of `Layout` (a hopper menu's fourth): the energy slot of the machines
+/// that have more than an input, an output and one more slot (`EnergyInventorySlot.fillOrConvert`).
+fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
+    match kind(block) {
+        Some(Kind::Machine("combining", _)) | Some(Kind::Advanced(_)) => vec![([39.0, 35.0], "slot/power")],
+        Some(Kind::Infuser) => vec![([143.0, 35.0], "slot/power")],
+        Some(Kind::Nucleosynthesizer) => vec![([173.0, 69.0], "slot/power")],
+        _ => vec![],
+    }
+}
+
 /// A factory screen's width: 34 wider for the ultimate tier's nine processes.
 fn screen_width(block: &str) -> f32 {
-    if matches!(kind(block), Some(Kind::Factory(9, ..))) { 210.0 } else { 176.0 }
+    match kind(block) {
+        Some(Kind::Factory(9, ..)) => 210.0,
+        // `DEFAULT_IMAGE_WIDTH + 20`.
+        Some(Kind::Nucleosynthesizer) => 196.0,
+        _ => 176.0,
+    }
 }
 
 /// Each process's input and output slot (`TileEntityItemToItemFactory.addSlots`).
@@ -5419,6 +5458,11 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
                 _ => SlotRule::Any,
             })
             .collect();
+        let extra = extra_slots(block);
+        if !extra.is_empty() {
+            rules.resize(3, SlotRule::Any);
+            rules.extend(extra.iter().map(|_| energy()));
+        }
     }
 }
 
@@ -6542,13 +6586,22 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         *screen = Some(super::native_hooks::NativeScreen { width: w, height: 166.0, slots, inventory_y: 84.0, inventory_x: 8.0 + (w - 176.0) / 2.0, own_labels: false, alt: None });
         return;
     }
+    let (w, h) = (screen_width(block), screen_height(block));
+    let mut slots: Vec<Option<[f32; 2]>> = l.slots.iter().map(|s| s.map(|(at, _)| at)).collect();
+    let extra = extra_slots(block);
+    if !extra.is_empty() {
+        slots.resize(5, None);
+        for (i, (at, _)) in extra.iter().enumerate() {
+            slots[3 + i] = Some(*at);
+        }
+    }
     *screen = Some(super::native_hooks::NativeScreen {
-        width: 176.0,
-        height: 166.0,
-        slots: l.slots.iter().map(|s| s.map(|(at, _)| at)).collect(),
-        inventory_y: 84.0,
-        inventory_x: 8.0,
-        own_labels: false,
+        width: w,
+        height: h,
+        slots,
+        inventory_y: h - 82.0,
+        inventory_x: 8.0 + (w - 176.0) / 2.0,
+        own_labels: kind(block) == Some(Kind::Nucleosynthesizer),
         alt: None,
     });
 }
@@ -6579,6 +6632,7 @@ fn power_rect(p: PowerBar) -> [f32; 4] {
         PowerBar::Vertical([x, y]) => [x, y, 6.0, 54.0],
         PowerBar::Horizontal([x, y]) => [x, y, 54.0, 6.0],
         PowerBar::Gauge([x, y]) => [x, y, WIDE[0], WIDE[1]],
+        PowerBar::SmallGauge([x, y]) => [x, y, SMALL_MED[0], SMALL_MED[1]],
     }
 }
 
@@ -6640,6 +6694,53 @@ fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
             }
         }
         _ => vec![],
+    }
+}
+
+/// The nucleosynthesizer's own parts (`GuiAntiprotonicNucleosynthesizer`): the inner screen with the
+/// process rate and the bolts between the antimatter and the energy, and the wide progress bar below.
+fn draw_nucleosynthesizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit")).as_deref() == Some("true");
+    let screen = [ox + 45.0, oy + 18.0, 104.0, 68.0];
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, screen, 0xFFFF_FFFF);
+    let rate = if lit { "100%" } else { "0%" };
+    let line = format!("Process Rate: {rate}");
+    let w = game.native_text_width(&line) * 0.8;
+    game.native_text_scaled(batch, &line, [screen[0] + (screen[2] - w) / 2.0, screen[1] + screen[3] - 2.0 - 8.0 * 0.8], 0x3C_FE9A, 0.8);
+    // `BoltEffect`: up to twenty jagged lines across the screen's middle while it works.
+    if lit {
+        let (x0, x1, mid) = (screen[0] + 2.0, screen[0] + 100.0, screen[1] + 32.0);
+        let t = (game.ticks / 2) as u32;
+        for bolt in 0..8u32 {
+            let mut y = mid;
+            let mut x = x0;
+            let mut seed = t.wrapping_mul(2_654_435_761).wrapping_add(bolt.wrapping_mul(40_503));
+            while x < x1 {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let step = 6.0;
+                let ny = (y + ((seed >> 24) as f32 / 255.0 - 0.5) * 12.0).clamp(screen[1] + 4.0, screen[1] + screen[3] - 14.0);
+                let (lo, hi) = (y.min(ny), y.max(ny));
+                game.native_fill(batch, [x, lo, 1.0, (hi - lo).max(1.0)], 0xFF73_7380);
+                game.native_fill(batch, [x, ny, step.min(x1 - x), 1.0], 0xFF73_7380);
+                y = ny;
+                x += step;
+            }
+        }
+    }
+    // `GuiDynamicHorizontalRateBar`: the dynamic-rate sprite multiplied by a colour that runs from
+    // (60, 45, 74) to (100, 30, 170) along the bar.
+    let (x, y, bar_w) = (ox + 5.0, oy + 88.0, 183.0);
+    nine_slice(game, batch, "bar/base", 5.0, 1.0, [x, y, bar_w, 8.0]);
+    let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0) as f32;
+    let progress = (get(2) / get(3).max(1.0)).clamp(0.0, 1.0);
+    let inner = bar_w - 2.0;
+    let filled = (progress * inner).floor() as u32;
+    for i in 0..filled {
+        let f = i as f32 / inner;
+        let lerp = |a: f32, b: f32| (a + (b - a) * f).round() as u32;
+        let argb = 0xFF00_0000 | lerp(60.0, 100.0) << 16 | lerp(45.0, 30.0) << 8 | lerp(74.0, 170.0);
+        game.native_sprite_tinted(batch, &format!("{SPRITES}bar/dynamic_rate"), [0.0, 0.0, 1.0, 6.0], [x + 1.0 + i as f32, y + 1.0, 1.0, 6.0], argb);
     }
 }
 
@@ -6709,15 +6810,21 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0) as f32;
     let width = screen_width(block);
     let inv_dx = (width - 176.0) / 2.0;
-    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, width, 166.0]);
+    let height = screen_height(block);
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, width, height]);
     if let Some(Kind::Factory(n, ..)) = kind(block) {
         draw_factory_slots(game, batch, block, n, &l, data, origin);
     }
-    for (at, name) in l.slots.iter().flatten() {
+    for (at, name) in l.slots.iter().flatten().chain(extra_slots(block).iter()) {
         sprite(game, batch, name, [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
     }
+    if kind(block) == Some(Kind::Nucleosynthesizer) {
+        let title = game.native_screen_title().unwrap_or_default();
+        centred(game, batch, &title, ox, width, oy + 4.0, 0x40_4040);
+        game.native_text(batch, "Inventory", [ox + 8.0, oy + height - 93.0], 0x40_4040, false);
+    }
     for row in 0..4 {
-        let y = if row < 3 { 84.0 + 18.0 * row as f32 } else { 142.0 };
+        let y = if row < 3 { height - 82.0 + 18.0 * row as f32 } else { height - 24.0 };
         for col in 0..9 {
             sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + inv_dx + 18.0 * col as f32, oy + y - 1.0, 18.0, 18.0]);
         }
@@ -6731,6 +6838,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         }
         let overlay = match size {
             SMALL => "small",
+            SMALL_MED => "small_med",
             WIDE => "wide",
             _ => "standard",
         };
@@ -6769,7 +6877,11 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         }
         // `GuiEnergyGauge` fills with Mekanism's energy texture.
         Some(PowerBar::Gauge(at)) => gauge(batch, at, WIDE, energy, (&format!("{SPRITES_ROOT}gauge_fluid/energy"), 0xFFFF_FFFF)),
+        Some(PowerBar::SmallGauge(at)) => gauge(batch, at, SMALL_MED, energy, (&format!("{SPRITES_ROOT}gauge_fluid/energy"), 0xFFFF_FFFF)),
         None => {}
+    }
+    if kind(block) == Some(Kind::Nucleosynthesizer) {
+        draw_nucleosynthesizer(game, batch, data, origin);
     }
     if let Some((at, name, [w, h])) = l.progress {
         sprite(game, batch, &format!("{name}/empty"), [0.0, 0.0, w, h], [ox + at[0], oy + at[1], w, h]);
