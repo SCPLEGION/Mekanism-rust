@@ -469,6 +469,19 @@ def build_module(ns, out):
             worn_models.build_element_world_model(ns, "liquifier_blade", json.loads(blade.read_text()), texture, out, report)
     if ns == "mekanism":
         # The Robit (`RenderRobit`): its element model, the glowing eyes and back light apart from the body.
+        # The Robit item (`RenderRobitItem`) draws its base skin model; Horizon has no such special model, so the item
+        # shows the same elements as a plain item model with the base texture.
+        robit_model = next((d / ns / "models/robit/robit.json" for d in search if (d / ns / "models/robit/robit.json").is_file()), None)
+        robit_skin = next((d / ns / "textures/entity/robit/robit.png" for d in search
+                           if (d / ns / "textures/entity/robit/robit.png").is_file()), None)
+        if robit_model is not None and robit_skin is not None:
+            item_model = json.loads(robit_model.read_text())
+            item_model["textures"] = {"robit": f"{ns}:item/robit_skin", "particle": f"{ns}:item/robit_skin"}
+            write_json(out / "assets" / ns / "models" / "item" / "robit_flat.json", item_model)
+            (out / "assets" / ns / "textures" / "item").mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(robit_skin, out / "assets" / ns / "textures" / "item" / "robit_skin.png")
+            write_json(out / "assets" / ns / "items" / "robit.json", {"model": {"type": "minecraft:model", "model": f"{ns}:item/robit_flat"}})
+            report["robit_item"] = 1
         # Skins (`MekanismRobitSkins`): the base skin and the allay's own model, each with its two textures (the
         # texture index moves while the Robit walks).
         for prefix, model_file, skin_names in (("robit", "robit", ("robit", "robit2")), ("allay", "robit_allay", ("allay", "allay2"))):
