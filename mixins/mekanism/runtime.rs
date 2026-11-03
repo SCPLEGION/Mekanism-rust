@@ -1318,7 +1318,7 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
         TANKS.with_borrow_mut(|t| {
             t.insert(pos);
         });
-    } else if matches!(kind(id), Some(Kind::DynamicValve)) {
+    } else if matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve)) {
         BIG_TANKS.with_borrow_mut(|t| {
             t.insert(pos);
         });
@@ -1378,8 +1378,43 @@ fn tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldB
     });
 }
 
-/// The fluid in each formed dynamic tank (`RenderDynamicTank`): a box of the still texture inset 0.01 inside the
-/// casing, as tall as its stage of `1000 * height` says (all of it for a gas), from the floor of the interior.
+/// A fluid or chemical filling part of a multiblock's inside (`MultiblockTileEntityRenderer`): where its
+/// interior starts, the interior's size, how full it is and with what.
+struct Fill {
+    at: [i32; 3],
+    size: [i32; 3],
+    scale: f64,
+    chemical: Option<String>,
+}
+
+const FILL_KEYS: [&str; 9] = ["x", "y", "z", "l", "h", "w", "scale", "chem", "on"];
+
+/// Tells clients what a multiblock's master holds, as up to two fills of its client view.
+fn put_fills(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fills: &[Fill]) {
+    let mut shown = Compound::new();
+    let mut owned = Vec::new();
+    for i in 0..2 {
+        for k in FILL_KEYS {
+            owned.push(format!("f{i}_{k}"));
+        }
+        let Some(f) = fills.get(i) else {
+            put_int(&mut shown, &format!("f{i}_on"), 0);
+            continue;
+        };
+        for (k, v) in FILL_KEYS.iter().zip([f.at[0], f.at[1], f.at[2], f.size[0], f.size[1], f.size[2]]) {
+            put_int(&mut shown, &format!("f{i}_{k}"), v as u32);
+        }
+        put_int(&mut shown, &format!("f{i}_scale"), (f.scale * 1_000_000.0) as u32);
+        put_int(&mut shown, &format!("f{i}_chem"), chemical_index(f.chemical.as_deref()) as u32);
+        put_int(&mut shown, &format!("f{i}_on"), 1);
+    }
+    let owned: Vec<&str> = owned.iter().map(String::as_str).collect();
+    put_client(game, pos, entity, &owned, shown);
+}
+
+/// The fills each formed multiblock's master tells (`RenderDynamicTank`, `RenderThermoelectricBoiler`...): a
+/// box of the still texture inset 0.01 inside the casing, as tall as its stage of `1000 * height` says (all
+/// of it for a gas), from the floor of its part of the interior.
 fn big_tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
     const GASES: [&str; 7] = [
         "mekanism:steam",
@@ -1395,21 +1430,26 @@ fn big_tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWo
             let Some((id, c)) = game.native_client_block_entity(*pos) else {
                 return false;
             };
-            if !matches!(kind(id), Some(Kind::DynamicValve)) {
+            if !matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve)) {
                 return false;
             }
-            let (sx, sy, sz) = (get_int(c, "tank_box_size_x") as i32, get_int(c, "tank_box_size_y") as i32, get_int(c, "tank_box_size_z") as i32);
-            // The interior: the casing is one block thick on every side.
-            let (length, height, width) = (sx - 2, sy - 2, sz - 2);
-            if sx > 0 && length > 0 && height > 0 && width > 0 {
-                let chemical = usize::try_from(get_int(c, "tank_box_fluid") as i32).ok().and_then(|i| CHEMICALS.get(i));
+            for i in 0..2 {
+                let key = |k: &str| get_int(c, &format!("f{i}_{k}"));
+                if key("on") == 0 {
+                    continue;
+                }
+                let (length, height, width) = (key("l") as i32, key("h") as i32, key("w") as i32);
+                if length <= 0 || height <= 0 || width <= 0 {
+                    continue;
+                }
+                let chemical = usize::try_from(key("chem") as i32).ok().and_then(|i| CHEMICALS.get(i));
                 let gaseous = chemical.is_some_and(|(n, ..)| GASES.contains(n));
                 let max_stages = (height * 1000).max(1);
-                let scale = f64::from(get_int(c, "tank_box_scale")) / 1_000_000.0;
+                let scale = f64::from(key("scale")) / 1_000_000.0;
                 let stage = if gaseous { max_stages } else { max_stages.min((scale * f64::from(max_stages)) as i32) };
                 let max_y = (f64::from(height) * f64::from(stage) / f64::from(max_stages) - 0.02).max(0.02);
                 let (sprite, argb) = gauge_texture(chemical);
-                let (x, y, z) = (f64::from(get_int(c, "tank_box_x") as i32 + 1), f64::from(get_int(c, "tank_box_y") as i32 + 1), f64::from(get_int(c, "tank_box_z") as i32 + 1));
+                let (x, y, z) = (f64::from(key("x") as i32), f64::from(key("y") as i32), f64::from(key("z") as i32));
                 boxes.push(super::native_hooks::NativeWorldBox {
                     min: [x + 0.01, y + 0.01, z + 0.01],
                     max: [x + f64::from(length) - 0.01, y + max_y, z + f64::from(width) - 0.01],
@@ -10574,7 +10614,7 @@ fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     }
     if get_pos(&entity.nbt, "master") != Some(pos) {
         // Only the master draws the tank's contents.
-        put_flag(game, pos, entity, "tank_box_size_x", false);
+        put_fills(game, pos, entity, &[]);
         return;
     }
     let mut tank = get_tank(&entity.nbt, "fluid", dynamic_tank::capacity(get_long(&entity.nbt, "volume")));
@@ -10609,21 +10649,16 @@ fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     }
     put_tank(&mut entity.nbt, "fluid", &tank);
     // `RenderDynamicTank`: the box inside the casing, how full it is and with what, for the master to draw.
-    let mut shown = Compound::new();
-    if let Some(Tag::IntArray(b)) = entity.nbt.get(&JavaString::from("box")).cloned()
-        && b.len() == 6
-        && tank.amount > 0
-    {
-        for (k, v) in ["tank_box_x", "tank_box_y", "tank_box_z", "tank_box_size_x", "tank_box_size_y", "tank_box_size_z"].iter().zip(b.iter()) {
-            put_int(&mut shown, k, *v as u32);
-        }
-        let scale = tank.amount as f64 / tank.capacity.max(1) as f64;
-        put_int(&mut shown, "tank_box_scale", (scale * 1_000_000.0) as u32);
-        put_int(&mut shown, "tank_box_fluid", chemical_index(tank.chemical.as_deref()) as u32);
-    } else {
-        put_int(&mut shown, "tank_box_size_x", 0);
-    }
-    put_client(game, pos, entity, &["tank_box_x", "tank_box_y", "tank_box_z", "tank_box_size_x", "tank_box_size_y", "tank_box_size_z", "tank_box_scale", "tank_box_fluid"], shown);
+    let fills = match entity.nbt.get(&JavaString::from("box")).cloned() {
+        Some(Tag::IntArray(b)) if b.len() == 6 && tank.amount > 0 => vec![Fill {
+            at: [b[0] + 1, b[1] + 1, b[2] + 1],
+            size: [b[3] - 2, b[4] - 2, b[5] - 2],
+            scale: tank.amount as f64 / tank.capacity.max(1) as f64,
+            chemical: tank.chemical.clone(),
+        }],
+        _ => Vec::new(),
+    };
+    put_fills(game, pos, entity, &fills);
 }
 
 /// A sneaking right click with an empty hand on a dynamic valve switches it between filling the tank
@@ -10807,7 +10842,8 @@ pub(super) fn use_sps_port(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 /// on each side, with air, superheating elements and one full layer of pressure dispersers inside, the
 /// elements below the dispersers. The boiler, its valves and the Resistive Heaters touching its walls.
 #[allow(clippy::type_complexity)]
-fn find_boiler(game: &Game<'_>, start: [i32; 3]) -> Option<(boiler::Boiler, Vec<[i32; 3]>, Vec<[i32; 3]>)> {
+#[allow(clippy::type_complexity)]
+fn find_boiler(game: &Game<'_>, start: [i32; 3]) -> Option<(boiler::Boiler, Vec<[i32; 3]>, Vec<[i32; 3]>, [i32; 7])> {
     let (lo, hi, seen) = find_box(game, start, boiler::is_frame, boiler::MIN_SIZE, boiler::MAX_SIZE)?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
     let mut b = boiler::Boiler { volume: size(0) * size(1) * size(2), ..Default::default() };
@@ -10863,7 +10899,7 @@ fn find_boiler(game: &Game<'_>, start: [i32; 3]) -> Option<(boiler::Boiler, Vec<
             }
         }
     }
-    Some((b, valves, heaters))
+    Some((b, valves, heaters, [lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], layer]))
 }
 
 fn positions(nbt: &Compound, key: &str) -> Vec<[i32; 3]> {
@@ -10891,7 +10927,8 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
     if ticker == 0 {
         match find_boiler(game, pos) {
-            Some((b, valves, heaters)) => {
+            Some((b, valves, heaters, bounds)) => {
+                entity.nbt.insert("box".into(), Tag::IntArray(bounds.to_vec()));
                 for (key, v) in [
                     ("elements", b.elements),
                     ("volume", b.volume),
@@ -10907,11 +10944,13 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
             None => {
                 put_long(&mut entity.nbt, "volume", 0);
                 entity.nbt.remove(&JavaString::from("master"));
+                entity.nbt.remove(&JavaString::from("box"));
             }
         }
     }
     let b = boiler_of(&entity.nbt);
     if b.volume == 0 || get_pos(&entity.nbt, "master") != Some(pos) {
+        put_fills(game, pos, entity, &[]);
         return None;
     }
     let mut water = get_tank(&entity.nbt, "water", b.water_capacity());
@@ -10950,6 +10989,31 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     put_tank(&mut entity.nbt, "water", &water);
     put_tank(&mut entity.nbt, "steam", &steam);
     put_long(&mut entity.nbt, "boil_rate", boiled);
+    // `RenderThermoelectricBoiler`: the water below the dispersers and the steam above them.
+    let mut fills = Vec::new();
+    if let Some(Tag::IntArray(bx)) = entity.nbt.get(&JavaString::from("box")).cloned()
+        && bx.len() == 7
+    {
+        let (lo, hi, layer) = ([bx[0], bx[1], bx[2]], [bx[3], bx[4], bx[5]], bx[6]);
+        let (length, width) = (hi[0] - lo[0] - 1, hi[2] - lo[2] - 1);
+        if water.amount > 0 {
+            fills.push(Fill {
+                at: [lo[0] + 1, lo[1] + 1, lo[2] + 1],
+                size: [length, layer - lo[1] - 1, width],
+                scale: water.amount as f64 / water.capacity.max(1) as f64,
+                chemical: water.chemical.clone(),
+            });
+        }
+        if steam.amount > 0 {
+            fills.push(Fill {
+                at: [lo[0] + 1, layer + 1, lo[2] + 1],
+                size: [length, hi[1] - layer - 1, width],
+                scale: steam.amount as f64 / steam.capacity.max(1) as f64,
+                chemical: steam.chemical.clone(),
+            });
+        }
+    }
+    put_fills(game, pos, entity, &fills);
     Some(boiled > 0)
 }
 
