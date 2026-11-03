@@ -9,6 +9,13 @@ pub const ITEM: &str = "mekanism:robit";
 pub const MAX_ENERGY: u64 = 100_000;
 /// `EntityRobit.inventorySlots`: 27 storage slots, the energy slot, the smelting input and output.
 pub const INVENTORY_SLOTS: usize = 30;
+/// The slots after the 27 of storage (`EntityRobit`'s constructor).
+pub const ENERGY_SLOT: usize = 27;
+pub const SMELT_INPUT: usize = 28;
+pub const SMELT_OUTPUT: usize = 29;
+/// `ticksRequired`: five seconds, at `usage.energizedSmelter`'s 5 FE a tick.
+pub const SMELT_TICKS: u32 = 100;
+pub const SMELT_USAGE: u64 = 5;
 /// `DISTANCE_MULTIPLIER`: energy per block walked.
 const DISTANCE_MULTIPLIER: f64 = 1.5;
 /// `RobitAIFollow(this, 1, 4, 2)`: starts walking from 4 blocks, stops at 2.

@@ -17339,10 +17339,9 @@ pub(super) fn ui_draw(game: &Game<'_>, id: &str, batch: &mut horizon_client::hud
     } else if id == ROBIT_SCREEN {
         let o = robit_origin(batch);
         ROBIT_ORIGIN.with_borrow_mut(|v| *v = o);
-        if ROBIT_TAB.with(std::cell::Cell::get) == RobitTab::Inventory {
-            robit_draw_inventory(game, batch, o);
-        } else {
-            robit_draw(game, batch);
+        match ROBIT_TAB.with(std::cell::Cell::get) {
+            RobitTab::Main => robit_draw(game, batch),
+            tab => robit_draw_inventory(game, batch, o, tab),
         }
     }
 }
@@ -17793,6 +17792,7 @@ fn robit_tick(game: &mut Game<'_>, id: u32, players: &[RobitPlayer]) {
             energy = energy.saturating_sub(robit::travel_energy(step[0].hypot(step[1])));
         }
     }
+    robit_machinery(game, &mut data, &mut energy);
     put_long(&mut data, "energy", energy);
     game.native_with_mob(id, |m| {
         m.no_ai = true;
@@ -17803,6 +17803,73 @@ fn robit_tick(game: &mut Game<'_>, id: u32, players: &[RobitPlayer]) {
         }
         m.extra.mod_data = Some(data);
     });
+}
+
+/// The energy slot fills the Robit from the item in it, and the smelting slots cook (`EntityRobit.baseTick`).
+fn robit_machinery(game: &Game<'_>, data: &mut Compound, energy: &mut u64) {
+    let mut items = robit_items(data);
+    let mut changed = false;
+    // `EnergyInventorySlot.fillContainerOrConvert`: the item's energy, or a redstone's worth.
+    if let Some(stack) = items[robit::ENERGY_SLOT].as_mut()
+        && *energy < robit::MAX_ENERGY
+    {
+        if let Some(e) = item_energy_of(stack).filter(|e| e.can_discharge) {
+            let have = stored_energy(stack);
+            let moved = have.min(e.rate).min(robit::MAX_ENERGY - *energy);
+            if moved > 0 {
+                set_energy(stack, have - moved);
+                *energy += moved;
+                changed = true;
+            }
+        } else if let Some((_, value)) = REDSTONE_ENERGY.iter().find(|(id, _)| *id == &*stack.item)
+            && *energy + *value <= robit::MAX_ENERGY
+        {
+            *energy += *value;
+            stack.count -= 1;
+            changed = true;
+            if stack.count == 0 {
+                items[robit::ENERGY_SLOT] = None;
+            }
+        }
+    }
+    // The smelting recipe of the input, five seconds at the Energized Smelter's usage.
+    let mut progress = get_int(data, "progress");
+    let cooking = items[robit::SMELT_INPUT].as_ref().and_then(|s| world_recipes!(game).cook("minecraft:smelting", s));
+    match cooking {
+        Some(cooking) if *energy >= robit::SMELT_USAGE => {
+            let out = cooking.result.item.to_string();
+            let max = max_stack(game, &out);
+            let room = match &items[robit::SMELT_OUTPUT] {
+                None => max,
+                Some(o) if *o.item == *out => max.saturating_sub(o.count),
+                Some(_) => 0,
+            };
+            if room >= cooking.result.count {
+                *energy -= robit::SMELT_USAGE;
+                progress += 1;
+                if progress >= robit::SMELT_TICKS {
+                    progress = 0;
+                    if let Some(input) = items[robit::SMELT_INPUT].as_mut() {
+                        input.count -= 1;
+                        if input.count == 0 {
+                            items[robit::SMELT_INPUT] = None;
+                        }
+                    }
+                    match &mut items[robit::SMELT_OUTPUT] {
+                        Some(o) => o.count += cooking.result.count,
+                        slot => *slot = Some(stack_of(&out, cooking.result.count)),
+                    }
+                    changed = true;
+                }
+            }
+        }
+        Some(_) => {}
+        None => progress = 0,
+    }
+    put_int(data, "progress", progress);
+    if changed {
+        set_robit_items(data, &items);
+    }
 }
 
 /// A Robit died: it drops as its item with the energy and the name it had, and its slots spill
@@ -17838,6 +17905,9 @@ pub(super) fn use_mob(game: &mut Game<'_>, id: u32, claimed: &mut bool) {
     if game.native_on(MOD_ID) && ROBITS.with_borrow(|set| set.contains(&id)) {
         ROBIT_UI.with_borrow_mut(|ui| *ui = Some(id));
         game.native_open_ui(ROBIT_SCREEN);
+        let mut out = vec![6];
+        out.extend(id.to_be_bytes());
+        game.native_send_to_server(ROBIT_CHANNEL, &out);
         *claimed = true;
     }
 }
@@ -17858,6 +17928,8 @@ struct RobitView {
     energy: u64,
     follow: bool,
     pickup: bool,
+    /// The smelting progress, 0 to 100.
+    progress: u8,
     owner: String,
 }
 
@@ -17874,6 +17946,7 @@ fn send_robit_states(game: &mut Game<'_>, players: &[RobitPlayer]) {
         let mut out = id.to_be_bytes().to_vec();
         out.extend(get_long(&data, "energy").to_be_bytes());
         out.push(get_int(&data, "follow") as u8 | (get_int(&data, "pickup") as u8) << 1);
+        out.push((get_int(&data, "progress") * 100 / robit::SMELT_TICKS) as u8);
         out.extend(get_string(&data, "owner_name").unwrap_or_default().bytes());
         for p in players {
             game.native_send_to_player(p.uuid, ROBIT_STATE_CHANNEL, &out);
@@ -17882,7 +17955,7 @@ fn send_robit_states(game: &mut Game<'_>, players: &[RobitPlayer]) {
 }
 
 fn robit_state_payload(data: &[u8]) {
-    if data.len() < 13 {
+    if data.len() < 14 {
         return;
     }
     let id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
@@ -17892,7 +17965,8 @@ fn robit_state_payload(data: &[u8]) {
         energy: u64::from_be_bytes(energy),
         follow: data[12] & 1 != 0,
         pickup: data[12] & 2 != 0,
-        owner: String::from_utf8_lossy(&data[13..]).into_owned(),
+        progress: data[13],
+        owner: String::from_utf8_lossy(&data[14..]).into_owned(),
     };
     ROBIT_VIEWS.with_borrow_mut(|v| {
         v.insert(id, view);
@@ -17902,13 +17976,14 @@ fn robit_state_payload(data: &[u8]) {
 /// A button on the Robit's screen, on the server: go home, toggle pickup, toggle following
 /// (`GuiInteractionEntity.GO_HOME`, `PICKUP_DROPS`, `FOLLOW`).
 fn robit_op_payload(game: &mut Game<'_>, data: &[u8]) {
-    if data.len() == 7 && data[0] == 4 {
+    if data.len() == 8 && data[0] == 4 {
         let how = match data[6] {
             0 => slot_click::Click::Left,
             1 => slot_click::Click::Right,
             _ => slot_click::Click::Shift,
         };
-        robit_inventory_click(game, u32::from_be_bytes([data[1], data[2], data[3], data[4]]), data[5] as usize, how);
+        let tab = if data[7] == 2 { RobitTab::Smelting } else if data[7] == 1 { RobitTab::Inventory } else { RobitTab::Main };
+        robit_inventory_click(game, u32::from_be_bytes([data[1], data[2], data[3], data[4]]), data[5] as usize, how, tab);
         return;
     }
     let [op, a, b, c, d] = data[..] else {
@@ -18000,6 +18075,13 @@ fn robit_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         sprite(game, batch, "bar/horizontal_power", [0.0, 0.0, 2.0, 2.0], [o[0] + 28.0, o[1] + 75.0, 118.0 * fraction, 4.0]);
     }
     robit_draw_tabs(game, batch, o);
+    if let Some(r) = robit_inv_cell(RobitTab::Main, robit::ENERGY_SLOT, o) {
+        sprite(game, batch, "slot/power", [0.0, 0.0, 18.0, 18.0], r);
+        let item = ROBIT_SLOTS.with_borrow(|s| s.0.get(robit::ENERGY_SLOT).cloned().flatten());
+        if let Some((item, _)) = item {
+            game.native_item(batch, &item, [r[0] + 1.0, r[1] + 1.0], 16.0);
+        }
+    }
     for (icon, r, _) in ROBIT_BUTTONS {
         let rect = [o[0] + r[0], o[1] + r[1], r[2], r[3]];
         draw_button(game, batch, rect, inside(cursor, rect), true, 0xFFFF_FFFF, Some((icon, 18.0)));
@@ -18019,7 +18101,10 @@ fn robit_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
             return;
         }
     }
-    if ROBIT_TAB.with(std::cell::Cell::get) == RobitTab::Inventory {
+    if ROBIT_TAB.with(std::cell::Cell::get) != RobitTab::Main
+        || robit_inv_cell(RobitTab::Main, robit::ENERGY_SLOT, o).is_some_and(|r| inside(at, r))
+        || (0..36).any(|i| robit_inv_cell(RobitTab::Main, ROBIT_INV_ROBIT + i, o).is_some_and(|r| inside(at, r)))
+    {
         robit_inventory_press(game, at, button);
         return;
     }
@@ -18048,7 +18133,7 @@ thread_local! {
 
 // --- The Robit's inventory screen (GuiRobitInventory) ------------------------------------------------------
 
-const ROBIT_INV_ROBIT: usize = 27;
+const ROBIT_INV_ROBIT: usize = 30;
 /// The screen's list: the Robit's 27 slots, then the player's inventory (rows from the top, then the hotbar).
 const ROBIT_INV_ALL: usize = ROBIT_INV_ROBIT + 36;
 const ROBIT_ITEMS_CHANNEL: &str = "mekanism:robit_items";
@@ -18058,6 +18143,7 @@ enum RobitTab {
     #[default]
     Main,
     Inventory,
+    Smelting,
 }
 
 thread_local! {
@@ -18100,7 +18186,7 @@ fn player_slot(i: usize) -> usize {
 }
 
 /// A click on the Robit's inventory screen, on the server (`doClick` with the cursor kept here).
-fn robit_inventory_click(game: &mut Game<'_>, id: u32, slot: usize, how: slot_click::Click) {
+fn robit_inventory_click(game: &mut Game<'_>, id: u32, slot: usize, how: slot_click::Click, tab: RobitTab) {
     let Some(player) = game.native_acting_player() else {
         return;
     };
@@ -18125,14 +18211,16 @@ fn robit_inventory_click(game: &mut Game<'_>, id: u32, slot: usize, how: slot_cl
         slots.push(game.inventory.get(player_slot(i)).cloned().flatten().map(|s| max(game, s)));
     }
     let mut cursor = ROBIT_WATCH.with_borrow_mut(|w| w.get_mut(&name).and_then(|e| e.1.take())).map(|s| max(game, s));
-    let other: Vec<usize> = if slot < ROBIT_INV_ROBIT { (ROBIT_INV_ROBIT..ROBIT_INV_ALL).collect() } else { (0..ROBIT_INV_ROBIT).collect() };
-    slot_click::click(&mut slots, &mut cursor, slot, how, &|_, _| true, &other);
-    let mut items: Vec<Option<ItemStack>> = slots[..ROBIT_INV_ROBIT].iter().map(|s| s.as_ref().map(|w| w.stack.clone())).collect();
-    items.resize(robit::INVENTORY_SLOTS, None);
-    // The energy and smelting slots keep what they held.
-    for i in ROBIT_INV_ROBIT..robit::INVENTORY_SLOTS {
-        items[i] = robit_slots[i].clone();
-    }
+    let other: Vec<usize> = if slot < ROBIT_INV_ROBIT { (ROBIT_INV_ROBIT..ROBIT_INV_ALL).collect() } else { robit_visible(tab).iter().map(|(i, _)| *i).collect() };
+    // `EnergyInventorySlot.fillOrConvert`, the smelting input's `containsRecipe` and the output slot.
+    let allowed = |i: usize, w: &Wrapped| match i {
+        robit::ENERGY_SLOT => item_energy_of(&w.stack).is_some_and(|e| e.can_discharge) || REDSTONE_ENERGY.iter().any(|(id, _)| *id == &*w.stack.item),
+        robit::SMELT_INPUT => world_recipes!(game).cook("minecraft:smelting", &w.stack).is_some(),
+        robit::SMELT_OUTPUT => false,
+        _ => true,
+    };
+    slot_click::click(&mut slots, &mut cursor, slot, how, &allowed, &other);
+    let items: Vec<Option<ItemStack>> = slots[..ROBIT_INV_ROBIT].iter().map(|s| s.as_ref().map(|w| w.stack.clone())).collect();
     set_robit_items(&mut data, &items);
     for i in 0..36 {
         let at = player_slot(i);
@@ -18209,22 +18297,33 @@ fn robit_items_payload(data: &[u8]) {
     ROBIT_SLOTS.with_borrow_mut(|v| *v = (slots, cursor));
 }
 
-const ROBIT_TABS: [(&str, RobitTab); 2] = [("button/main", RobitTab::Main), ("button/inventory", RobitTab::Inventory)];
+const ROBIT_TABS: [(&str, RobitTab); 3] = [("button/main", RobitTab::Main), ("button/inventory", RobitTab::Inventory), ("button/smelting", RobitTab::Smelting)];
 
 fn robit_tab_rect(i: usize, o: [f32; 2]) -> [f32; 4] {
     // The Java order is main, crafting, inventory, smelting, repair, 20 apart.
-    let row = [0.0, 2.0][i];
+    let row = [0.0, 2.0, 3.0][i];
     [o[0] + ROBIT_WINDOW[0] + 3.0, o[1] + 10.0 + 20.0 * row, 18.0, 18.0]
 }
 
-fn robit_inv_cell(slot: usize, o: [f32; 2]) -> [f32; 4] {
+/// The Robit's slots a tab shows, with where each sits (`EntityRobit`'s slot constructors).
+fn robit_visible(tab: RobitTab) -> Vec<(usize, [f32; 2])> {
+    match tab {
+        RobitTab::Main => vec![(robit::ENERGY_SLOT, [153.0, 17.0])],
+        RobitTab::Inventory => (0..ROBIT_INV_ROBIT - 3).map(|i| (i, [8.0 + 18.0 * (i % 9) as f32, 18.0 + 18.0 * (i / 9) as f32])).collect(),
+        RobitTab::Smelting => vec![(robit::SMELT_INPUT, [51.0, 35.0]), (robit::SMELT_OUTPUT, [116.0, 35.0])],
+    }
+}
+
+/// Where slot `slot` of the screen's list is drawn (slots are 18 px cells, the item 1 px in).
+fn robit_inv_cell(tab: RobitTab, slot: usize, o: [f32; 2]) -> Option<[f32; 4]> {
     if slot < ROBIT_INV_ROBIT {
-        [o[0] + 8.0 + 18.0 * (slot % 9) as f32, o[1] + 18.0 + 18.0 * (slot / 9) as f32, 18.0, 18.0]
+        let (_, at) = robit_visible(tab).into_iter().find(|(i, _)| *i == slot)?;
+        Some([o[0] + at[0] - 1.0, o[1] + at[1] - 1.0, 18.0, 18.0])
     } else {
         let p = slot - ROBIT_INV_ROBIT;
         let (row, col) = (p / 9, p % 9);
         let y = if row < 3 { 84.0 + 18.0 * row as f32 } else { 142.0 };
-        [o[0] + 8.0 + 18.0 * col as f32, o[1] + y, 18.0, 18.0]
+        Some([o[0] + 7.0 + 18.0 * col as f32, o[1] + y - 1.0, 18.0, 18.0])
     }
 }
 
@@ -18238,17 +18337,29 @@ fn robit_draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o
     }
 }
 
-fn robit_draw_inventory(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2]) {
+fn robit_draw_inventory(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2], tab: RobitTab) {
     nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [o[0] - 3.0, o[1] - 3.0, ROBIT_WINDOW[0] + 6.0, ROBIT_WINDOW[1] + 6.0], 0xBFFF_FFFF);
     nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [o[0], o[1], ROBIT_WINDOW[0], ROBIT_WINDOW[1]], 0xFFFF_FFFF);
     robit_draw_tabs(game, batch, o);
     centred(game, batch, "Robit", o[0], ROBIT_WINDOW[0], o[1] + 5.0, 0x40_4040);
     game.native_text(batch, "Inventory", [o[0] + 8.0, o[1] + 73.0], 0x40_4040, false);
+    if tab == RobitTab::Smelting {
+        let id = ROBIT_UI.with_borrow(|u| *u).unwrap_or(0);
+        let view = ROBIT_VIEWS.with_borrow(|v| v.get(&id).cloned()).unwrap_or_default();
+        sprite(game, batch, "progress/bar/empty", [0.0, 0.0, 25.0, 9.0], [o[0] + 78.0, o[1] + 38.0, 25.0, 9.0]);
+        let done = (f32::from(view.progress) / 100.0 * 25.0).floor();
+        if done > 0.0 {
+            sprite(game, batch, "progress/bar/full", [0.0, 0.0, done, 9.0], [o[0] + 78.0, o[1] + 38.0, done, 9.0]);
+        }
+    }
     let cursor = game.native_cursor();
     let (slots, held) = ROBIT_SLOTS.with_borrow(|s| s.clone());
     let mut hovered = None;
+    let tab = ROBIT_TAB.with(std::cell::Cell::get);
     for slot in 0..ROBIT_INV_ALL {
-        let r = robit_inv_cell(slot, o);
+        let Some(r) = robit_inv_cell(tab, slot, o) else {
+            continue;
+        };
         sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], r);
         let stack = if slot < ROBIT_INV_ROBIT {
             slots.get(slot).cloned().flatten()
@@ -18284,12 +18395,13 @@ fn robit_inventory_press(game: &mut Game<'_>, at: [f32; 2], button: u8) {
     };
     let o = ROBIT_ORIGIN.with_borrow(|o| *o);
     let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let tab = ROBIT_TAB.with(std::cell::Cell::get);
     for slot in 0..ROBIT_INV_ALL {
-        if inside(at, robit_inv_cell(slot, o)) {
+        if robit_inv_cell(tab, slot, o).is_some_and(|r| inside(at, r)) {
             let how = if shift { 2 } else { button.min(1) };
             let mut out = vec![4];
             out.extend(id.to_be_bytes());
-            out.extend([slot as u8, how]);
+            out.extend([slot as u8, how, tab as u8]);
             game.native_send_to_server(ROBIT_CHANNEL, &out);
         }
     }
@@ -18298,7 +18410,7 @@ fn robit_inventory_press(game: &mut Game<'_>, at: [f32; 2], button: u8) {
 fn robit_set_tab(game: &mut Game<'_>, tab: RobitTab) {
     ROBIT_TAB.with(|t| t.set(tab));
     if let Some(id) = ROBIT_UI.with_borrow(|u| *u) {
-        let mut out = vec![if tab == RobitTab::Inventory { 6 } else { 5 }];
+        let mut out = vec![6];
         out.extend(id.to_be_bytes());
         game.native_send_to_server(ROBIT_CHANNEL, &out);
     }
@@ -18306,10 +18418,12 @@ fn robit_set_tab(game: &mut Game<'_>, tab: RobitTab) {
 
 /// The mod screen closed (Escape, or another screen replaced it): the Robit's inventory lets go of the cursor.
 pub(super) fn ui_closed(game: &mut Game<'_>, id: &str) {
-    if id == ROBIT_SCREEN && ROBIT_TAB.with(std::cell::Cell::get) == RobitTab::Inventory {
-        robit_set_tab(game, RobitTab::Main);
-    }
     if id == ROBIT_SCREEN {
         ROBIT_TAB.with(|t| t.set(RobitTab::Main));
+        if let Some(rid) = ROBIT_UI.with_borrow(|u| *u) {
+            let mut out = vec![5];
+            out.extend(rid.to_be_bytes());
+            game.native_send_to_server(ROBIT_CHANNEL, &out);
+        }
     }
 }
