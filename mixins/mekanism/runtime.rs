@@ -663,6 +663,29 @@ fn tick_machine(game: &mut Game<'_>, entity: &mut ModBlockEntity, recipe: &str, 
         find_operation(game, recipe, entity.items.first().cloned().flatten(), &middle)
     };
     let before = output.count;
+    // The issues the warning tab lists (`RecipeError`): bit 0 energy, 1 input, 2 output room, 3 input without a recipe.
+    let mut warn = 0;
+    match &operation {
+        None if input.item.is_some() && waiting.is_none() => warn |= 8,
+        None => {}
+        Some(op) => {
+            let fits = match &output.item {
+                None => op.output_count <= max_stack,
+                Some(item) => *item == op.output && output.count + op.output_count <= max_stack,
+            };
+            if !fits {
+                warn |= 4;
+            } else if input.count < op.input_count || (recipe == "combining" && middle.count < op.extra_count) {
+                warn |= 2;
+            } else if m.energy.stored < m.usage {
+                warn |= 1;
+            }
+        }
+    }
+    if waiting.is_some() {
+        warn |= 4;
+    }
+    put_int(&mut entity.nbt, "warn", warn);
     let extra = (recipe == "combining").then_some(&mut middle);
     m.tick(&mut input, &mut output, extra, operation.as_ref(), max_stack);
     if output.count != before
@@ -5071,7 +5094,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
     if tabs(&entity.id) & TAB_REDSTONE != 0 {
         entity.data.resize(DATA_GAUGES + l.gauges.len() * GAUGE_SLOTS, 0);
         let signal = get_int(&entity.nbt, "powered") & 3;
-        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2) as i32);
+        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2 | (get_int(&entity.nbt, "warn") & 15) << 4) as i32);
         // Then, for the side configuration window, each type's faces in relative-side order and
         // which types' auto-eject is off.
         if tabs(&entity.id) & TAB_SIDES != 0 {
@@ -8007,6 +8030,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
     }
     draw_extras(game, batch, block, data, origin);
+    draw_warning_tab(game, batch, block, &l, data, origin, width);
     if kind(block) == Some(Kind::FissionPort) && get(0) > 0.0 {
         draw_fission(game, batch, data, origin);
     }
@@ -8087,7 +8111,64 @@ fn inside(at: [f32; 2], rect: [f32; 4]) -> bool {
 
 /// The tooltips: a gauge's chemical and amount, the power bar's stored and maximum energy, the
 /// progress bar's percent, and the energy tab's usage and upgrades.
+/// `GuiWarningTab`: the issues listed by the warning tab, in `WarningType` order.
+fn warnings(block: &str, l: &Layout, data: &[i32]) -> Vec<&'static str> {
+    if tabs(block) & TAB_REDSTONE == 0 {
+        return vec![];
+    }
+    let word = data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32;
+    let (control, now, last) = redstone_of(l, data);
+    let mut out = vec![];
+    for (bit, text) in [
+        (3, " - Input does not produce output"),
+        (1, " - No matching recipe or not enough input"),
+        (2, " - Not enough room in output"),
+        (0, " - Not enough energy to operate"),
+    ] {
+        if matches!(kind(block), Some(Kind::Machine(..))) && word >> 4 & (1 << bit) != 0 {
+            out.push(text);
+        }
+    }
+    match control {
+        RedstoneControl::High if !now => out.push(" - Redstone signal absent, provide one to activate."),
+        RedstoneControl::Low if now => out.push(" - Redstone signal present, remove it to activate."),
+        RedstoneControl::Pulse if !(now && !last) => out.push(" - Redstone pulse required to activate."),
+        _ => {}
+    }
+    out
+}
+
+/// The warning tab: left of the screen at 109, on the right where a heat tab takes the left.
+fn warning_rect(block: &str, width: f32) -> [f32; 4] {
+    if matches!(kind(block), Some(Kind::Heater | Kind::FuelwoodHeater)) { [width, 109.0, 26.0, 26.0] } else { [-26.0, 109.0, 26.0, 26.0] }
+}
+
+fn draw_warning_tab(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, l: &Layout, data: &[i32], origin: [f32; 2], width: f32) {
+    if warnings(block, l, data).is_empty() {
+        return;
+    }
+    let r = warning_rect(block, width);
+    let side = if r[0] < 0.0 { "left" } else { "right" };
+    sprite(game, batch, &format!("tab/warning_info_{side}"), [0.0, 0.0, 26.0, 26.0], [origin[0] + r[0], origin[1] + r[1], 26.0, 26.0]);
+}
+
+fn warning_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    let Some(l) = layout(block) else {
+        return false;
+    };
+    let list = warnings(block, &l, data);
+    if list.is_empty() || !inside(at, warning_rect(block, screen_width(block))) {
+        return false;
+    }
+    lines.push("§eIssues:".to_owned());
+    lines.extend(list.iter().map(|t| (*t).to_owned()));
+    true
+}
+
 pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
+    if !qio_select_open(block) && warning_tooltip(block, data, at, lines) {
+        return;
+    }
     if qio_select_open(block) {
         if inside(at, QIO_BACK) {
             lines.push("Back".to_owned());
