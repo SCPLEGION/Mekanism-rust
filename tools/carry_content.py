@@ -94,10 +94,10 @@ def pipe_declaration(size):
             "shapes": {"property": "up", "values": {"true": box, "false": box}}}
 
 
-def pipe_models(ns, out, name, blockstate):
+def pipe_models(ns, out, name, blockstate, report=None):
     """Vanilla element models for a transmitter whose blockstate uses Mekanism's OBJ model, taken from the OBJ
     itself: per side the arm of `<side>NORMAL` and the centre face of `<side>NONE`, as a multipart blockstate.
-    Returns its size, or None. (The push and pull arms need the connection modes, which are not synced.)"""
+    Returns its size, or None."""
     try:
         model_id = blockstate["variants"][""]["model"]
     except (KeyError, TypeError):
@@ -142,6 +142,18 @@ def pipe_models(ns, out, name, blockstate):
         for f in el["faces"].values():
             f["texture"] = "#center" if f["texture"].startswith("#center") else "#side"
         return el
+
+    # The push and pull arms (`<side>PUSH`, `<side>PULL`) are not boxes: the game draws their quads as world models
+    # (north's, turned to each side by the bundle) where a side is set to push or pull.
+    side_png = next(iter(SRC.glob(f"**/textures/{side.split(':', 1)[1]}.png")), None)
+    if side_png is not None:
+        for mode in ("PUSH", "PULL"):
+            obj = next((o for o in obj_models.parse(text) if o["name"] == "north" + mode), None)
+            if obj is None:
+                continue
+            quads = [([(p[0] - 0.5, p[1] - 0.5, p[2] - 0.5) for p, _ in quad], [(uv[0], 1 - uv[1]) for _, uv in quad])
+                     for quad in obj["faces"] if len(quad) == 4]
+            worn_models.build_quads_world_model(ns, f"{name}_{mode.lower()}", quads, side_png, out, report if report is not None else {})
 
     tex = {"particle": center, "center": center, "side": side}
     base = f"{ns}:block/transmitter/horizon/{name}"
@@ -457,16 +469,41 @@ def build_module(ns, out):
             worn_models.build_element_world_model(ns, "liquifier_blade", json.loads(blade.read_text()), texture, out, report)
     if ns == "mekanism":
         # The Robit (`RenderRobit`): its element model, the glowing eyes and back light apart from the body.
-        robit = next((d / ns / "models/robit/robit.json" for d in search if (d / ns / "models/robit/robit.json").is_file()), None)
-        skin = next((d / ns / "textures/entity/robit/robit.png" for d in search
-                     if (d / ns / "textures/entity/robit/robit.png").is_file()), None)
-        if robit is not None and skin is not None:
+        # The Robit item (`RenderRobitItem`) draws its base skin model; Horizon has no such special model, so the item
+        # shows the same elements as a plain item model with the base texture.
+        robit_model = next((d / ns / "models/robit/robit.json" for d in search if (d / ns / "models/robit/robit.json").is_file()), None)
+        robit_skin = next((d / ns / "textures/entity/robit/robit.png" for d in search
+                           if (d / ns / "textures/entity/robit/robit.png").is_file()), None)
+        if robit_model is not None and robit_skin is not None:
+            item_model = json.loads(robit_model.read_text())
+            item_model["textures"] = {"robit": f"{ns}:item/robit_skin", "particle": f"{ns}:item/robit_skin"}
+            write_json(out / "assets" / ns / "models" / "item" / "robit_flat.json", item_model)
+            (out / "assets" / ns / "textures" / "item").mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(robit_skin, out / "assets" / ns / "textures" / "item" / "robit_skin.png")
+            write_json(out / "assets" / ns / "items" / "robit.json", {"model": {"type": "minecraft:model", "model": f"{ns}:item/robit_flat"}})
+            report["robit_item"] = 1
+        # Skins (`MekanismRobitSkins`): the base skin and the allay's own model, each with its two textures (the
+        # texture index moves while the Robit walks).
+        for prefix, model_file, skin_names in (("robit", "robit", ("robit", "robit2")), ("allay", "robit_allay", ("allay", "allay2"))):
+            robit = next((d / ns / f"models/robit/{model_file}.json" for d in search
+                          if (d / ns / f"models/robit/{model_file}.json").is_file()), None)
+            if robit is None:
+                continue
             data = json.loads(robit.read_text())
-            for name, glow in (("robit_body", False), ("robit_glow", True)):
-                part = {"elements": [e for e in data["elements"] if bool(e.get("light_emission")) == glow]}
-                worn_models.build_element_world_model(ns, name, part, skin, out, report, (8, 0, 8))
-            # The skin previews (`GuiRobitSkinSelectScroll`) turn each skin's body, one model per texture.
-            body = {"elements": [e for e in data["elements"] if not e.get("light_emission")]}
+            for index, skin_name in enumerate(skin_names):
+                skin = next((d / ns / f"textures/entity/robit/{skin_name}.png" for d in search
+                             if (d / ns / f"textures/entity/robit/{skin_name}.png").is_file()), None)
+                if skin is None:
+                    continue
+                for part_name, glow in (("body", False), ("glow", True)):
+                    part = {"elements": [e for e in data["elements"] if bool(e.get("light_emission")) == glow]}
+                    suffix = "" if index == 0 else str(index + 1)
+                    worn_models.build_element_world_model(ns, f"{prefix}_{part_name}{suffix}", part, skin, out, report, (8, 0, 8))
+    if ns == "mekanism":
+        # The skin previews (`GuiRobitSkinSelectScroll`) turn each skin's body, one model per texture of the skin.
+        robit = next((d / ns / "models/robit/robit.json" for d in search if (d / ns / "models/robit/robit.json").is_file()), None)
+        if robit is not None:
+            body = {"elements": [e for e in json.loads(robit.read_text())["elements"] if not e.get("light_emission")]}
             for skin_json in sorted({f for d in search for f in (d.parent / "data" / ns / "mekanism" / "robit_skin").glob("*.json")}, key=lambda f: f.name):
                 for index, texture_id in enumerate(json.loads(skin_json.read_text()).get("textures", [])):
                     tex_ns, tex_name = texture_id.split(":")
@@ -474,7 +511,21 @@ def build_module(ns, out):
                                 if (d / tex_ns / "textures/entity/robit" / f"{tex_name}.png").is_file()), None)
                     if png is not None:
                         suffix = "" if index == 0 else f"_{index}"
-                        worn_models.build_element_world_model(ns, f"robit_body_{skin_json.stem}{suffix}", body, png, out, report, (8, 0, 8))
+                        worn_models.build_element_world_model(ns, f"robit_preview_{skin_json.stem}{suffix}", body, png, out, report, (8, 0, 8))
+    if ns == "mekanism":
+        # The Personal Chest (`RenderPersonalChest`): vanilla's chest parts in Mekanism's skin, the lid turned.
+        chest = next((d / ns / "textures/block/models/personal_chest.png" for d in search
+                      if (d / ns / "textures/block/models/personal_chest.png").is_file()), None)
+        if chest is not None:
+            worn_models.build_vanilla_world_model(ns, "personal_chest", "minecraft:chest#main", (-8, 0, -8), chest, out, report)
+    if ns == "mekanism":
+        # The Industrial Alarm's bulb (`RenderIndustrialAlarm`), centred on its axis.
+        bulb = next((d / ns / "models/block/industrial_alarm_active_bulb.json" for d in search
+                     if (d / ns / "models/block/industrial_alarm_active_bulb.json").is_file()), None)
+        tex = next((d / ns / "textures/block/models/industrial_alarm_active.png" for d in search
+                    if (d / ns / "textures/block/models/industrial_alarm_active.png").is_file()), None)
+        if bulb is not None and tex is not None:
+            worn_models.build_element_world_model(ns, "alarm_bulb", json.loads(bulb.read_text()), tex, out, report, (0, 0, 0))
     if ns == "mekanism":
         # Moving parts of machines (`RenderSeismicVibrator`, `RenderPigmentMixer`): their shafts are world models.
         for model_name, name, center in (("vibrator_shaft", "vibrator_shaft", (8, 8, 8)),
@@ -523,7 +574,7 @@ def build_module(ns, out):
             path.write_text(json.dumps(lever_blockstate(name, blockstate, ns), indent=2) + "\n")
         declaration = {"template": template}
         if template == PIPE_TEMPLATE:
-            size = pipe_models(ns, out, name, blockstate)
+            size = pipe_models(ns, out, name, blockstate, report)
             if size:
                 declaration = pipe_declaration(size)
                 report["pipes"] = report.get("pipes", 0) + 1
