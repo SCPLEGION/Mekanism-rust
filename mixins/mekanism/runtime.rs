@@ -1327,7 +1327,7 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
         FUSIONS.with_borrow_mut(|t| {
             t.insert(pos);
         });
-    } else if matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation | Kind::TurbineValve)) {
+    } else if matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation | Kind::TurbineValve | Kind::FissionPort)) {
         BIG_TANKS.with_borrow_mut(|t| {
             t.insert(pos);
         });
@@ -1394,9 +1394,11 @@ struct Fill {
     size: [i32; 3],
     scale: f64,
     chemical: Option<String>,
+    /// A slightly smaller box, so that it does not fight the one it sits in (a reactor's heated coolant).
+    shrunk: bool,
 }
 
-const FILL_KEYS: [&str; 9] = ["x", "y", "z", "l", "h", "w", "scale", "chem", "on"];
+const FILL_KEYS: [&str; 10] = ["x", "y", "z", "l", "h", "w", "scale", "chem", "on", "shrunk"];
 
 /// Tells clients what a multiblock's master holds, as up to two fills of its client view.
 fn put_fills(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fills: &[Fill]) {
@@ -1416,6 +1418,7 @@ fn put_fills(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fi
         put_int(&mut shown, &format!("f{i}_scale"), (f.scale * 1_000_000.0) as u32);
         put_int(&mut shown, &format!("f{i}_chem"), chemical_index(f.chemical.as_deref()) as u32);
         put_int(&mut shown, &format!("f{i}_on"), 1);
+        put_int(&mut shown, &format!("f{i}_shrunk"), u32::from(f.shrunk));
     }
     let owned: Vec<&str> = owned.iter().map(String::as_str).collect();
     put_client(game, pos, entity, &owned, shown);
@@ -1439,7 +1442,7 @@ fn big_tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWo
             let Some((id, c)) = game.native_client_block_entity(*pos) else {
                 return false;
             };
-            if !matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation | Kind::TurbineValve)) {
+            if !matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation | Kind::TurbineValve | Kind::FissionPort)) {
                 return false;
             }
             for i in 0..2 {
@@ -1459,12 +1462,29 @@ fn big_tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWo
                 let max_y = (f64::from(height) * f64::from(stage) / f64::from(max_stages) - 0.02).max(0.02);
                 let (sprite, argb) = gauge_texture(chemical);
                 let (x, y, z) = (f64::from(key("x") as i32), f64::from(key("y") as i32), f64::from(key("z") as i32));
+                // `renderObject(min, min, min, length - 0.02, maxY, width - 0.02)`: the two corners, not a size.
+                let (lo, hi) = if key("shrunk") != 0 { (0.02, 0.03) } else { (0.01, 0.02) };
                 boxes.push(super::native_hooks::NativeWorldBox {
-                    min: [x + 0.01, y + 0.01, z + 0.01],
-                    max: [x + f64::from(length) - 0.01, y + max_y, z + f64::from(width) - 0.01],
+                    min: [x + lo, y + lo, z + lo],
+                    max: [x + f64::from(length) - hi, y + max_y, z + f64::from(width) - hi],
                     colors: [argb; 6],
                     sprite: Some(sprite),
                 });
+            }
+            // The fuel assemblies of a burning reactor glow: a translucent box round each column, a bit taller than
+            // the stack to take in the control rod under it, with no top or bottom.
+            if let Some(Tag::IntArray(columns)) = c.get(&JavaString::from("glow")) {
+                let glow = (0x99_u32 << 24) | 0x76E0EC;
+                for column in columns.chunks(4).filter(|c| c.len() == 4) {
+                    let (x, y, z) = (f64::from(column[0]), f64::from(column[1]), f64::from(column[2]));
+                    let tall = f64::from(column[3]) + 0.625;
+                    boxes.push(super::native_hooks::NativeWorldBox {
+                        min: [x + 0.05, y + 0.01 * tall, z + 0.05],
+                        max: [x + 0.95, y + 0.99 * tall, z + 0.95],
+                        colors: [glow, glow, 0, 0, glow, glow],
+                        sprite: None,
+                    });
+                }
             }
             true
         });
@@ -4061,6 +4081,7 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
             size: [2, tower.height as i32 - 2, 2],
             scale: (water.amount as f64 / water.capacity.max(1) as f64).min(1.0),
             chemical: water.chemical.clone(),
+            shrunk: false,
         }]
     } else {
         Vec::new()
@@ -5264,7 +5285,8 @@ fn free_runners_use(game: &mut Game<'_>, claimed: &mut bool) {
 /// `FissionReactorValidator`, simplified: the frame blocks joined to `start` must be exactly the shell
 /// of a box 3 to 18 on each side, with fuel assemblies, control rods or air inside. The reactor and its
 /// ports.
-fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, Vec<[i32; 3]>)> {
+#[allow(clippy::type_complexity)]
+fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, Vec<[i32; 3]>, [i32; 3], [i32; 3], Vec<[i32; 4]>)> {
     let (lo, hi, seen) = find_box(game, start, fission::is_frame, fission::MIN_SIZE, fission::MAX_SIZE)?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
     let mut reactor = fission::Reactor { volume: size(0) * size(1) * size(2), ..Default::default() };
@@ -5288,7 +5310,25 @@ fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, V
             }
         }
     }
-    (reactor.assemblies > 0).then_some((reactor, ports))
+    // Each column of fuel assemblies: its lowest block and how many are stacked (`FormedAssembly`).
+    let mut columns = Vec::new();
+    for x in lo[0] + 1..hi[0] {
+        for z in lo[2] + 1..hi[2] {
+            let mut y = lo[1] + 1;
+            while y < hi[1] {
+                if block_name(game, [x, y, z]) == "mekanismgenerators:fission_fuel_assembly" {
+                    let start = y;
+                    while y < hi[1] && block_name(game, [x, y, z]) == "mekanismgenerators:fission_fuel_assembly" {
+                        y += 1;
+                    }
+                    columns.push([x, start, z, y - start]);
+                } else {
+                    y += 1;
+                }
+            }
+        }
+    }
+    (reactor.assemblies > 0).then_some((reactor, ports, lo, [size(0) as i32, size(1) as i32, size(2) as i32], columns))
 }
 
 const FISSION_PORT: &str = "mekanismgenerators:fission_reactor_port";
@@ -5352,7 +5392,9 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
     if ticker == 0 {
         match find_reactor(game, pos) {
-            Some((r, ports)) => {
+            Some((r, ports, lo, size, columns)) => {
+                entity.nbt.insert("box".into(), Tag::IntArray(vec![lo[0], lo[1], lo[2], size[0], size[1], size[2]]));
+                entity.nbt.insert("columns".into(), Tag::IntArray(columns.concat()));
                 put_long(&mut entity.nbt, "assemblies", r.assemblies);
                 put_long(&mut entity.nbt, "volume", r.volume);
                 let master = ports.first().copied().unwrap_or(pos);
@@ -5362,11 +5404,13 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
             None => {
                 put_long(&mut entity.nbt, "assemblies", 0);
                 entity.nbt.remove(&JavaString::from("master"));
+                entity.nbt.remove(&JavaString::from("box"));
             }
         }
     }
     let r = fission::Reactor { assemblies: get_long(&entity.nbt, "assemblies"), volume: get_long(&entity.nbt, "volume") };
     if r.assemblies == 0 || get_pos(&entity.nbt, "master") != Some(pos) {
+        put_fills(game, pos, entity, &[]);
         return;
     }
     let ports: Vec<[i32; 3]> = match entity.nbt.get(&JavaString::from("ports")) {
@@ -5415,6 +5459,28 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     put_tank(&mut entity.nbt, "water", &water);
     put_tank(&mut entity.nbt, "steam", &steam);
     put_tank(&mut entity.nbt, "waste", &waste);
+    // `RenderFissionReactor`: the coolant (water) and the heated coolant (steam) fill the inside, and the
+    // assemblies glow while it burns.
+    let mut fills = Vec::new();
+    if let Some(Tag::IntArray(b)) = entity.nbt.get(&JavaString::from("box")).cloned()
+        && b.len() == 6
+    {
+        let (at, size) = ([b[0] + 1, b[1] + 1, b[2] + 1], [b[3] - 2, b[4] - 2, b[5] - 2]);
+        if water.amount > 0 {
+            fills.push(Fill { at, size, scale: water.amount as f64 / water.capacity.max(1) as f64, chemical: water.chemical.clone(), shrunk: false });
+        }
+        if steam.amount > 0 {
+            fills.push(Fill { at, size, scale: steam.amount as f64 / steam.capacity.max(1) as f64, chemical: steam.chemical.clone(), shrunk: true });
+        }
+    }
+    put_fills(game, pos, entity, &fills);
+    let columns = match entity.nbt.get(&JavaString::from("columns")) {
+        Some(Tag::IntArray(v)) if get_long(&entity.nbt, "active") == 1 => v.clone(),
+        _ => Vec::new(),
+    };
+    let mut glow = Compound::new();
+    glow.insert("glow".into(), Tag::IntArray(columns));
+    put_client(game, pos, entity, &["glow"], glow);
 }
 
 /// A right click with an empty hand on a fission port: sneaking switches the reactor on or off, else it
@@ -10739,6 +10805,7 @@ fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
             size: [b[3] - 2, b[4] - 2, b[5] - 2],
             scale: tank.amount as f64 / tank.capacity.max(1) as f64,
             chemical: tank.chemical.clone(),
+            shrunk: false,
         }],
         _ => Vec::new(),
     };
@@ -11086,6 +11153,7 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
                 size: [length, layer - lo[1] - 1, width],
                 scale: water.amount as f64 / water.capacity.max(1) as f64,
                 chemical: water.chemical.clone(),
+                shrunk: false,
             });
         }
         if steam.amount > 0 {
@@ -11094,6 +11162,7 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
                 size: [length, hi[1] - layer - 1, width],
                 scale: steam.amount as f64 / steam.capacity.max(1) as f64,
                 chemical: steam.chemical.clone(),
+                shrunk: false,
             });
         }
     }
@@ -11313,6 +11382,7 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
             size: [b[3] - 2, height, b[5] - 2],
             scale: steam.amount as f64 / steam.capacity.max(1) as f64,
             chemical: steam.chemical.clone(),
+            shrunk: false,
         });
     }
     put_fills(game, pos, entity, &fills);
