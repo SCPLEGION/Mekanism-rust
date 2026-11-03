@@ -466,7 +466,9 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::HeatGenerator | Kind::BioGenerator) => (vec![0, 1], vec![]),
         // The fuelwood heater burns from the first slot.
         Some(Kind::FuelwoodHeater) => (vec![0], vec![]),
-        Some(Kind::Wind | Kind::GasGenerator) => (vec![0], vec![]),
+        Some(Kind::Wind) => (vec![0], vec![]),
+        // The gas-burning generator: the energy slot, then the fill slot of its fuel.
+        Some(Kind::GasGenerator) => (vec![0, 1], vec![]),
         // The plain solar generator is an iron block with no menu.
         Some(Kind::Solar(..)) if block.ends_with("advanced_solar_generator") => (vec![0], vec![]),
         // The oxidizer's item goes in the first slot; the separator takes water buckets there and gives
@@ -4801,12 +4803,15 @@ fn tick_gas_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     let mut energy = EnergyContainer::new(chem::GAS_GENERATOR_STORAGE, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(chem::GAS_GENERATOR_STORAGE);
     let mut fuel = get_tank(&entity.nbt, "fuel", chem::GAS_GENERATOR_TANK);
-    let (made, _) = chem::burn_fuel(&mut fuel, energy.capacity - energy.stored);
+    let (made, used) = chem::burn_fuel(&mut fuel, energy.capacity - energy.stored);
     energy.insert(made, Action::Execute);
     charge_slot(entity, 0, &mut energy);
+    // `ChemicalInventorySlot.fill`: a tank item in the fuel slot gives the generator its gas.
+    fill_tank_from_item(entity, 1, &mut fuel, |c| chem::fuel(c).is_some());
     push_energy(game, pos, &mut energy, None, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_tank(&mut entity.nbt, "fuel", &fuel);
+    put_int(&mut entity.nbt, "used", used as u32);
     Some(made > 0)
 }
 
@@ -7015,7 +7020,7 @@ fn layout(block: &str) -> Option<Layout> {
         },
         // The gas-burning generator's fuel gauge (GuiGasGenerator).
         Kind::GasGenerator => Layout {
-            slots: [Some(([143.0, 35.0], "slot/power")), None, None],
+            slots: [Some(([143.0, 35.0], "slot/power")), Some(([17.0, 35.0], "slot/normal")), None],
             gauges: vec![gauge("fuel", chem::GAS_GENERATOR_TANK, 55.0, 18.0, WIDE)],
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
@@ -7338,6 +7343,10 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
             entity.data[3] = get_int(&entity.nbt, "gain").min(32_767) as i32;
             entity.data.truncate(DATA_USAGE);
             entity.data.extend(wide(get_long(&entity.nbt, "loss")));
+        }
+        // `TileEntityGasGenerator.getUsed`: the gas burnt last tick, for the screen's burn rate.
+        if kind(&entity.id) == Some(Kind::GasGenerator) {
+            entity.data[3] = get_int(&entity.nbt, "used").min(32_767) as i32;
         }
         if let Some(k @ (Kind::Heater | Kind::FuelwoodHeater)) = kind(&entity.id) {
             let temp = 300.0 + get_double(&entity.nbt, "heat_out").unwrap_or(0.0) / 100.0;
@@ -8160,6 +8169,7 @@ fn chemical_layout_slots(block: &str) -> &'static [usize] {
         Some(Kind::ChemicalInfuser | Kind::PigmentMixer) => &[1, 2],
         Some(Kind::Painting) => &[1],
         Some(Kind::Washer) => &[1],
+        Some(Kind::GasGenerator) => &[1],
         _ => &[],
     }
 }
@@ -9509,6 +9519,8 @@ fn armor_sidebar(block: &str) -> Option<([f32; 2], bool, [f32; 2])> {
         Kind::EnergyCube(_) => Some(([176.0, 36.0], false, [180.0, 41.0])),
         // `GuiSideHolder.create(-26, 36, ...)`, `armorSideBar(-20, 41, 0)`.
         Kind::InductionPort => Some(([-26.0, 36.0], true, [-20.0, 41.0])),
+        // `GuiSideHolder.create(-26, 6, 98, ...)`, `armorSideBar(-20, 11, 0)`: the generators.
+        Kind::GasGenerator | Kind::HeatGenerator | Kind::BioGenerator | Kind::Wind | Kind::Solar(..) => Some(([-26.0, 6.0], true, [-20.0, 11.0])),
         _ => None,
     }
 }
@@ -10624,6 +10636,16 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         // `GuiSlot.warning`: the input slot without a recipe or enough input, the output slot without room.
         let name = if (i == 0 && warn & 2 != 0) || (i == 2 && warn & 4 != 0) { &"slot/warning" } else { name };
         sprite(game, batch, name, [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
+        // `SlotOverlay.MINUS` on the fuel slot (`fuelSlot.setSlotOverlay`).
+        if i == 1 && kind(block) == Some(Kind::GasGenerator) {
+            sprite(game, batch, "slot/overlay/minus", [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
+        }
+    }
+    // `renderInventoryTextAndOther`: the gas burn rate, right aligned beside the inventory label.
+    if kind(block) == Some(Kind::GasGenerator) {
+        let text = format!("Burn Rate: {} mB/t", get(3) as i64);
+        let w = game.native_text_width(&text);
+        game.native_text(batch, &text, [ox + 170.0 - w, oy + height - 94.0], 0x40_4040, false);
     }
     if kind(block) == Some(Kind::Nucleosynthesizer) {
         let title = game.native_screen_title().unwrap_or_default();
