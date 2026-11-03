@@ -5983,6 +5983,44 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     if let Some(p) = game.player.as_mut() {
         p.fall_distance = 0.0;
     }
+    jetpack_flames(game);
+}
+
+/// `RenderTickHandler.doJetpackRender`: flame and smoke from the two side nozzles and the middle of the pack, for a
+/// standing or crouching player (the swimming and gliding poses are not told apart here).
+fn jetpack_flames(game: &mut Game<'_>) {
+    use horizon_client::particles::{ParticleOptions, ParticleType};
+    let Some(me) = game.native_player() else {
+        return;
+    };
+    let crouching = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let velocity = game.player.as_ref().map_or([0.0; 3], |p| [p.velocity.x, p.velocity.y, p.velocity.z]);
+    let (x_angle, side_z, centre_z, eye) = if crouching { (20f64.to_radians(), -0.8, -0.9, 1.27 + 0.5) } else { (0.0, -0.54, -0.2, 1.62) };
+    let (sin_y, cos_y) = (-f64::from(me.yaw)).to_radians().sin_cos();
+    let (sin_x, cos_x) = x_angle.sin_cos();
+    let turn = |v: [f64; 3]| -> [f64; 3] {
+        let (y, z) = (v[1] * cos_x - v[2] * sin_x, v[1] * sin_x + v[2] * cos_x);
+        [v[0] * cos_y + z * sin_y, y, z * cos_y - v[0] * sin_y]
+    };
+    thread_local! {
+        static FLAME_RNG: std::cell::RefCell<bolt::Rng> = std::cell::RefCell::new(bolt::Rng::new(0x1E7));
+    }
+    let mut float = || FLAME_RNG.with_borrow_mut(|r| r.float());
+    let random = (float() - 0.5) * 0.1;
+    let nozzles = [
+        (turn([-0.43, -0.55, side_z]), true),
+        (turn([0.43, -0.55, side_z]), true),
+        (turn([(f64::from(float()) - 0.5) * 0.4, -0.86, centre_z]), false),
+    ];
+    let flame = ParticleOptions::simple(ParticleType::Flame);
+    let smoke = ParticleOptions::simple(ParticleType::Smoke);
+    for (v, jitter) in nozzles {
+        let spread = if jitter { f64::from(random) } else { 0.0 };
+        let motion = [0, 1, 2].map(|i| v[i] * 0.2 + velocity[i] + v[i] * spread);
+        let at = [me.x + v[0] + velocity[0], me.y + eye + v[1] + velocity[1], me.z + v[2] + velocity[2]];
+        game.lan_send_particles(me.dimension, &flame, None, at, motion, 1.0, 0);
+        game.lan_send_particles(me.dimension, &smoke, None, at, motion, 1.0, 0);
+    }
 }
 
 /// A right click on a chemical tank holding hydrogen with a jetpack in hand fills the jetpack, as
