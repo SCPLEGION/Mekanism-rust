@@ -19580,8 +19580,10 @@ fn robit_draw_skins(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
             let suffix = if index == 0 { String::new() } else { format!("_{index}") };
             let yaw = (game.ticks as f32 * 4.0) % 360.0;
             let clip = [r[0], r[1], r[0] + r[2], r[1] + r[3]];
-            game.native_gui_model(batch, &format!("mekanism:robit_body_{short}{suffix}"), None, clip, 70.0, 0.5, yaw);
-            game.native_gui_model(batch, "mekanism:robit_glow", None, clip, 70.0, 0.5, yaw);
+            // `getTranslateY` 0.8 of the box, `size` 48: the feet 38.4 px down, the model centred.
+            let feet = [r[0] + 24.0, r[1] + 38.4];
+            game.native_gui_model(batch, &format!("mekanism:robit_body_{short}{suffix}"), None, clip, feet, 48.0, yaw);
+            game.native_gui_model(batch, "mekanism:robit_glow", None, clip, feet, 48.0, yaw);
             if inside(cursor, r) {
                 game.native_fill(batch, r, 0x70FF_EA00);
                 hovered = Some(robit_skin_name(s));
