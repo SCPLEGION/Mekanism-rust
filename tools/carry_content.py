@@ -472,6 +472,14 @@ def build_module(ns, out):
         if chest is not None:
             worn_models.build_vanilla_world_model(ns, "personal_chest", "minecraft:chest#main", (-8, 0, -8), chest, out, report)
     if ns == "mekanism":
+        # The Industrial Alarm's bulb (`RenderIndustrialAlarm`), centred on its axis.
+        bulb = next((d / ns / "models/block/industrial_alarm_active_bulb.json" for d in search
+                     if (d / ns / "models/block/industrial_alarm_active_bulb.json").is_file()), None)
+        tex = next((d / ns / "textures/block/models/industrial_alarm_active.png" for d in search
+                    if (d / ns / "textures/block/models/industrial_alarm_active.png").is_file()), None)
+        if bulb is not None and tex is not None:
+            worn_models.build_element_world_model(ns, "alarm_bulb", json.loads(bulb.read_text()), tex, out, report, (0, 0, 0))
+    if ns == "mekanism":
         # Moving parts of machines (`RenderSeismicVibrator`, `RenderPigmentMixer`): their shafts are world models.
         for model_name, name, center in (("vibrator_shaft", "vibrator_shaft", (8, 8, 8)),
                                          ("pigment_mixer_shaft", "pigment_mixer_shaft", (1, 0, 1))):
