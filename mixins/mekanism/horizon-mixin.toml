@@ -541,7 +541,9 @@ bindings = [
   { name = "key", ty = "&str", value = "key" },
   { name = "text", ty = "Option<&str>", value = "text" },
   { name = "pressed", ty = "bool", value = "pressed" },
+]
 
+[[injection]]
 id = "world-items"
 hook = "world_items"
 hook_version = 1
