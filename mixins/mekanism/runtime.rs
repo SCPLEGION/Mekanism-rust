@@ -334,10 +334,19 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         return;
     }
     // The machines whose only slot is the energy slot (`EnergyInventorySlot`), which automation fills.
-    if matches!(
-        kind(block),
-        Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer | Kind::Heater | Kind::Vibrator)
-    ) {
+    if matches!(kind(block), Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer)) {
+        // Their energy slot and chemical slots: a hopper's five slots, which the furnace's roles would spoil.
+        let used: Vec<usize> = (0..3).filter(|&i| layout(block).is_some_and(|l| l.slots[i].is_some())).chain(3..3 + extra_slots(block).len()).collect();
+        *container = Some(ModContainer {
+            slots: 5,
+            faces: std::array::from_fn(|_| used.clone()),
+            inputs: used,
+            outputs: vec![],
+            menu: Some("minecraft:hopper".into()),
+        });
+        return;
+    }
+    if matches!(kind(block), Some(Kind::Heater | Kind::Vibrator)) {
         *container = Some(ModContainer {
             slots: 3,
             faces: std::array::from_fn(|_| vec![0]),
@@ -418,11 +427,16 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
     // output between two inputs), open a hopper's five-slot menu.
     if !extra_slots(block).is_empty() || matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_))) {
         let mut inputs = inputs;
+        let mut outputs = outputs;
         let mut side = vec![1];
         if !matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_) | Kind::Evaporation)) {
-            for i in 0..extra_slots(block).len() {
-                inputs.push(3 + i);
-                side.push(3 + i);
+            for (i, (_, sprite)) in extra_slots(block).iter().enumerate() {
+                if *sprite == "slot/output" {
+                    outputs.push(3 + i);
+                } else {
+                    inputs.push(3 + i);
+                    side.push(3 + i);
+                }
             }
         }
         *container = Some(ModContainer {
@@ -1451,6 +1465,8 @@ fn tick_centrifuge(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
     let mut input = get_tank(&entity.nbt, "input", nuclear::CENTRIFUGE_TANK);
     let mut output = get_tank(&entity.nbt, "output", nuclear::CENTRIFUGE_TANK);
     let mut active = false;
+    fill_tank_from_item(entity, 1, &mut input, |c| nuclear::centrifuging(c).is_some());
+    drain_tank_into_item(entity, 2, &mut output);
     if let Some((need, made, amount)) = input.chemical.as_deref().and_then(nuclear::centrifuging)
         && input.amount >= need
         && output.accepts(made)
@@ -1484,6 +1500,7 @@ fn tick_washer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
     let mut water = get_tank(&entity.nbt, "fluid", nuclear::WASHER_TANK);
     let mut output = get_tank(&entity.nbt, "output", nuclear::WASHER_TANK);
     let mut active = false;
+    drain_tank_into_item(entity, 1, &mut output);
     if let Some(r) = input.chemical.as_deref().and_then(nuclear::find_washing)
         && input.amount >= r.input_amount
         && water.chemical.as_deref() == Some("minecraft:water")
@@ -1701,6 +1718,9 @@ fn tick_chemical_infuser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlo
     let mut right = get_tank(&entity.nbt, "right", cap);
     let mut out = get_tank(&entity.nbt, "output", cap);
     let mut active = false;
+    fill_tank_from_item(entity, 1, &mut left, mekanism_core::recipes::infusing_input);
+    fill_tank_from_item(entity, 2, &mut right, mekanism_core::recipes::infusing_input);
+    drain_tank_into_item(entity, 3, &mut out);
     if let (Some(a), Some(b)) = (left.chemical.clone(), right.chemical.clone())
         && let Some((r, swapped)) = mekanism_core::recipes::find_chemical_infusing(&a, &b)
     {
@@ -1805,6 +1825,8 @@ fn tick_separator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     fill_tank_from_bucket(game, entity, 0, None, &mut fluid, |f| matches!(f, "minecraft:water" | "mekanism:brine"));
     let mut left = get_tank(&entity.nbt, "left", chem::SEPARATOR_GAS);
     let mut right = get_tank(&entity.nbt, "right", chem::SEPARATOR_GAS);
+    drain_tank_into_item(entity, 3, &mut left);
+    drain_tank_into_item(entity, 4, &mut right);
     let active = chem::separate(&mut fluid, &mut left, &mut right, &mut energy);
     push_chemical(game, pos, &mut left, None, u64::MAX, false);
     push_chemical(game, pos, &mut right, None, u64::MAX, false);
@@ -1853,6 +1875,9 @@ fn tick_rotary(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
         fluid.insert(&f, 1_000);
         entity.items[0] = None;
     }
+    // `ChemicalInventorySlot.rotary`: the gas drains into a tank item, which moves to the output slot once full.
+    drain_tank_into_item(entity, 3, &mut gas);
+    move_full_chemical_item(entity, 3, 4);
     let mut active = false;
     if let Some(output) = fluid.chemical.as_deref().and_then(chem::rotary_chemical)
         && fluid.amount > 0
@@ -1977,6 +2002,20 @@ fn chemical_item_capacity(item: &str) -> Option<u64> {
     match kind(item)? {
         Kind::ChemicalTank(t) => Some(chem::chemical_tank(t).0),
         _ => None,
+    }
+}
+
+/// `drainTankIntoSlot(outputSlot)`: a chemical tank item in slot `from` that is full goes to the empty slot `to`.
+fn move_full_chemical_item(entity: &mut ModBlockEntity, from: usize, to: usize) {
+    let Some(Some(stack)) = entity.items.get(from).cloned() else {
+        return;
+    };
+    let Some(capacity) = chemical_item_capacity(&stack.item) else {
+        return;
+    };
+    if entity.items.get(to).is_some_and(|s| s.is_none()) && item_tank(&stack, CHEMICAL_KEY, capacity).is_some_and(|t| t.amount >= capacity) {
+        entity.items[to] = Some(stack);
+        entity.items[from] = None;
     }
 }
 
@@ -4838,14 +4877,14 @@ fn layout(block: &str) -> Option<Layout> {
         },
         // GuiIsotopicCentrifuge.
         Kind::Centrifuge => Layout {
-            slots: [Some(([155.0, 14.0], "slot/power")), None, None],
+            slots: [Some(([155.0, 14.0], "slot/power")), Some(([5.0, 56.0], "slot/normal")), Some(([155.0, 56.0], "slot/normal"))],
             gauges: vec![gauge("input", nuclear::CENTRIFUGE_TANK, 25.0, 13.0, STANDARD), gauge("output", nuclear::CENTRIFUGE_TANK, 133.0, 13.0, STANDARD)],
             power: Some(PowerBar::Horizontal([115.0, 75.0])),
             progress: None,
         },
         // GuiChemicalInfuser: the left and right inputs, the output in the middle, 9 px higher.
         Kind::ChemicalInfuser => Layout {
-            slots: [Some(([154.0, 14.0], "slot/power")), None, None],
+            slots: [Some(([154.0, 14.0], "slot/power")), Some(([6.0, 56.0], "slot/normal")), Some(([154.0, 56.0], "slot/normal"))],
             gauges: vec![
                 gauge("left", chem::CHEMICAL_INFUSER_TANK, 25.0, 13.0, STANDARD),
                 gauge("output", chem::CHEMICAL_INFUSER_TANK, 79.0, 4.0, STANDARD),
@@ -4856,7 +4895,7 @@ fn layout(block: &str) -> Option<Layout> {
         },
         // GuiChemicalWasher: water, dirty slurry, clean slurry.
         Kind::Washer => Layout {
-            slots: [Some(([152.0, 14.0], "slot/power")), None, None],
+            slots: [Some(([152.0, 14.0], "slot/power")), Some(([152.0, 56.0], "slot/normal")), None],
             gauges: vec![
                 gauge("fluid", nuclear::WASHER_TANK, 7.0, 13.0, STANDARD),
                 gauge("input", nuclear::WASHER_TANK, 28.0, 13.0, STANDARD),
@@ -5020,6 +5059,10 @@ fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
         Some(Kind::Oxidizer) => vec![([152.0, 55.0], "slot/normal")],
         Some(Kind::Dissolution) => vec![([8.0, 65.0], "slot/normal"), ([152.0, 55.0], "slot/normal")],
         Some(Kind::Crystallizer) => vec![([8.0, 65.0], "slot/normal")],
+        Some(Kind::ChemicalInfuser) => vec![([80.0, 65.0], "slot/normal")],
+        Some(Kind::Separator) => vec![([59.0, 52.0], "slot/normal"), ([101.0, 52.0], "slot/normal")],
+        // The chemical side's drain slot and the output it moves a full item to.
+        Some(Kind::Rotary) => vec![([5.0, 25.0], "slot/normal"), ([5.0, 56.0], "slot/output")],
         _ => vec![],
     }
 }
@@ -5599,6 +5642,16 @@ thread_local! {
     static MOVES: std::cell::RefCell<WindowMoves> = std::cell::RefCell::new(WindowMoves::default());
 }
 
+/// The slots of `Layout` that are chemical slots (they take chemical tank items).
+fn chemical_layout_slots(block: &str) -> &'static [usize] {
+    match kind(block) {
+        Some(Kind::Centrifuge) => &[1, 2],
+        Some(Kind::ChemicalInfuser) => &[1, 2],
+        Some(Kind::Washer) => &[1],
+        _ => &[],
+    }
+}
+
 /// The window open on `block`'s screen, as an index into `WindowMoves`.
 /// What each container slot of a machine's menu takes (hook point `native_slot_rules`): the energy slot
 /// only items that hold energy (`EnergyInventorySlot`), the output slots nothing (`OutputInventorySlot`).
@@ -5623,6 +5676,9 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
                 _ => SlotRule::Any,
             })
             .collect();
+        for &i in chemical_layout_slots(block) {
+            rules[i] = SlotRule::Items(chemical_item_ids());
+        }
         let extra = extra_slots(block);
         if !extra.is_empty() {
             rules.resize(3, SlotRule::Any);
