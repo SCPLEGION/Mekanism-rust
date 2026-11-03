@@ -26,6 +26,7 @@ use mekanism_core::fusion;
 use mekanism_core::bin::{self, Bin};
 use mekanism_core::boiler;
 use mekanism_core::isotopes;
+use mekanism_core::miner;
 use mekanism_core::turbine;
 use mekanism_core::dynamic_tank;
 use mekanism_core::sides::{self as side_config, SideMode, Sides, Transmission};
@@ -1432,6 +1433,12 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
         let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
         mekanism_core::recipes::find_oxidizing(&stack.item, stack.count, &in_tag).map(|r| (stack, *r))
     });
+    let warn = match &recipe {
+        None if entity.items.first().is_some_and(|s| s.is_some()) => 8,
+        Some((_, r)) if !(tank.accepts(r.output) && tank.amount + r.amount <= tank.capacity) => 4,
+        _ => 0,
+    };
+    put_int(&mut entity.nbt, "warn", warn);
     match recipe {
         Some((stack, r)) if tank.accepts(r.output) && tank.amount + r.amount <= tank.capacity => {
             if energy.consume(chem::OXIDIZER_USAGE) {
@@ -1448,6 +1455,7 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
         _ => progress = 0,
     }
     push_chemical(game, pos, &mut tank, None, u64::MAX, false);
+    // `RecipeError`s (bit 1 input, 2 output room, 3 no recipe): an item without a recipe, or a tank without room.
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "output", &tank);
@@ -1477,6 +1485,15 @@ fn tick_dissolution(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
         nuclear::find_dissolution(&stack.item, stack.count, &in_tag).map(|r| (stack, *r))
     });
+    let warn = match &recipe {
+        None if entity.items.first().is_some_and(|s| s.is_some()) => 8,
+        Some((_, r)) => {
+            u32::from(!(input.chemical.as_deref() == Some(r.chemical) && input.amount >= r.per_tick)) << 1
+                | u32::from(!(output.accepts(r.output) && output.amount + r.amount <= output.capacity)) << 2
+        }
+        _ => 0,
+    };
+    put_int(&mut entity.nbt, "warn", warn);
     match recipe {
         Some((stack, r))
             if input.chemical.as_deref() == Some(r.chemical)
@@ -1535,6 +1552,14 @@ fn tick_centrifuge(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
         active = true;
     }
     push_chemical(game, pos, &mut output, None, u64::MAX, false);
+    let warn = match input.chemical.as_deref().and_then(nuclear::centrifuging) {
+        None if input.chemical.is_some() => 8,
+        Some((need, made, amount)) => {
+            u32::from(input.amount < need) << 1 | u32::from(!(output.accepts(made) && output.amount + amount <= output.capacity)) << 2
+        }
+        None => 0,
+    };
+    put_int(&mut entity.nbt, "warn", warn);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_tank(&mut entity.nbt, "input", &input);
     put_tank(&mut entity.nbt, "output", &output);
@@ -1574,6 +1599,15 @@ fn tick_washer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
         active = true;
     }
     push_chemical(game, pos, &mut output, None, u64::MAX, false);
+    let warn = match input.chemical.as_deref().map(nuclear::find_washing) {
+        Some(None) => 8,
+        Some(Some(r)) => {
+            u32::from(input.amount < r.input_amount || water.chemical.as_deref() != Some("minecraft:water") || water.amount < r.water) << 1
+                | u32::from(!(output.accepts(r.output) && output.amount + r.amount <= output.capacity)) << 2
+        }
+        None => 0,
+    };
+    put_int(&mut entity.nbt, "warn", warn);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_tank(&mut entity.nbt, "input", &input);
     put_tank(&mut entity.nbt, "fluid", &water);
@@ -1610,6 +1644,15 @@ fn tick_crystallizer(entity: &mut ModBlockEntity) -> Option<bool> {
         }
         _ => progress = 0,
     }
+    let room = entity.items.get(2).cloned().flatten();
+    let warn = match input.chemical.as_deref().map(nuclear::find_crystallizing) {
+        Some(None) => 8,
+        Some(Some(r)) => {
+            u32::from(input.amount < r.amount) << 1 | u32::from(!room.as_ref().is_none_or(|o| &*o.item == r.output && o.count + r.count <= 64)) << 2
+        }
+        None => 0,
+    };
+    put_int(&mut entity.nbt, "warn", warn);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "input", &input);
@@ -1658,6 +1701,16 @@ fn tick_advanced(game: &mut Game<'_>, entity: &mut ModBlockEntity, m: &'static c
             .map(|r| (stack, *r))
     });
     let out = entity.items.get(2).cloned().flatten();
+    let warn = match (&recipe, entity.items.first().is_some_and(|s| s.is_some())) {
+        (None, true) => 8,
+        (Some((_, r)), _) => {
+            let max = items.get(r.output).map_or(64, |i| i.max_stack);
+            let fits = out.as_ref().is_none_or(|o| &*o.item == r.output && o.count + r.output_count <= max);
+            u32::from(!(tank.chemical.as_deref() == Some(r.chemical) && tank.amount >= r.chemical_amount)) << 1 | u32::from(!fits) << 2
+        }
+        _ => 0,
+    };
+    put_int(&mut entity.nbt, "warn", warn);
     match recipe {
         Some((stack, r)) => {
             let max = items.get(r.output).map_or(64, |i| i.max_stack);
@@ -6819,7 +6872,7 @@ fn upgrade_slot_button(game: &mut Game<'_>, entity: &mut ModBlockEntity, id: i32
         let Some(held) = game.carried.clone() else {
             return true;
         };
-        let Some(kind) = upgrade_of(&held).filter(|k| supported_upgrades(&entity.id).contains(k)) else {
+        let Some(_) = upgrade_of(&held).filter(|k| supported_upgrades(&entity.id).contains(k)) else {
             return true;
         };
         // The upgrade goes into the window's input slot (`getUpgradeSlot`); the machine installs it
@@ -7291,7 +7344,8 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
     }
     // `GasMode.getNext` on the chemical tank's button.
     if id == 0 && matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) {
-        put_int(&mut entity.nbt, "dump", (get_int(&entity.nbt, "dump") + 1) % 3);
+        let next = (get_int(&entity.nbt, "dump") + 1) % 3;
+        put_int(&mut entity.nbt, "dump", next);
         return;
     }
     // The Digital Miner's Start, Stop, Config (with the filters), Reset and its three switches.
@@ -7346,7 +7400,10 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
             put_long(&mut m.nbt, "scram", 0);
         }
         // `GasMode.getNext`: idle, dumping excess, dumping.
-        (Some(Kind::TurbineValve), 0) => put_int(&mut m.nbt, "dump", (get_int(&m.nbt, "dump") + 1) % 3),
+        (Some(Kind::TurbineValve), 0) => {
+            let next = (get_int(&m.nbt, "dump") + 1) % 3;
+            put_int(&mut m.nbt, "dump", next)
+        }
         (Some(Kind::FusionPort), 0) => {
             let mut plasma = fusion_plasma(&m.nbt);
             fusion::ignite(&mut plasma, fusion_injection(&m.nbt));
@@ -7391,7 +7448,7 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
             inventory_x: 0.0,
             own_labels: true,
             alt: None,
-            ..Default::default(),
+            ..Default::default()
         }));
     }
     if kind(block) == Some(Kind::DigitalMiner) && let Some(s) = screen.as_mut() {
@@ -7404,7 +7461,7 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
             inventory_x: 58.0,
             own_labels: true,
             alt: None,
-            ..Default::default(),
+            ..Default::default()
         }));
     }
     if is_qio_tile(block) && let Some(s) = screen.as_mut() {
@@ -7416,7 +7473,7 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
             inventory_x: 0.0,
             own_labels: true,
             alt: None,
-            ..Default::default(),
+            ..Default::default()
         }));
     }
 }
@@ -7470,7 +7527,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
             inventory_x: 58.0,
             own_labels: true,
             alt: None,
-            ..Default::default(),
+            ..Default::default()
         });
         return;
     }
@@ -7485,7 +7542,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
             inventory_x: 8.0,
             own_labels: true,
             alt: None,
-            ..Default::default(),
+            ..Default::default()
         });
         return;
     }
@@ -7520,7 +7577,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(),
         own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort | Kind::FusionPort)),
         alt: None,
-        ..Default::default(),
+        ..Default::default()
     });
 }
 
@@ -7731,8 +7788,8 @@ fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
     }
 }
 
-/// The nucleosynthesizer's own parts (`GuiAntiprotonicNucleosynthesizer`): the inner screen with the
-/// process rate and the bolts between the antimatter and the energy, and the wide progress bar below.
+// The nucleosynthesizer's own parts (`GuiAntiprotonicNucleosynthesizer`): the inner screen with the
+// process rate and the bolts between the antimatter and the energy, and the wide progress bar below.
 thread_local! {
     static BOLTS: std::cell::RefCell<mekanism_core::bolt::BoltRenderer> = std::cell::RefCell::new(mekanism_core::bolt::BoltRenderer::new(
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64),
@@ -7878,7 +7935,7 @@ fn draw_fusion_view(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
     draw_mek_button(game, batch, [ox + FUSION_BACK[0], oy + FUSION_BACK[1], 14.0, 14.0], true, inside(mouse, FUSION_BACK));
     sprite(game, batch, "button/back", [0.0, 0.0, 14.0, 14.0], [ox + FUSION_BACK[0], oy + FUSION_BACK[1], 14.0, 14.0]);
     draw_fusion_tabs(game, batch, origin, view);
-    let progress = |name: &str, at: [f32; 2], full: bool| {
+    let progress = |game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, name: &str, at: [f32; 2], full: bool| {
         sprite(game, batch, &format!("progress/{name}/{}", if full { "full" } else { "empty" }), [0.0, 0.0, 28.0, 8.0], [ox + at[0], oy + at[1], 28.0, 8.0]);
     };
     if view == 1 {
@@ -7889,9 +7946,9 @@ fn draw_fusion_view(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
         draw_data_gauge(game, batch, origin, [66.0, 50.0], STANDARD, (case as f64 / FUSION_MAX_TEMP as f64).min(1.0) as f32, lava);
         let (water, _, _) = fusion_gauge(data, 2);
         let (steam, steam_cap, _) = fusion_gauge(data, 3);
-        progress("small_right", [34.0, 76.0], plasma > case);
-        progress("small_right", [88.0, 61.0], case > 0);
-        progress("small_right", [88.0, 91.0], case > 0 && water > 0 && steam < steam_cap);
+        progress(game, batch, "small_right", [34.0, 76.0], plasma > case);
+        progress(game, batch, "small_right", [88.0, 61.0], case > 0);
+        progress(game, batch, "small_right", [88.0, 91.0], case > 0 && water > 0 && steam < steam_cap);
         draw_fusion_chemical_gauge(game, batch, data, origin, 2, [120.0, 84.0], SMALL);
         draw_fusion_chemical_gauge(game, batch, data, origin, 3, [156.0, 84.0], SMALL);
         let capacity = read_wide(data, DATA_CAPACITY).max(1);
@@ -7903,8 +7960,8 @@ fn draw_fusion_view(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
     draw_fusion_chemical_gauge(game, batch, data, origin, 0, [30.0, 64.0], SMALL);
     draw_fusion_chemical_gauge(game, batch, data, origin, 4, [84.0, 50.0], STANDARD);
     draw_fusion_chemical_gauge(game, batch, data, origin, 1, [138.0, 64.0], SMALL);
-    progress("small_right", [52.0, 76.0], burning);
-    progress("small_left", [106.0, 76.0], burning);
+    progress(game, batch, "small_right", [52.0, 76.0], burning);
+    progress(game, batch, "small_left", [106.0, 76.0], burning);
     centred(game, batch, &format!("Injection Rate: {}", data.get(2).copied().unwrap_or(0)), ox + 16.0, 154.0, oy + 35.0, 0x40_4040);
     let label = "Edit Rate:";
     game.native_text(batch, label, [ox + 101.0 - game.native_text_width(label), oy + 117.0], 0x40_4040, false);
@@ -7975,7 +8032,7 @@ fn fusion_payload(game: &mut Game<'_>, data: &[u8]) {
     if !near || kind(block_name(game, pos)) != Some(Kind::FusionPort) {
         return;
     }
-    let Some(Some(master)) = game.native_with_mod_block_entity(pos, |m| multiblock_master(m, pos)) else {
+    let Some(Some(Some(master))) = game.native_with_mod_block_entity(pos, |m| multiblock_master(m, pos)) else {
         return;
     };
     let rate = u64::from(rate - rate % 2).min(fusion::MAX_INJECTION);
@@ -8144,7 +8201,7 @@ fn draw_boiler_stats(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch,
     let (_, steam_cap, _) = fusion_gauge(data, 2);
     let elements = data.get(2).copied().unwrap_or(0).max(0) as u64;
     let capacity = elements * 16_000_000 / 10;
-    let text = |t: &str, x: f32, y: f32, rgb: u32| game.native_text(batch, t, [ox + x, oy + y], rgb, false);
+    let mut text = |t: &str, x: f32, y: f32, rgb: u32| game.native_text(batch, t, [ox + x, oy + y], rgb, false);
     text(&format!("Max Water: {} mB", thousands(water_cap)), 8.0, 26.0, 0x40_4040);
     text(&format!("Max Steam: {} mB", thousands(steam_cap)), 8.0, 35.0, 0x40_4040);
     text("Heat Transfer", 8.0, 49.0, 0x20_2020);
@@ -8306,7 +8363,7 @@ fn fission_payload(game: &mut Game<'_>, data: &[u8]) {
     if !near || !limit.is_finite() || limit < 0.0 || kind(block_name(game, pos)) != Some(Kind::FissionPort) {
         return;
     }
-    let Some(Some(master)) = game.native_with_mod_block_entity(pos, |m| multiblock_master(m, pos)) else {
+    let Some(Some(Some(master))) = game.native_with_mod_block_entity(pos, |m| multiblock_master(m, pos)) else {
         return;
     };
     let set = |m: &mut ModBlockEntity| {
@@ -8788,7 +8845,7 @@ fn warning_bits(block: &str, l: &Layout, data: &[i32]) -> u32 {
         return (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 15;
     }
     if kind(block).is_some_and(|k| base_usage(k).is_some()) {
-        return (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 1;
+        return (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 15;
     }
     if !matches!(kind(block), Some(Kind::Machine(..))) {
         return 0;
@@ -10220,8 +10277,10 @@ fn tick_importer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     return_to_network(&mut net, &mut entity.items);
     // With enabled filters only what they name goes in; with none, everything does.
     let filters = load_sorter(&entity.nbt);
-    let in_tag = |tag: &str, item: &str| world_items!(game).item_tags.get(tag).is_some_and(|t| t.contains(item));
     let active: Vec<String> = filters.active().cloned().collect();
+    // The tags are copied out (only for tag filters to read) so the game stays free to move the items.
+    let tags = if active.is_empty() { Default::default() } else { world_items!(game).item_tags.clone() };
+    let in_tag = |tag: &str, item: &str| tags.get(tag).is_some_and(|t| t.contains(item));
     let wanted = |s: &ItemStack| active.is_empty() || active.iter().any(|f| Sorter::matches_item(f, &s.item, &in_tag));
     if let Some((back, face)) = qio_target(game, pos)
         && let Some(stack) = game.native_extract_item_where(back, face, qio::TRANSIT_COUNT, &wanted)
@@ -11985,8 +12044,6 @@ fn draw_mek_button(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, r
 fn draw_frequency_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, data: &[i32], origin: [f32; 2]) {
     let [ox, oy] = origin;
     let at = |r: [f32; 4]| [ox + r[0], oy + r[1], r[2], r[3]];
-    let cursor = game.native_cursor();
-    let mouse = [cursor[0] - ox, cursor[1] - oy];
     nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 176.0, 240.0]);
     for row in 0..4 {
         let y = if row < 3 { 158.0 + 18.0 * row as f32 } else { 216.0 };
@@ -12689,7 +12746,7 @@ fn qio_screen(block: &str) -> super::native_hooks::NativeScreen {
             inventory_x: 8.0 + (QIO_WIDTH - 176.0) / 2.0,
             own_labels: true,
             alt: None,
-            ..Default::default(),
+            ..Default::default()
         }
     }
 }
@@ -13351,10 +13408,6 @@ fn miner_filter_name(f: &miner::Filter) -> String {
         miner::FilterKind::Item => miner_item_name(&f.name),
         _ => f.name.clone(),
     }
-}
-
-fn mcfg_value(r: miner::Region, i: usize) -> i32 {
-    [r.radius, r.min_y, r.max_y][i]
 }
 
 fn draw_text_field(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, b: [f32; 4], t: &freq::TextBox) {
@@ -14075,8 +14128,14 @@ fn adapter_payload(game: &mut Game<'_>, data: &[u8]) {
         1 => {
             m.nbt.remove(&JavaString::from("filter"));
         }
-        2 => put_int(&mut m.nbt, "inverted", u32::from(get_int(&m.nbt, "inverted") == 0)),
-        3 => put_int(&mut m.nbt, "fuzzy", u32::from(get_int(&m.nbt, "fuzzy") == 0)),
+        2 => {
+            let flipped = u32::from(get_int(&m.nbt, "inverted") == 0);
+            put_int(&mut m.nbt, "inverted", flipped)
+        }
+        3 => {
+            let flipped = u32::from(get_int(&m.nbt, "fuzzy") == 0);
+            put_int(&mut m.nbt, "fuzzy", flipped)
+        }
         4 => put_long(&mut m.nbt, "count", u64::from(count)),
         _ => {}
     });
