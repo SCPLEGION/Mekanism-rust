@@ -6775,6 +6775,14 @@ fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
 
 /// The nucleosynthesizer's own parts (`GuiAntiprotonicNucleosynthesizer`): the inner screen with the
 /// process rate and the bolts between the antimatter and the energy, and the wide progress bar below.
+thread_local! {
+    static BOLTS: std::cell::RefCell<mekanism_core::bolt::BoltRenderer> = std::cell::RefCell::new(mekanism_core::bolt::BoltRenderer::new(
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64),
+    ));
+    /// The game tick last seen and when it began: the frame's share of a tick.
+    static BOLT_CLOCK: std::cell::RefCell<(u64, std::time::Instant)> = std::cell::RefCell::new((0, std::time::Instant::now()));
+}
+
 fn draw_nucleosynthesizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
     let [ox, oy] = origin;
     let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit")).as_deref() == Some("true");
@@ -6784,25 +6792,36 @@ fn draw_nucleosynthesizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudB
     let line = format!("Process Rate: {rate}");
     let w = game.native_text_width(&line) * 0.8;
     game.native_text_scaled(batch, &line, [screen[0] + (screen[2] - w) / 2.0, screen[1] + screen[3] - 2.0 - 8.0 * 0.8], 0x3C_FE9A, 0.8);
-    // `BoltEffect`: up to twenty jagged lines across the screen's middle while it works.
-    if lit {
-        let (x0, x1, mid) = (screen[0] + 2.0, screen[0] + 100.0, screen[1] + 32.0);
-        let t = (game.ticks / 2) as u32;
-        for bolt in 0..8u32 {
-            let mut y = mid;
-            let mut x = x0;
-            let mut seed = t.wrapping_mul(2_654_435_761).wrapping_add(bolt.wrapping_mul(40_503));
-            while x < x1 {
-                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                let step = 6.0;
-                let ny = (y + ((seed >> 24) as f32 / 255.0 - 0.5) * 12.0).clamp(screen[1] + 4.0, screen[1] + screen[3] - 14.0);
-                let (lo, hi) = (y.min(ny), y.max(ny));
-                game.native_fill(batch, [x, lo, 1.0, (hi - lo).max(1.0)], 0xFF73_7380);
-                game.native_fill(batch, [x, ny, step.min(x1 - x), 1.0], 0xFF73_7380);
-                y = ny;
-                x += step;
+    // `BoltEffect` through `BoltRenderer`: `min(ceil(rate / 8), 20)` bolts of fifteen segments across the
+    // screen's middle, a new one every tick (`CONSECUTIVE`, lifespan 1, no fade).
+    let rate = if lit { 1.0_f32 } else { 0.0 };
+    let count = ((rate / 8.0).ceil() as i32).min(20);
+    if count > 0 {
+        use mekanism_core::bolt::{BoltEffect, BoltRenderInfo, Timestamp, V3};
+        let from = V3(45.0 + 2.0, 18.0 + (68.0 - 4.0) / 2.0, 0.0);
+        let effect = BoltEffect {
+            info: BoltRenderInfo::with_color(0.45, 0.45, 0.5, 1.0),
+            start: from,
+            end: V3(from.0 + (104.0 - 4.0), from.1, 0.0),
+            segments: 15,
+            count,
+            size: 1.0,
+        };
+        let partial = BOLT_CLOCK.with_borrow_mut(|c| {
+            if c.0 != game.ticks {
+                *c = (game.ticks, std::time::Instant::now());
             }
-        }
+            (c.1.elapsed().as_secs_f32() * 20.0).min(0.999)
+        });
+        let now = Timestamp { ticks: game.ticks as i64, partial };
+        BOLTS.with_borrow_mut(|r| {
+            for segment in r.states(&effect, 1.0, now) {
+                for q in segment.chunks(4) {
+                    let p = |v: &V3| [ox + v.0, oy + v.1];
+                    game.native_fill_quad(batch, [p(&q[0]), p(&q[1]), p(&q[2]), p(&q[3])], effect.info.color, true);
+                }
+            }
+        });
     }
     // `GuiDynamicHorizontalRateBar`: the dynamic-rate sprite multiplied by a colour that runs from
     // (60, 45, 74) to (100, 30, 170) along the bar.
