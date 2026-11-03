@@ -11180,7 +11180,15 @@ const MODULES_KEY: &str = "mekanism:modules";
 const MODULE_ITEMS_KEY: &str = "mekanism:module_items";
 const MODULE_TYPE_KEY: &str = "mekanism:module_type";
 
+/// What gameplay sees: the installed modules that are switched on (the tweaker's `enabled` option).
 fn modules_of(stack: &ItemStack) -> modules::Installed {
+    let mut all = installed_modules(stack);
+    all.retain(|id, _| module_enabled(stack, id));
+    all
+}
+
+/// Every module the item holds, switched on or not.
+fn installed_modules(stack: &ItemStack) -> modules::Installed {
     let mut out = modules::Installed::new();
     if let Some(Tag::Compound(c)) = custom_data(stack).and_then(|c| c.get(&JavaString::from(MODULES_KEY))) {
         for (k, v) in c.iter() {
@@ -11205,7 +11213,7 @@ fn module_type(stack: &ItemStack) -> Option<String> {
 fn item_energy_of(stack: &ItemStack) -> Option<gear::ItemEnergy> {
     let mut e = gear::item_energy(&stack.item)?;
     if modules::is_container(&stack.item) {
-        (e.capacity, e.rate) = modules::energy(&modules_of(stack));
+        (e.capacity, e.rate) = modules::energy(&installed_modules(stack));
     }
     Some(e)
 }
@@ -16775,7 +16783,7 @@ fn tick_station(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity)
     let mut active = false;
     match (module, held) {
         (Some((slot, id)), Some(mut held)) => {
-            let mut installed = modules_of(&held);
+            let mut installed = installed_modules(&held);
             let room = modules::max_installed(&held.item, &id).saturating_sub(installed.get(&id).copied().unwrap_or(0));
             if room > 0 && energy.consume(usage) {
                 active = true;
@@ -16803,7 +16811,7 @@ fn tick_station(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity)
     let mut client = Compound::new();
     if let Some(Some(held)) = entity.items.get(1) {
         client.insert("stn_item".into(), Tag::String(held.item.as_ref().into()));
-        let listed: Vec<String> = modules_of(held).into_iter().map(|(id, n)| format!("{id}={n}")).collect();
+        let listed: Vec<String> = installed_modules(held).into_iter().map(|(id, n)| format!("{id}={n}")).collect();
         client.insert("stn_mods".into(), Tag::String(listed.join(";").as_str().into()));
     }
     put_client(game, pos, entity, &STN_KEYS, client);
@@ -16830,7 +16838,7 @@ fn stn_payload(game: &mut Game<'_>, data: &[u8]) {
     }
     let out = game.native_with_mod_block_entity(pos, |m| {
         let held = m.items.get_mut(1)?.as_mut().filter(|s| modules::is_container(&s.item))?;
-        let mut installed = modules_of(held);
+        let mut installed = installed_modules(held);
         let mut kept = module_items_of(held);
         let item = kept.get(&JavaString::from(id)).and_then(horizon_items::item_nbt::item_from_nbt)?;
         let took = modules::uninstall(&mut installed, id, if all { u32::MAX } else { 1 });
@@ -17024,7 +17032,7 @@ fn tw_stack_mut<'a>(game: &'a mut Game<'_>, slot: usize) -> Option<&'a mut ItemS
 }
 
 fn tw_slots(game: &Game<'_>) -> Vec<usize> {
-    (0..14).filter(|i| tw_stack(game, *i).is_some_and(|s| !modules_of(s).is_empty())).collect()
+    (0..14).filter(|i| tw_stack(game, *i).is_some_and(|s| !installed_modules(s).is_empty())).collect()
 }
 
 /// A stored setting of `module` on `stack`, or the default.
@@ -17070,7 +17078,7 @@ fn tw_set(stack: &mut ItemStack, module: &str, s: &module_config::Setting, insta
 
 /// Whether `module` is switched on on `stack` (the `enabled` option; modules that can't be disabled always are).
 fn module_enabled(stack: &ItemStack, module: &str) -> bool {
-    let n = modules_of(stack).get(module).copied().unwrap_or(0);
+    let n = installed_modules(stack).get(module).copied().unwrap_or(0);
     match module_config::settings(module, n).first() {
         Some(s) if s.key == "enabled" => module_setting(stack, module, s, n) == 1,
         _ => n > 0,
@@ -17141,7 +17149,7 @@ fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
             game.native_text(batch, "Pick an item", [o[0] + 12.0, o[1] + 44.0], 0x60_6060, false);
             return;
         };
-        let installed = modules_of(stack);
+        let installed = installed_modules(stack);
         let ids: Vec<&String> = installed.keys().collect();
         ui.scroll = ui.scroll.min(ids.len().saturating_sub(TW_ROWS));
         if ui.module.as_ref().is_some_and(|m| !installed.contains_key(m)) {
@@ -17194,7 +17202,7 @@ fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
         let Some(stack) = ui.slot.and_then(|s| tw_stack(game, s)) else {
             return;
         };
-        let installed = modules_of(stack);
+        let installed = installed_modules(stack);
         let ids: Vec<&String> = installed.keys().collect();
         if let Some(i) = (0..TW_ROWS).find(|i| inside(at, tw_module_row(*i, o))) {
             if let Some(id) = ids.get(ui.scroll + i) {
@@ -17245,7 +17253,7 @@ fn tweaker_payload(game: &mut Game<'_>, data: &[u8]) {
     let Some(stack) = tw_stack_mut(game, slot) else {
         return;
     };
-    let n = modules_of(stack).get(module).copied().unwrap_or(0);
+    let n = installed_modules(stack).get(module).copied().unwrap_or(0);
     if let Some(s) = module_config::settings(module, n).into_iter().find(|s| s.key == key) {
         tw_set(stack, module, &s, n, value);
     }
