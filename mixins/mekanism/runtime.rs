@@ -5783,6 +5783,28 @@ fn set_jetpack_fuel(stack: &mut ItemStack, amount: u64) {
     set_custom_compound(stack, CHEMICAL_KEY, value);
 }
 
+/// The sounds that go on while something works (`SoundHandler.startTileSound`, `ItemFlamethrower`'s
+/// `FlamethrowerSound`): each active Industrial Alarm sounds from its block, and a flamethrower sounds
+/// from the first live flame (`flamethrower_active`) or, held and idle, near its holder (`flamethrower_idle`).
+/// Horizon's `native_loop_sound` stops a loop that is not asked for again.
+fn loop_sounds(game: &mut Game<'_>) {
+    let active: Vec<[i32; 3]> = ALARMS.with_borrow(|a| a.iter().copied().collect());
+    for pos in active {
+        if game.native_block_property(pos, "active").as_deref() == Some("true") {
+            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+            game.native_loop_sound(&format!("mekanism:alarm:{pos:?}"), "mekanism:tile.machine.industrial_alarm", Some(at), 1.0, 1.0);
+        }
+    }
+    let ticks = game.ticks as u64;
+    let flame = FLAME_VIEW.with_borrow(|view| view.iter().find(|f| f.arrived != u64::MAX && ticks <= f.arrived + 2).map(|f| f.pos));
+    if let Some(at) = flame {
+        game.native_loop_sound("mekanism:flame", "mekanism:item.flamethrower.active", Some(at), 1.0, 1.0);
+        game.native_stop_loop_sound("mekanism:flame_idle");
+    } else if game.held_mut().as_ref().is_some_and(|s| &*s.item == flamethrower::ITEM) {
+        game.native_loop_sound("mekanism:flame_idle", "mekanism:item.flamethrower.idle", None, 0.3, 1.0);
+    }
+}
+
 /// The window's tick (`CommonPlayerTickHandler.tickEnd` for the local player): holding jump with a
 /// fuelled jetpack on, outside creative flight, thrusts in its normal mode and stops the fall, and tells
 /// the server, which spends the hydrogen.
@@ -5794,6 +5816,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     if !game.native_window() || !game.native_on(MOD_ID) || !game.native_playing() {
         return;
     }
+    loop_sounds(game);
     free_runners_tick(game);
     mekasuit_sprint(game);
     mekasuit_client(game);

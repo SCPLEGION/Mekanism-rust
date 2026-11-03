@@ -439,6 +439,7 @@ def build_module(ns, out):
     search += [SRC / "datagen" / "generated" / n / "assets" for n in NAMESPACES]
     report["composite_models"] = flatten_models.flatten_tree(out / "assets" / ns, search)
     report["sps_textures"] = sps_textures(ns, out, search)
+    report["sounds"] = sound_files(ns, out)
     if ns == "mekanismgenerators":
         # The turbine's blades (`ModelTurbine`): one pair of rings per blade index.
         turbine_png = next((d / ns / "render/turbine.png" for d in search if (d / ns / "render/turbine.png").is_file()), None)
@@ -705,6 +706,34 @@ def sps_textures(ns, out, search):
     if flame is not None:
         shutil.copyfile(flame, dst / "flame.png")
     return 18
+
+
+def sound_files(ns, out):
+    """The sounds the native mod loops (`native_loop_sound`): the Industrial Alarm and the Flamethrower, with their
+    `sounds.json` events, so Horizon's sound registry finds them under the mod's namespace."""
+    if ns != "mekanism":
+        return 0
+    import json
+    root = Path(__file__).resolve().parent.parent / "src"
+    events_file = root / "datagen/generated/mekanism/assets/mekanism/sounds.json"
+    files = ["tile/industrial_alarm", "item/flamethrower_active", "item/flamethrower_idle"]
+    if not events_file.is_file():
+        return 0
+    events = json.loads(events_file.read_text())
+    keep = {
+        name: value
+        for name, value in events.items()
+        if name in ("tile.machine.industrial_alarm", "item.flamethrower.active", "item.flamethrower.idle")
+    }
+    dst = out / "assets" / ns
+    for f in files:
+        src = root / "main/resources/assets/mekanism/sounds" / (f + ".ogg")
+        if not src.is_file():
+            return 0
+        (dst / "sounds" / f).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst / "sounds" / (f + ".ogg"))
+    (dst / "sounds.json").write_text(json.dumps(keep, indent=2))
+    return len(files)
 
 
 def gauge_textures(ns, out):
