@@ -98,6 +98,18 @@ pub struct BoltRenderInfo {
 }
 
 impl BoltRenderInfo {
+    /// `BoltRenderInfo.ELECTRICITY`.
+    pub fn electricity() -> BoltRenderInfo {
+        BoltRenderInfo {
+            parallel_noise: 0.2,
+            spread_factor: 0.2,
+            branch_initiation: 0.1,
+            branch_continuation: 0.6,
+            spreader: SegmentSpreader::Memory(0.9),
+            ..BoltRenderInfo::with_color(0.54, 0.91, 1.0, 0.8)
+        }
+    }
+
     /// `BoltRenderInfo.DEFAULT` with `color(rgbad(r, g, b, a))`.
     pub fn with_color(r: f32, g: f32, b: f32, a: f32) -> BoltRenderInfo {
         let c = |v: f32| (v * 255.0).round() as u32;
@@ -288,7 +300,7 @@ pub struct Timestamp {
 }
 
 impl Timestamp {
-    fn is_passed(self, prev: Timestamp, mut duration: f64) -> bool {
+    pub fn is_passed(self, prev: Timestamp, mut duration: f64) -> bool {
         let passed = self.ticks - prev.ticks;
         if passed as f64 > duration {
             return true;
@@ -338,6 +350,81 @@ impl BoltRenderer {
     }
 }
 
+/// What an owner wants of its bolt now (`BoltRenderer.update`): the bolt, how long it lives and the delay
+/// before the owner's next one (`SpawnFunction.delay`; none for `NO_DELAY`). Bolts fade with `FadeFunction.fade(0.5)`.
+#[derive(Clone, Copy)]
+pub struct BoltSpec {
+    pub effect: BoltEffect,
+    pub lifespan: f32,
+    pub delay: f32,
+}
+
+struct Owner {
+    bolts: Vec<(Vec<Quads>, Timestamp, f32, u32)>,
+    last_spawn: Timestamp,
+    delay: f32,
+    last_update: Timestamp,
+}
+
+/// `BoltRenderer`: many owners, each with the bolts it has spawned.
+pub struct BoltField {
+    owners: std::collections::HashMap<i64, Owner>,
+    refresh: Timestamp,
+    rng: Rng,
+}
+
+impl BoltField {
+    pub fn new(seed: u64) -> BoltField {
+        BoltField { owners: Default::default(), refresh: Timestamp::default(), rng: Rng::new(seed) }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.owners.is_empty()
+    }
+
+    /// `update`: spawn a bolt for `owner` when its delay has passed.
+    pub fn update(&mut self, owner: i64, spec: BoltSpec, now: Timestamp) {
+        let o = self.owners.entry(owner).or_insert_with(|| Owner {
+            bolts: Vec::new(),
+            last_spawn: Timestamp::default(),
+            delay: 0.0,
+            last_update: now,
+        });
+        if now.is_passed(o.last_spawn, f64::from(o.delay)) {
+            o.bolts.push((spec.effect.generate(&mut self.rng), now, spec.lifespan, spec.effect.info.color));
+            o.delay = spec.delay;
+            o.last_spawn = now;
+        }
+        o.last_update = now;
+    }
+
+    /// `collectBoltStates`: each live bolt's colour and quad corners (the faded part), expiring the old ones
+    /// three times a tick and forgetting owners five seconds after their last bolt.
+    pub fn states(&mut self, now: Timestamp) -> Vec<(u32, Vec<V3>)> {
+        let refresh = now.is_passed(self.refresh, 1.0 / 3.0);
+        if refresh {
+            self.refresh = now;
+        }
+        let mut out = Vec::new();
+        self.owners.retain(|_, o| {
+            if refresh {
+                o.bolts.retain(|(_, at, life, _)| !now.is_passed(*at, f64::from(*life)));
+            }
+            for (quads, at, life, color) in &o.bolts {
+                let age = (now.ticks - at.ticks) as f32 + (now.partial - at.partial);
+                let scale = age / life;
+                let total = quads.len();
+                let start = if scale > 0.5 { (total as f32 * (scale - 0.5) / 0.5) as usize } else { 0 };
+                let end = if scale < 0.5 { (total as f32 * (scale / 0.5)) as usize } else { total };
+                let vecs: Vec<V3> = quads.iter().take(end).skip(start).flatten().copied().collect();
+                out.push((*color, vecs));
+            }
+            !(o.bolts.is_empty() && now.is_passed(o.last_update, 100.0))
+        });
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +450,20 @@ mod tests {
         assert!(last.iter().all(|v| v.0.is_finite() && v.1.is_finite()));
         assert!((last[1].0 - 147.0).abs() < 10.0);
         assert!(quads.iter().all(|q| q.len() == 16));
+    }
+
+    #[test]
+    fn a_field_spawns_after_the_delay_and_expires() {
+        let spec = BoltSpec { effect: effect(1), lifespan: 8.0, delay: 4.0 };
+        let mut field = BoltField::new(5);
+        let at = |t: i64| Timestamp { ticks: t, partial: 0.0 };
+        field.update(1, spec, at(100));
+        assert_eq!(field.states(at(100)).len(), 1);
+        field.update(1, spec, at(102));
+        assert_eq!(field.states(at(102)).len(), 1);
+        field.update(1, spec, at(105));
+        assert_eq!(field.states(at(105)).len(), 2);
+        assert_eq!(field.states(at(120)).len(), 0);
     }
 
     #[test]

@@ -7,6 +7,7 @@ use super::Game;
 use horizon_client::containers::{ModBlockEntity, ModContainer};
 use horizon_client::items::ItemStack;
 use horizon_world::nbt::{Compound, JavaString, Tag};
+use mekanism_core::bolt;
 use mekanism_core::bounding;
 use mekanism_core::chemical::{self as chem, ChemicalTank};
 use mekanism_core::energy::{Action, EnergyContainer};
@@ -636,7 +637,11 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity, false),
-            Kind::PigmentMixer => tick_chemical_infuser(game, pos, entity, true),
+            Kind::PigmentMixer => {
+                let active = tick_chemical_infuser(game, pos, entity, true);
+                put_flag(game, pos, entity, "shaft_active", active == Some(true));
+                active
+            }
             Kind::Evaporation => tick_evaporation(game, pos, entity),
             Kind::Rotary => tick_rotary(game, pos, entity),
             Kind::Transporter(pull) => {
@@ -669,7 +674,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::Bin(t) => {
-                tick_bin(game, entity, t);
+                tick_bin(game, pos, entity, t);
                 None
             }
             Kind::PersonalStorage => None,
@@ -694,7 +699,11 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::Laser | Kind::LaserAmplifier | Kind::TractorBeam => tick_laser(game, pos, entity),
-            Kind::Vibrator => tick_vibrator(game, pos, entity),
+            Kind::Vibrator => {
+                let active = tick_vibrator(game, pos, entity);
+                put_flag(game, pos, entity, "shaft_active", active == Some(true));
+                active
+            }
             // Lit for a second after it last charged something.
             Kind::Chargepad => Some((game.world.game_time.max(0) as u64).saturating_sub(get_long(&entity.nbt, "charged_at")) <= 20),
         }
@@ -1267,18 +1276,553 @@ fn wind_rotor_speed(game: &Game<'_>, pos: [i32; 3]) -> f32 {
     SPEED * height / (game.world.top_y() - min) as f32
 }
 
-/// The rotors this client has heard of: the angle they have turned to and the tick it was worked out at.
+// The rotors this client has heard of: the angle they have turned to and the tick it was worked out at.
 thread_local! {
     static ROTORS: std::cell::RefCell<std::collections::HashMap<[i32; 3], (f32, u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// A block entity's client view arrived (`native_client_block_entity_changed`): a wind generator's rotor.
+thread_local! {
+    /// The seismic vibrators and pigment mixers this client has heard of, with the ticks a vibrator has run
+    /// (`clientPiston`) and the tick that was counted at.
+    static SHAFTS: std::cell::RefCell<std::collections::HashMap<[i32; 3], (u64, u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+thread_local! {
+    /// The fusion reactor ports this client has heard of (the master draws the plasma).
+    static FUSIONS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// One orbiting speck of an SPS (`SPSOrbitEffect`).
+struct Orbit {
+    start: bolt::V3,
+    axis: bolt::V3,
+    scale: f32,
+    ticker: u64,
+}
+
+/// What an SPS casing's client keeps: its bolts and the specks that circle its core.
+struct SpsFx {
+    bolts: bolt::BoltField,
+    orbits: std::collections::VecDeque<Orbit>,
+    rng: bolt::Rng,
+    last_tick: u64,
+}
+
+thread_local! {
+    /// The SPS ports this client has heard of (the master draws the effects).
+    static SPS_FX: std::cell::RefCell<std::collections::HashMap<[i32; 3], SpsFx>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+thread_local! {
+    /// The turbine valves this client has heard of, with the turn (lower, upper blade) of each rotor.
+    static TURBINES: std::cell::RefCell<std::collections::HashMap<[i32; 3], Vec<[f32; 2]>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+thread_local! {
+    /// The dynamic tank valves this client has heard of (the master draws the tank).
+    static BIG_TANKS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
+    /// The nutritional liquifiers this client has heard of.
+    static LIQUIFIERS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
+    /// The bins this client has heard of.
+    static BINS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
+    /// The energy cubes this client has heard of.
+    static CORES: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
+    /// The fluid tanks this client has heard of.
+    static TANKS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// A block entity's client view arrived (`native_client_block_entity_changed`): a wind generator's rotor or a
+/// fluid tank's contents are for the world to draw.
 pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
     if id == "mekanismgenerators:wind_generator" {
         ROTORS.with_borrow_mut(|r| {
             r.entry(pos).or_insert((0.0, 0));
         });
+    } else if matches!(kind(id), Some(Kind::FluidTank(_))) {
+        TANKS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    } else if matches!(kind(id), Some(Kind::FusionPort)) {
+        FUSIONS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    } else if matches!(kind(id), Some(Kind::SpsPort)) {
+        SPS_FX.with_borrow_mut(|t| {
+            t.entry(pos).or_insert_with(|| SpsFx {
+                bolts: bolt::BoltField::new(u64::from(pos[0] as u32) << 32 ^ u64::from(pos[2] as u32) ^ 0x5B5),
+                orbits: Default::default(),
+                rng: bolt::Rng::new(u64::from(pos[1] as u32) ^ 0xA5),
+                last_tick: 0,
+            });
+        });
+
+    } else if matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation | Kind::TurbineValve | Kind::FissionPort)) {
+        BIG_TANKS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+        if matches!(kind(id), Some(Kind::TurbineValve)) {
+            TURBINES.with_borrow_mut(|t| {
+                t.entry(pos).or_default();
+            });
+        }
+    } else if matches!(kind(id), Some(Kind::Vibrator | Kind::PigmentMixer)) {
+        SHAFTS.with_borrow_mut(|t| {
+            t.entry(pos).or_insert((0, 0));
+        });
+    } else if matches!(kind(id), Some(Kind::Liquifier)) {
+        LIQUIFIERS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    } else if matches!(kind(id), Some(Kind::Bin(_))) {
+        BINS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    } else if matches!(kind(id), Some(Kind::EnergyCube(_))) {
+        CORES.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    } else if id == "mekanism:teleporter" {
+        PORTALS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
     }
+}
+
+/// The fluid in each tank (`RenderFluidTank`): a box of its still texture tinted with its colour from just above
+/// the tank's floor, 0.135 in from the sides, its top by how full the tank is; the down face is not drawn.
+fn tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    const MIN_XZ: f64 = 0.135;
+    const MAX_XZ: f64 = 0.865;
+    const MIN_Y: f64 = 0.12375;
+    TANKS.with_borrow_mut(|tanks| {
+        tanks.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::FluidTank(_))) {
+                return false;
+            }
+            let scale = f64::from(get_int(c, "tank_scale"));
+            if scale > 0.0 {
+                let chemical = usize::try_from(get_int(c, "tank_fluid") as i32).ok().and_then(|i| CHEMICALS.get(i));
+                let (sprite, argb) = gauge_texture(chemical);
+                let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
+                let top = MIN_Y + 0.75225 * scale / 200.0;
+                let faces = [argb, argb, argb, 0, argb, argb];
+                boxes.push(super::native_hooks::NativeWorldBox {
+                    min: [x + MIN_XZ, y + MIN_Y, z + MIN_XZ],
+                    max: [x + MAX_XZ, y + top, z + MAX_XZ],
+                    colors: faces,
+                    sprite: Some(sprite),
+                });
+            }
+            true
+        });
+    });
+}
+
+/// A fluid or chemical filling part of a multiblock's inside (`MultiblockTileEntityRenderer`): where its
+/// interior starts, the interior's size, how full it is and with what.
+struct Fill {
+    at: [i32; 3],
+    size: [i32; 3],
+    scale: f64,
+    chemical: Option<String>,
+    /// A slightly smaller box, so that it does not fight the one it sits in (a reactor's heated coolant).
+    shrunk: bool,
+}
+
+const FILL_KEYS: [&str; 10] = ["x", "y", "z", "l", "h", "w", "scale", "chem", "on", "shrunk"];
+
+/// Tells clients what a multiblock's master holds, as up to two fills of its client view.
+fn put_fills(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fills: &[Fill]) {
+    let mut shown = Compound::new();
+    let mut owned = Vec::new();
+    for i in 0..2 {
+        for k in FILL_KEYS {
+            owned.push(format!("f{i}_{k}"));
+        }
+        let Some(f) = fills.get(i) else {
+            put_int(&mut shown, &format!("f{i}_on"), 0);
+            entity.nbt.remove(&JavaString::from(format!("pscale{i}").as_str()));
+            continue;
+        };
+        // `MekanismUtils.getScale`: the drawn level eases towards the real one, a tenth of the way a tick.
+        let prev = get_int(&entity.nbt, &format!("pscale{i}")) as f32 / 1_000_000.0;
+        let target = f.scale as f32;
+        let (empty, full) = (target <= 0.0, target >= 1.0);
+        let difference = (prev - target).abs();
+        let eased = if difference > 0.01 {
+            (9.0 * prev + target) / 10.0
+        } else if (!empty && full && difference > 0.0) || (!empty && prev == 0.0) {
+            target
+        } else if empty && prev < 0.01 {
+            0.0
+        } else {
+            prev
+        };
+        put_int(&mut entity.nbt, &format!("pscale{i}"), (eased * 1_000_000.0) as u32);
+        for (k, v) in FILL_KEYS.iter().zip([f.at[0], f.at[1], f.at[2], f.size[0], f.size[1], f.size[2]]) {
+            put_int(&mut shown, &format!("f{i}_{k}"), v as u32);
+        }
+        put_int(&mut shown, &format!("f{i}_scale"), (eased * 1_000_000.0) as u32);
+        put_int(&mut shown, &format!("f{i}_chem"), chemical_index(f.chemical.as_deref()) as u32);
+        put_int(&mut shown, &format!("f{i}_on"), 1);
+        put_int(&mut shown, &format!("f{i}_shrunk"), u32::from(f.shrunk));
+    }
+    let owned: Vec<&str> = owned.iter().map(String::as_str).collect();
+    put_client(game, pos, entity, &owned, shown);
+}
+
+/// `ValveData.onTransfer` and `tick`: a valve that took fluid in stays active for 30 ticks. Each master keeps
+/// `vact` ([x, y, z, ticks] a valve); this counts it down, marks the `touched` valves and gives the active ones.
+fn valves_active(entity: &mut ModBlockEntity, touched: &[[i32; 3]]) -> Vec<[i32; 3]> {
+    let mut valves: Vec<[i32; 4]> = match entity.nbt.get(&JavaString::from("vact")) {
+        Some(Tag::IntArray(v)) => v.chunks(4).filter(|c| c.len() == 4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
+        _ => Vec::new(),
+    };
+    for v in &mut valves {
+        v[3] -= 1;
+    }
+    for t in touched {
+        match valves.iter_mut().find(|v| v[..3] == t[..]) {
+            Some(v) => v[3] = 30,
+            None => valves.push([t[0], t[1], t[2], 30]),
+        }
+    }
+    valves.retain(|v| v[3] > 0);
+    if valves.is_empty() {
+        entity.nbt.remove(&JavaString::from("vact"));
+    } else {
+        entity.nbt.insert("vact".into(), Tag::IntArray(valves.concat()));
+    }
+    valves.iter().map(|v| [v[0], v[1], v[2]]).collect()
+}
+
+/// Tells clients which valves of the multiblock (corners `lo` and `hi` of its casing) run, with the side of the
+/// casing each is on (`Direction` ordinals), for the first fill to draw as `ValveRenderData`.
+fn put_valves(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, active: &[[i32; 3]], lo: [i32; 3], hi: [i32; 3]) {
+    let mut list = Vec::new();
+    for v in active {
+        let side = if v[0] == lo[0] {
+            4
+        } else if v[0] == hi[0] {
+            5
+        } else if v[1] == lo[1] {
+            0
+        } else if v[1] == hi[1] {
+            1
+        } else if v[2] == lo[2] {
+            2
+        } else {
+            3
+        };
+        list.extend([v[0], v[1], v[2], side]);
+    }
+    let mut shown = Compound::new();
+    if !list.is_empty() {
+        shown.insert("vlv".into(), Tag::IntArray(list));
+    }
+    put_client(game, pos, entity, &["vlv"], shown);
+}
+
+/// One running valve (`ValveRenderData.get`, `ModelRenderer.shouldSkipValveRender`): a column of the fluid in the
+/// casing beside the valve, still on the up and down faces and flowing on the sides.
+#[allow(clippy::too_many_arguments)]
+fn valve_boxes(
+    boxes: &mut Vec<super::native_hooks::NativeWorldBox>,
+    valve: [i32; 3],
+    side: i32,
+    main: f32,
+    floor: i32,
+    height: i32,
+    argb: u32,
+    still: &str,
+    flowing: &str,
+) {
+    let level = valve[1] - floor;
+    let skip = match side {
+        0 => main >= 0.49,
+        1 => main >= height as f32,
+        _ => main - level as f32 >= 0.69,
+    };
+    if skip {
+        return;
+    }
+    let (mut min_x, mut max_x, mut min_z, mut max_z) = (0.3_f32, 0.7_f32, 0.3_f32, 0.7_f32);
+    let (mut min_y, mut max_y) = (main - level as f32 + 0.01, 0.7_f32);
+    match side {
+        0 => (min_y, max_y) = (main + 1.01, 1.5),
+        1 => (min_y, max_y) = (main - height as f32 - 0.01, -0.01),
+        2 => (min_z, max_z) = (1.02, 1.4),
+        3 => (min_z, max_z) = (-0.4, -0.03),
+        4 => (min_x, max_x) = (1.02, 1.4),
+        _ => (min_x, max_x) = (-0.4, -0.03),
+    }
+    let (x, y, z) = (f64::from(valve[0]), f64::from(valve[1]), f64::from(valve[2]));
+    let min = [x + f64::from(min_x), y + f64::from(min_y), z + f64::from(min_z)];
+    let max = [x + f64::from(max_x), y + f64::from(max_y), z + f64::from(max_z)];
+    // [east, west, up, down, south, north]; with the fluid at the floor there is no face to look up at.
+    let down = if main == 0.0 { 0 } else { argb };
+    boxes.push(super::native_hooks::NativeWorldBox { min, max, colors: [0, 0, argb, down, 0, 0], sprite: Some(still.to_string()) });
+    boxes.push(super::native_hooks::NativeWorldBox { min, max, colors: [argb, argb, 0, 0, argb, argb], sprite: Some(flowing.to_string()) });
+}
+
+/// The fills each formed multiblock's master tells (`RenderDynamicTank`, `RenderThermoelectricBoiler`...): a
+/// box of the still texture inset 0.01 inside the casing, as tall as its stage of `1000 * height` says (all
+/// of it for a gas), from the floor of its part of the interior.
+fn big_tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    const GASES: [&str; 7] = [
+        "mekanism:steam",
+        "mekanism:hydrogen",
+        "mekanism:oxygen",
+        "mekanism:sulfur_dioxide",
+        "mekanism:sulfur_trioxide",
+        "mekanism:hydrogen_chloride",
+        "mekanism:ethene",
+    ];
+    BIG_TANKS.with_borrow_mut(|set| {
+        set.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation | Kind::TurbineValve | Kind::FissionPort)) {
+                return false;
+            }
+            for i in 0..2 {
+                let key = |k: &str| get_int(c, &format!("f{i}_{k}"));
+                if key("on") == 0 {
+                    continue;
+                }
+                let (length, height, width) = (key("l") as i32, key("h") as i32, key("w") as i32);
+                if length <= 0 || height <= 0 || width <= 0 {
+                    continue;
+                }
+                let chemical = usize::try_from(key("chem") as i32).ok().and_then(|i| CHEMICALS.get(i));
+                let gaseous = chemical.is_some_and(|(n, ..)| GASES.contains(n));
+                let max_stages = (height * 1000).max(1);
+                let scale = f64::from(key("scale")) / 1_000_000.0;
+                let stage = if gaseous { max_stages } else { max_stages.min((scale * f64::from(max_stages)) as i32) };
+                let max_y = (f64::from(height) * f64::from(stage) / f64::from(max_stages) - 0.02).max(0.02);
+                let (sprite, argb) = gauge_texture(chemical);
+                let (x, y, z) = (f64::from(key("x") as i32), f64::from(key("y") as i32), f64::from(key("z") as i32));
+                // `renderObject(min, min, min, length - 0.02, maxY, width - 0.02)`: the two corners, not a size.
+                let (lo, hi) = if key("shrunk") != 0 { (0.02, 0.03) } else { (0.01, 0.02) };
+                boxes.push(super::native_hooks::NativeWorldBox {
+                    min: [x + lo, y + lo, z + lo],
+                    max: [x + f64::from(length) - hi, y + max_y, z + f64::from(width) - hi],
+                    colors: [argb; 6],
+                    sprite: Some(sprite.clone()),
+                });
+                // `RenderResizableCuboid.renderValves`: the first fill (a fluid) shows its running valves.
+                if i == 0
+                    && let Some(Tag::IntArray(list)) = c.get(&JavaString::from("vlv"))
+                {
+                    let flowing = match sprite.as_str() {
+                        "block/water_still" => "block/water_flow".to_string(),
+                        "block/lava_still" => "block/lava_flow".to_string(),
+                        _ => sprite.clone(),
+                    };
+                    let main = (max_y - 0.01) as f32;
+                    for v in list.chunks(4).filter(|v| v.len() == 4) {
+                        valve_boxes(boxes, [v[0], v[1], v[2]], v[3], main, y as i32, height, argb, &sprite, &flowing);
+                    }
+                }
+            }
+            // The fuel assemblies of a burning reactor glow: a translucent box round each column, a bit taller than
+            // the stack to take in the control rod under it, with no top or bottom.
+            if let Some(Tag::IntArray(columns)) = c.get(&JavaString::from("glow")) {
+                let glow = (0x99_u32 << 24) | 0x76E0EC;
+                for column in columns.chunks(4).filter(|c| c.len() == 4) {
+                    let (x, y, z) = (f64::from(column[0]), f64::from(column[1]), f64::from(column[2]));
+                    let tall = f64::from(column[3]) + 0.625;
+                    boxes.push(super::native_hooks::NativeWorldBox {
+                        min: [x + 0.05, y + 0.01 * tall, z + 0.05],
+                        max: [x + 0.95, y + 0.99 * tall, z + 0.95],
+                        colors: [glow, glow, 0, 0, glow, glow],
+                        sprite: None,
+                    });
+                }
+            }
+            true
+        });
+    });
+}
+
+/// `RenderSPS` (hook point `native_world_quads`, API 45): a bolt from the face of each coil that is lit to the
+/// middle, flashes to the casing while energy comes in, the core's billboard and the specks circling it.
+pub(super) fn world_quads(game: &Game<'_>, quads: &mut Vec<super::native_hooks::NativeWorldQuad>) {
+    let ticks = game.ticks as u64;
+    let now = bolt::Timestamp { ticks: ticks as i64, partial: game.clock.fraction() as f32 };
+    let partial = now.partial;
+    let (right, up) = game.native_camera_axes();
+    let (right, up) = (right.map(|v| v as f32), up.map(|v| v as f32));
+    let corner = |c: [f32; 3], x: f32, y: f32| -> [f64; 3] { std::array::from_fn(|k| f64::from(c[k] + right[k] * x + up[k] * y)) };
+    SPS_FX.with_borrow_mut(|set| {
+        set.retain(|pos, fx| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::SpsPort)) {
+                return false;
+            }
+            let lo = get_ints(c, "sps_lo");
+            if get_int(c, "sps_on") == 0 || lo.len() != 3 {
+                return true;
+            }
+            let center = bolt::V3(lo[0] as f32 + 3.5, lo[1] as f32 + 3.5, lo[2] as f32 + 3.5);
+            let energy = get_int(c, "sps_e");
+            let processed = f32::from_bits(get_int(c, "sps_p"));
+            let scale = (((f64::from(processed).log10() + 2.0) / 4.0) as f32).clamp(0.0, 1.0);
+            let lerp = |a: f32, b: f32| a + (b - a) * scale;
+            let key = |p: [i32; 3]| i64::from(p[0]).wrapping_mul(73_856_093) ^ i64::from(p[1]).wrapping_mul(19_349_663) ^ i64::from(p[2]).wrapping_mul(83_492_791);
+            let mut target_effects = 0usize;
+            // `getBoltFromData` for each lit coil.
+            let coils = get_ints(c, "sps_c");
+            for coil in coils.chunks(5).filter(|c| c.len() == 5 && c[4] > 0) {
+                let (_, d) = DIRECTIONS[(coil[3].clamp(0, 5)) as usize];
+                let level = coil[4];
+                let start = bolt::V3(
+                    (coil[0] + d[0]) as f32 + 0.5 + 0.5 * d[0] as f32,
+                    (coil[1] + d[1]) as f32 + 0.5 + 0.5 * d[1] as f32,
+                    (coil[2] + d[2]) as f32 + 0.5 + 0.5 * d[2] as f32,
+                );
+                let effect = bolt::BoltEffect {
+                    info: bolt::BoltRenderInfo::electricity(),
+                    start,
+                    end: center,
+                    segments: 15,
+                    count: 1 + (level - 1) / 2,
+                    size: 0.01 * level as f32,
+                };
+                fx.bolts.update(key([coil[0], coil[1], coil[2]]), bolt::BoltSpec { effect, lifespan: 8.0, delay: 4.0 }, now);
+            }
+            if energy > 0 {
+                if f64::from(fx.rng.float()) < f64::from(lerp(0.01, 0.4)) {
+                    let side = (fx.rng.float() * 6.0) as usize % 6;
+                    let (min, max) = ([lo[0] as f32 + 1.0, lo[1] as f32 + 1.0, lo[2] as f32 + 1.0], [lo[0] as f32 + 6.0, lo[1] as f32 + 6.0, lo[2] as f32 + 6.0]);
+                    let mut end = [0.0; 3];
+                    for k in 0..3 {
+                        end[k] = min[k] + fx.rng.float() * (max[k] - min[k]);
+                    }
+                    // `CuboidSide`: north, south, west, east, bottom, top fix one coordinate.
+                    let (axis, high) = [(2, false), (2, true), (0, false), (0, true), (1, false), (1, true)][side];
+                    end[axis] = if high { max[axis] } else { min[axis] };
+                    let effect = bolt::BoltEffect {
+                        info: bolt::BoltRenderInfo::electricity(),
+                        start: center,
+                        end: bolt::V3(end[0], end[1], end[2]),
+                        segments: 15,
+                        count: 1,
+                        size: 0.01 * lerp(0.5, 5.0),
+                    };
+                    let owner = 31 * side as i64 + key([end[0] as i32, end[1] as i32, end[2] as i32]) ^ i64::from(end[0].to_bits() ^ end[1].to_bits() ^ end[2].to_bits());
+                    fx.bolts.update(owner, bolt::BoltSpec { effect, lifespan: 8.0, delay: 0.0 }, now);
+                }
+                target_effects = lerp(10.0, 120.0) as usize;
+            }
+            // The specks: one fewer or, half the time, one more a frame.
+            if fx.orbits.len() > target_effects {
+                fx.orbits.pop_front();
+            } else if fx.orbits.len() < target_effects && fx.rng.float() < 0.5 {
+                let vec = |rng: &mut bolt::Rng| {
+                    let v = bolt::V3(rng.float() - 0.5, rng.float() - 0.5, rng.float() - 0.5);
+                    let l = (v.0 * v.0 + v.1 * v.1 + v.2 * v.2).sqrt().max(1e-6);
+                    bolt::V3(v.0 / l, v.1 / l, v.2 / l)
+                };
+                let start = vec(&mut fx.rng);
+                let k = 1.0 + fx.rng.float();
+                let axis = vec(&mut fx.rng);
+                let scale = 0.01 + fx.rng.float() * 0.04;
+                fx.orbits.push_back(Orbit { start: bolt::V3(start.0 * k, start.1 * k, start.2 * k), axis, scale, ticker: 0 });
+            }
+            let elapsed = if fx.last_tick == 0 { 0 } else { ticks.saturating_sub(fx.last_tick) };
+            fx.last_tick = ticks;
+            let speed = (energy.max(1) as f32).log10();
+            for orbit in &mut fx.orbits {
+                orbit.ticker += elapsed;
+                // `SPSOrbitEffect.transformPos`: the start turned about its axis.
+                let angle = ((orbit.ticker as f32 + partial) * speed).to_radians();
+                let (s, co) = angle.sin_cos();
+                let (a, v) = (orbit.axis, orbit.start);
+                let cross = bolt::V3(a.1 * v.2 - a.2 * v.1, a.2 * v.0 - a.0 * v.2, a.0 * v.1 - a.1 * v.0);
+                let dot = a.0 * v.0 + a.1 * v.1 + a.2 * v.2;
+                let at = [0, 1, 2].map(|k| {
+                    let (vk, ak, ck) = ([v.0, v.1, v.2][k], [a.0, a.1, a.2][k], [cross.0, cross.1, cross.2][k]);
+                    [center.0, center.1, center.2][k] + vk * co + ck * s + ak * dot * (1.0 - co)
+                });
+                let r = orbit.scale;
+                quads.push(super::native_hooks::NativeWorldQuad {
+                    corners: [corner(at, r, -r), corner(at, r, r), corner(at, -r, r), corner(at, -r, -r)],
+                    color: 0xF066_D7ED,
+                    sprite: Some("mekanism:gui/sps_orbit".into()),
+                    uv: [0.0, 0.0, 1.0, 1.0],
+                });
+            }
+            if processed > 0.0 {
+                let r = lerp(0.1, 4.0);
+                let at = [center.0, center.1, center.2];
+                quads.push(super::native_hooks::NativeWorldQuad {
+                    corners: [corner(at, r, -r), corner(at, r, r), corner(at, -r, r), corner(at, -r, -r)],
+                    color: 0xF0FF_FFFF,
+                    sprite: Some(format!("mekanism:gui/sps_core_{}", ticks % 16)),
+                    uv: [0.0, 0.0, 1.0, 1.0],
+                });
+            }
+            for (argb, vecs) in fx.bolts.states(now) {
+                for q in vecs.chunks(4).filter(|q| q.len() == 4) {
+                    quads.push(super::native_hooks::NativeWorldQuad {
+                        corners: std::array::from_fn(|i| [f64::from(q[i].0), f64::from(q[i].1), f64::from(q[i].2)]),
+                        color: argb,
+                        sprite: None,
+                        uv: [0.0, 0.0, 1.0, 1.0],
+                    });
+                }
+            }
+            true
+        });
+    });
+}
+
+/// The paste in each liquifier (`RenderNutritionalLiquifier`): a box of the still texture from 0.313 up by
+/// its stage of 40, not drawn on the down face.
+fn liquifier_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    LIQUIFIERS.with_borrow_mut(|set| {
+        set.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::Liquifier)) {
+                return false;
+            }
+            let stage = get_int(c, "liq_stage");
+            if stage > 0 {
+                let paste = CHEMICALS.iter().find(|(n, ..)| *n == chem::NUTRITIONAL_PASTE);
+                let (sprite, argb) = gauge_texture(paste);
+                let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
+                let faces = [argb, argb, argb, 0, argb, argb];
+                boxes.push(super::native_hooks::NativeWorldBox {
+                    min: [x + 0.001, y + 0.313, z + 0.001],
+                    max: [x + 0.999, y + 0.313 + 0.624 * f64::from(stage) / 40.0, z + 0.999],
+                    colors: faces,
+                    sprite: Some(sprite),
+                });
+            }
+            true
+        });
+    });
 }
 
 /// The rotors that turn (hook point `native_world_models`, API 43): `RenderWindGenerator` puts the blades 4.5 up,
@@ -1318,10 +1862,373 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                 pitch: 0.0,
                 roll,
                 light_at: [pos[0], pos[1] + 4, pos[2]],
+                color: 0xFFFF_FFFF,
+                rotation: None,
+                full_bright: false,
+                scale: 1.0,
             });
             true
         });
     });
+    // `RenderSeismicVibrator` and `RenderPigmentMixer`: the vibrator's shaft rises with sin(clientPiston / 5),
+    // the mixer's turns 5 degrees a tick; both only while they work.
+    let ticks_now = game.ticks as u64;
+    let partial_now = game.clock.fraction() as f32;
+    SHAFTS.with_borrow_mut(|shafts| {
+        shafts.retain(|pos, (count, last)| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            let k = kind(id);
+            if !matches!(k, Some(Kind::Vibrator | Kind::PigmentMixer)) {
+                return false;
+            }
+            let active = get_int(c, "shaft_active") != 0;
+            if *last == 0 {
+                *last = ticks_now;
+            }
+            if active && k == Some(Kind::Vibrator) {
+                *count += ticks_now.saturating_sub(*last);
+            }
+            *last = ticks_now;
+            if !active {
+                return true;
+            }
+            let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
+            if k == Some(Kind::Vibrator) {
+                let piston = ((*count as f32 + partial_now) / 5.0).sin().max(0.0);
+                models.push(super::native_hooks::NativeWorldModel {
+                    model: "mekanism:vibrator_shaft".into(),
+                    position: [x + 0.5, y + 0.5 + 0.625 * f64::from(piston), z + 0.5],
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    roll: 0.0,
+                    light_at: [pos[0], pos[1] + 1, pos[2]],
+                    color: 0xFFFF_FFFF,
+                    rotation: None,
+                    full_bright: false,
+                    scale: 1.0,
+                });
+            } else {
+                let (dx, dz) = match game.native_block_property(*pos, "facing").as_deref() {
+                    Some("north") => (7.0 / 16.0, 6.0 / 16.0),
+                    Some("south") => (7.0 / 16.0, 0.5),
+                    Some("west") => (6.0 / 16.0, 7.0 / 16.0),
+                    _ => (0.5, 7.0 / 16.0),
+                };
+                let time = ticks_now as f32 + partial_now;
+                models.push(super::native_hooks::NativeWorldModel {
+                    model: "mekanism:pigment_mixer_shaft".into(),
+                    position: [x + dx + 1.0 / 16.0, y, z + dz + 1.0 / 16.0],
+                    yaw: -((time * 5.0) % 360.0),
+                    pitch: 0.0,
+                    roll: 0.0,
+                    light_at: [pos[0], pos[1] + 1, pos[2]],
+                    color: 0xFFFF_FFFF,
+                    rotation: None,
+                    full_bright: false,
+                    scale: 1.0,
+                });
+            }
+            true
+        });
+    });
+    // `RenderFusionReactor`: three cores, each scaled, turned about Y and then about (0, 1/√2, 1/√2).
+    let animation = ticks_now as f32 + partial_now;
+    FUSIONS.with_borrow_mut(|set| {
+        set.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::FusionPort)) {
+                return false;
+            }
+            if get_int(c, "fus_on") != 0 {
+                let scaled = get_int(c, "fus_scaled") as f32;
+                let sin = |degrees: f32| ((degrees % 360.0).to_radians()).sin();
+                let axis = glam::Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2);
+                let ctrl = [get_int(c, "fus_x") as i32, get_int(c, "fus_y") as i32, get_int(c, "fus_z") as i32];
+                // (colour, scale, Y multiplier, axis multiplier, Y shift, axis shift)
+                for (rgb, scale, m1, m2, s1, s2) in [
+                    (0xFF383C_u32, 1.0 + 0.7 * sin(3.14 * scaled + 135.0), -6.0, -7.0, 0.0, 36.0),
+                    (0xD55ECB, 1.0 + 0.8 * sin(3.0 * scaled), 4.0, 4.0, 0.0, 36.0),
+                    (0xFFA160, 1.0 - 0.9 * sin(4.0 * scaled + 90.0), 5.0, -3.0, -35.0, 106.0),
+                ] {
+                    let q = glam::Quat::from_axis_angle(glam::Vec3::Y, (animation * m1 + s1).to_radians())
+                        * glam::Quat::from_axis_angle(axis, (animation * m2 + s2).to_radians());
+                    models.push(super::native_hooks::NativeWorldModel {
+                        model: "mekanism:fusion_core".into(),
+                        position: [f64::from(ctrl[0]) + 0.5, f64::from(ctrl[1]) - 1.5, f64::from(ctrl[2]) + 0.5],
+                        yaw: 0.0,
+                        pitch: 0.0,
+                        roll: 0.0,
+                        light_at: ctrl,
+                        color: 0xFF00_0000 | rgb,
+                        rotation: Some(q.to_array()),
+                        full_bright: true,
+                        scale,
+                    });
+                }
+            }
+            true
+        });
+    });
+    // `RenderIndustrialTurbine` and `RenderTurbineRotor`: each rotor's two blade rings turn by the flow, at
+    // `BASE_SPEED / (index + 1)` degrees a frame, the lower ring at the rotor's 1/4 and the upper at its 3/4.
+    TURBINES.with_borrow_mut(|set| {
+        set.retain(|pos, turns| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::TurbineValve)) {
+                return false;
+            }
+            let Some(Tag::IntArray(column)) = c.get(&JavaString::from("rot_col")) else {
+                return true;
+            };
+            if column.len() < 3 {
+                return true;
+            }
+            let rotors = column.len() - 2;
+            if turns.len() != rotors {
+                *turns = vec![[0.0; 2]; rotors];
+            }
+            let speed = get_int(c, "rot_flow") as f32 / 1000.0 * 512.0;
+            for (i, turn) in turns.iter_mut().enumerate() {
+                let base = i * 2;
+                turn[0] = (turn[0] + speed / (base + 1) as f32) % 360.0;
+                turn[1] = (turn[1] + speed / (base + 2) as f32) % 360.0;
+                let at = [column[0], column[2 + i], column[1]];
+                for (k, (turn, up)) in [(turn[0], 0.25), (turn[1], 0.75)].into_iter().enumerate() {
+                    models.push(super::native_hooks::NativeWorldModel {
+                        model: format!("mekanismgenerators:turbine_blade_{}", (base + k).min(27)),
+                        position: [f64::from(at[0]) + 0.5, f64::from(at[1]) + up, f64::from(at[2]) + 0.5],
+                        yaw: turn,
+                        pitch: 0.0,
+                        roll: 0.0,
+                        light_at: at,
+                        color: 0xFFFF_FFFF,
+                        rotation: None,
+                        full_bright: false,
+                        scale: 1.0,
+                    });
+                }
+            }
+            true
+        });
+    });
+    // `RenderRobit`: the model stands on the mob's feet, turned with its body (the window's client draws the
+    // mob as its base type, which `mob_hidden` leaves out).
+    for id in ROBITS.with_borrow(|set| set.iter().copied().collect::<Vec<u32>>()) {
+        let Some((at, body, _, _)) = game.native_mob_pose(id) else {
+            continue;
+        };
+        let light_at = [at[0].floor() as i32, at[1].floor() as i32 + 1, at[2].floor() as i32];
+        for (name, full_bright) in [("mekanism:robit_body", false), ("mekanism:robit_glow", true)] {
+            models.push(super::native_hooks::NativeWorldModel {
+                model: name.into(),
+                position: at,
+                yaw: -body,
+                pitch: 0.0,
+                roll: 0.0,
+                light_at,
+                color: 0xFFFF_FFFF,
+                rotation: None,
+                full_bright,
+                scale: 1.0,
+            });
+        }
+    }
+    // `RenderNutritionalLiquifier`: the blade turns at 25 degrees a tick while it works.
+    let time = game.ticks as f32 + game.clock.fraction() as f32;
+    LIQUIFIERS.with_borrow(|set| {
+        for pos in set {
+            let Some((_, c)) = game.native_client_block_entity(*pos) else {
+                continue;
+            };
+            if get_int(c, "liq_active") == 0 {
+                continue;
+            }
+            models.push(super::native_hooks::NativeWorldModel {
+                model: "mekanism:liquifier_blade".into(),
+                position: [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5],
+                yaw: (time * 25.0) % 360.0,
+                pitch: 0.0,
+                roll: 0.0,
+                light_at: *pos,
+                color: 0xFFFF_FFFF,
+                rotation: None,
+                full_bright: false,
+                scale: 1.0,
+            });
+        }
+    });
+    // `RenderEnergyCube`: the core floats, bobs and turns while the cube holds energy, tinted with the tier's
+    // colour and the fill as alpha.
+    const TIER_RGB: [u32; 5] = [0x5FFFB8, 0xFF806A, 0x4BF8FF, 0xF787FF, 0x585858];
+    CORES.with_borrow_mut(|cores| {
+        cores.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::EnergyCube(_))) {
+                return false;
+            }
+            let alpha = get_int(c, "core_alpha").min(255);
+            if alpha > 0 {
+                let rgb = TIER_RGB.get(get_int(c, "core_tier") as usize).copied().unwrap_or(0xFFFFFF);
+                let scaled = 4.0 * time;
+                let bob = f64::from((3.0 * time).to_radians().sin() / 7.0 * 0.4);
+                // poseStack: rotate Y by `scaled`, then about (0, 1/√2, 1/√2) by 36 + `scaled`.
+                let axis = glam::Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2);
+                let q = glam::Quat::from_axis_angle(glam::Vec3::Y, scaled.to_radians())
+                    * glam::Quat::from_axis_angle(axis, (36.0 + scaled).to_radians());
+                models.push(super::native_hooks::NativeWorldModel {
+                    model: "mekanism:energy_core".into(),
+                    position: [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5 + bob, f64::from(pos[2]) + 0.5],
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    roll: 0.0,
+                    light_at: *pos,
+                    color: (alpha << 24) | rgb,
+                    rotation: Some(q.to_array()),
+                    full_bright: true,
+                    scale: 1.0,
+                });
+            }
+            true
+        });
+    });
+}
+
+/// What `RenderBin` draws for one bin: its pose is the facing's, the item and the count's text hang from it.
+struct BinFace {
+    item: String,
+    count: String,
+    locked: bool,
+    pos: [i32; 3],
+    cover: [i32; 3],
+    item_pose: glam::DMat4,
+    text_pose: glam::DMat4,
+}
+
+/// The bins with something to show and nothing solid over their front (`RenderBin.extractRenderState`).
+fn bin_faces(game: &Game<'_>) -> Vec<BinFace> {
+    use glam::{DMat4, DVec3};
+    use std::f64::consts::{FRAC_PI_2, PI};
+    let mut faces = Vec::new();
+    BINS.with_borrow_mut(|bins| {
+        bins.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            let Some(Kind::Bin(tier)) = kind(id) else {
+                return false;
+            };
+            let item = get_string(c, "bin_item").unwrap_or_default();
+            let locked = get_int(c, "bin_lock") != 0;
+            if item.is_empty() || (get_int(c, "bin_count") == 0 && !locked) {
+                return true;
+            }
+            let Some(front) = game.native_block_property(*pos, "facing") else {
+                return true;
+            };
+            let Some(d) = direction(&front) else {
+                return true;
+            };
+            let cover = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+            let opposite = horizon_core::geometry::Direction::ALL[face_index([-d[0], -d[1], -d[2]])];
+            if game.native_face_sturdy(cover, opposite) {
+                return true;
+            }
+            let count = if tier == BaseTier::Creative { "Infinite".to_owned() } else { get_int(c, "bin_count").to_string() };
+            let origin = DMat4::from_translation(DVec3::new(f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])));
+            let t = |x: f64, y: f64, z: f64| DMat4::from_translation(DVec3::new(x, y, z));
+            let (ry, rx) = (DMat4::from_rotation_y, DMat4::from_rotation_x);
+            let mut item_pose = origin
+                * match front.as_str() {
+                    "north" => t(0.71, 0.8, -0.0001) * ry(PI),
+                    "south" => t(0.29, 0.8, 1.0001),
+                    "west" => t(-0.0001, 0.8, 0.29) * ry(-FRAC_PI_2),
+                    _ => t(1.0001, 0.8, 0.71) * ry(FRAC_PI_2),
+                };
+            item_pose = item_pose
+                * DMat4::from_scale(DVec3::new(0.025, 0.025, 0.0001))
+                * t(8.0, -8.0, 8.0)
+                * DMat4::from_scale(DVec3::splat(16.0));
+            let text_pose = origin
+                * t(0.0, -0.25, 0.0)
+                * match front.as_str() {
+                    "south" => t(0.0, 1.0, 0.0) * rx(FRAC_PI_2),
+                    "north" => t(1.0, 1.0, 1.0) * ry(PI) * rx(FRAC_PI_2),
+                    "east" => t(0.0, 1.0, 1.0) * ry(FRAC_PI_2) * rx(FRAC_PI_2),
+                    _ => t(1.0, 1.0, 0.0) * ry(-FRAC_PI_2) * rx(FRAC_PI_2),
+                }
+                * t(0.5, 1.0, 0.5)
+                * rx(-FRAC_PI_2);
+            faces.push(BinFace { item, count, locked, pos: *pos, cover, item_pose, text_pose });
+            true
+        });
+    });
+    faces
+}
+
+/// The items on the bins' fronts (hook point `native_world_items`, API 44).
+pub(super) fn world_items(game: &Game<'_>, items: &mut Vec<super::native_hooks::NativeWorldItem>) {
+    // The liquifier's food, at 0.6 up, turning at 10 degrees a tick while it works (GROUND display).
+    let time = game.ticks as f32 + game.clock.fraction() as f32;
+    LIQUIFIERS.with_borrow(|set| {
+        for pos in set {
+            let Some((_, c)) = game.native_client_block_entity(*pos) else {
+                continue;
+            };
+            let Some(item) = get_string(c, "liq_item").filter(|i| !i.is_empty()) else {
+                continue;
+            };
+            let spin = if get_int(c, "liq_active") != 0 { f64::from((time * 10.0) % 360.0) } else { 0.0 };
+            let matrix = glam::DMat4::from_translation(glam::DVec3::new(f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.6, f64::from(pos[2]) + 0.5))
+                * glam::DMat4::from_rotation_y(spin.to_radians());
+            items.push(super::native_hooks::NativeWorldItem {
+                item,
+                matrix: matrix.to_cols_array(),
+                light_at: *pos,
+                seed: (i64::from(pos[0]) * 3129871 ^ i64::from(pos[2]) * 116129781 ^ i64::from(pos[1])) as i32,
+                ground: true,
+            });
+        }
+    });
+    for f in bin_faces(game) {
+        items.push(super::native_hooks::NativeWorldItem {
+            item: f.item,
+            matrix: f.item_pose.to_cols_array(),
+            light_at: f.cover,
+            seed: (i64::from(f.pos[0]) * 3129871 ^ i64::from(f.pos[2]) * 116129781 ^ i64::from(f.pos[1])) as i32,
+            ground: false,
+        });
+    }
+}
+
+/// The counts under them (hook point `native_world_texts`, API 44): `RenderBin` scales the text to fit the
+/// block's width, at most 0.02, and centres it.
+pub(super) fn world_texts(game: &Game<'_>, texts: &mut Vec<super::native_hooks::NativeWorldText>) {
+    for f in bin_faces(game) {
+        let required_width = game.native_text_width(&f.count).max(1.0) as i32;
+        let required_height = 9 + 2;
+        let scale = (0.4 / required_width as f32).min(0.02);
+        let real_height = (1.0 / scale).floor() as i32;
+        let real_width = (1.0 / scale).floor() as i32;
+        let offset_x = (real_width - required_width) / 2;
+        let offset_y = (real_height - required_height) / 2;
+        let s = f64::from(scale);
+        texts.push(super::native_hooks::NativeWorldText {
+            text: f.count,
+            matrix: (f.text_pose * glam::DMat4::from_scale(glam::DVec3::new(s, -s, s))).to_cols_array(),
+            x: (offset_x - real_width / 2) as f32,
+            y: (1 + offset_y - real_height / 2) as f32,
+            color: if f.locked { 0xFF30_FFF9 } else { 0xFFFF_FFFF },
+            light_at: f.cover,
+        });
+    }
 }
 
 // --- Energy cubes -----------------------------------------------------------------------------------
@@ -1342,6 +2249,11 @@ fn tick_cube(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, ti
     }
     put_long(&mut entity.nbt, "energy", energy.stored);
     entity.data = vec![(energy.stored * 1000 / capacity.max(1)) as i32, 1000, 0, 0];
+    // The core, for `RenderEnergyCube`: the tier and how full the cube is (its alpha), as 0..=255.
+    let mut core = Compound::new();
+    put_int(&mut core, "core_alpha", (energy.stored as f64 / capacity.max(1) as f64 * 255.0) as u32);
+    put_int(&mut core, "core_tier", tier as u32);
+    put_client(game, pos, entity, &["core_alpha", "core_tier"], core);
 }
 
 // --- Universal cables -------------------------------------------------------------------------------
@@ -1723,6 +2635,17 @@ fn tick_liquifier(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
         _ => progress = 0,
     }
     push_chemical(game, pos, &mut tank, None, u64::MAX, false);
+    // `RenderNutritionalLiquifier`: the paste's stage (of 40), whether it works, and the last food it ate.
+    if active && let Some(Some(food)) = entity.items.first() {
+        let item = food.item.to_string();
+        entity.nbt.insert("last_item".into(), Tag::String(item.as_str().into()));
+    }
+    let mut shown = Compound::new();
+    let scale = if tank.capacity == 0 { 0.0 } else { tank.amount as f64 / tank.capacity as f64 };
+    put_int(&mut shown, "liq_stage", if tank.amount == 0 { 0 } else { ((scale * 39.0) as u32).min(39) });
+    put_int(&mut shown, "liq_active", u32::from(active));
+    shown.insert("liq_item".into(), Tag::String(get_string(&entity.nbt, "last_item").unwrap_or_default().as_str().into()));
+    put_client(game, pos, entity, &["liq_stage", "liq_active", "liq_item"], shown);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "output", &tank);
@@ -3477,6 +4400,7 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     };
     let Some(tower) = tower else {
         entity.data = vec![0, 1000, 0, 1000];
+        put_fills(game, pos, entity, &[]);
         return Some(false);
     };
     let mut water = get_tank(&entity.nbt, "water", evap::input_capacity(tower.height));
@@ -3520,10 +4444,15 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     // A tower that is not making brine may take brine in, to make lithium.
     let takes_brine = water.chemical.as_deref() == Some("mekanism:brine")
         || (water.amount == 0 && brine.chemical.as_deref() != Some("mekanism:brine"));
+    let mut touched = Vec::new();
     for valve in valves {
+        let before = water.amount;
         pull_fluid(game, valve, &mut water, "minecraft:water");
         if takes_brine {
             pull_fluid(game, valve, &mut water, "mekanism:brine");
+        }
+        if water.amount > before {
+            touched.push(valve);
         }
         if brine.amount > 0 {
             push_chemical(game, valve, &mut brine, None, u64::MAX, false);
@@ -3532,6 +4461,26 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     put_tank(&mut entity.nbt, "water", &water);
     put_tank(&mut entity.nbt, "brine", &brine);
     put_int(&mut entity.nbt, "progress", progress);
+    // `RenderThermalEvaporationPlant`: the input tank fills the inside of the tower (2 by 2, between the floor and the roof).
+    let fills = if water.amount > 0 && tower.height > 2 {
+        vec![Fill {
+            at: [tower.origin[0] + 1, tower.origin[1] + 1, tower.origin[2] + 1],
+            size: [2, tower.height as i32 - 2, 2],
+            scale: (water.amount as f64 / water.capacity.max(1) as f64).min(1.0),
+            chemical: water.chemical.clone(),
+            shrunk: false,
+        }]
+    } else {
+        Vec::new()
+    };
+    put_fills(game, pos, entity, &fills);
+    let active = valves_active(entity, &touched);
+    if fills.is_empty() {
+        put_valves(game, pos, entity, &[], [0; 3], [0; 3]);
+    } else {
+        let o = tower.origin;
+        put_valves(game, pos, entity, &active, o, [o[0] + 3, o[1] + tower.height as i32 - 1, o[2] + 3]);
+    }
     entity.nbt.insert("temperature".into(), Tag::Double(temperature.to_bits()));
     // `lastGain` (what the screen shows, in hundredths) and `lastEnvironmentLoss` (heat units, in hundredths of a kelvin).
     let multiplier = evap::temp_multiplier(temperature, tower.height);
@@ -3656,12 +4605,13 @@ fn pull_fluid(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTank, fluid
 
 /// Fills `into` with `id` from the carriers and tanks of its kind beside `pos`: pipes and fluid tanks
 /// for a fluid, tubes and chemical tanks for a chemical.
-fn pull_from_carriers(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTank, fluid: &str) {
+fn pull_from_carriers(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTank, fluid: &str) -> u64 {
     let is_fluid = FLUIDS.contains(&fluid);
+    let mut gained = 0;
     for (_, d) in DIRECTIONS {
         let room = into.capacity - into.amount;
         if room == 0 || !into.accepts(fluid) {
-            return;
+            return gained;
         }
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
         let taken = game.native_with_mod_block_entity(at, |m| {
@@ -3682,8 +4632,10 @@ fn pull_from_carriers(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTan
         });
         if let Some(Some(n)) = taken {
             into.insert(fluid, n);
+            gained += n;
         }
     }
+    gained
 }
 
 // --- Fluid tanks ------------------------------------------------------------------------------------
@@ -3714,6 +4666,12 @@ fn tick_fluid_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
         push_chemical(game, pos, &mut tank, Some([0, -1, 0]), rate, false);
     }
     put_tank(&mut entity.nbt, "fluid", &tank);
+    // What the tank shows in the world (`RenderFluidTank`): its fluid and how full it is, in 200ths.
+    let scale = if tank.amount == 0 { 0 } else { (tank.amount.saturating_mul(200) / tank.capacity.max(1)).clamp(1, 200) };
+    let mut client = Compound::new();
+    put_int(&mut client, "tank_scale", scale as u32);
+    put_int(&mut client, "tank_fluid", chemical_index(tank.chemical.as_deref()) as u32);
+    put_client(game, pos, entity, &["tank_scale", "tank_fluid"], client);
 }
 
 /// A right click on a fluid tank (`BlockFluidTank.useItemOn`): a full bucket empties into it, an empty
@@ -3919,6 +4877,14 @@ fn get_long(nbt: &Compound, key: &str) -> u64 {
 
 fn get_int(nbt: &Compound, key: &str) -> u32 {
     get_long(nbt, key).min(u32::MAX as u64) as u32
+}
+
+/// An int array of the block entity, empty when there is none.
+fn get_ints(nbt: &Compound, key: &str) -> Vec<i32> {
+    match nbt.get(&JavaString::from(key)) {
+        Some(Tag::IntArray(v)) => v.clone(),
+        _ => Vec::new(),
+    }
 }
 
 fn get_double(nbt: &Compound, key: &str) -> Option<f64> {
@@ -4736,7 +5702,8 @@ fn free_runners_use(game: &mut Game<'_>, claimed: &mut bool) {
 /// `FissionReactorValidator`, simplified: the frame blocks joined to `start` must be exactly the shell
 /// of a box 3 to 18 on each side, with fuel assemblies, control rods or air inside. The reactor and its
 /// ports.
-fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, Vec<[i32; 3]>)> {
+#[allow(clippy::type_complexity)]
+fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, Vec<[i32; 3]>, [i32; 3], [i32; 3], Vec<[i32; 4]>)> {
     let (lo, hi, seen) = find_box(game, start, fission::is_frame, fission::MIN_SIZE, fission::MAX_SIZE)?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
     let mut reactor = fission::Reactor { volume: size(0) * size(1) * size(2), ..Default::default() };
@@ -4760,7 +5727,25 @@ fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, V
             }
         }
     }
-    (reactor.assemblies > 0).then_some((reactor, ports))
+    // Each column of fuel assemblies: its lowest block and how many are stacked (`FormedAssembly`).
+    let mut columns = Vec::new();
+    for x in lo[0] + 1..hi[0] {
+        for z in lo[2] + 1..hi[2] {
+            let mut y = lo[1] + 1;
+            while y < hi[1] {
+                if block_name(game, [x, y, z]) == "mekanismgenerators:fission_fuel_assembly" {
+                    let start = y;
+                    while y < hi[1] && block_name(game, [x, y, z]) == "mekanismgenerators:fission_fuel_assembly" {
+                        y += 1;
+                    }
+                    columns.push([x, start, z, y - start]);
+                } else {
+                    y += 1;
+                }
+            }
+        }
+    }
+    (reactor.assemblies > 0).then_some((reactor, ports, lo, [size(0) as i32, size(1) as i32, size(2) as i32], columns))
 }
 
 const FISSION_PORT: &str = "mekanismgenerators:fission_reactor_port";
@@ -4824,7 +5809,9 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
     if ticker == 0 {
         match find_reactor(game, pos) {
-            Some((r, ports)) => {
+            Some((r, ports, lo, size, columns)) => {
+                entity.nbt.insert("box".into(), Tag::IntArray(vec![lo[0], lo[1], lo[2], size[0], size[1], size[2]]));
+                entity.nbt.insert("columns".into(), Tag::IntArray(columns.concat()));
                 put_long(&mut entity.nbt, "assemblies", r.assemblies);
                 put_long(&mut entity.nbt, "volume", r.volume);
                 let master = ports.first().copied().unwrap_or(pos);
@@ -4834,11 +5821,13 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
             None => {
                 put_long(&mut entity.nbt, "assemblies", 0);
                 entity.nbt.remove(&JavaString::from("master"));
+                entity.nbt.remove(&JavaString::from("box"));
             }
         }
     }
     let r = fission::Reactor { assemblies: get_long(&entity.nbt, "assemblies"), volume: get_long(&entity.nbt, "volume") };
     if r.assemblies == 0 || get_pos(&entity.nbt, "master") != Some(pos) {
+        put_fills(game, pos, entity, &[]);
         return;
     }
     let ports: Vec<[i32; 3]> = match entity.nbt.get(&JavaString::from("ports")) {
@@ -4887,6 +5876,28 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     put_tank(&mut entity.nbt, "water", &water);
     put_tank(&mut entity.nbt, "steam", &steam);
     put_tank(&mut entity.nbt, "waste", &waste);
+    // `RenderFissionReactor`: the coolant (water) and the heated coolant (steam) fill the inside, and the
+    // assemblies glow while it burns.
+    let mut fills = Vec::new();
+    if let Some(Tag::IntArray(b)) = entity.nbt.get(&JavaString::from("box")).cloned()
+        && b.len() == 6
+    {
+        let (at, size) = ([b[0] + 1, b[1] + 1, b[2] + 1], [b[3] - 2, b[4] - 2, b[5] - 2]);
+        if water.amount > 0 {
+            fills.push(Fill { at, size, scale: water.amount as f64 / water.capacity.max(1) as f64, chemical: water.chemical.clone(), shrunk: false });
+        }
+        if steam.amount > 0 {
+            fills.push(Fill { at, size, scale: steam.amount as f64 / steam.capacity.max(1) as f64, chemical: steam.chemical.clone(), shrunk: true });
+        }
+    }
+    put_fills(game, pos, entity, &fills);
+    let columns = match entity.nbt.get(&JavaString::from("columns")) {
+        Some(Tag::IntArray(v)) if get_long(&entity.nbt, "active") == 1 => v.clone(),
+        _ => Vec::new(),
+    };
+    let mut glow = Compound::new();
+    glow.insert("glow".into(), Tag::IntArray(columns));
+    put_client(game, pos, entity, &["glow"], glow);
 }
 
 /// A right click with an empty hand on a fission port: sneaking switches the reactor on or off, else it
@@ -5273,9 +6284,10 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
     if ticker == 0 {
         match find_fusion(game, pos) {
-            Some((_, ports)) => {
+            Some((lo, ports)) => {
                 entity.nbt.insert("master".into(), Tag::IntArray(ports[0].to_vec()));
                 entity.nbt.insert("ports".into(), Tag::IntArray(ports.concat()));
+                entity.nbt.insert("controller".into(), Tag::IntArray(vec![lo[0] + 2, lo[1] + fusion::SIZE - 1, lo[2] + 2]));
             }
             None => {
                 entity.nbt.remove(&JavaString::from("master"));
@@ -5283,6 +6295,7 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         }
     }
     if get_pos(&entity.nbt, "master") != Some(pos) {
+        put_flag(game, pos, entity, "fus_on", false);
         return;
     }
     let ports: Vec<[i32; 3]> = match entity.nbt.get(&JavaString::from("ports")) {
@@ -5338,6 +6351,21 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     }
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_long(&mut entity.nbt, "production", out.energy);
+    // `RenderFusionReactor`: the plasma shows while the reactor burns; its size follows the temperature
+    // in units of 100 million kelvin, at the controller.
+    let mut core = Compound::new();
+    put_int(&mut core, "fus_on", u32::from(plasma.burning));
+    put_int(&mut core, "fus_scaled", (plasma.plasma / 100_000_000.0).round().clamp(0.0, 1_000_000.0) as u32);
+    if let Some(Tag::IntArray(c)) = entity.nbt.get(&JavaString::from("controller")).cloned()
+        && c.len() == 3
+    {
+        for (k, v) in ["fus_x", "fus_y", "fus_z"].iter().zip(c.iter()) {
+            put_int(&mut core, k, *v as u32);
+        }
+    } else {
+        put_int(&mut core, "fus_on", 0);
+    }
+    put_client(game, pos, entity, &["fus_on", "fus_scaled", "fus_x", "fus_y", "fus_z"], core);
 }
 
 /// A right click with an empty hand on a Fusion Reactor's controller or port: sneaking ignites the
@@ -9893,6 +10921,69 @@ fn tick_teleporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
     }
     let status = teleporter_status(game, pos, entity);
     put_int(&mut entity.nbt, "status", status);
+    // The portal, for `RenderTeleporter`: where the frame is, whether it is turned, and the frequency's colour,
+    // shown while the teleporter is ready (`shouldRender`).
+    let mut portal = Compound::new();
+    if let (Some(d), 0) = (dir, status) {
+        let is_frame = |o: &[i32; 3]| block_name(game, [pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]]) == teleporter::FRAME;
+        let rotated = !teleporter::frame_offsets(d, false).iter().all(is_frame);
+        let direction = DIRECTIONS.iter().position(|(_, v)| *v == d).map_or(0, |i| i + 1);
+        let color = freq::COLORS.get(get_int(&entity.nbt, "freq_color") as usize).map_or(0xFFFF_FF, |c| c.1);
+        put_int(&mut portal, "portal", direction as u32);
+        put_int(&mut portal, "portal_rotated", u32::from(rotated));
+        put_int(&mut portal, "portal_color", color);
+    } else {
+        put_int(&mut portal, "portal", 0);
+    }
+    put_client(game, pos, entity, &["portal", "portal_rotated", "portal_color"], portal);
+}
+
+// The portals this client has heard of, drawn as `RenderTeleporter` does: a translucent sheet of the
+// portal texture tinted with the frequency's colour, between the teleporter's frame.
+thread_local! {
+    static PORTALS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+fn portal_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    PORTALS.with_borrow_mut(|portals| {
+        portals.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if id != "mekanism:teleporter" {
+                return false;
+            }
+            let Some((_, d)) = usize::try_from(get_int(c, "portal")).ok().and_then(|i| i.checked_sub(1)).and_then(|i| DIRECTIONS.get(i)) else {
+                return true;
+            };
+            let rotated = get_int(c, "portal_rotated") != 0;
+            let argb = (191u32 << 24) | (get_int(c, "portal_color") & 0xFF_FFFF);
+            // `setBounds`: the sheet is 0.08 thick (0.46..0.54) across one of the two axes the frame spans.
+            let (lo, hi) = if d[0] + d[1] + d[2] > 0 { (1.0, 3.0) } else { (-2.0, 0.0) };
+            let (thin, flat) = (0.46, 0.54);
+            let (min, max): ([f64; 3], [f64; 3]) = match d.iter().position(|v| *v != 0) {
+                Some(0) if rotated => ([lo, thin, 0.0], [hi, flat, 1.0]),
+                Some(0) => ([lo, 0.0, thin], [hi, 1.0, flat]),
+                Some(1) if rotated => ([thin, lo, 0.0], [flat, hi, 1.0]),
+                Some(1) => ([0.0, lo, thin], [1.0, hi, flat]),
+                _ if rotated => ([0.0, thin, lo], [1.0, flat, hi]),
+                _ => ([thin, 0.0, lo], [flat, 1.0, hi]),
+            };
+            let at = |p: [f64; 3], q: [f64; 3]| -> ([f64; 3], [f64; 3]) {
+                (std::array::from_fn(|i| f64::from(pos[i]) + p[i]), std::array::from_fn(|i| f64::from(pos[i]) + q[i]))
+            };
+            let (min, max) = at(min, max);
+            // East, west, up, down, south, north; the horizontal frame shows its top and bottom only.
+            let colors = if d[1] == 0 { [0, 0, argb, argb, 0, 0] } else if rotated { [argb, argb, 0, 0, 0, 0] } else { [0, 0, 0, 0, argb, argb] };
+            boxes.push(super::native_hooks::NativeWorldBox {
+                min,
+                max,
+                colors,
+                sprite: Some(format!("{SPRITES_ROOT}gauge_fluid/teleporter_portal")),
+            });
+            true
+        });
+    });
 }
 
 /// The closest other formed teleporter on `frequency` in this dimension, and where a player arrives:
@@ -10064,7 +11155,7 @@ fn portable_teleporter_use(game: &mut Game<'_>, claimed: &mut bool) {
 
 /// `TankValidator`: the casing, valves and glass joined to `start` make the shell of a box 3 to 18 on
 /// each side, its edges casing, with air inside. The box's volume and its valves.
-fn find_dynamic_tank(game: &Game<'_>, start: [i32; 3]) -> Option<(u64, Vec<[i32; 3]>)> {
+fn find_dynamic_tank(game: &Game<'_>, start: [i32; 3]) -> Option<(u64, Vec<[i32; 3]>, [i32; 3], [i32; 3])> {
     let (lo, hi, seen) = find_box(game, start, dynamic_tank::is_frame, dynamic_tank::MIN_SIZE, dynamic_tank::MAX_SIZE)?;
     let size = [0, 1, 2].map(|k| hi[k] - lo[k] + 1);
     let mut valves = Vec::new();
@@ -10089,7 +11180,7 @@ fn find_dynamic_tank(game: &Game<'_>, start: [i32; 3]) -> Option<(u64, Vec<[i32;
         }
     }
     let volume = size.iter().map(|&s| s as u64).product();
-    (!valves.is_empty()).then_some((volume, valves))
+    (!valves.is_empty()).then_some((volume, valves, lo, size))
 }
 
 /// Whether a valve's buffer takes `chemical` from a pipe or tube: input mode, and the buffer empty or
@@ -10105,18 +11196,22 @@ fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
     if ticker == 0 {
         match find_dynamic_tank(game, pos) {
-            Some((volume, valves)) => {
+            Some((volume, valves, lo, size)) => {
                 put_long(&mut entity.nbt, "volume", volume);
+                entity.nbt.insert("box".into(), Tag::IntArray(vec![lo[0], lo[1], lo[2], size[0], size[1], size[2]]));
                 entity.nbt.insert("master".into(), Tag::IntArray(valves[0].to_vec()));
                 entity.nbt.insert("valves".into(), Tag::IntArray(valves.concat()));
             }
             None => {
                 put_long(&mut entity.nbt, "volume", 0);
                 entity.nbt.remove(&JavaString::from("master"));
+                entity.nbt.remove(&JavaString::from("box"));
             }
         }
     }
     if get_pos(&entity.nbt, "master") != Some(pos) {
+        // Only the master draws the tank's contents.
+        put_fills(game, pos, entity, &[]);
         return;
     }
     let mut tank = get_tank(&entity.nbt, "fluid", dynamic_tank::capacity(get_long(&entity.nbt, "volume")));
@@ -10134,12 +11229,17 @@ fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
         get_long(nbt, "output") == 1
     };
     let mut outputs = Vec::new();
+    let mut touched = Vec::new();
     for p in positions(&entity.nbt, "valves") {
+        let before = tank.amount;
         let out = if p == pos {
             drain(&mut entity.nbt, &mut tank)
         } else {
             game.native_with_mod_block_entity(p, |m| drain(&mut m.nbt, &mut tank)).unwrap_or(false)
         };
+        if tank.amount > before {
+            touched.push(p);
+        }
         if out {
             outputs.push(p);
         }
@@ -10150,6 +11250,28 @@ fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
         }
     }
     put_tank(&mut entity.nbt, "fluid", &tank);
+    // `RenderDynamicTank`: the box inside the casing, how full it is and with what, for the master to draw.
+    let fills = match entity.nbt.get(&JavaString::from("box")).cloned() {
+        Some(Tag::IntArray(b)) if b.len() == 6 && tank.amount > 0 => vec![Fill {
+            at: [b[0] + 1, b[1] + 1, b[2] + 1],
+            size: [b[3] - 2, b[4] - 2, b[5] - 2],
+            scale: tank.amount as f64 / tank.capacity.max(1) as f64,
+            chemical: tank.chemical.clone(),
+            shrunk: false,
+        }],
+        _ => Vec::new(),
+    };
+    put_fills(game, pos, entity, &fills);
+    // `RenderDynamicTank`: a fluid (not a chemical) shows its running valves.
+    let active = valves_active(entity, &touched);
+    let fluid = !fills.is_empty() && tank.chemical.as_deref().is_some_and(|c| FLUIDS.contains(&c));
+    if let (true, Some(Tag::IntArray(b))) = (fluid, entity.nbt.get(&JavaString::from("box")).cloned())
+        && b.len() == 6
+    {
+        put_valves(game, pos, entity, &active, [b[0], b[1], b[2]], [b[0] + b[3] - 1, b[1] + b[4] - 1, b[2] + b[5] - 1]);
+    } else {
+        put_valves(game, pos, entity, &[], [0; 3], [0; 3]);
+    }
 }
 
 /// A sneaking right click with an empty hand on a dynamic valve switches it between filling the tank
@@ -10183,7 +11305,7 @@ pub(super) fn use_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 /// `SPSValidator`: the box of casing and ports joined to `start`, 7 on each side, with air and coils
 /// inside, every coil against a port. Its low corner, its ports, and the ports with a coil behind them.
 #[allow(clippy::type_complexity)]
-fn find_sps(game: &Game<'_>, start: [i32; 3]) -> Option<(Vec<[i32; 3]>, Vec<[i32; 3]>)> {
+fn find_sps(game: &Game<'_>, start: [i32; 3]) -> Option<(Vec<[i32; 3]>, Vec<[i32; 3]>, [i32; 3])> {
     let (lo, _, seen) = find_box(game, start, sps::is_frame, sps::SIZE, sps::SIZE)?;
     let mut ports = Vec::new();
     let mut coils = 0;
@@ -10217,7 +11339,7 @@ fn find_sps(game: &Game<'_>, start: [i32; 3]) -> Option<(Vec<[i32; 3]>, Vec<[i32
         })
         .collect();
     // A coil not against a port fails the structure.
-    (!ports.is_empty() && coiled.len() == coils).then_some((ports, coiled))
+    (!ports.is_empty() && coiled.len() == coils).then_some((ports, coiled, lo))
 }
 
 fn sps_of(nbt: &Compound) -> sps::Sps {
@@ -10237,7 +11359,8 @@ fn tick_sps_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
     if ticker == 0 {
         match find_sps(game, pos) {
-            Some((ports, coiled)) => {
+            Some((ports, coiled, lo)) => {
+                entity.nbt.insert("sps_lo".into(), Tag::IntArray(lo.to_vec()));
                 entity.nbt.insert("master".into(), Tag::IntArray(ports[0].to_vec()));
                 entity.nbt.insert("ports".into(), Tag::IntArray(ports.concat()));
                 entity.nbt.insert("coiled".into(), Tag::IntArray(coiled.concat()));
@@ -10249,6 +11372,7 @@ fn tick_sps_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
         }
     }
     if get_pos(&entity.nbt, "master") != Some(pos) {
+        put_client(game, pos, entity, &["sps_on"], Compound::new());
         return;
     }
     let ports = positions(&entity.nbt, "ports");
@@ -10271,6 +11395,8 @@ fn tick_sps_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     s.input = input.amount;
     // Each coiled port hands the coils what it holds, at most an int's worth (`getAmountAsInt`).
     let mut received = 0u64;
+    // `CoilData.receiveEnergy`: the laser level of each coil, with the side its port is on.
+    let mut lasers: Vec<i32> = Vec::new();
     if s.can_operate() {
         for &p in &coiled {
             let take = |nbt: &mut Compound| {
@@ -10281,6 +11407,17 @@ fn tick_sps_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
             };
             let n = if p == pos { take(&mut entity.nbt) } else { game.native_with_mod_block_entity(p, |m| take(&mut m.nbt)).unwrap_or(0) };
             received = received.saturating_add(n).min(i32::MAX as u64);
+            if n > 0 {
+                let level = 1 + ((((n as f64).log10() - 3.0) * 1.8) as i32).max(0);
+                let lo = get_ints(&entity.nbt, "sps_lo");
+                let side = DIRECTIONS.iter().position(|(_, d)| {
+                    let at = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
+                    lo.len() == 3 && (0..3).all(|k| at[k] > lo[k] && at[k] < lo[k] + sps::SIZE - 1) && block_name(game, at) == sps::COIL
+                });
+                if let Some(side) = side {
+                    lasers.extend([p[0], p[1], p[2], side as i32, level]);
+                }
+            }
         }
     }
     let processed = s.tick(received);
@@ -10299,6 +11436,14 @@ fn tick_sps_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     entity.nbt.insert("processed".into(), Tag::Double(processed.to_bits()));
     put_long(&mut entity.nbt, "input_processed", s.input_processed);
     put_long(&mut entity.nbt, "received", received);
+    // `RenderSPS`: the coils' laser levels, what the casing received and processed, and where the box is.
+    let mut shown = Compound::new();
+    put_int(&mut shown, "sps_on", 1);
+    shown.insert("sps_c".into(), Tag::IntArray(lasers));
+    shown.insert("sps_lo".into(), Tag::IntArray(get_ints(&entity.nbt, "sps_lo")));
+    put_int(&mut shown, "sps_e", received.min(u64::from(u32::MAX >> 1)) as u32);
+    put_int(&mut shown, "sps_p", (processed.max(0.0) as f32).to_bits());
+    put_client(game, pos, entity, &["sps_on", "sps_c", "sps_lo", "sps_e", "sps_p"], shown);
 }
 
 /// A sneaking right click with an empty hand on an SPS port switches it between input and output
@@ -10333,7 +11478,8 @@ pub(super) fn use_sps_port(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 /// on each side, with air, superheating elements and one full layer of pressure dispersers inside, the
 /// elements below the dispersers. The boiler, its valves and the Resistive Heaters touching its walls.
 #[allow(clippy::type_complexity)]
-fn find_boiler(game: &Game<'_>, start: [i32; 3]) -> Option<(boiler::Boiler, Vec<[i32; 3]>, Vec<[i32; 3]>)> {
+#[allow(clippy::type_complexity)]
+fn find_boiler(game: &Game<'_>, start: [i32; 3]) -> Option<(boiler::Boiler, Vec<[i32; 3]>, Vec<[i32; 3]>, [i32; 7])> {
     let (lo, hi, seen) = find_box(game, start, boiler::is_frame, boiler::MIN_SIZE, boiler::MAX_SIZE)?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
     let mut b = boiler::Boiler { volume: size(0) * size(1) * size(2), ..Default::default() };
@@ -10389,7 +11535,7 @@ fn find_boiler(game: &Game<'_>, start: [i32; 3]) -> Option<(boiler::Boiler, Vec<
             }
         }
     }
-    Some((b, valves, heaters))
+    Some((b, valves, heaters, [lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], layer]))
 }
 
 fn positions(nbt: &Compound, key: &str) -> Vec<[i32; 3]> {
@@ -10417,7 +11563,8 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
     if ticker == 0 {
         match find_boiler(game, pos) {
-            Some((b, valves, heaters)) => {
+            Some((b, valves, heaters, bounds)) => {
+                entity.nbt.insert("box".into(), Tag::IntArray(bounds.to_vec()));
                 for (key, v) in [
                     ("elements", b.elements),
                     ("volume", b.volume),
@@ -10433,17 +11580,22 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
             None => {
                 put_long(&mut entity.nbt, "volume", 0);
                 entity.nbt.remove(&JavaString::from("master"));
+                entity.nbt.remove(&JavaString::from("box"));
             }
         }
     }
     let b = boiler_of(&entity.nbt);
     if b.volume == 0 || get_pos(&entity.nbt, "master") != Some(pos) {
+        put_fills(game, pos, entity, &[]);
         return None;
     }
     let mut water = get_tank(&entity.nbt, "water", b.water_capacity());
     let mut steam = get_tank(&entity.nbt, "steam", b.steam_capacity());
+    let mut touched = Vec::new();
     for &v in &positions(&entity.nbt, "valves") {
-        pull_from_carriers(game, v, &mut water, "minecraft:water");
+        if pull_from_carriers(game, v, &mut water, "minecraft:water") > 0 {
+            touched.push(v);
+        }
     }
     let mut casing = mekanism_core::heat::HeatCapacitor::new(
         b.heat_capacity(),
@@ -10476,6 +11628,41 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     put_tank(&mut entity.nbt, "water", &water);
     put_tank(&mut entity.nbt, "steam", &steam);
     put_long(&mut entity.nbt, "boil_rate", boiled);
+    // `RenderThermoelectricBoiler`: the water below the dispersers and the steam above them.
+    let mut fills = Vec::new();
+    if let Some(Tag::IntArray(bx)) = entity.nbt.get(&JavaString::from("box")).cloned()
+        && bx.len() == 7
+    {
+        let (lo, hi, layer) = ([bx[0], bx[1], bx[2]], [bx[3], bx[4], bx[5]], bx[6]);
+        let (length, width) = (hi[0] - lo[0] - 1, hi[2] - lo[2] - 1);
+        if water.amount > 0 {
+            fills.push(Fill {
+                at: [lo[0] + 1, lo[1] + 1, lo[2] + 1],
+                size: [length, layer - lo[1] - 1, width],
+                scale: water.amount as f64 / water.capacity.max(1) as f64,
+                chemical: water.chemical.clone(),
+                shrunk: false,
+            });
+        }
+        if steam.amount > 0 {
+            fills.push(Fill {
+                at: [lo[0] + 1, layer + 1, lo[2] + 1],
+                size: [length, hi[1] - layer - 1, width],
+                scale: steam.amount as f64 / steam.capacity.max(1) as f64,
+                chemical: steam.chemical.clone(),
+                shrunk: false,
+            });
+        }
+    }
+    put_fills(game, pos, entity, &fills);
+    // `RenderThermoelectricBoiler`: running valves show while there is water.
+    let active = valves_active(entity, &touched);
+    match entity.nbt.get(&JavaString::from("box")).cloned() {
+        Some(Tag::IntArray(bx)) if bx.len() == 7 && water.amount > 0 => {
+            put_valves(game, pos, entity, &active, [bx[0], bx[1], bx[2]], [bx[3], bx[4], bx[5]]);
+        }
+        _ => put_valves(game, pos, entity, &[], [0; 3], [0; 3]),
+    }
     Some(boiled > 0)
 }
 
@@ -10552,7 +11739,8 @@ const TURBINE_VALVE: &str = "mekanismgenerators:turbine_valve";
 /// `TurbineValidator`, simplified: the frame blocks joined to `start` must be exactly the shell of a
 /// box 3 to 17 on each side, with rotors, a rotational complex, pressure dispersers, coils, condensers
 /// or air inside; the steam is below the lowest disperser. The turbine and its valves.
-fn find_turbine(game: &Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, Vec<[i32; 3]>)> {
+#[allow(clippy::type_complexity)]
+fn find_turbine(game: &Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, Vec<[i32; 3]>, [i32; 3], [i32; 3])> {
     let (lo, hi, seen) = find_box(game, start, turbine::is_frame, turbine::MIN_SIZE, turbine::MAX_SIZE)?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
     let mut t = turbine::Turbine { volume: size(0) * size(1) * size(2), ..Default::default() };
@@ -10585,7 +11773,7 @@ fn find_turbine(game: &Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, V
         }
     }
     t.lower_volume = size(0) * size(2) * (disperser_y? - lo[1]) as u64;
-    (t.rotors > 0 && t.coils > 0).then_some((t, valves))
+    (t.rotors > 0 && t.coils > 0).then_some((t, valves, lo, [size(0) as i32, size(1) as i32, size(2) as i32]))
 }
 
 /// An Industrial Turbine valve. Once a second each valve checks its turbine; the first valve runs it: it
@@ -10609,7 +11797,8 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
     if ticker == 0 {
         match find_turbine(game, pos) {
-            Some((t, valves)) => {
+            Some((t, valves, lo, size)) => {
+                entity.nbt.insert("box".into(), Tag::IntArray(vec![lo[0], lo[1], lo[2], size[0], size[1], size[2]]));
                 for (key, v) in [
                     ("rotors", t.rotors),
                     ("dispersers", t.dispersers),
@@ -10627,11 +11816,13 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
             None => {
                 put_long(&mut entity.nbt, "rotors", 0);
                 entity.nbt.remove(&JavaString::from("master"));
+                entity.nbt.remove(&JavaString::from("box"));
             }
         }
     }
     let t = turbine_of(&entity.nbt);
     if t.rotors == 0 || get_pos(&entity.nbt, "master") != Some(pos) {
+        put_fills(game, pos, entity, &[]);
         return None;
     }
     let valves: Vec<[i32; 3]> = match entity.nbt.get(&JavaString::from("valves")) {
@@ -10675,6 +11866,39 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_long(&mut entity.nbt, "production", made);
     put_long(&mut entity.nbt, "flow", used);
+    // `RenderIndustrialTurbine`: the steam fills the lower part of the inside, below the dispersers.
+    let mut fills = Vec::new();
+    if let Some(Tag::IntArray(b)) = entity.nbt.get(&JavaString::from("box")).cloned()
+        && b.len() == 6
+        && steam.amount > 0
+    {
+        let height = (t.lower_volume / (b[3].max(1) as u64 * b[5].max(1) as u64)) as i32;
+        fills.push(Fill {
+            at: [b[0] + 1, b[1] + 1, b[2] + 1],
+            size: [b[3] - 2, height, b[5] - 2],
+            scale: steam.amount as f64 / steam.capacity.max(1) as f64,
+            chemical: steam.chemical.clone(),
+            shrunk: false,
+        });
+    }
+    put_fills(game, pos, entity, &fills);
+    // The rotors' column and the flow, for the rotor blades: [x, z, y of each rotor from the bottom].
+    let mut shown = Compound::new();
+    if let Some(Tag::IntArray(b)) = entity.nbt.get(&JavaString::from("box")).cloned()
+        && b.len() == 6
+    {
+        let (x, z) = (b[0] + b[3] / 2, b[2] + b[5] / 2);
+        let mut column = vec![x, z];
+        for y in b[1] + 1..b[1] + b[4] - 1 {
+            if block_name(game, [x, y, z]) == "mekanismgenerators:turbine_rotor" {
+                column.push(y);
+            }
+        }
+        shown.insert("rot_col".into(), Tag::IntArray(column));
+        let ratio = if made > 0 { used as f64 / t.max_flow().max(1.0) } else { 0.0 };
+        put_int(&mut shown, "rot_flow", (ratio * 1000.0).round() as u32);
+    }
+    put_client(game, pos, entity, &["rot_col", "rot_flow"], shown);
     Some(made > 0)
 }
 
@@ -10757,7 +11981,7 @@ fn settle_bin(entity: &mut ModBlockEntity, tier: BaseTier) -> Bin {
 
 /// A bin's tick: what hoppers put in the input slot goes in, and the output slot shows a stack of it for
 /// hoppers below to take (`BinInventorySlot` through the item handler).
-fn tick_bin(game: &mut Game<'_>, entity: &mut ModBlockEntity, tier: BaseTier) {
+fn tick_bin(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, tier: BaseTier) {
     let mut b = settle_bin(entity, tier);
     if let Some(s) = entity.items[0].clone().filter(plain) {
         let took = b.insert(tier, &s.item, u64::from(s.count), false) as u32;
@@ -10776,6 +12000,12 @@ fn tick_bin(game: &mut Game<'_>, entity: &mut ModBlockEntity, tier: BaseTier) {
     let ticks = get_int(&entity.nbt, "add_ticks");
     put_int(&mut entity.nbt, "add_ticks", ticks.saturating_sub(1));
     put_bin(&mut entity.nbt, &b);
+    // What `RenderBin` shows on the front: the item (the locked one when empty), how many, and the lock.
+    let mut shown = Compound::new();
+    shown.insert("bin_item".into(), Tag::String(b.item_type().unwrap_or_default().into()));
+    put_int(&mut shown, "bin_count", b.count.min(u64::from(u32::MAX)) as u32);
+    put_int(&mut shown, "bin_lock", u32::from(b.lock.is_some()));
+    put_client(game, pos, entity, &["bin_item", "bin_count", "bin_lock"], shown);
 }
 
 fn bin_line(tier: BaseTier, b: &Bin) -> String {
@@ -12385,6 +13615,13 @@ fn frequency_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
 /// Merges what one part of the port tells the screens into the block entity's `client` compound: the
 /// `owned` keys are replaced by `new`'s, the others stay (a QIO block has the frequency's, its filters'
 /// and its own). The viewers hear of it when it changed.
+/// Tells clients whether the machine works, as `key` of its client view.
+fn put_flag(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, key: &str, on: bool) {
+    let mut flag = Compound::new();
+    put_int(&mut flag, key, u32::from(on));
+    put_client(game, pos, entity, &[key], flag);
+}
+
 fn put_client(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, owned: &[&str], new: Compound) {
     let before = match entity.nbt.get(&JavaString::from("client")) {
         Some(Tag::Compound(c)) => c.clone(),
@@ -14107,8 +15344,12 @@ pub(super) fn world_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::
         let max = [min[0] + d, min[1] + f64::from(r.max_y - r.min_y) - 0.02, min[2] + d];
         // `ARGB.white(alpha)`: east/west 0.78, up/down 0.82, north/south 0.8.
         let (east_west, up_down, north_south) = (0xC7FF_FFFF, 0xD1FF_FFFF, 0xCCFF_FFFF);
-        boxes.push(super::native_hooks::NativeWorldBox { min, max, colors: [east_west, east_west, up_down, up_down, north_south, north_south] });
+        boxes.push(super::native_hooks::NativeWorldBox { min, max, colors: [east_west, east_west, up_down, up_down, north_south, north_south], sprite: None });
     }
+    tank_boxes(game, boxes);
+    portal_boxes(game, boxes);
+    liquifier_boxes(game, boxes);
+    big_tank_boxes(game, boxes);
 }
 
 /// Opens the config screen from the main one, and keeps it open while the screen is.
@@ -16265,6 +17506,7 @@ fn stabilizer_boxes(game: &Game<'_>, pos: [i32; 3], c: &Compound, boxes: &mut Ve
                 min,
                 max,
                 colors: [side(east, east_west), side(west, east_west), 0, 0, side(south, north_south), side(north, north_south)],
+                sprite: None,
             });
         }
     }
@@ -17581,6 +18823,13 @@ fn radial_scroll(game: &mut Game<'_>, steps: f32) {
 }
 
 // --- Robit (EntityRobit) ---------------------------------------------------------------------------------
+
+/// A mob the game draws as its network base, which the mod draws itself (`native_mob_hidden`, API 48): a Robit.
+pub(super) fn mob_hidden(game: &Game<'_>, id: u32, hidden: &mut bool) {
+    if game.native_on(MOD_ID) && ROBITS.with_borrow(|set| set.contains(&id)) {
+        *hidden = true;
+    }
+}
 
 /// The Robit's mob type, added through Horizon API 46: a clone of its network base, half a block big
 /// and with one point of health (`EntityRobit.createAttributes`).
