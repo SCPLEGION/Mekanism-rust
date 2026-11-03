@@ -517,3 +517,14 @@ bindings = [
   { name = "channel", ty = "&str", value = "channel" },
   { name = "data", ty = "&[u8]", value = "data" },
 ]
+
+[[injection]]
+id = "ui-closed"
+hook = "ui_closed"
+hook_version = 1
+kind = "HEAD"
+helper = "ui_closed.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "id", ty = "&str", value = "id" },
+]

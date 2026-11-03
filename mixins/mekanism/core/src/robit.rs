@@ -7,7 +7,7 @@ pub const ITEM: &str = "mekanism:robit";
 
 /// `EntityRobit.MAX_ENERGY`.
 pub const MAX_ENERGY: u64 = 100_000;
-/// `ItemRobit`'s inventory (`EntityRobit.inventorySlots`: 30 slots in the inventory screen).
+/// `EntityRobit.inventorySlots`: 27 storage slots, the energy slot, the smelting input and output.
 pub const INVENTORY_SLOTS: usize = 30;
 /// `DISTANCE_MULTIPLIER`: energy per block walked.
 const DISTANCE_MULTIPLIER: f64 = 1.5;

@@ -44,6 +44,7 @@ use mekanism_core::module_config;
 use mekanism_core::modules;
 use mekanism_core::radial;
 use mekanism_core::robit;
+use mekanism_core::slot_click;
 use mekanism_core::tier::{self, BaseTier};
 use mekanism_core::upgrades::{Upgrade, Upgrades};
 use std::sync::Arc;
@@ -17336,8 +17337,13 @@ pub(super) fn ui_draw(game: &Game<'_>, id: &str, batch: &mut horizon_client::hud
     } else if id == RADIAL_ID {
         radial_draw(game, batch);
     } else if id == ROBIT_SCREEN {
-        ROBIT_ORIGIN.with_borrow_mut(|o| *o = robit_origin(batch));
-        robit_draw(game, batch);
+        let o = robit_origin(batch);
+        ROBIT_ORIGIN.with_borrow_mut(|v| *v = o);
+        if ROBIT_TAB.with(std::cell::Cell::get) == RobitTab::Inventory {
+            robit_draw_inventory(game, batch, o);
+        } else {
+            robit_draw(game, batch);
+        }
     }
 }
 
@@ -17349,6 +17355,10 @@ pub(super) fn ui_click(game: &mut Game<'_>, id: &str, at: [f32; 2], button: u8, 
     } else if id == ROBIT_SCREEN {
         robit_click(game, at, button, pressed);
     }
+}
+
+pub(super) fn ui_close_hook(game: &mut Game<'_>, id: &str) {
+    ui_closed(game, id);
 }
 
 pub(super) fn ui_wheel(game: &mut Game<'_>, id: &str, steps: f32) {
@@ -17713,6 +17723,9 @@ pub(super) fn mobs_tick(game: &mut Game<'_>) {
     if game.ticks % 10 == 0 {
         send_robit_states(game, &players);
     }
+    if game.ticks % 2 == 0 {
+        send_robit_inventories(game);
+    }
 }
 
 const ROBIT_LIST_CHANNEL: &str = "mekanism:robits";
@@ -17811,6 +17824,9 @@ pub(super) fn client_payload(channel: &str, data: &[u8]) {
     if channel == ROBIT_STATE_CHANNEL {
         robit_state_payload(data);
     }
+    if channel == ROBIT_ITEMS_CHANNEL {
+        robit_items_payload(data);
+    }
     if channel == ROBIT_LIST_CHANNEL {
         let ids = data.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
         ROBITS.with_borrow_mut(|set| *set = ids);
@@ -17886,10 +17902,31 @@ fn robit_state_payload(data: &[u8]) {
 /// A button on the Robit's screen, on the server: go home, toggle pickup, toggle following
 /// (`GuiInteractionEntity.GO_HOME`, `PICKUP_DROPS`, `FOLLOW`).
 fn robit_op_payload(game: &mut Game<'_>, data: &[u8]) {
+    if data.len() == 7 && data[0] == 4 {
+        let how = match data[6] {
+            0 => slot_click::Click::Left,
+            1 => slot_click::Click::Right,
+            _ => slot_click::Click::Shift,
+        };
+        robit_inventory_click(game, u32::from_be_bytes([data[1], data[2], data[3], data[4]]), data[5] as usize, how);
+        return;
+    }
     let [op, a, b, c, d] = data[..] else {
         return;
     };
     let id = u32::from_be_bytes([a, b, c, d]);
+    if op == 5 || op == 6 {
+        if let Some(player) = game.native_acting_player() {
+            if op == 6 {
+                ROBIT_WATCH.with_borrow_mut(|w| {
+                    w.entry(player.name).or_insert((id, None)).0 = id;
+                });
+            } else {
+                robit_inventory_close(game);
+            }
+        }
+        return;
+    }
     let Some(player) = game.native_acting_player() else {
         return;
     };
@@ -17962,6 +17999,7 @@ fn robit_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
     if fraction > 0.0 {
         sprite(game, batch, "bar/horizontal_power", [0.0, 0.0, 2.0, 2.0], [o[0] + 28.0, o[1] + 75.0, 118.0 * fraction, 4.0]);
     }
+    robit_draw_tabs(game, batch, o);
     for (icon, r, _) in ROBIT_BUTTONS {
         let rect = [o[0] + r[0], o[1] + r[1], r[2], r[3]];
         draw_button(game, batch, rect, inside(cursor, rect), true, 0xFFFF_FFFF, Some((icon, 18.0)));
@@ -17969,7 +18007,23 @@ fn robit_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
 }
 
 fn robit_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
-    if !pressed || button != 0 {
+    if !pressed {
+        return;
+    }
+    let o = ROBIT_ORIGIN.with_borrow(|o| *o);
+    for (i, (_, tab)) in ROBIT_TABS.iter().enumerate() {
+        if button == 0 && inside(at, robit_tab_rect(i, o)) {
+            if ROBIT_TAB.with(std::cell::Cell::get) != *tab {
+                robit_set_tab(game, *tab);
+            }
+            return;
+        }
+    }
+    if ROBIT_TAB.with(std::cell::Cell::get) == RobitTab::Inventory {
+        robit_inventory_press(game, at, button);
+        return;
+    }
+    if button != 0 {
         return;
     }
     let Some(id) = ROBIT_UI.with_borrow(|u| *u) else {
@@ -17990,4 +18044,272 @@ fn robit_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
 
 thread_local! {
     static ROBIT_ORIGIN: std::cell::RefCell<[f32; 2]> = const { std::cell::RefCell::new([0.0, 0.0]) };
+}
+
+// --- The Robit's inventory screen (GuiRobitInventory) ------------------------------------------------------
+
+const ROBIT_INV_ROBIT: usize = 27;
+/// The screen's list: the Robit's 27 slots, then the player's inventory (rows from the top, then the hotbar).
+const ROBIT_INV_ALL: usize = ROBIT_INV_ROBIT + 36;
+const ROBIT_ITEMS_CHANNEL: &str = "mekanism:robit_items";
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum RobitTab {
+    #[default]
+    Main,
+    Inventory,
+}
+
+thread_local! {
+    static ROBIT_TAB: std::cell::Cell<RobitTab> = const { std::cell::Cell::new(RobitTab::Main) };
+    /// Client: the Robit's slots and the cursor stack the server reported (item id, count).
+    static ROBIT_SLOTS: std::cell::RefCell<(Vec<Option<(String, u32)>>, Option<(String, u32)>)> = const { std::cell::RefCell::new((Vec::new(), None)) };
+    /// Server: who has the inventory open, and the stack on their cursor.
+    static ROBIT_WATCH: std::cell::RefCell<std::collections::HashMap<String, (u32, Option<ItemStack>)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+struct Wrapped {
+    stack: ItemStack,
+    max: u32,
+}
+
+impl Clone for Wrapped {
+    fn clone(&self) -> Self {
+        Wrapped { stack: self.stack.clone(), max: self.max }
+    }
+}
+
+impl slot_click::Stack for Wrapped {
+    fn count(&self) -> u32 {
+        self.stack.count
+    }
+    fn set_count(&mut self, n: u32) {
+        self.stack.count = n;
+    }
+    fn same(&self, other: &Self) -> bool {
+        self.stack.item == other.stack.item && format!("{:?}", self.stack.extra) == format!("{:?}", other.stack.extra)
+    }
+    fn max(&self) -> u32 {
+        self.max
+    }
+}
+
+/// Index into `game.inventory` of the screen's player slot `i` (0..36): the three rows, then the hotbar.
+fn player_slot(i: usize) -> usize {
+    if i < 27 { 9 + i } else { i - 27 }
+}
+
+/// A click on the Robit's inventory screen, on the server (`doClick` with the cursor kept here).
+fn robit_inventory_click(game: &mut Game<'_>, id: u32, slot: usize, how: slot_click::Click) {
+    let Some(player) = game.native_acting_player() else {
+        return;
+    };
+    let name = player.name.clone();
+    let max = |game: &Game<'_>, s: ItemStack| {
+        let m = max_stack(game, &s.item);
+        Wrapped { stack: s, max: m }
+    };
+    let data = game.native_with_mob(id, |m| {
+        let near = (m.position.x - player.position[0]).powi(2) + (m.position.z - player.position[2]).powi(2) <= 256.0;
+        (m.kind.id == robit::TYPE && near).then(|| robit_data(m))
+    });
+    let Some(Some(mut data)) = data else {
+        return;
+    };
+    let robit_slots = robit_items(&data);
+    let mut slots: Vec<Option<Wrapped>> = Vec::with_capacity(ROBIT_INV_ALL);
+    for i in 0..ROBIT_INV_ROBIT {
+        slots.push(robit_slots[i].clone().map(|s| max(game, s)));
+    }
+    for i in 0..36 {
+        slots.push(game.inventory.get(player_slot(i)).cloned().flatten().map(|s| max(game, s)));
+    }
+    let mut cursor = ROBIT_WATCH.with_borrow_mut(|w| w.get_mut(&name).and_then(|e| e.1.take())).map(|s| max(game, s));
+    let other: Vec<usize> = if slot < ROBIT_INV_ROBIT { (ROBIT_INV_ROBIT..ROBIT_INV_ALL).collect() } else { (0..ROBIT_INV_ROBIT).collect() };
+    slot_click::click(&mut slots, &mut cursor, slot, how, &|_, _| true, &other);
+    let mut items: Vec<Option<ItemStack>> = slots[..ROBIT_INV_ROBIT].iter().map(|s| s.as_ref().map(|w| w.stack.clone())).collect();
+    items.resize(robit::INVENTORY_SLOTS, None);
+    // The energy and smelting slots keep what they held.
+    for i in ROBIT_INV_ROBIT..robit::INVENTORY_SLOTS {
+        items[i] = robit_slots[i].clone();
+    }
+    set_robit_items(&mut data, &items);
+    for i in 0..36 {
+        let at = player_slot(i);
+        if let Some(s) = game.inventory.get_mut(at) {
+            *s = slots[ROBIT_INV_ROBIT + i].as_ref().map(|w| w.stack.clone());
+        }
+    }
+    game.native_with_mob(id, |m| m.extra.mod_data = Some(data));
+    ROBIT_WATCH.with_borrow_mut(|w| {
+        if let Some(e) = w.get_mut(&name) {
+            e.1 = cursor.map(|w| w.stack);
+        }
+    });
+}
+
+/// The inventory screen closed: the cursor stack goes back to the player.
+fn robit_inventory_close(game: &mut Game<'_>) {
+    let Some(player) = game.native_acting_player() else {
+        return;
+    };
+    if let Some((_, Some(stack))) = ROBIT_WATCH.with_borrow_mut(|w| w.remove(&player.name)) {
+        game.give_or_drop(stack);
+    }
+}
+
+/// While it is open the server tells its viewer what is in the Robit's slots and on their cursor.
+fn send_robit_inventories(game: &mut Game<'_>) {
+    let viewers: Vec<(String, u32, Option<ItemStack>)> = ROBIT_WATCH.with_borrow(|w| w.iter().map(|(n, (id, c))| (n.clone(), *id, c.clone())).collect());
+    if viewers.is_empty() {
+        return;
+    }
+    let players = game.native_server_players();
+    for (name, id, cursor) in viewers {
+        let Some(uuid) = players.iter().find(|p| p.name == name).map(|p| p.uuid).or_else(|| game.level.player_uuid.map(|u| u.iter().fold(0u128, |acc, part| acc << 32 | u128::from(*part as u32)))) else {
+            continue;
+        };
+        let Some(data) = game.native_with_mob(id, |m| robit_data(m)) else {
+            continue;
+        };
+        let put = |out: &mut Vec<u8>, s: &Option<ItemStack>| match s {
+            Some(s) => {
+                out.extend((s.count as u16).to_be_bytes());
+                out.push(s.item.len() as u8);
+                out.extend(s.item.bytes());
+            }
+            None => out.extend([0, 0, 0]),
+        };
+        let mut out = id.to_be_bytes().to_vec();
+        for s in robit_items(&data).iter().take(ROBIT_INV_ROBIT) {
+            put(&mut out, s);
+        }
+        put(&mut out, &cursor);
+        game.native_send_to_player(uuid, ROBIT_ITEMS_CHANNEL, &out);
+    }
+}
+
+fn robit_items_payload(data: &[u8]) {
+    let mut at = 4;
+    let mut read = || -> Option<Option<(String, u32)>> {
+        let count = u16::from_be_bytes([*data.get(at)?, *data.get(at + 1)?]);
+        let len = *data.get(at + 2)? as usize;
+        let id = String::from_utf8(data.get(at + 3..at + 3 + len)?.to_vec()).ok()?;
+        at += 3 + len;
+        Some((count > 0).then_some((id, u32::from(count))))
+    };
+    let mut slots = vec![];
+    for _ in 0..ROBIT_INV_ROBIT {
+        let Some(s) = read() else {
+            return;
+        };
+        slots.push(s);
+    }
+    let cursor = read().flatten();
+    ROBIT_SLOTS.with_borrow_mut(|v| *v = (slots, cursor));
+}
+
+const ROBIT_TABS: [(&str, RobitTab); 2] = [("button/main", RobitTab::Main), ("button/inventory", RobitTab::Inventory)];
+
+fn robit_tab_rect(i: usize, o: [f32; 2]) -> [f32; 4] {
+    // The Java order is main, crafting, inventory, smelting, repair, 20 apart.
+    let row = [0.0, 2.0][i];
+    [o[0] + ROBIT_WINDOW[0] + 3.0, o[1] + 10.0 + 20.0 * row, 18.0, 18.0]
+}
+
+fn robit_inv_cell(slot: usize, o: [f32; 2]) -> [f32; 4] {
+    if slot < ROBIT_INV_ROBIT {
+        [o[0] + 8.0 + 18.0 * (slot % 9) as f32, o[1] + 18.0 + 18.0 * (slot / 9) as f32, 18.0, 18.0]
+    } else {
+        let p = slot - ROBIT_INV_ROBIT;
+        let (row, col) = (p / 9, p % 9);
+        let y = if row < 3 { 84.0 + 18.0 * row as f32 } else { 142.0 };
+        [o[0] + 8.0 + 18.0 * col as f32, o[1] + y, 18.0, 18.0]
+    }
+}
+
+fn robit_draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2]) {
+    let cursor = game.native_cursor();
+    nine_slice_tinted(game, batch, "holder_left", [26.0, 9.0], 4.0, [o[0] + ROBIT_WINDOW[0] - 4.0, o[1] + 6.0, 30.0, 106.0], 0xFFFF_FFFF);
+    let current = ROBIT_TAB.with(std::cell::Cell::get);
+    for (i, (icon, tab)) in ROBIT_TABS.iter().enumerate() {
+        let r = robit_tab_rect(i, o);
+        draw_button(game, batch, r, inside(cursor, r), *tab != current, 0xFFFF_FFFF, Some((icon, 18.0)));
+    }
+}
+
+fn robit_draw_inventory(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2]) {
+    nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [o[0] - 3.0, o[1] - 3.0, ROBIT_WINDOW[0] + 6.0, ROBIT_WINDOW[1] + 6.0], 0xBFFF_FFFF);
+    nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [o[0], o[1], ROBIT_WINDOW[0], ROBIT_WINDOW[1]], 0xFFFF_FFFF);
+    robit_draw_tabs(game, batch, o);
+    centred(game, batch, "Robit", o[0], ROBIT_WINDOW[0], o[1] + 5.0, 0x40_4040);
+    game.native_text(batch, "Inventory", [o[0] + 8.0, o[1] + 73.0], 0x40_4040, false);
+    let cursor = game.native_cursor();
+    let (slots, held) = ROBIT_SLOTS.with_borrow(|s| s.clone());
+    let mut hovered = None;
+    for slot in 0..ROBIT_INV_ALL {
+        let r = robit_inv_cell(slot, o);
+        sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], r);
+        let stack = if slot < ROBIT_INV_ROBIT {
+            slots.get(slot).cloned().flatten()
+        } else {
+            game.inventory.get(player_slot(slot - ROBIT_INV_ROBIT)).cloned().flatten().map(|s| (s.item.to_string(), s.count))
+        };
+        if let Some((item, count)) = stack {
+            game.native_item(batch, &item, [r[0] + 1.0, r[1] + 1.0], 16.0);
+            if count > 1 {
+                let text = count.to_string();
+                let w = game.native_text_width(&text);
+                game.native_text(batch, &text, [r[0] + 17.0 - w, r[1] + 9.0], 0xFF_FFFF, true);
+            }
+        }
+        if inside(cursor, r) {
+            hovered = Some(r);
+        }
+    }
+    if let Some(r) = hovered {
+        game.native_fill(batch, [r[0] + 1.0, r[1] + 1.0, 16.0, 16.0], 0x80_FFFFFF);
+    }
+    if let Some((item, count)) = held {
+        game.native_item(batch, &item, [cursor[0] - 8.0, cursor[1] - 8.0], 16.0);
+        if count > 1 {
+            game.native_text(batch, &count.to_string(), [cursor[0] + 3.0, cursor[1] + 1.0], 0xFF_FFFF, true);
+        }
+    }
+}
+
+fn robit_inventory_press(game: &mut Game<'_>, at: [f32; 2], button: u8) {
+    let Some(id) = ROBIT_UI.with_borrow(|u| *u) else {
+        return;
+    };
+    let o = ROBIT_ORIGIN.with_borrow(|o| *o);
+    let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    for slot in 0..ROBIT_INV_ALL {
+        if inside(at, robit_inv_cell(slot, o)) {
+            let how = if shift { 2 } else { button.min(1) };
+            let mut out = vec![4];
+            out.extend(id.to_be_bytes());
+            out.extend([slot as u8, how]);
+            game.native_send_to_server(ROBIT_CHANNEL, &out);
+        }
+    }
+}
+
+fn robit_set_tab(game: &mut Game<'_>, tab: RobitTab) {
+    ROBIT_TAB.with(|t| t.set(tab));
+    if let Some(id) = ROBIT_UI.with_borrow(|u| *u) {
+        let mut out = vec![if tab == RobitTab::Inventory { 6 } else { 5 }];
+        out.extend(id.to_be_bytes());
+        game.native_send_to_server(ROBIT_CHANNEL, &out);
+    }
+}
+
+/// The mod screen closed (Escape, or another screen replaced it): the Robit's inventory lets go of the cursor.
+pub(super) fn ui_closed(game: &mut Game<'_>, id: &str) {
+    if id == ROBIT_SCREEN && ROBIT_TAB.with(std::cell::Cell::get) == RobitTab::Inventory {
+        robit_set_tab(game, RobitTab::Main);
+    }
+    if id == ROBIT_SCREEN {
+        ROBIT_TAB.with(|t| t.set(RobitTab::Main));
+    }
 }
