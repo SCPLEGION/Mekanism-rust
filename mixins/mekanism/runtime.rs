@@ -2740,6 +2740,7 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         .filter(|&at| sun && block_name(game, at) == "mekanismgenerators:advanced_solar_generator" && can_see_sky(game, at))
         .count() as u32;
     let mut temperature = get_double(&entity.nbt, "temperature").unwrap_or(evap::AMBIENT_TEMP);
+    let before = temperature;
     temperature = evap::step_temperature(temperature, solars, evap::AMBIENT_TEMP);
     let mut progress = get_int(&entity.nbt, "progress");
     let ops = evap::operations(evap::temp_multiplier(temperature, tower.height), &mut progress);
@@ -2779,6 +2780,11 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     put_tank(&mut entity.nbt, "brine", &brine);
     put_int(&mut entity.nbt, "progress", progress);
     entity.nbt.insert("temperature".into(), Tag::Double(temperature.to_bits()));
+    // `lastGain` (what the screen shows, in hundredths) and `lastEnvironmentLoss` (heat units, in hundredths of a kelvin).
+    let multiplier = evap::temp_multiplier(temperature, tower.height);
+    let gain = if ops == 0 || multiplier <= 0.0 { 0.0 } else if multiplier < 1.0 { 1.0 / (1.0 / multiplier).ceil() } else { multiplier };
+    put_int(&mut entity.nbt, "gain", (gain * 100.0).round() as u32);
+    put_long(&mut entity.nbt, "loss", ((before - temperature).abs() * f64::from(tower.height) * 100.0 * 100.0) as u64);
     // The flame shows the temperature up to 3,000 K, the arrow the brine tank.
     let heat = (temperature - evap::AMBIENT_TEMP) / (evap::MAX_MULTIPLIER_TEMP - evap::AMBIENT_TEMP);
     entity.data = vec![
@@ -4756,7 +4762,7 @@ fn layout(block: &str) -> Option<Layout> {
             ],
             gauges: vec![
                 gauge("water", evap::input_capacity(0), 6.0, 13.0, STANDARD),
-                gauge("brine", evap::OUTPUT_TANK, 172.0 - 18.0, 13.0, STANDARD),
+                gauge("brine", evap::OUTPUT_TANK, 172.0, 13.0, STANDARD),
             ],
             power: None,
             progress: None,
@@ -4969,6 +4975,16 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
         // A heater's temperature in tenths of a kelvin: the ambient 300 K and its held heat over its
         // heat capacity (`HEAT_CAPACITY`, 100); then the fuelwood heater's burn time, or the
         // resistive heater's usage a tick.
+        if kind(&entity.id) == Some(Kind::Evaporation) {
+            let height = get_int(&entity.nbt, "height");
+            entity.data[0] = i32::from(height > 0);
+            entity.data[1] = height as i32;
+            let temp = get_double(&entity.nbt, "temperature").unwrap_or(evap::AMBIENT_TEMP);
+            entity.data[2] = (temp * 10.0).clamp(0.0, 32_767.0) as i32;
+            entity.data[3] = get_int(&entity.nbt, "gain").min(32_767) as i32;
+            entity.data.truncate(DATA_USAGE);
+            entity.data.extend(wide(get_long(&entity.nbt, "loss")));
+        }
         if let Some(k @ (Kind::Heater | Kind::FuelwoodHeater)) = kind(&entity.id) {
             let temp = 300.0 + get_double(&entity.nbt, "heat_out").unwrap_or(0.0) / 100.0;
             entity.data[2] = (temp * 10.0).clamp(0.0, 32_767.0) as i32;
@@ -5072,7 +5088,7 @@ fn screen_width(block: &str) -> f32 {
     match kind(block) {
         Some(Kind::Factory(9, ..)) => 210.0,
         // `DEFAULT_IMAGE_WIDTH + 20`.
-        Some(Kind::Nucleosynthesizer) => 196.0,
+        Some(Kind::Nucleosynthesizer | Kind::Evaporation) => 196.0,
         _ => 176.0,
     }
 }
@@ -6826,7 +6842,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         slots,
         inventory_y: h - 82.0,
         inventory_x: 8.0 + (w - 176.0) / 2.0,
-        own_labels: kind(block) == Some(Kind::Nucleosynthesizer),
+        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation)),
         alt: None,
     });
 }
@@ -6880,6 +6896,8 @@ fn extras(block: &str) -> Extras {
         },
         Some(Kind::Pump | Kind::Plenisher) => Extras { screen: Some([54.0, 23.0, 80.0, 42.0]), arrows: vec![[32.0, 39.0]], ..none },
         Some(Kind::Heater) => Extras { screen: Some([48.0, 23.0, 80.0, 42.0]), ..none },
+        // `GuiThermalEvaporationController`: the screen between the gauges and the arrows under the buckets.
+        Some(Kind::Evaporation) => Extras { screen: Some([48.0, 19.0, 100.0, 40.0]), arrows: vec![[32.0, 39.0], [156.0, 39.0]], ..none },
         Some(Kind::FuelwoodHeater) => Extras {
             screen: Some([48.0, 23.0, 80.0, 28.0]),
             active_progress: vec![([144.0, 31.0], "progress/flame", [13.0, 13.0])],
@@ -6891,6 +6909,12 @@ fn extras(block: &str) -> Extras {
 
 /// The inner screen's lines: the pump's energy and fluid; the plenisher's energy, whether it has
 /// finished, and its fluid.
+/// `Double.toString` for the small values the screens show: `1.0`, `0.25`.
+fn java_double(v: f64) -> String {
+    let text = format!("{v}");
+    if text.contains('.') { text } else { format!("{text}.0") }
+}
+
 fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
     let fe = mekanism_core::energy::format_fe;
     let energy = format!("{}/{}", fe(read_wide(data, DATA_STORED)), fe(read_wide(data, DATA_CAPACITY)));
@@ -6904,6 +6928,16 @@ fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
     };
     match kind(block) {
         Some(Kind::Pump) => vec![energy, fluid()],
+        Some(Kind::Evaporation) => {
+            let kelvin = f64::from(data.get(2).copied().unwrap_or(3000).max(0)) / 10.0;
+            let gain = f64::from(data.get(3).copied().unwrap_or(0).max(0)) / 100.0;
+            vec![
+                "Formed".to_owned(),
+                format!("Height: {}", data.get(1).copied().unwrap_or(0)),
+                format!("Temp: {}", mekanism_core::energy::format_unit(kelvin, "K")),
+                format!("Production: {} mB/t", java_double(gain)),
+            ]
+        }
         Some(Kind::Plenisher) => {
             let finished = if data.get(2).copied().unwrap_or(0) == 1 { "Yes" } else { "No" };
             vec![energy, format!("Finished: {finished}"), fluid()]
@@ -7001,7 +7035,9 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
     if let Some([x, y, w, h]) = e.screen {
         nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + x, oy + y, w, h], 0xFFFF_FFFF);
         for (i, line) in screen_lines(block, data).iter().enumerate() {
-            game.native_text(batch, line, [ox + x + 3.0, oy + y + 3.0 + 10.0 * i as f32], 0x3C_FE9A, false);
+            // The evaporation screen has no spacing between lines (`clearSpacing`): the font's nine pixels.
+            let step = if kind(block) == Some(Kind::Evaporation) { 9.0 } else { 10.0 };
+            game.native_text(batch, line, [ox + x + 3.0, oy + y + 3.0 + step * i as f32], 0x3C_FE9A, false);
         }
     }
     for [x, y] in &e.arrows {
@@ -7066,6 +7102,13 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         let title = game.native_screen_title().unwrap_or_default();
         centred(game, batch, &title, ox, width, oy + 4.0, 0x40_4040);
         game.native_text(batch, "Inventory", [ox + 8.0, oy + height - 93.0], 0x40_4040, false);
+    }
+    if kind(block) == Some(Kind::Evaporation) {
+        // `renderTitleTextWithOffset(inputGauge.getRelativeRight(), OUTPUT_GAUGE_X)`: centred between the two
+        // gauges; the inventory label is 10 px in and 2 px down.
+        let title = game.native_screen_title().unwrap_or_default();
+        centred(game, batch, &title, ox + 22.0, 150.0, oy + 4.0, 0x40_4040);
+        game.native_text(batch, "Inventory", [ox + 18.0, oy + height - 92.0], 0x40_4040, false);
     }
     for row in 0..4 {
         let y = if row < 3 { height - 82.0 + 18.0 * row as f32 } else { height - 24.0 };
@@ -7138,10 +7181,20 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
     }
     // The heaters' heat tab (`GuiHeatTab`, in kelvin) above the energy tab.
-    if matches!(kind(block), Some(Kind::Heater | Kind::FuelwoodHeater)) {
+    if matches!(kind(block), Some(Kind::Heater | Kind::FuelwoodHeater | Kind::Evaporation)) {
         sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
     }
     draw_extras(game, batch, block, data, origin);
+    if kind(block) == Some(Kind::Evaporation) {
+        // `GuiHorizontalRateBar` at (58, 62): the temperature over 3,000 K.
+        let (x, y) = (ox + 58.0, oy + 62.0);
+        nine_slice(game, batch, "bar/base", 5.0, 1.0, [x, y, 78.0, 8.0]);
+        let level = (f64::from(get(2)) / 10.0 / evap::MAX_MULTIPLIER_TEMP).clamp(0.0, 1.0);
+        let w = (level * 76.0).floor() as f32;
+        if w > 0.0 {
+            sprite(game, batch, "bar/horizontal_rate", [0.0, 0.0, w, 6.0], [x + 1.0, y + 1.0, w, 6.0]);
+        }
+    }
     draw_tabs(game, batch, block, &l, data, origin);
     let text_x = if l.gauges.len() > 2 { 50.0 } else { 30.0 };
     for (i, line) in multiblock_lines(block, data).iter().enumerate() {
@@ -7212,6 +7265,18 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
     };
     if window_tooltip(block, data, window_at(block, at), lines) || tab_tooltip(block, &l, data, at, lines) {
         return;
+    }
+    if kind(block) == Some(Kind::Evaporation) {
+        if inside(at, [-26.0, 109.0, 26.0, 26.0]) {
+            let loss = mekanism_core::energy::format_unit(read_wide(data, DATA_USAGE) as f64 / 100.0, "K");
+            lines.push(format!("Dissipated: {loss}/t"));
+            lines.push("Unit: Kelvin".to_owned());
+            return;
+        }
+        if inside(at, [58.0, 62.0, 78.0, 8.0]) {
+            lines.push(mekanism_core::energy::format_unit(f64::from(data.get(2).copied().unwrap_or(0).max(0)) / 10.0, "K"));
+            return;
+        }
     }
     let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0);
     for (i, g) in l.gauges.iter().enumerate() {
