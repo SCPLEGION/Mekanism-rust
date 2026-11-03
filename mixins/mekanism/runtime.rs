@@ -19,6 +19,7 @@ use mekanism_core::seismic;
 use mekanism_core::chargepad;
 use mekanism_core::entangloporter::{self as qe, Frequency};
 use mekanism_core::sorter::{self, Sorter};
+use mekanism_core::oredictionificator as od;
 use mekanism_core::plenisher::{self, Plenisher, Spot};
 use mekanism_core::fission;
 use mekanism_core::frequency as freq;
@@ -105,6 +106,8 @@ enum Kind {
     Plenisher,
     /// The Logistical Sorter: moves items from behind it to the front, by its filters.
     Sorter,
+    /// The Oredictionificator: turns an item of a tag into the item its filter selects.
+    Oredictionificator,
     /// The Chargepad: charges an item of the player standing on it.
     Chargepad,
     /// The Quantum Entangloporter: shares energy, fluid and chemicals across its frequency.
@@ -203,6 +206,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:electric_pump" => return Some(Kind::Pump),
         "mekanism:fluidic_plenisher" => return Some(Kind::Plenisher),
         "mekanism:logistical_sorter" => return Some(Kind::Sorter),
+        od::BLOCK => return Some(Kind::Oredictionificator),
         chargepad::CHARGEPAD => return Some(Kind::Chargepad),
         qe::ENTANGLOPORTER => return Some(Kind::Entangloporter),
         "mekanism:solar_neutron_activator" => return Some(Kind::Activator),
@@ -358,6 +362,17 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             inputs: used,
             outputs: vec![],
             menu: Some("minecraft:hopper".into()),
+        });
+        return;
+    }
+    // The input in the first slot (the furnace menu's), the result out of the last.
+    if kind(block) == Some(Kind::Oredictionificator) {
+        *container = Some(ModContainer {
+            slots: 3,
+            faces: [vec![2], vec![0], vec![0], vec![0], vec![0], vec![0]],
+            inputs: vec![0],
+            outputs: vec![2],
+            menu: Some("minecraft:furnace".into()),
         });
         return;
     }
@@ -531,6 +546,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::Activator => tick_activator(game, pos, entity),
+            Kind::Oredictionificator => tick_oredictionificator(game, entity),
             Kind::BoilerValve => tick_boiler_valve(game, pos, entity),
             Kind::Heater => tick_heater(entity),
             Kind::FuelwoodHeater => tick_fuelwood_heater(game, entity),
@@ -611,6 +627,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     adapter_sync(game, pos, entity);
     upgrade_sync(game, pos, entity);
     sorter_sync(game, pos, entity);
+    od_sync(game, pos, entity);
     miner_sync(game, pos, entity);
     multiblock_data(game, pos, entity);
     if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Pipe(_)) {
@@ -4108,6 +4125,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
         sorter_payload(game, data);
         return;
     }
+    if channel == OD_CHANNEL && game.native_on(MOD_ID) {
+        od_payload(game, data);
+        return;
+    }
     if channel == MINER_CHANNEL && game.native_on(MOD_ID) {
         miner_payload(game, data);
         return;
@@ -5085,6 +5106,13 @@ fn layout(block: &str) -> Option<Layout> {
         // The frequency screens (`draw_frequency_screen`): the teleporter's power bar.
         Kind::Teleporter => Layout { slots: [None, None, None], gauges: vec![], power: Some(PowerBar::Vertical([158.0, 26.0])), progress: None },
         Kind::Entangloporter => Layout { slots: [None, None, None], gauges: vec![], power: None, progress: None },
+        // TileEntityOredictionificator and GuiOredictionificator.
+        Kind::Oredictionificator => Layout {
+            slots: [Some(([56.0, 115.0], "slot/normal")), None, Some(([164.0, 115.0], "slot/output"))],
+            gauges: vec![],
+            power: None,
+            progress: large_right(94.0, 119.0),
+        },
         // TileEntityElectricMachine and GuiElectricMachine.
         Kind::Machine(recipe, _) => Layout {
             slots: [
@@ -5441,6 +5469,11 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
         if kind(&entity.id) == Some(Kind::Plenisher) {
             entity.data[2] = get_int(&entity.nbt, "finished") as i32;
         }
+        // The progress arrow is full while it converted something this tick (`didProcess`).
+        if kind(&entity.id) == Some(Kind::Oredictionificator) {
+            entity.data[2] = get_int(&entity.nbt, "did") as i32;
+            entity.data[3] = 1;
+        }
         // A heater's temperature in tenths of a kelvin: the ambient 300 K and its held heat over its
         // heat capacity (`HEAT_CAPACITY`, 100); then the fuelwood heater's burn time, or the
         // resistive heater's usage a tick.
@@ -5502,7 +5535,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
     if tabs(&entity.id) & TAB_REDSTONE != 0 {
         entity.data.resize(DATA_GAUGES + l.gauges.len() * GAUGE_SLOTS, 0);
         let signal = get_int(&entity.nbt, "powered") & 3;
-        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2 | (if matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) { get_int(&entity.nbt, "dump") % 3 } else if kind(&entity.id) == Some(Kind::DigitalMiner) { miner_flags(&entity.nbt) } else { get_int(&entity.nbt, "warn") & 15 | energy_warn(&entity.id, &entity.nbt) }) << 4) as i32);
+        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2 | (if matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) { get_int(&entity.nbt, "dump") % 3 } else if kind(&entity.id) == Some(Kind::DigitalMiner) { miner_flags(&entity.nbt) } else if kind(&entity.id) == Some(Kind::Oredictionificator) { u32::from(od_filters(&entity.nbt).iter().any(|f| f.enabled && !f.has_filter())) } else { get_int(&entity.nbt, "warn") & 15 | energy_warn(&entity.id, &entity.nbt) }) << 4) as i32);
         // Then, for the side configuration window, each type's faces in relative-side order and
         // which types' auto-eject is off.
         if tabs(&entity.id) & TAB_SIDES != 0 {
@@ -5596,6 +5629,8 @@ fn screen_height(block: &str) -> f32 {
         Some(Kind::FissionPort) => 255.0,
         // `DEFAULT_IMAGE_HEIGHT + 76`.
         Some(Kind::DigitalMiner) => 242.0,
+        // `DEFAULT_IMAGE_HEIGHT + 64`.
+        Some(Kind::Oredictionificator) => 230.0,
         _ => 166.0,
     }
 }
@@ -5639,6 +5674,8 @@ fn screen_width(block: &str) -> f32 {
         Some(Kind::FissionPort) => 195.0,
         // `DEFAULT_IMAGE_WIDTH + 10`.
         Some(Kind::FusionPort) => 186.0,
+        // `DEFAULT_IMAGE_WIDTH + 60`.
+        Some(Kind::Oredictionificator) => 236.0,
         _ => 176.0,
     }
 }
@@ -5735,6 +5772,7 @@ fn tabs(block: &str) -> u8 {
         }
         Some(Kind::EnergyCube(_) | Kind::ChemicalTank(_)) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
         Some(Kind::Vibrator | Kind::Heater | Kind::FuelwoodHeater) => TAB_REDSTONE | TAB_SECURITY,
+        Some(Kind::Oredictionificator) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
         Some(Kind::FluidTank(_)) => TAB_SECURITY,
         _ => 0,
     }
@@ -6057,6 +6095,10 @@ pub(super) fn screen_overlay(game: &Game<'_>, block: &str, data: &[i32], batch: 
 }
 
 fn draw_window(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    FILTER_OD.set(is_od(block));
+    if od_edit_open() && is_od(block) {
+        return draw_od_window(game, batch, origin);
+    }
     if is_filter_screen(block) {
         return draw_filter_window(game, batch, origin);
     }
@@ -6159,6 +6201,10 @@ pub(super) fn screen_covers(block: &str, at: [f32; 2], covered: &mut bool) {
 
 fn screen_covers_base(block: &str, at: [f32; 2], covered: &mut bool) {
     let wat = window_at(block, at);
+    if is_od(block) && od_edit_open() {
+        *covered |= inside(wat, OD_WINDOW);
+        return;
+    }
     if is_filter_screen(block) {
         *covered |= filter_covers(wat);
         return;
@@ -6309,6 +6355,13 @@ pub(super) fn screen_wheel(game: &Game<'_>, block: &str, steps: f32, taken: &mut
             MINER_UI.with_borrow_mut(|ui| ui.scroll = notch(ui.scroll, c.filters.len()));
             *taken = true;
         }
+    } else if is_od(block) {
+        if !od_edit_open() && let Some((pos, filters)) = od_view(game) {
+            let hidden = filters.len().saturating_sub(OD_ROWS);
+            let first = od_scroll(pos).min(hidden);
+            OD_SCROLL.set((pos, if steps > 0.0 { first.saturating_sub(1) } else { (first + 1).min(hidden) }));
+            *taken = true;
+        }
     } else if is_filter_screen(block)
         && FILTER_EDIT.with_borrow(|e| e.is_none())
         && FILTER_SELECT.get().is_none()
@@ -6335,6 +6388,11 @@ pub(super) fn screen_escape(block: &str, consumed: &mut bool) {
         }
         return;
     }
+    if is_od(block) && od_edit_open() {
+        OD_EDIT.with_borrow_mut(|e| *e = None);
+        *consumed = true;
+        return;
+    }
     if window(block).is_some() {
         set_window(block, None);
         *consumed = true;
@@ -6342,6 +6400,10 @@ pub(super) fn screen_escape(block: &str, consumed: &mut bool) {
 }
 
 fn open_window_id(block: &str) -> Option<usize> {
+    FILTER_OD.set(is_od(block));
+    if is_od(block) && od_edit_open() {
+        return Some(WINDOW_FILTER);
+    }
     if is_filter_screen(block) {
         return if FILTER_SELECT.get().is_some() {
             Some(WINDOW_SELECT)
@@ -7333,6 +7395,9 @@ fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], r
         } else {
             sorter_click(game, block, at, right);
         }
+        return;
+    }
+    if is_od(block) && od_click(game, block, at) {
         return;
     }
     if is_qio_screen(block) {
@@ -8761,6 +8826,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
     }
     draw_extras(game, batch, block, data, origin);
+    if is_od(block) {
+        draw_od_list(game, batch, origin);
+    }
     if let Some(Kind::ChemicalTank(t)) = kind(block) {
         draw_tank_screen(game, batch, &l, data, origin, t == BaseTier::Creative);
     }
@@ -8888,6 +8956,10 @@ fn warning_bits(block: &str, l: &Layout, data: &[i32]) -> u32 {
     if kind(block) == Some(Kind::DigitalMiner) {
         return (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 15;
     }
+    // `WarningType.INVALID_OREDICTIONIFICATOR_FILTER`: bit 4 here.
+    if is_od(block) {
+        return ((data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 1) << 4;
+    }
     if kind(block).is_some_and(|k| base_usage(k).is_some()) {
         return (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 15;
     }
@@ -8910,6 +8982,7 @@ fn warnings(block: &str, l: &Layout, data: &[i32]) -> Vec<&'static str> {
         (1, " - No matching recipe or not enough input"),
         (2, " - Not enough room in output"),
         (0, " - Not enough energy to operate"),
+        (4, " - Filter is no longer valid or supported"),
     ] {
         if bits & (1 << bit) != 0 {
             out.push(text);
@@ -9029,6 +9102,9 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
                 sorter_tooltip(game, at, lines);
             }
         }
+        return;
+    }
+    if is_od(block) && (od_edit_open() || open_window_id(block).is_none()) && od_tooltip(game, window_at(block, at), lines) {
         return;
     }
     if is_qio_screen(block) {
@@ -12018,6 +12094,9 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
     if !qio_select_open(block) {
         *typing |= qio_typing(block) || filter_typing(block) || adapter_typing(block);
     }
+    if is_od(block) {
+        *typing |= OD_EDIT.with_borrow(|e| e.as_ref().is_some_and(|e| e.text.focused));
+    }
     if fission_stats_open(block) {
         *typing |= STATS_TEXT.with_borrow(|t| t.focused);
     }
@@ -12048,6 +12127,10 @@ pub(super) fn screen_key(game: &mut Game<'_>, block: &str, key: &str, text: Opti
     }
     if !select && is_filter_screen(block) {
         filter_key(key, text);
+        return;
+    }
+    if is_od(block) {
+        od_key(game, key, text);
         return;
     }
     if !select && kind(block) == Some(Kind::QioRedstoneAdapter) {
@@ -12623,7 +12706,7 @@ fn draw_sorter_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
         let row = sorter_row(i);
         let [rx, ry] = [ox + row[0], oy + row[1]];
         let hovered = inside(mouse, row);
-        nine_slice(game, batch, if hovered { "list/filter/hovered" } else { "list/filter/base" }, 156.0, 1.0, [rx, ry, 156.0, 29.0]);
+        nine_slice_tinted(game, batch, if hovered { "list/filter/hovered" } else { "list/filter/base" }, [156.0, 29.0], 1.0, [rx, ry, 156.0, 29.0], 0xFFFF_FFFF);
         let tint = if f.starts_with('#') { 0x4D54_FF54 } else { 0x4D54_54FF };
         game.native_fill(batch, [rx, ry, 156.0, 29.0], tint);
         sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [rx + 2.0, ry + 2.0, 18.0, 18.0]);
@@ -12926,6 +13009,9 @@ const FILTER_MAX: [f32; 4] = [174.0, 43.0, 20.0, 11.0];
 const SELECT_WINDOW: [f32; 4] = [62.0, 20.0, 152.0, 90.0];
 /// The edit window (`GuiQIOItemStackFilter`: 185 wide, 15 down, centred on the 236 wide screen).
 fn filter_window() -> [f32; 4] {
+    if FILTER_OD.get() {
+        return OD_WINDOW;
+    }
     if FILTER_QIO.get() { [25.0, 15.0, 185.0, 90.0] } else { FILTER_WINDOW }
 }
 
@@ -14493,4 +14579,439 @@ fn qio_filter_tooltip(game: &Game<'_>, block: &str, at: [f32; 2], lines: &mut Ve
             lines.push("Right click: delete".to_owned());
         }
     }
+}
+
+// --- Oredictionificator (TileEntityOredictionificator, GuiOredictionificator, GuiOredictionificatorFilter) --
+
+const OD_CHANNEL: &str = "mekanism:oredictionificator";
+/// The filters that fit in the list at once (`FILTER_COUNT`).
+const OD_ROWS: usize = 3;
+const OD_HOLDER: [f32; 4] = [9.0, 17.0, 204.0, 68.0];
+const OD_NEW_HOLDER: [f32; 4] = [9.0, 85.0, 204.0, 22.0];
+const OD_NEW: [f32; 4] = [10.0, 86.0, 202.0, 20.0];
+const OD_BAR: [f32; 4] = [213.0, 17.0, 14.0, 90.0];
+/// The filter window (`GuiOredictionificatorFilter`: 162 wide, centred on the 236 wide screen, 15 down) and its parts.
+const OD_WINDOW: [f32; 4] = [37.0, 15.0, 162.0, 100.0];
+const OD_SCREEN: [f32; 4] = [29.0, 18.0, 116.0, 52.0];
+const OD_TEXT: [f32; 4] = [31.0, 56.0, 112.0, 12.0];
+const OD_LAST: [f32; 4] = [3.0, 38.0, 12.0, 12.0];
+const OD_NEXT: [f32; 4] = [16.0, 38.0, 12.0, 12.0];
+const OD_DELETE: [f32; 4] = [20.0, 72.0, 60.0, 20.0];
+const OD_SAVE: [f32; 4] = [82.0, 72.0, 60.0, 20.0];
+
+fn is_od(block: &str) -> bool {
+    kind(block) == Some(Kind::Oredictionificator)
+}
+
+fn od_row(i: usize) -> [f32; 4] {
+    [10.0, 18.0 + 22.0 * i as f32, 202.0, 22.0]
+}
+
+/// A row's enable radio button (`RadioButton`, 8 px, 4 in from the right).
+fn od_radio(i: usize) -> [f32; 4] {
+    let [x, y, w, h] = od_row(i);
+    [x + w - 12.0, y + h / 2.0 - 4.0, 8.0, 8.0]
+}
+
+fn od_filters(nbt: &Compound) -> Vec<od::Filter> {
+    strings_of(nbt, "od_filters").iter().filter_map(|l| od::Filter::load(l)).collect()
+}
+
+/// The items of a tag, in a fixed order.
+fn od_tag_items(items: &horizon_client::items::Items, tag: &str) -> Vec<String> {
+    // Vanilla's order for the tag (`TagLoader`: file order, nested tags in place); sorted when it is not known.
+    if let Some(order) = items.item_tag_order.get(tag) {
+        return order.clone();
+    }
+    let mut all: Vec<String> = items.item_tags.get(tag).map(|t| t.iter().map(|i| i.to_string()).collect()).unwrap_or_default();
+    all.sort();
+    all
+}
+
+/// The tags an item is in that a filter may name.
+fn od_item_tags(items: &horizon_client::items::Items, item: &str) -> Vec<String> {
+    let mut tags: Vec<String> = items.item_tags.iter().filter(|(k, t)| od::valid_tag(k) && t.contains(item)).map(|(k, _)| k.to_string()).collect();
+    tags.sort();
+    tags
+}
+
+/// The Oredictionificator, every tick: an item of a tag a filter names becomes the filter's item, as
+/// much as the output slot has room for.
+fn tick_oredictionificator(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool> {
+    let filters = od_filters(&entity.nbt);
+    let mut did = false;
+    if let Some(Some(input)) = entity.items.first().cloned()
+        && !filters.is_empty()
+    {
+        let items = world_items!(game);
+        let tags = od_item_tags(items, &input.item);
+        if let Some(result) = od::result(&filters, &tags, &|tag| od_tag_items(items, tag)) {
+            let max = items.get(&result).map_or(64, |i| i.max_stack);
+            let out = entity.items.get(2).cloned().flatten();
+            let room = match &out {
+                None => max,
+                Some(o) if *o.item == *result => max.saturating_sub(o.count),
+                Some(_) => 0,
+            };
+            let n = input.count.min(room);
+            if n > 0 {
+                entity.items[0] = (input.count > n).then(|| ItemStack { count: input.count - n, ..input });
+                entity.items[2] = Some(match out {
+                    Some(o) => ItemStack { count: o.count + n, ..o },
+                    None => stack_of(&result, n),
+                });
+                did = true;
+            }
+        }
+    }
+    put_int(&mut entity.nbt, "did", u32::from(did));
+    Some(did)
+}
+
+/// Sends the filters to the players looking at the machine.
+fn od_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    if !is_od(&entity.id) {
+        return;
+    }
+    let mut client = Compound::new();
+    client.insert("od_filters".into(), Tag::List(strings_of(&entity.nbt, "od_filters").iter().map(|s| Tag::String(s.as_str().into())).collect()));
+    put_client(game, pos, entity, &["od_filters"], client);
+}
+
+/// A player's packet, on the server: a radio button, Delete or Save. Only within reach.
+fn od_payload(game: &mut Game<'_>, data: &[u8]) {
+    let (Some(r), Some(player)) = (od::Request::decode(data), game.native_acting_player()) else {
+        return;
+    };
+    let near = (0..3).map(|k| (player.position[k] - f64::from(r.pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    if !near || !is_od(block_name(game, r.pos)) {
+        return;
+    }
+    let exists = world_items!(game).item_tags.contains_key(r.tag.as_str());
+    let index = (r.index != od::NEW).then_some(usize::from(r.index));
+    game.native_with_mod_block_entity(r.pos, |m| {
+        let mut filters = od_filters(&m.nbt);
+        match r.op {
+            od::Op::Toggle => {
+                if let Some(f) = index.and_then(|i| filters.get_mut(i)) {
+                    f.enabled = !f.enabled;
+                }
+            }
+            od::Op::Delete => {
+                if let Some(i) = index.filter(|i| *i < filters.len()) {
+                    filters.remove(i);
+                }
+            }
+            od::Op::Save => {
+                if od::valid_target(&r.tag, exists) {
+                    let enabled = index.and_then(|i| filters.get(i)).is_none_or(|f| f.enabled);
+                    od::save(&mut filters, index, od::Filter { enabled, tag: r.tag.clone(), selected: r.selected.clone() });
+                }
+            }
+        }
+        let lines: Vec<String> = filters.iter().map(od::Filter::save).collect();
+        m.nbt.insert("od_filters".into(), string_list(&lines));
+    });
+}
+
+fn od_send(game: &Game<'_>, op: od::Op, pos: [i32; 3], index: Option<usize>, filter: &od::Filter) {
+    let r = od::Request { op, pos, index: index.map_or(od::NEW, |i| i.min(usize::from(u16::MAX - 1)) as u16), tag: filter.tag.clone(), selected: filter.selected.clone() };
+    game.native_send_to_server(OD_CHANNEL, &r.encode());
+}
+
+/// The filters the open machine has, and where it is.
+fn od_view(game: &Game<'_>) -> Option<([i32; 3], Vec<od::Filter>)> {
+    let (x, y, z) = game.container?;
+    let (_, c) = game.native_client_block_entity([x, y, z])?;
+    Some(([x, y, z], strings_of(c, "od_filters").iter().filter_map(|l| od::Filter::load(l)).collect()))
+}
+
+/// A filter window being edited: a copy of the filter (`index`) or a new one, its text box and status line.
+struct OdEdit {
+    index: Option<usize>,
+    filter: od::Filter,
+    text: freq::TextBox,
+    /// The status line (`GuiFilter.status`) and the tick it turns back to OK.
+    error: Option<(String, u64)>,
+}
+
+thread_local! {
+    static OD_EDIT: std::cell::RefCell<Option<OdEdit>> = const { std::cell::RefCell::new(None) };
+    /// Whether the open screen is the Oredictionificator's (the filter window is laid out differently).
+    static FILTER_OD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static OD_SCROLL: std::cell::Cell<([i32; 3], usize)> = const { std::cell::Cell::new(([0; 3], 0)) };
+}
+
+fn od_scroll(pos: [i32; 3]) -> usize {
+    let (at, scroll) = OD_SCROLL.get();
+    if at == pos { scroll } else { 0 }
+}
+
+fn od_edit_open() -> bool {
+    OD_EDIT.with_borrow(|e| e.is_some())
+}
+
+fn od_window_rect(r: [f32; 4]) -> [f32; 4] {
+    [OD_WINDOW[0] + r[0], OD_WINDOW[1] + r[1], r[2], r[3]]
+}
+
+/// A filter's text under its tag: the item it gives and that item's mod (`FilterButton`).
+fn od_result_text(items: &horizon_client::items::Items, f: &od::Filter) -> Option<(String, String)> {
+    let result = f.result(&od_tag_items(items, &f.tag))?;
+    let namespace = result.split_once(':').map_or("minecraft", |(n, _)| n).to_owned();
+    Some((result, namespace))
+}
+
+/// The list, its holders and the New Filter button, over the machine's screen.
+fn draw_od_list(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let at = |r: [f32; 4]| [ox + r[0], oy + r[1], r[2], r[3]];
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    let (pos, filters) = od_view(game).unwrap_or(([0; 3], vec![]));
+    nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, at(OD_HOLDER), 0xFFFF_FFFF);
+    nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, at(OD_NEW_HOLDER), 0xFFFF_FFFF);
+    nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, at(OD_BAR), 0xFFFF_FFFF);
+    draw_mek_button(game, batch, at(OD_NEW), true, inside(mouse, OD_NEW) && !od_edit_open());
+    centred(game, batch, "New Filter", ox + OD_NEW[0], OD_NEW[2], oy + OD_NEW[1] + 6.0, 0xFF_FFFF);
+    let hidden = filters.len().saturating_sub(OD_ROWS);
+    let first = od_scroll(pos).min(hidden);
+    let thumb = if hidden > 0 { (first as f32 / hidden as f32 * (OD_BAR[3] - 2.0 - 15.0)).round() } else { 0.0 };
+    let bar = if hidden > 0 { "scroll/bar" } else { "scroll/bar_inactive" };
+    sprite(game, batch, bar, [0.0, 0.0, 12.0, 15.0], [ox + OD_BAR[0] + 1.0, oy + OD_BAR[1] + 1.0 + thumb, 12.0, 15.0]);
+    let items = world_items!(game);
+    for (i, f) in filters.iter().skip(first).take(OD_ROWS).enumerate() {
+        let row = od_row(i);
+        let [rx, ry] = [ox + row[0], oy + row[1]];
+        let hovered = inside(mouse, row) && !od_edit_open();
+        nine_slice_tinted(game, batch, if hovered { "list/filter/hovered" } else { "list/filter/base" }, [156.0, 29.0], 1.0, [rx, ry, row[2], row[3]], 0xFFFF_FFFF);
+        let result = od_result_text(items, f);
+        sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [rx + 2.0, ry + 2.0, 18.0, 18.0]);
+        // `WarningType.INVALID_OREDICTIONIFICATOR_FILTER` on the slot of an enabled filter that names no usable tag.
+        if f.enabled && !f.has_filter() {
+            sprite(game, batch, "slot/warning", [0.0, 0.0, 18.0, 18.0], [rx + 2.0, ry + 2.0, 18.0, 18.0]);
+        }
+        if let Some((item, _)) = &result {
+            game.native_item(batch, item, [rx + 3.0, ry + 3.0], 16.0);
+        }
+        game.native_text(batch, &f.tag, [rx + 19.0, ry + 3.0], 0x40_4040, false);
+        if let Some((item, namespace)) = &result {
+            game.native_text_scaled(batch, &format!("{} ({namespace})", filter_name(item)), [rx + 19.0, ry + 12.0], 0x40_4040, 0.7);
+        }
+        let radio = od_radio(i);
+        let name = if f.enabled {
+            "button/radio/selected"
+        } else if inside(mouse, radio) && !od_edit_open() {
+            "button/radio/hovered"
+        } else {
+            "button/radio/base"
+        };
+        sprite(game, batch, name, [0.0, 0.0, 8.0, 8.0], at(radio));
+    }
+}
+
+fn od_tooltip(game: &Game<'_>, at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    if od_edit_open() {
+        let on = |r: [f32; 4]| inside(at, od_window_rect(r));
+        if on(OD_LAST) {
+            lines.push("Last Item".to_owned());
+        } else if on(OD_NEXT) {
+            lines.push("Next Item".to_owned());
+        }
+        return true;
+    }
+    let Some((pos, filters)) = od_view(game) else {
+        return false;
+    };
+    let first = od_scroll(pos);
+    for i in 0..OD_ROWS.min(filters.len().saturating_sub(first)) {
+        if inside(at, od_radio(i)) {
+            lines.push(if filters[first + i].enabled { "Filter: \u{a7}aenabled".to_owned() } else { "Filter: \u{a7}cdisabled".to_owned() });
+            return true;
+        }
+    }
+    false
+}
+
+/// A press on the list: a radio button, a row (opens its window), the New Filter button, the scroll bar.
+fn od_click(game: &Game<'_>, block: &str, at: [f32; 2]) -> bool {
+    let Some((pos, filters)) = od_view(game) else {
+        return false;
+    };
+    // Another window (the sides', the upgrades') is the standard path's.
+    if !od_edit_open() && open_window_id(block).is_some() {
+        return false;
+    }
+    if windowed(block, at, |wat| od_window_click(game, pos, wat)) {
+        return true;
+    }
+    if inside(at, OD_NEW) {
+        OD_EDIT.with_borrow_mut(|e| {
+            *e = Some(OdEdit { index: None, filter: od::Filter::new(""), text: freq::TextBox { focused: true, ..Default::default() }, error: None });
+        });
+        return true;
+    }
+    let first = od_scroll(pos);
+    let hidden = filters.len().saturating_sub(OD_ROWS);
+    if inside(at, OD_BAR) {
+        let f = ((at[1] - OD_BAR[1] - 8.0) / (OD_BAR[3] - 16.0)).clamp(0.0, 1.0);
+        OD_SCROLL.set((pos, ((hidden as f32 + 0.5) * f) as usize));
+        return true;
+    }
+    for i in 0..OD_ROWS.min(filters.len().saturating_sub(first)) {
+        if !inside(at, od_row(i)) {
+            continue;
+        }
+        let index = first + i;
+        if inside(at, od_radio(i)) {
+            od_send(game, od::Op::Toggle, pos, Some(index), &filters[index]);
+        } else {
+            let filter = filters[index].clone();
+            OD_EDIT.with_borrow_mut(|e| *e = Some(OdEdit { index: Some(index), filter, text: freq::TextBox { focused: true, ..Default::default() }, error: None }));
+        }
+        return true;
+    }
+    inside(at, OD_HOLDER)
+}
+
+/// The window's text (`GuiOredictionificatorFilter.setText`): the tag typed becomes the filter's, if a
+/// filter may name it. Sets the status line when not.
+fn od_set_text(game: &Game<'_>, e: &mut OdEdit) -> bool {
+    let fail = |e: &mut OdEdit, why: &str| {
+        e.error = Some((why.to_owned(), game.ticks as u64 + 100));
+        false
+    };
+    let tag = match od::parse_tag(&e.text.value) {
+        Ok(t) => t,
+        Err("Tag filter must have a tag") => return fail(e, "No tag"),
+        Err(why) if why.starts_with("Invalid path") => return fail(e, "Invalid tag path"),
+        Err(_) => return fail(e, "Invalid tag namespace"),
+    };
+    if e.filter.has_filter() && e.filter.tag == tag {
+        fail(e, "Same tag")
+    } else if od::valid_target(&tag, world_items!(game).item_tags.contains_key(tag.as_str())) {
+        e.filter.tag = tag;
+        e.text = freq::TextBox { focused: true, ..Default::default() };
+        true
+    } else {
+        fail(e, "Unsupported tag")
+    }
+}
+
+/// A press while the window is open: it takes every click.
+fn od_window_click(game: &Game<'_>, pos: [i32; 3], at: [f32; 2]) -> bool {
+    if !od_edit_open() {
+        return false;
+    }
+    let on = |r: [f32; 4]| inside(at, od_window_rect(r));
+    let mut edit = OD_EDIT.with_borrow_mut(|e| e.take());
+    let Some(e) = edit.as_mut() else {
+        return true;
+    };
+    e.text.focused = on(OD_TEXT);
+    let mut keep = true;
+    if on([6.0, 6.0, 8.0, 8.0]) {
+        keep = false;
+    } else if on(OD_LAST) || on(OD_NEXT) {
+        if e.filter.has_filter() {
+            let items = od_tag_items(world_items!(game), &e.filter.tag);
+            e.filter.step(&items, on(OD_NEXT));
+        }
+    } else if on(OD_DELETE) {
+        if let Some(i) = e.index {
+            od_send(game, od::Op::Delete, pos, Some(i), &e.filter);
+        }
+        keep = false;
+    } else if on(OD_SAVE) {
+        keep = !od_save(game, pos, e);
+    }
+    if keep {
+        OD_EDIT.with_borrow_mut(|slot| *slot = edit);
+    }
+    true
+}
+
+/// Save (`GuiTextFilter.validateAndSave`): a typed tag is set first; the filter must name a tag.
+fn od_save(game: &Game<'_>, pos: [i32; 3], e: &mut OdEdit) -> bool {
+    if !e.text.value.is_empty() && !od_set_text(game, e) {
+        return false;
+    }
+    if !e.filter.has_filter() {
+        e.error = Some(("No tag".to_owned(), game.ticks as u64 + 100));
+        return false;
+    }
+    od_send(game, od::Op::Save, pos, e.index, &e.filter);
+    true
+}
+
+/// The window's drawing (hook point `native_screen_overlay`).
+fn draw_od_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    OD_EDIT.with_borrow(|e| {
+        let Some(e) = e.as_ref() else {
+            return;
+        };
+        let [ox, oy] = origin;
+        let cursor = game.native_cursor();
+        let at = [cursor[0] - ox, cursor[1] - oy];
+        let screen = |r: [f32; 4]| {
+            let [x, y, w, h] = od_window_rect(r);
+            [ox + x, oy + y, w, h]
+        };
+        let hover = |r: [f32; 4]| inside(at, od_window_rect(r));
+        let [x, y, w, h] = screen([0.0, 0.0, OD_WINDOW[2], OD_WINDOW[3]]);
+        nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
+        nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
+        draw_button(game, batch, screen([6.0, 6.0, 8.0, 8.0]), hover([6.0, 6.0, 8.0, 8.0]), true, 0xFFFF_FFFF, Some(("button/close", 12.0)));
+        let title = format!("{}: Oredictionificator Filter", if e.index.is_none() { "New" } else { "Edit" });
+        centred(game, batch, &title, x, w, y + 6.0, 0x40_4040);
+        sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [x + 7.0, y + 18.0, 18.0, 18.0]);
+        let items = world_items!(game);
+        let result = e.filter.has_filter().then(|| od_result_text(items, &e.filter)).flatten();
+        if let Some((item, _)) = &result {
+            game.native_item(batch, item, [x + 8.0, y + 19.0], 16.0);
+        }
+        let s = screen(OD_SCREEN);
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, s, 0xFFFF_FFFF);
+        let status = match &e.error {
+            Some((why, until)) if game.ticks as u64 <= *until => format!("Status: \u{a7}4{why}"),
+            _ => "Status: \u{a7}2All OK".to_owned(),
+        };
+        game.native_text(batch, &status, [s[0] + 3.0, s[1] + 3.0], 0x3C_FE9A, false);
+        if e.filter.has_filter() {
+            if let Some((item, namespace)) = &result {
+                game.native_text(batch, &format!("{} ({namespace})", filter_name(item)), [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, false);
+            }
+            game.native_text(batch, &e.filter.tag, [s[0] + 3.0, s[1] + 25.0], 0x3C_FE9A, false);
+        }
+        let b = screen(OD_TEXT);
+        game.native_fill(batch, [b[0] - 1.0, b[1] - 1.0, b[2] + 2.0, b[3] + 2.0], if e.text.focused { 0xFFFF_FFFF } else { 0xFFA0_A0A0 });
+        game.native_fill(batch, b, 0xFF00_0000);
+        game.native_text(batch, &e.text.value, [b[0] + 2.0, b[1] + 2.0], 0xE0_E0E0, false);
+        if e.text.focused && (game.ticks / 6) % 2 == 0 {
+            let before: String = e.text.value.chars().take(e.text.cursor).collect();
+            game.native_text(batch, "_", [b[0] + 2.0 + game.native_text_width(&before), b[1] + 2.0], 0xE0_E0E0, false);
+        }
+        draw_button(game, batch, screen(OD_LAST), hover(OD_LAST), true, 0xFFFF_FFFF, Some(("button/left", 12.0)));
+        draw_button(game, batch, screen(OD_NEXT), hover(OD_NEXT), true, 0xFFFF_FFFF, Some(("button/right", 12.0)));
+        for (r, label) in [(OD_DELETE, if e.index.is_some() { "Delete" } else { "Cancel" }), (OD_SAVE, "Save")] {
+            let b = screen(r);
+            draw_button(game, batch, b, hover(r), true, 0xFFFF_FFFF, None);
+            centred(game, batch, label, b[0], b[2], b[1] + 6.0, 0xFF_FFFF);
+        }
+    });
+}
+
+fn od_key(game: &Game<'_>, key: &str, text: Option<&str>) {
+    let mut edit = OD_EDIT.with_borrow_mut(|e| e.take());
+    if let Some(e) = edit.as_mut()
+        && e.text.focused
+    {
+        // The text is forced to lower case (`getInputTransformer`) and limited to resource locations.
+        let lower = text.map(str::to_lowercase);
+        let typed = e.text.key(key, lower.as_deref(), |c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-./:".contains(c), 100);
+        if typed == freq::Typed::Enter {
+            od_set_text(game, e);
+        }
+    }
+    OD_EDIT.with_borrow_mut(|slot| *slot = edit);
 }
