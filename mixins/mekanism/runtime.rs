@@ -7,6 +7,7 @@ use super::Game;
 use horizon_client::containers::{ModBlockEntity, ModContainer};
 use horizon_client::items::ItemStack;
 use horizon_world::nbt::{Compound, JavaString, Tag};
+use mekanism_core::bolt;
 use mekanism_core::bounding;
 use mekanism_core::chemical::{self as chem, ChemicalTank};
 use mekanism_core::energy::{Action, EnergyContainer};
@@ -1287,6 +1288,27 @@ thread_local! {
     static FUSIONS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
+/// One orbiting speck of an SPS (`SPSOrbitEffect`).
+struct Orbit {
+    start: bolt::V3,
+    axis: bolt::V3,
+    scale: f32,
+    ticker: u64,
+}
+
+/// What an SPS casing's client keeps: its bolts and the specks that circle its core.
+struct SpsFx {
+    bolts: bolt::BoltField,
+    orbits: std::collections::VecDeque<Orbit>,
+    rng: bolt::Rng,
+    last_tick: u64,
+}
+
+thread_local! {
+    /// The SPS ports this client has heard of (the master draws the effects).
+    static SPS_FX: std::cell::RefCell<std::collections::HashMap<[i32; 3], SpsFx>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 thread_local! {
     /// The turbine valves this client has heard of, with the turn (lower, upper blade) of each rotor.
     static TURBINES: std::cell::RefCell<std::collections::HashMap<[i32; 3], Vec<[f32; 2]>>> = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -1332,6 +1354,16 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
         FUSIONS.with_borrow_mut(|t| {
             t.insert(pos);
         });
+    } else if matches!(kind(id), Some(Kind::SpsPort)) {
+        SPS_FX.with_borrow_mut(|t| {
+            t.entry(pos).or_insert_with(|| SpsFx {
+                bolts: bolt::BoltField::new(u64::from(pos[0] as u32) << 32 ^ u64::from(pos[2] as u32) ^ 0x5B5),
+                orbits: Default::default(),
+                rng: bolt::Rng::new(u64::from(pos[1] as u32) ^ 0xA5),
+                last_tick: 0,
+            });
+        });
+
     } else if matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation | Kind::TurbineValve | Kind::FissionPort)) {
         BIG_TANKS.with_borrow_mut(|t| {
             t.insert(pos);
@@ -1617,6 +1649,141 @@ fn big_tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWo
                         max: [x + 0.95, y + 0.99 * tall, z + 0.95],
                         colors: [glow, glow, 0, 0, glow, glow],
                         sprite: None,
+                    });
+                }
+            }
+            true
+        });
+    });
+}
+
+/// `RenderSPS` (hook point `native_world_quads`, API 45): a bolt from the face of each coil that is lit to the
+/// middle, flashes to the casing while energy comes in, the core's billboard and the specks circling it.
+pub(super) fn world_quads(game: &Game<'_>, quads: &mut Vec<super::native_hooks::NativeWorldQuad>) {
+    let ticks = game.ticks as u64;
+    let now = bolt::Timestamp { ticks: ticks as i64, partial: game.clock.fraction() as f32 };
+    let partial = now.partial;
+    let (right, up) = game.native_camera_axes();
+    let (right, up) = (right.map(|v| v as f32), up.map(|v| v as f32));
+    let corner = |c: [f32; 3], x: f32, y: f32| -> [f64; 3] { std::array::from_fn(|k| f64::from(c[k] + right[k] * x + up[k] * y)) };
+    SPS_FX.with_borrow_mut(|set| {
+        set.retain(|pos, fx| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::SpsPort)) {
+                return false;
+            }
+            let lo = get_ints(c, "sps_lo");
+            if get_int(c, "sps_on") == 0 || lo.len() != 3 {
+                return true;
+            }
+            let center = bolt::V3(lo[0] as f32 + 3.5, lo[1] as f32 + 3.5, lo[2] as f32 + 3.5);
+            let energy = get_int(c, "sps_e");
+            let processed = f32::from_bits(get_int(c, "sps_p"));
+            let scale = (((f64::from(processed).log10() + 2.0) / 4.0) as f32).clamp(0.0, 1.0);
+            let lerp = |a: f32, b: f32| a + (b - a) * scale;
+            let key = |p: [i32; 3]| i64::from(p[0]).wrapping_mul(73_856_093) ^ i64::from(p[1]).wrapping_mul(19_349_663) ^ i64::from(p[2]).wrapping_mul(83_492_791);
+            let mut target_effects = 0usize;
+            // `getBoltFromData` for each lit coil.
+            let coils = get_ints(c, "sps_c");
+            for coil in coils.chunks(5).filter(|c| c.len() == 5 && c[4] > 0) {
+                let (_, d) = DIRECTIONS[(coil[3].clamp(0, 5)) as usize];
+                let level = coil[4];
+                let start = bolt::V3(
+                    (coil[0] + d[0]) as f32 + 0.5 + 0.5 * d[0] as f32,
+                    (coil[1] + d[1]) as f32 + 0.5 + 0.5 * d[1] as f32,
+                    (coil[2] + d[2]) as f32 + 0.5 + 0.5 * d[2] as f32,
+                );
+                let effect = bolt::BoltEffect {
+                    info: bolt::BoltRenderInfo::electricity(),
+                    start,
+                    end: center,
+                    segments: 15,
+                    count: 1 + (level - 1) / 2,
+                    size: 0.01 * level as f32,
+                };
+                fx.bolts.update(key([coil[0], coil[1], coil[2]]), bolt::BoltSpec { effect, lifespan: 8.0, delay: 4.0 }, now);
+            }
+            if energy > 0 {
+                if f64::from(fx.rng.float()) < f64::from(lerp(0.01, 0.4)) {
+                    let side = (fx.rng.float() * 6.0) as usize % 6;
+                    let (min, max) = ([lo[0] as f32 + 1.0, lo[1] as f32 + 1.0, lo[2] as f32 + 1.0], [lo[0] as f32 + 6.0, lo[1] as f32 + 6.0, lo[2] as f32 + 6.0]);
+                    let mut end = [0.0; 3];
+                    for k in 0..3 {
+                        end[k] = min[k] + fx.rng.float() * (max[k] - min[k]);
+                    }
+                    // `CuboidSide`: north, south, west, east, bottom, top fix one coordinate.
+                    let (axis, high) = [(2, false), (2, true), (0, false), (0, true), (1, false), (1, true)][side];
+                    end[axis] = if high { max[axis] } else { min[axis] };
+                    let effect = bolt::BoltEffect {
+                        info: bolt::BoltRenderInfo::electricity(),
+                        start: center,
+                        end: bolt::V3(end[0], end[1], end[2]),
+                        segments: 15,
+                        count: 1,
+                        size: 0.01 * lerp(0.5, 5.0),
+                    };
+                    let owner = 31 * side as i64 + key([end[0] as i32, end[1] as i32, end[2] as i32]) ^ i64::from(end[0].to_bits() ^ end[1].to_bits() ^ end[2].to_bits());
+                    fx.bolts.update(owner, bolt::BoltSpec { effect, lifespan: 8.0, delay: 0.0 }, now);
+                }
+                target_effects = lerp(10.0, 120.0) as usize;
+            }
+            // The specks: one fewer or, half the time, one more a frame.
+            if fx.orbits.len() > target_effects {
+                fx.orbits.pop_front();
+            } else if fx.orbits.len() < target_effects && fx.rng.float() < 0.5 {
+                let vec = |rng: &mut bolt::Rng| {
+                    let v = bolt::V3(rng.float() - 0.5, rng.float() - 0.5, rng.float() - 0.5);
+                    let l = (v.0 * v.0 + v.1 * v.1 + v.2 * v.2).sqrt().max(1e-6);
+                    bolt::V3(v.0 / l, v.1 / l, v.2 / l)
+                };
+                let start = vec(&mut fx.rng);
+                let k = 1.0 + fx.rng.float();
+                let axis = vec(&mut fx.rng);
+                let scale = 0.01 + fx.rng.float() * 0.04;
+                fx.orbits.push_back(Orbit { start: bolt::V3(start.0 * k, start.1 * k, start.2 * k), axis, scale, ticker: 0 });
+            }
+            let elapsed = if fx.last_tick == 0 { 0 } else { ticks.saturating_sub(fx.last_tick) };
+            fx.last_tick = ticks;
+            let speed = (energy.max(1) as f32).log10();
+            for orbit in &mut fx.orbits {
+                orbit.ticker += elapsed;
+                // `SPSOrbitEffect.transformPos`: the start turned about its axis.
+                let angle = ((orbit.ticker as f32 + partial) * speed).to_radians();
+                let (s, co) = angle.sin_cos();
+                let (a, v) = (orbit.axis, orbit.start);
+                let cross = bolt::V3(a.1 * v.2 - a.2 * v.1, a.2 * v.0 - a.0 * v.2, a.0 * v.1 - a.1 * v.0);
+                let dot = a.0 * v.0 + a.1 * v.1 + a.2 * v.2;
+                let at = [0, 1, 2].map(|k| {
+                    let (vk, ak, ck) = ([v.0, v.1, v.2][k], [a.0, a.1, a.2][k], [cross.0, cross.1, cross.2][k]);
+                    [center.0, center.1, center.2][k] + vk * co + ck * s + ak * dot * (1.0 - co)
+                });
+                let r = orbit.scale;
+                quads.push(super::native_hooks::NativeWorldQuad {
+                    corners: [corner(at, r, -r), corner(at, r, r), corner(at, -r, r), corner(at, -r, -r)],
+                    color: 0xF066_D7ED,
+                    sprite: Some("mekanism:gui/sps_orbit".into()),
+                    uv: [0.0, 0.0, 1.0, 1.0],
+                });
+            }
+            if processed > 0.0 {
+                let r = lerp(0.1, 4.0);
+                let at = [center.0, center.1, center.2];
+                quads.push(super::native_hooks::NativeWorldQuad {
+                    corners: [corner(at, r, -r), corner(at, r, r), corner(at, -r, r), corner(at, -r, -r)],
+                    color: 0xF0FF_FFFF,
+                    sprite: Some(format!("mekanism:gui/sps_core_{}", ticks % 16)),
+                    uv: [0.0, 0.0, 1.0, 1.0],
+                });
+            }
+            for (argb, vecs) in fx.bolts.states(now) {
+                for q in vecs.chunks(4).filter(|q| q.len() == 4) {
+                    quads.push(super::native_hooks::NativeWorldQuad {
+                        corners: std::array::from_fn(|i| [f64::from(q[i].0), f64::from(q[i].1), f64::from(q[i].2)]),
+                        color: argb,
+                        sprite: None,
+                        uv: [0.0, 0.0, 1.0, 1.0],
                     });
                 }
             }
@@ -4673,6 +4840,14 @@ fn get_long(nbt: &Compound, key: &str) -> u64 {
 
 fn get_int(nbt: &Compound, key: &str) -> u32 {
     get_long(nbt, key).min(u32::MAX as u64) as u32
+}
+
+/// An int array of the block entity, empty when there is none.
+fn get_ints(nbt: &Compound, key: &str) -> Vec<i32> {
+    match nbt.get(&JavaString::from(key)) {
+        Some(Tag::IntArray(v)) => v.clone(),
+        _ => Vec::new(),
+    }
 }
 
 fn get_double(nbt: &Compound, key: &str) -> Option<f64> {
@@ -11051,7 +11226,7 @@ pub(super) fn use_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 /// `SPSValidator`: the box of casing and ports joined to `start`, 7 on each side, with air and coils
 /// inside, every coil against a port. Its low corner, its ports, and the ports with a coil behind them.
 #[allow(clippy::type_complexity)]
-fn find_sps(game: &Game<'_>, start: [i32; 3]) -> Option<(Vec<[i32; 3]>, Vec<[i32; 3]>)> {
+fn find_sps(game: &Game<'_>, start: [i32; 3]) -> Option<(Vec<[i32; 3]>, Vec<[i32; 3]>, [i32; 3])> {
     let (lo, _, seen) = find_box(game, start, sps::is_frame, sps::SIZE, sps::SIZE)?;
     let mut ports = Vec::new();
     let mut coils = 0;
@@ -11085,7 +11260,7 @@ fn find_sps(game: &Game<'_>, start: [i32; 3]) -> Option<(Vec<[i32; 3]>, Vec<[i32
         })
         .collect();
     // A coil not against a port fails the structure.
-    (!ports.is_empty() && coiled.len() == coils).then_some((ports, coiled))
+    (!ports.is_empty() && coiled.len() == coils).then_some((ports, coiled, lo))
 }
 
 fn sps_of(nbt: &Compound) -> sps::Sps {
@@ -11105,7 +11280,8 @@ fn tick_sps_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
     if ticker == 0 {
         match find_sps(game, pos) {
-            Some((ports, coiled)) => {
+            Some((ports, coiled, lo)) => {
+                entity.nbt.insert("sps_lo".into(), Tag::IntArray(lo.to_vec()));
                 entity.nbt.insert("master".into(), Tag::IntArray(ports[0].to_vec()));
                 entity.nbt.insert("ports".into(), Tag::IntArray(ports.concat()));
                 entity.nbt.insert("coiled".into(), Tag::IntArray(coiled.concat()));
@@ -11117,6 +11293,7 @@ fn tick_sps_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
         }
     }
     if get_pos(&entity.nbt, "master") != Some(pos) {
+        put_client(game, pos, entity, &["sps_on"], Compound::new());
         return;
     }
     let ports = positions(&entity.nbt, "ports");
@@ -11139,6 +11316,8 @@ fn tick_sps_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     s.input = input.amount;
     // Each coiled port hands the coils what it holds, at most an int's worth (`getAmountAsInt`).
     let mut received = 0u64;
+    // `CoilData.receiveEnergy`: the laser level of each coil, with the side its port is on.
+    let mut lasers: Vec<i32> = Vec::new();
     if s.can_operate() {
         for &p in &coiled {
             let take = |nbt: &mut Compound| {
@@ -11149,6 +11328,17 @@ fn tick_sps_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
             };
             let n = if p == pos { take(&mut entity.nbt) } else { game.native_with_mod_block_entity(p, |m| take(&mut m.nbt)).unwrap_or(0) };
             received = received.saturating_add(n).min(i32::MAX as u64);
+            if n > 0 {
+                let level = 1 + ((((n as f64).log10() - 3.0) * 1.8) as i32).max(0);
+                let lo = get_ints(&entity.nbt, "sps_lo");
+                let side = DIRECTIONS.iter().position(|(_, d)| {
+                    let at = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
+                    lo.len() == 3 && (0..3).all(|k| at[k] > lo[k] && at[k] < lo[k] + sps::SIZE - 1) && block_name(game, at) == sps::COIL
+                });
+                if let Some(side) = side {
+                    lasers.extend([p[0], p[1], p[2], side as i32, level]);
+                }
+            }
         }
     }
     let processed = s.tick(received);
@@ -11167,6 +11357,14 @@ fn tick_sps_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     entity.nbt.insert("processed".into(), Tag::Double(processed.to_bits()));
     put_long(&mut entity.nbt, "input_processed", s.input_processed);
     put_long(&mut entity.nbt, "received", received);
+    // `RenderSPS`: the coils' laser levels, what the casing received and processed, and where the box is.
+    let mut shown = Compound::new();
+    put_int(&mut shown, "sps_on", 1);
+    shown.insert("sps_c".into(), Tag::IntArray(lasers));
+    shown.insert("sps_lo".into(), Tag::IntArray(get_ints(&entity.nbt, "sps_lo")));
+    put_int(&mut shown, "sps_e", received.min(u64::from(u32::MAX >> 1)) as u32);
+    put_int(&mut shown, "sps_p", (processed.max(0.0) as f32).to_bits());
+    put_client(game, pos, entity, &["sps_on", "sps_c", "sps_lo", "sps_e", "sps_p"], shown);
 }
 
 /// A sneaking right click with an empty hand on an SPS port switches it between input and output
