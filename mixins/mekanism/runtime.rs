@@ -496,7 +496,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         // An energy cube's charge slot (top) and discharge slot (bottom).
         Some(Kind::EnergyCube(_)) => (vec![0, 1], vec![]),
         // The fluid tank's bucket slot and the output slot under it.
-        Some(Kind::FluidTank(_)) => (vec![0], vec![1]),
+        Some(Kind::FluidTank(_) | Kind::DynamicValve) => (vec![0], vec![1]),
         // Tanks, the multiblocks' ports and the machines below open a screen with no slots of their own.
         Some(
             Kind::ChemicalTank(_)
@@ -505,7 +505,6 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::FusionPort
             | Kind::BoilerValve
             | Kind::SpsPort
-            | Kind::DynamicValve
             | Kind::InductionPort
             | Kind::Laser
             | Kind::LaserAmplifier
@@ -532,11 +531,11 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
     };
     // The machines with a fourth slot, and those whose slots the furnace's roles would spoil (a bucket
     // output between two inputs), open a hopper's five-slot menu.
-    if !extra_slots(block).is_empty() || matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_))) {
+    if !extra_slots(block).is_empty() || matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_) | Kind::DynamicValve)) {
         let mut inputs = inputs;
         let mut outputs = outputs;
         let mut side = vec![1];
-        if !matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_) | Kind::Evaporation)) {
+        if !matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_) | Kind::DynamicValve | Kind::Evaporation)) {
             for (i, (_, sprite)) in extra_slots(block).iter().enumerate() {
                 if *sprite == "slot/output" {
                     outputs.push(3 + i);
@@ -5003,26 +5002,47 @@ fn pull_from_carriers(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTan
 
 /// A fluid tank takes from every side and gives out of its bottom at its tier's rate, as a chemical
 /// tank does.
+/// `FluidInventorySlot.input` / `HybridInventorySlot.input` with the container edit mode (`handleContainer`):
+/// an empty bucket fills from the tank, a full one empties into it (and, on a dynamic tank, a chemical tank
+/// item takes or gives the tank's chemical). In Both a bucket that can do neither goes to the output slot;
+/// Fill only fills containers from the tank, Empty only empties them into it.
+fn container_slots(game: &Game<'_>, entity: &mut ModBlockEntity, tank: &mut ChemicalTank) {
+    let held = entity.items.first().cloned().flatten();
+    let edit = get_int(&entity.nbt, "emode") % 3;
+    let Some(bucket) = held else {
+        return;
+    };
+    if kind(&entity.id) == Some(Kind::DynamicValve) && chemical_item_capacity(&bucket.item).is_some() {
+        let mut done = false;
+        if edit != 2 && tank.chemical.as_deref().is_some_and(|c| !FLUIDS.contains(&c)) {
+            done = drain_tank_into_item(entity, 0, tank);
+        }
+        if !done && edit != 1 {
+            fill_tank_from_item(entity, 0, tank, |c| !FLUIDS.contains(&c));
+        }
+        return;
+    }
+    let empty = &*bucket.item == "minecraft:bucket";
+    if matches!((empty, edit), (true, 2) | (false, 1)) {
+        return;
+    }
+    let done = if empty {
+        drain_tank_into_bucket(game, entity, 0, Some(1), tank)
+    } else {
+        fill_tank_from_bucket(game, entity, 0, Some(1), tank, |f| FLUIDS.contains(&f))
+    };
+    let can_fill = bucket_fluid(&bucket.item).is_some_and(|f| tank.chemical.as_deref().is_none_or(|c| c == f));
+    // Nothing to take from the tank, or a bucket of something else than the tank holds.
+    let stuck = if empty { tank.amount < 1_000 } else { !can_fill };
+    if edit == 0 && !done && stuck && (empty || bucket_fluid(&bucket.item).is_some()) && put_item(game, entity, 1, &bucket.item) {
+        take_one(entity, 0);
+    }
+}
+
 fn tick_fluid_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, tier: BaseTier) {
     let (capacity, rate) = tier::fluid_tank(tier);
     let mut tank = get_tank(&entity.nbt, "fluid", capacity);
-    // `FluidInventorySlot.input` with the edit mode Both (`handleContainer`): an empty bucket fills from
-    // the tank, a full one empties into it, and a bucket that can do neither goes to the output slot.
-    let held = entity.items.first().cloned().flatten();
-    if let Some(bucket) = held {
-        let empty = &*bucket.item == "minecraft:bucket";
-        let done = if empty {
-            drain_tank_into_bucket(game, entity, 0, Some(1), &mut tank)
-        } else {
-            fill_tank_from_bucket(game, entity, 0, Some(1), &mut tank, |f| FLUIDS.contains(&f))
-        };
-        let can_fill = bucket_fluid(&bucket.item).is_some_and(|f| tank.chemical.as_deref().is_none_or(|c| c == f));
-        // Nothing to take from the tank, or a bucket of something else than the tank holds.
-        let stuck = if empty { tank.amount < 1_000 } else { !can_fill };
-        if !done && stuck && (empty || bucket_fluid(&bucket.item).is_some()) && put_item(game, entity, 1, &bucket.item) {
-            take_one(entity, 0);
-        }
-    }
+    container_slots(game, entity, &mut tank);
     if tank.amount > 0 {
         push_chemical(game, pos, &mut tank, Some([0, -1, 0]), rate, false);
     }
@@ -7254,9 +7274,10 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::SmallGauge([172.0, 18.0])),
             progress: None,
         },
+        // GuiDynamicTank: the two container slots in their holder, the merged tank's medium gauge.
         Kind::DynamicValve => Layout {
-            slots: [None; 3],
-            gauges: vec![gauge("fluid", 0, 79.0, 13.0, STANDARD)],
+            slots: [Some(([146.0, 21.0], "slot/inner_holder_slot")), Some(([146.0, 51.0], "slot/inner_holder_slot")), None],
+            gauges: vec![gauge("fluid", 0, 7.0, 16.0, [34.0, 56.0])],
             power: None,
             progress: None,
         },
@@ -7482,7 +7503,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
     if tabs(&entity.id) & TAB_REDSTONE != 0 {
         entity.data.resize(DATA_GAUGES + l.gauges.len() * GAUGE_SLOTS, 0);
         let signal = get_int(&entity.nbt, "powered") & 3;
-        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2 | (if matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) { get_int(&entity.nbt, "dump") % 3 } else if kind(&entity.id) == Some(Kind::DigitalMiner) { miner_flags(&entity.nbt) } else if kind(&entity.id) == Some(Kind::Oredictionificator) { u32::from(od_filters(&entity.nbt).iter().any(|f| f.enabled && !f.has_filter())) } else { get_int(&entity.nbt, "warn") & 15 | energy_warn(&entity.id, &entity.nbt) }) << 4) as i32);
+        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2 | (if matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) { get_int(&entity.nbt, "dump") % 3 } else if matches!(kind(&entity.id), Some(Kind::FluidTank(_) | Kind::DynamicValve)) { get_int(&entity.nbt, "emode") % 3 } else if kind(&entity.id) == Some(Kind::DigitalMiner) { miner_flags(&entity.nbt) } else if kind(&entity.id) == Some(Kind::Oredictionificator) { u32::from(od_filters(&entity.nbt).iter().any(|f| f.enabled && !f.has_filter())) } else { get_int(&entity.nbt, "warn") & 15 | energy_warn(&entity.id, &entity.nbt) }) << 4) as i32);
         // Then, for the side configuration window, each type's faces in relative-side order and
         // which types' auto-eject is off.
         if tabs(&entity.id) & TAB_SIDES != 0 {
@@ -7707,6 +7728,8 @@ const TAB_REDSTONE: u8 = 2;
 const TAB_SECURITY: u8 = 4;
 /// The side and transporter configuration tabs.
 const TAB_SIDES: u8 = 8;
+/// The container edit mode tab (`GuiContainerEditModeTab`) of the fluid tank and the dynamic tank.
+const TAB_EDIT_MODE: u8 = 16;
 
 /// Which tabs a block's screen has: machines have them all; generators no side configuration;
 /// energy cubes and chemical tanks no upgrades (`without(AttributeUpgradeSupport)`); fluid tanks no
@@ -7744,7 +7767,8 @@ fn tabs(block: &str) -> u8 {
         Some(Kind::EnergyCube(_) | Kind::ChemicalTank(_)) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
         Some(Kind::Vibrator | Kind::Heater | Kind::FuelwoodHeater) => TAB_REDSTONE | TAB_SECURITY,
         Some(Kind::Oredictionificator) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
-        Some(Kind::FluidTank(_)) => TAB_SECURITY,
+        Some(Kind::FluidTank(_)) => TAB_SECURITY | TAB_EDIT_MODE,
+        Some(Kind::DynamicValve) => TAB_EDIT_MODE,
         _ => 0,
     }
 }
@@ -7769,6 +7793,8 @@ enum TabKind {
     Sort,
     /// The Digital Miner's visuals toggle (`GuiVisualsTab`).
     Visuals,
+    /// The container edit mode (both, fill, empty).
+    EditMode,
 }
 
 fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
@@ -7785,6 +7811,11 @@ fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
     if matches!(kind(block), Some(Kind::DigitalMiner | Kind::Stabilizer)) {
         out.push(Tab { at: [-26.0, 6.0], icon: "button/visuals", argb: 0xFFFF_FFFF, what: TabKind::Visuals });
     }
+    // `GuiContainerEditModeTab` (imageWidth, 138): its icon follows the mode.
+    if t & TAB_EDIT_MODE != 0 {
+        let icon = ["container_edit_mode/both", "container_edit_mode/fill", "container_edit_mode/empty"][edit_mode(l, data)];
+        out.push(Tab { at: [right, 138.0], icon, argb: 0xFF36_6BD0, what: TabKind::EditMode });
+    }
     if t & TAB_UPGRADE != 0 {
         out.push(Tab { at: [right, 6.0], icon: "button/upgrade", argb: 0xFFFF_FFFF, what: TabKind::Upgrade });
     }
@@ -7796,6 +7827,11 @@ fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
         out.push(Tab { at: [right, 137.0], icon, argb: 0xFFC9_071F, what: TabKind::Redstone });
     }
     out
+}
+
+/// The container edit mode (0 both, 1 fill, 2 empty), kept beside the redstone data.
+fn edit_mode(l: &Layout, data: &[i32]) -> usize {
+    (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as usize >> 4) % 3
 }
 
 /// The part of a tab that takes clicks and shows its tooltip: the button inside the holder's border.
@@ -7867,6 +7903,7 @@ fn tab_tooltip(block: &str, l: &Layout, data: &[i32], at: [f32; 2], lines: &mut 
         TabKind::Security => sec_tab_tooltip(lines),
         TabKind::Redstone => lines.push(redstone_of(l, data).0.name().into()),
         TabKind::Sort => lines.push("Auto-Sort".into()),
+        TabKind::EditMode => lines.push(["Both", "Fill", "Empty"][edit_mode(l, data)].into()),
         TabKind::Visuals => {
             let (shown, too_big) = (miner_visuals_on(data), kind(block) == Some(Kind::DigitalMiner) && miner_view(block, data).radius > 64);
             lines.push(format!("Visuals: {}", if shown { "On" } else { "Off" }));
@@ -8296,6 +8333,10 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
             .collect();
         for &i in chemical_layout_slots(block) {
             rules[i] = SlotRule::Items(chemical_item_ids());
+        }
+        // The dynamic tank's output slot only gives (`OutputInventorySlot`).
+        if kind(block) == Some(Kind::DynamicValve) {
+            rules[1] = SlotRule::Refuse;
         }
         let extra = extra_slots(block);
         if !extra.is_empty() {
@@ -9150,6 +9191,8 @@ const BUTTON_REDSTONE_NEXT: i32 = 100;
 const BUTTON_REDSTONE_PREVIOUS: i32 = 101;
 /// The factory's sorting tab (`GuiInteraction.AUTO_SORT_BUTTON`).
 const BUTTON_SORT: i32 = 102;
+const BUTTON_EDIT_NEXT: i32 = 103;
+const BUTTON_EDIT_PREVIOUS: i32 = 104;
 
 /// The capacity of a multiblock's tank, from the size its master saved.
 fn multiblock_capacity(entity: &ModBlockEntity, key: &str) -> u64 {
@@ -9302,7 +9345,18 @@ fn multiblock_lines(block: &str, data: &[i32]) -> Vec<String> {
         // The turbine's screen draws its own inner screen (`GuiIndustrialTurbine`).
         Some(Kind::TurbineValve) => vec![],
         Some(Kind::InductionPort) => vec![format!("Max I/O: {}/t", fe(usage))],
-        Some(Kind::DynamicValve) => vec![format!("Volume: {} blocks", get(1))],
+        // `GuiDynamicTank`: what the tank holds, then its capacity.
+        Some(Kind::DynamicValve) => {
+            let (amount, capacity) = (read_wide(data, DATA_GAUGES), read_wide(data, DATA_GAUGES + 4));
+            let name = usize::try_from(data.get(DATA_GAUGES + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c)).map(|c| c.1);
+            let mut lines = match (amount, name) {
+                (0, _) | (_, None) => vec!["Empty".to_owned()],
+                (_, Some(name)) => vec![format!("{name}:"), format!("{} mB", thousands(amount))],
+            };
+            lines.push("Capacity: ".to_owned());
+            lines.push(format!("{} mB", thousands(capacity)));
+            lines
+        }
         // The SPS screen draws its own inner screen (`GuiSPS`).
         Some(Kind::SpsPort) => vec![],
         _ => vec![],
@@ -9439,6 +9493,7 @@ fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], r
         Some(TabKind::Upgrade) if !right => set_window(block, Some(Window::Upgrades(None))),
         Some(TabKind::Transporter) if !right => set_window(block, Some(Window::Transporter)),
         Some(TabKind::Sort) if !right => *button = Some(BUTTON_SORT),
+        Some(TabKind::EditMode) => *button = Some(if right { BUTTON_EDIT_PREVIOUS } else { BUTTON_EDIT_NEXT }),
         Some(TabKind::Visuals) if !right => miner_toggle_visuals(game),
         _ => {}
     }
@@ -9456,6 +9511,12 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         let now = RedstoneControl::from_ordinal(get_int(&entity.nbt, "control"));
         let next = if id == BUTTON_REDSTONE_NEXT { now.next() } else { now.previous() };
         put_int(&mut entity.nbt, "control", next.ordinal());
+        return;
+    }
+    // The container edit mode tab (`NEXT_MODE` / `PREVIOUS_MODE`).
+    if matches!(id, BUTTON_EDIT_NEXT | BUTTON_EDIT_PREVIOUS) && tabs(&entity.id) & TAB_EDIT_MODE != 0 {
+        let now = get_int(&entity.nbt, "emode") % 3;
+        put_int(&mut entity.nbt, "emode", if id == BUTTON_EDIT_NEXT { (now + 1) % 3 } else { (now + 2) % 3 });
         return;
     }
     // The security tab (`GuiInteraction.NEXT_SECURITY_MODE` / `PREVIOUS_SECURITY_MODE`).
@@ -9822,6 +9883,8 @@ fn extras(block: &str) -> Extras {
         // `GuiTexturedElement.downArrow(imageWidth + 8, 91)` between the washer's two fluid slots.
         Some(Kind::Washer) => Extras { active_progress: vec![large(64.0, 39.0)], arrows: vec![[184.0, 91.0]], ..none },
         Some(Kind::Heater) => Extras { screen: Some([48.0, 23.0, 80.0, 42.0]), ..none },
+        // `GuiDynamicTank`: the screen, and the arrow from the container slot to the output.
+        Some(Kind::DynamicValve) => Extras { screen: Some([49.0, 21.0, 84.0, 46.0]), arrows: vec![[150.0, 39.0]], ..none },
         Some(Kind::BioGenerator) => Extras { screen: Some([48.0, 23.0, 80.0, 40.0]), ..none },
         Some(Kind::Wind) => Extras { screen: Some([48.0, 21.0, 80.0, 44.0]), ..none },
         Some(Kind::Solar(..)) => Extras { screen: Some([40.0, 23.0, 96.0, 40.0]), ..none },
@@ -10056,6 +10119,7 @@ fn draw_data_gauge(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o
         SMALL => "small",
         SMALL_MED => "small_med",
         WIDE => "wide",
+        [34.0, _] => "medium",
         _ => "standard",
     };
     sprite(game, batch, &format!("gauge/overlay/{overlay}"), [0.0, 0.0, size[0] - 2.0, size[1] - 2.0], [x + 1.0, y + 1.0, size[0] - 2.0, size[1] - 2.0]);
@@ -10638,11 +10702,13 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
             let at = |dy: f32, step: f32| [ox + x + pad, oy + y + dy + step * i as f32];
             match kind(block) {
                 // `GuiInnerScreen.defaultFormat`: 5 px in, 0.8 scale, 2 px between the lines, centred in the screen.
-                Some(Kind::BioGenerator | Kind::Wind | Kind::Solar(..)) => {
+                Some(Kind::BioGenerator | Kind::Wind | Kind::Solar(..) | Kind::DynamicValve) => {
+                    // `.spacing(1)` on the tank's screen: a line is 9 px and 1 px apart there, 2 px elsewhere.
+                    let gap = if kind(block) == Some(Kind::DynamicValve) { 1.0 } else { 2.0 };
                     let n = screen_lines(block, data).len() as f32;
-                    let top = ((h - (11.0 * n - 2.0)) / 2.0).floor();
+                    let top = ((h - ((9.0 + gap) * n - gap)) / 2.0).floor();
                     let red = kind(block) == Some(Kind::Wind) && i == 2;
-                    game.native_text_scaled(batch, line, [ox + x + 5.0, oy + y + top + 11.0 * i as f32], if red { 0xAA_0000 } else { 0x3C_FE9A }, 0.8)
+                    game.native_text_scaled(batch, line, [ox + x + 5.0, oy + y + top + (9.0 + gap) * i as f32], if red { 0xAA_0000 } else { 0x3C_FE9A }, 0.8)
                 }
                 Some(Kind::Evaporation) => game.native_text_scaled(batch, line, at(2.0, 9.0), 0x3C_FE9A, 0.8),
                 // `clearSpacing().clearFormat()`: top-aligned, 5 px in, 9 px a line.
@@ -10784,6 +10850,10 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
             sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + first[0] - 1.0, oy + first[1] + 18.0 * i as f32 - 1.0, 18.0, 18.0]);
         }
     }
+    // `GuiElementHolder` (141, 16, 26, 56) behind the dynamic tank's two container slots.
+    if kind(block) == Some(Kind::DynamicValve) {
+        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, [ox + 141.0, oy + 16.0, 26.0, 56.0], 0xFFFF_FFFF);
+    }
     let warn = warning_bits(block, &l, data);
     let extra = extra_slots(block);
     let slots = l.slots.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|s| (i, s))).chain(extra.iter().map(|s| (9, s)));
@@ -10864,6 +10934,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
             SMALL => "small",
             SMALL_MED => "small_med",
             WIDE => "wide",
+            [34.0, _] => "medium",
             _ => "standard",
         };
         sprite(game, batch, &format!("gauge/overlay/{overlay}"), [0.0, 0.0, size[0] - 2.0, size[1] - 2.0], [x + 1.0, y + 1.0, size[0] - 2.0, size[1] - 2.0]);
@@ -11703,12 +11774,24 @@ fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
             }
         }
     }
+    // The container slots (`TankMultiblockData.tick`: `inputSlot.handleTank`) work on the tank of the master.
+    if let Some(master) = get_pos(&entity.nbt, "master")
+        && master != pos
+    {
+        if entity.items.first().is_some_and(Option::is_some)
+            && let Some(mut tank) = game.native_with_mod_block_entity(master, |m| get_tank(&m.nbt, "fluid", dynamic_tank::capacity(get_long(&m.nbt, "volume"))))
+        {
+            container_slots(game, entity, &mut tank);
+            game.native_with_mod_block_entity(master, |m| put_tank(&mut m.nbt, "fluid", &tank));
+        }
+    }
     if get_pos(&entity.nbt, "master") != Some(pos) {
         // Only the master draws the tank's contents.
         put_fills(game, pos, entity, &[]);
         return;
     }
     let mut tank = get_tank(&entity.nbt, "fluid", dynamic_tank::capacity(get_long(&entity.nbt, "volume")));
+    container_slots(game, entity, &mut tank);
     // Each valve's buffer into the tank.
     let drain = |nbt: &mut Compound, tank: &mut ChemicalTank| {
         let mut buffer = get_tank(nbt, "buffer", dynamic_tank::VALVE_BUFFER);
