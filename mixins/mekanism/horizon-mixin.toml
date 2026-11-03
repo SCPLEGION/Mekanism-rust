@@ -601,3 +601,14 @@ bindings = [
   { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
   { name = "keep", ty = "&mut bool", value = "&mut *keep" },
 ]
+
+[[injection]]
+id = "hud"
+hook = "hud"
+hook_version = 1
+kind = "HEAD"
+helper = "hud.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+]

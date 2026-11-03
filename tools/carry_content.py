@@ -440,6 +440,7 @@ def build_module(ns, out):
     report["composite_models"] = flatten_models.flatten_tree(out / "assets" / ns, search)
     report["sps_textures"] = sps_textures(ns, out, search)
     report["sounds"] = sound_files(ns, out)
+    report["hud_sprites"] = hud_sprites(ns, out)
     if ns == "mekanismgenerators":
         # The turbine's blades (`ModelTurbine`): one pair of rings per blade index.
         turbine_png = next((d / ns / "render/turbine.png" for d in search if (d / ns / "render/turbine.png").is_file()), None)
@@ -705,7 +706,11 @@ def sps_textures(ns, out, search):
     flame = next((d / ns / "render/flame.png" for d in search if (d / ns / "render/flame.png").is_file()), None)
     if flame is not None:
         shutil.copyfile(flame, dst / "flame.png")
-    return 18
+    # The Laser's beam (`LaserParticle`) draws this sprite.
+    beam = SRC / "main/resources/assets/mekanism/textures/particle/laser.png"
+    if ns == "mekanism" and beam.is_file():
+        shutil.copyfile(beam, dst / "laser_beam.png")
+    return 19
 
 
 def sound_files(ns, out):
@@ -716,24 +721,41 @@ def sound_files(ns, out):
     import json
     root = Path(__file__).resolve().parent.parent / "src"
     events_file = root / "datagen/generated/mekanism/assets/mekanism/sounds.json"
-    files = ["tile/industrial_alarm", "item/flamethrower_active", "item/flamethrower_idle"]
+    sounds_dir = root / "main/resources/assets/mekanism/sounds"
     if not events_file.is_file():
         return 0
     events = json.loads(events_file.read_text())
-    keep = {
-        name: value
-        for name, value in events.items()
-        if name in ("tile.machine.industrial_alarm", "item.flamethrower.active", "item.flamethrower.idle")
-    }
+    # Every machine's working hum (`tile.machine.*`) and the Flamethrower's loops.
+    names = [n for n in events if n.startswith("tile.machine.") or n.startswith("item.flamethrower.")]
+    keep = {name: events[name] for name in names}
+    files = []
+    for value in keep.values():
+        for sound in value["sounds"]:
+            files.append((sound["name"] if isinstance(sound, dict) else sound).split(":", 1)[1])
     dst = out / "assets" / ns
     for f in files:
-        src = root / "main/resources/assets/mekanism/sounds" / (f + ".ogg")
+        src = sounds_dir / (f + ".ogg")
         if not src.is_file():
-            return 0
+            continue
         (dst / "sounds" / f).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, dst / "sounds" / (f + ".ogg"))
     (dst / "sounds.json").write_text(json.dumps(keep, indent=2))
     return len(files)
+
+
+def hud_sprites(ns, out):
+    """The HUD's icons (`textures/gui/sprites/hud/*`, `HUDRenderer`) as `textures/gui/hud_<name>.png`: Horizon's GUI
+    atlas holds a content mod's `textures/gui` only."""
+    src = SRC / "main/resources/assets/mekanism/textures/gui/sprites/hud"
+    if ns != "mekanism" or not src.is_dir():
+        return 0
+    dst = out / "assets" / ns / "textures/gui"
+    dst.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for icon in sorted(src.glob("*.png")):
+        shutil.copyfile(icon, dst / f"hud_{icon.name}")
+        count += 1
+    return count
 
 
 def gauge_textures(ns, out):
