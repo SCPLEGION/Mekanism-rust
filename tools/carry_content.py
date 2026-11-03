@@ -427,6 +427,11 @@ def build_module(ns, out):
     search += [SRC / "datagen" / "generated" / n / "assets" for n in NAMESPACES]
     report["composite_models"] = flatten_models.flatten_tree(out / "assets" / ns, search)
     if ns == "mekanismgenerators":
+        # The turbine's blades (`ModelTurbine`): one pair of rings per blade index.
+        turbine_png = next((d / ns / "render/turbine.png" for d in search if (d / ns / "render/turbine.png").is_file()), None)
+        if turbine_png is not None:
+            for index in range(28):
+                worn_models.build_turbine_blade(ns, index, turbine_png, out, report)
         # The rotor spins, so the native code draws it (`native_world_models`): the OBJ as a world model.
         rotor = next((d / ns / "models/block/wind_generator_blades.obj" for d in search
                       if (d / ns / "models/block/wind_generator_blades.obj").is_file()), None)

@@ -402,3 +402,74 @@ def build_element_world_model(ns, name, model, texture_png, out, report, center=
     sprite.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(texture_png, sprite)
     report["world_models"] = report.get("world_models", 0) + 1
+
+
+def _entity_cube(origin, size, tex, tex_size=(16, 16)):
+    """The polygons of a vanilla `ModelPart.Cube` (px, y up as the model is drawn unflipped): four points and
+    their uv (0..1, v down) per face, in `Cube`'s own vertex order."""
+    (x0, y0, z0), (w, h, d) = origin, size
+    x1, y1, z1 = x0 + w, y0 + h, z0 + d
+    v = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+         (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
+    u, vv = tex
+    f1, f2, f3, f4 = u + d, u + d + w, u + 2 * d + w, u + 2 * d + 2 * w
+    f5, f6, f7 = vv, vv + d, vv + d + h
+    # (vertex indices, u0, v0, u1, v1) of each face; Polygon puts (u1, v0), (u0, v0), (u0, v1), (u1, v1) on 0..3.
+    faces = [((5, 4, 0, 1), f1, f5, f2, f6), ((2, 3, 7, 6), f2, f6, f3, f5),
+             ((0, 4, 7, 3), u, f6, f1, f7), ((1, 0, 3, 2), f1, f6, f2, f7),
+             ((5, 1, 2, 6), f2, f6, f3, f7), ((4, 5, 6, 7), f3, f6, f4, f7)]
+    out = []
+    for idx, a, b, c, e in faces:
+        uv = [(c, b), (a, b), (a, e), (c, e)]
+        out.append(([v[i] for i in idx], [(p / tex_size[0], q / tex_size[1]) for p, q in uv]))
+    return out
+
+
+# `ModelTurbine`: (arm rotation axis, sign) and its boxes: (origin, size, texOffs, is the blade).
+_TURBINE_ARMS = [
+    ("z", 1, [((-1, 0, -4), (2, 1, 3), (0, 9), False), ((-1.5, 0, -8), (3, 1, 4), (0, 0), True)]),
+    ("x", -1, [((1, 0, -1), (3, 1, 2), (0, 13), False), ((4, 0, -1.5), (4, 1, 3), (0, 5), True)]),
+    ("z", -1, [((-1, 0, 1), (2, 1, 3), (0, 9), False), ((-1.5, 0, 4), (3, 1, 4), (0, 0), True)]),
+    ("x", 1, [((-4, 0, -1), (3, 1, 2), (0, 13), False), ((-8, 0, -1.5), (4, 1, 3), (0, 5), True)]),
+]
+
+
+def build_turbine_blade(ns, index, texture_png, out, report):
+    """One turbine blade pair's arms (`ModelTurbine.setupAnim` for blade `index`) about the shaft, as a world model
+    whose origin is the arms' pivot."""
+    bend = 0.418879
+    scale = index * 0.5
+    adjusted = scale / 16
+    # west, east: x grows by `scale`, z by `adjusted`, pushed out by 2 px per index; north, south the other way.
+    blade_of = {0: (adjusted, scale, 0.0, -2.0), 1: (scale, adjusted, 2.0, 0.0),
+                2: (adjusted, scale, 0.0, 2.0), 3: (scale, adjusted, -2.0, 0.0)}
+    polygons, normals = [], []
+    turn = math.radians(5 * index)
+    for arm_index, (axis, sign, boxes) in enumerate(_TURBINE_ARMS):
+        sx, sz, tx, tz = blade_of[arm_index]
+        angle = bend * sign
+        c, s = math.cos(angle), math.sin(angle)
+        for origin, size, tex, is_blade in boxes:
+            for pts, uvs in _entity_cube(origin, size, tex):
+                final = []
+                for p in pts:
+                    x, y, z = p
+                    if is_blade:
+                        x, z = x * (1 + sx) - tx * index, z * (1 + sz) - tz * index
+                    if axis == "z":
+                        x, y = x * c - y * s, x * s + y * c
+                    else:
+                        y, z = y * c - z * s, y * s + z * c
+                    ct, st = math.cos(turn), math.sin(turn)
+                    x, z = x * ct + z * st, -x * st + z * ct
+                    final.append([x / 16, y / 16, z / 16])
+                poly, normal = polygon(final, uvs)
+                polygons.append(poly)
+                normals.append(normal)
+    target = out / "assets" / ns / "horizon" / "world_models" / f"turbine_blade_{index}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"pose": [0, 0, 0, 0, 0, 0, 1, 1, 1], "polygons": polygons, "normals": normals}))
+    sprite = out / "assets" / ns / "textures/entity/equipment/horizon_models" / f"turbine_blade_{index}.png"
+    sprite.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(texture_png, sprite)
+    report["world_models"] = report.get("world_models", 0) + 1

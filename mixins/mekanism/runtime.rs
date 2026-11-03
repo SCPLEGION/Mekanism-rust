@@ -1288,6 +1288,11 @@ thread_local! {
 }
 
 thread_local! {
+    /// The turbine valves this client has heard of, with the turn (lower, upper blade) of each rotor.
+    static TURBINES: std::cell::RefCell<std::collections::HashMap<[i32; 3], Vec<[f32; 2]>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+thread_local! {
     /// The dynamic tank valves this client has heard of (the master draws the tank).
     static BIG_TANKS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
@@ -1331,6 +1336,11 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
         BIG_TANKS.with_borrow_mut(|t| {
             t.insert(pos);
         });
+        if matches!(kind(id), Some(Kind::TurbineValve)) {
+            TURBINES.with_borrow_mut(|t| {
+                t.entry(pos).or_default();
+            });
+        }
     } else if matches!(kind(id), Some(Kind::Vibrator | Kind::PigmentMixer)) {
         SHAFTS.with_borrow_mut(|t| {
             t.entry(pos).or_insert((0, 0));
@@ -1662,6 +1672,50 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                         rotation: Some(q.to_array()),
                         full_bright: true,
                         scale,
+                    });
+                }
+            }
+            true
+        });
+    });
+    // `RenderIndustrialTurbine` and `RenderTurbineRotor`: each rotor's two blade rings turn by the flow, at
+    // `BASE_SPEED / (index + 1)` degrees a frame, the lower ring at the rotor's 1/4 and the upper at its 3/4.
+    TURBINES.with_borrow_mut(|set| {
+        set.retain(|pos, turns| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::TurbineValve)) {
+                return false;
+            }
+            let Some(Tag::IntArray(column)) = c.get(&JavaString::from("rot_col")) else {
+                return true;
+            };
+            if column.len() < 3 {
+                return true;
+            }
+            let rotors = column.len() - 2;
+            if turns.len() != rotors {
+                *turns = vec![[0.0; 2]; rotors];
+            }
+            let speed = get_int(c, "rot_flow") as f32 / 1000.0 * 512.0;
+            for (i, turn) in turns.iter_mut().enumerate() {
+                let base = i * 2;
+                turn[0] = (turn[0] + speed / (base + 1) as f32) % 360.0;
+                turn[1] = (turn[1] + speed / (base + 2) as f32) % 360.0;
+                let at = [column[0], column[2 + i], column[1]];
+                for (k, (turn, up)) in [(turn[0], 0.25), (turn[1], 0.75)].into_iter().enumerate() {
+                    models.push(super::native_hooks::NativeWorldModel {
+                        model: format!("mekanismgenerators:turbine_blade_{}", (base + k).min(27)),
+                        position: [f64::from(at[0]) + 0.5, f64::from(at[1]) + up, f64::from(at[2]) + 0.5],
+                        yaw: turn,
+                        pitch: 0.0,
+                        roll: 0.0,
+                        light_at: at,
+                        color: 0xFFFF_FFFF,
+                        rotation: None,
+                        full_bright: false,
+                        scale: 1.0,
                     });
                 }
             }
@@ -11386,6 +11440,23 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
         });
     }
     put_fills(game, pos, entity, &fills);
+    // The rotors' column and the flow, for the rotor blades: [x, z, y of each rotor from the bottom].
+    let mut shown = Compound::new();
+    if let Some(Tag::IntArray(b)) = entity.nbt.get(&JavaString::from("box")).cloned()
+        && b.len() == 6
+    {
+        let (x, z) = (b[0] + b[3] / 2, b[2] + b[5] / 2);
+        let mut column = vec![x, z];
+        for y in b[1] + 1..b[1] + b[4] - 1 {
+            if block_name(game, [x, y, z]) == "mekanismgenerators:turbine_rotor" {
+                column.push(y);
+            }
+        }
+        shown.insert("rot_col".into(), Tag::IntArray(column));
+        let ratio = if made > 0 { used as f64 / t.max_flow().max(1.0) } else { 0.0 };
+        put_int(&mut shown, "rot_flow", (ratio * 1000.0).round() as u32);
+    }
+    put_client(game, pos, entity, &["rot_col", "rot_flow"], shown);
     Some(made > 0)
 }
 
