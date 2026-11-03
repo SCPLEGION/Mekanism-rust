@@ -5,6 +5,7 @@
 // and these. Everything here is plain data and functions, so `cargo test` runs it without a game.
 
 pub mod bin;
+pub mod bounding;
 pub mod boiler;
 pub mod bolt;
 pub mod chargepad;
@@ -16,6 +17,7 @@ pub mod entangloporter;
 pub mod evaporation;
 pub mod factory;
 pub mod fission;
+pub mod formulaic;
 pub mod frequency;
 pub mod fusion;
 pub mod gear;
