@@ -333,6 +333,20 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         *container = Some(ModContainer { slots: 3, faces: std::array::from_fn(|_| vec![0]), inputs: vec![0], outputs: vec![], menu: Some("minecraft:furnace".into()) });
         return;
     }
+    // The machines whose only slot is the energy slot (`EnergyInventorySlot`), which automation fills.
+    if matches!(
+        kind(block),
+        Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer | Kind::Pump | Kind::Plenisher | Kind::Heater | Kind::Vibrator)
+    ) {
+        *container = Some(ModContainer {
+            slots: 3,
+            faces: std::array::from_fn(|_| vec![0]),
+            inputs: vec![0],
+            outputs: vec![],
+            menu: Some("minecraft:furnace".into()),
+        });
+        return;
+    }
     let (inputs, outputs) = match kind(block) {
         Some(Kind::Machine(..)) => (vec![0, 1], vec![2]),
         // The heat generator burns from the middle slot; generators charge an item in the first.
@@ -344,10 +358,10 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::Solar(..)) if block.ends_with("advanced_solar_generator") => (vec![0], vec![]),
         // The oxidizer's item goes in the first slot; the separator takes water buckets there and gives
         // the empty buckets back in the last.
-        Some(Kind::Oxidizer | Kind::Dissolution) => (vec![0], vec![]),
+        Some(Kind::Oxidizer | Kind::Dissolution) => (vec![0, 1], vec![]),
         // The crystallizer's crystals come out of the last slot.
-        Some(Kind::Crystallizer) => (vec![], vec![2]),
-        Some(Kind::Separator) => (vec![0], vec![2]),
+        Some(Kind::Crystallizer) => (vec![1], vec![2]),
+        Some(Kind::Separator) => (vec![0, 1], vec![2]),
         // An advanced machine's middle slot takes items that turn into its chemical (flint → oxygen).
         Some(Kind::Advanced(_)) => (vec![0, 1], vec![2]),
         // The nucleosynthesizer's item in the first slot, antimatter pellets in the middle one.
@@ -357,7 +371,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         // Water buckets in the first slot (empty buckets out of the last), and an empty bucket in the
         // middle one fills with brine.
         Some(Kind::Evaporation) => (vec![0, 1], vec![2]),
-        Some(Kind::Rotary) => (vec![0], vec![2]),
+        Some(Kind::Rotary) => (vec![0, 1], vec![2]),
         // The item to infuse in the first slot, the infuse item (coal, redstone...) in the middle one.
         Some(Kind::Infuser) => (vec![0, 1], vec![2]),
         // An energy cube's charge slot (top) and discharge slot (bottom).
@@ -377,21 +391,14 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::InductionPort
             | Kind::Laser
             | Kind::LaserAmplifier
-            | Kind::Vibrator
             | Kind::Sorter
             | Kind::Chargepad
             | Kind::Entangloporter
             | Kind::Teleporter
             | Kind::QioRedstoneAdapter
             | Kind::QioExporter
-            // Their item slots (buckets, energy) are not ported; the screen shows their tanks.
-            | Kind::Activator
-            | Kind::Centrifuge
-            | Kind::ChemicalInfuser
-            | Kind::Washer
-            | Kind::Pump
-            | Kind::Plenisher
-            | Kind::Heater,
+            // Their bucket slots are not ported; the screen shows their tanks.
+            | Kind::Activator,
         ) => {
             *container = Some(ModContainer {
                 slots: 3,
@@ -428,6 +435,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     let facing = game.native_block_property(pos, "facing").and_then(|f| direction(&f)).map_or(2, face_index);
     // A machine its redstone control holds back does nothing this tick and goes dark.
     let allowed = tabs(&entity.id) & TAB_REDSTONE == 0 || redstone_allows(game, pos, entity);
+    discharge_energy_slot(entity);
     let active = if !allowed {
         Some(false)
     } else {
@@ -567,6 +575,24 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
 }
 
 // --- Machines ---------------------------------------------------------------------------------------
+
+/// The energy slot (`EnergyInventorySlot.fillOrConvert`) of the machines that take their energy from an
+/// item in it: the item gives its energy to the machine's buffer before the machine runs.
+fn discharge_energy_slot(entity: &mut ModBlockEntity) {
+    let index = match kind(&entity.id) {
+        Some(Kind::Oxidizer | Kind::Dissolution | Kind::Crystallizer | Kind::Separator | Kind::Rotary) => 1,
+        Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer | Kind::Pump | Kind::Plenisher | Kind::Heater | Kind::Vibrator) => 0,
+        _ => return,
+    };
+    let capacity = energy_capacity(entity);
+    if capacity == 0 || energy_item(entity, index).is_none() {
+        return;
+    }
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    discharge_slot(entity, index, &mut energy);
+    put_long(&mut entity.nbt, "energy", energy.stored);
+}
 
 fn tick_machine(game: &mut Game<'_>, entity: &mut ModBlockEntity, recipe: &str, usage: u64) -> Option<bool> {
     let mut m = ElectricMachine::with_upgrades(usage, upgrades(&entity.nbt));
@@ -4404,14 +4430,14 @@ fn layout(block: &str) -> Option<Layout> {
         },
         // TileEntityChemicalOxidizer and GuiChemicalOxidizer.
         Kind::Oxidizer => Layout {
-            slots: [Some(([26.0, 36.0], "slot/normal")), None, None],
+            slots: [Some(([26.0, 36.0], "slot/normal")), Some(([152.0, 14.0], "slot/power")), None],
             gauges: vec![gauge("output", chem::OXIDIZER_TANK, 131.0, 13.0, STANDARD)],
             power: Some(PowerBar::Horizontal([115.0, 75.0])),
             progress: large_right(64.0, 40.0),
         },
         // TileEntityChemicalDissolutionChamber and its screen.
         Kind::Dissolution => Layout {
-            slots: [Some(([28.0, 36.0], "slot/normal")), None, None],
+            slots: [Some(([28.0, 36.0], "slot/normal")), Some(([152.0, 14.0], "slot/power")), None],
             gauges: vec![
                 gauge("input", nuclear::DISSOLUTION_TANK, 7.0, 4.0, STANDARD),
                 gauge("output", nuclear::DISSOLUTION_TANK, 131.0, 13.0, STANDARD),
@@ -4421,14 +4447,14 @@ fn layout(block: &str) -> Option<Layout> {
         },
         // TileEntityChemicalCrystallizer and its screen.
         Kind::Crystallizer => Layout {
-            slots: [None, None, Some(([129.0, 57.0], "slot/output"))],
+            slots: [None, Some(([152.0, 5.0], "slot/power")), Some(([129.0, 57.0], "slot/output"))],
             gauges: vec![gauge("input", nuclear::CRYSTALLIZER_TANK, 7.0, 4.0, STANDARD)],
             power: Some(PowerBar::Vertical([157.0, 23.0])),
             progress: large_right(53.0, 61.0),
         },
         // TileEntityElectrolyticSeparator and its screen; the empty buckets come out below the full one.
         Kind::Separator => Layout {
-            slots: [Some(([26.0, 35.0], "slot/normal")), None, Some(([26.0, 56.0], "slot/output"))],
+            slots: [Some(([26.0, 35.0], "slot/normal")), Some(([143.0, 35.0], "slot/power")), Some(([26.0, 56.0], "slot/output"))],
             gauges: vec![
                 gauge("fluid", chem::SEPARATOR_FLUID, 5.0, 10.0, STANDARD),
                 gauge("left", chem::SEPARATOR_GAS, 58.0, 18.0, SMALL),
@@ -4500,7 +4526,7 @@ fn layout(block: &str) -> Option<Layout> {
         // TileEntityRotaryCondensentrator and its screen: buckets on the fluid side (155, 25) and
         // (155, 56), the chemical gauge (25, 13) and the fluid gauge (133, 13).
         Kind::Rotary => Layout {
-            slots: [Some(([155.0, 25.0], "slot/normal")), None, Some(([155.0, 56.0], "slot/output"))],
+            slots: [Some(([155.0, 25.0], "slot/normal")), Some(([155.0, 5.0], "slot/power")), Some(([155.0, 56.0], "slot/output"))],
             gauges: vec![
                 gauge("chemical", chem::ROTARY_TANK, 25.0, 13.0, STANDARD),
                 gauge("fluid", chem::ROTARY_TANK, 133.0, 13.0, STANDARD),
@@ -4618,7 +4644,13 @@ fn layout(block: &str) -> Option<Layout> {
             power: None,
             progress: None,
         },
-        Kind::InductionPort | Kind::Laser | Kind::LaserAmplifier | Kind::Vibrator => Layout {
+        Kind::Vibrator => Layout {
+            slots: [Some(([143.0, 35.0], "slot/power")), None, None],
+            gauges: vec![],
+            power: Some(PowerBar::Gauge([55.0, 18.0])),
+            progress: None,
+        },
+        Kind::InductionPort | Kind::Laser | Kind::LaserAmplifier => Layout {
             slots: [None; 3],
             gauges: vec![],
             power: Some(PowerBar::Gauge([55.0, 18.0])),
@@ -4634,14 +4666,14 @@ fn layout(block: &str) -> Option<Layout> {
         },
         // GuiIsotopicCentrifuge.
         Kind::Centrifuge => Layout {
-            slots: [None, None, None],
+            slots: [Some(([155.0, 14.0], "slot/power")), None, None],
             gauges: vec![gauge("input", nuclear::CENTRIFUGE_TANK, 25.0, 13.0, STANDARD), gauge("output", nuclear::CENTRIFUGE_TANK, 133.0, 13.0, STANDARD)],
             power: Some(PowerBar::Horizontal([115.0, 75.0])),
             progress: None,
         },
         // GuiChemicalInfuser: the left and right inputs, the output in the middle, 9 px higher.
         Kind::ChemicalInfuser => Layout {
-            slots: [None, None, None],
+            slots: [Some(([154.0, 14.0], "slot/power")), None, None],
             gauges: vec![
                 gauge("left", chem::CHEMICAL_INFUSER_TANK, 25.0, 13.0, STANDARD),
                 gauge("output", chem::CHEMICAL_INFUSER_TANK, 79.0, 4.0, STANDARD),
@@ -4652,7 +4684,7 @@ fn layout(block: &str) -> Option<Layout> {
         },
         // GuiChemicalWasher: water, dirty slurry, clean slurry.
         Kind::Washer => Layout {
-            slots: [None, None, None],
+            slots: [Some(([152.0, 14.0], "slot/power")), None, None],
             gauges: vec![
                 gauge("fluid", nuclear::WASHER_TANK, 7.0, 13.0, STANDARD),
                 gauge("input", nuclear::WASHER_TANK, 28.0, 13.0, STANDARD),
@@ -4663,19 +4695,19 @@ fn layout(block: &str) -> Option<Layout> {
         },
         // GuiElectricPump and GuiFluidicPlenisher: the tank on the left, a screen in the middle.
         Kind::Pump => Layout {
-            slots: [None, None, None],
+            slots: [Some(([143.0, 35.0], "slot/power")), None, None],
             gauges: vec![gauge("fluid", isotopes::PUMP_TANK, 6.0, 13.0, STANDARD)],
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
         },
         Kind::Plenisher => Layout {
-            slots: [None, None, None],
+            slots: [Some(([143.0, 35.0], "slot/power")), None, None],
             gauges: vec![gauge("fluid", plenisher::PLENISHER_TANK, 6.0, 13.0, STANDARD)],
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
         },
         // GuiResistiveHeater: the screen with its temperature and usage, the power bar on the right.
-        Kind::Heater => Layout { slots: [None, None, None], gauges: vec![], power: Some(PowerBar::Vertical([164.0, 15.0])), progress: None },
+        Kind::Heater => Layout { slots: [Some(([15.0, 35.0], "slot/power")), None, None], gauges: vec![], power: Some(PowerBar::Vertical([164.0, 15.0])), progress: None },
         // GuiFuelwoodHeater: its fuel slot, the screen, the flame.
         Kind::FuelwoodHeater => Layout { slots: [Some(([15.0, 29.0], "slot/normal")), None, None], gauges: vec![], power: None, progress: None },
         Kind::DigitalMiner => Layout {
