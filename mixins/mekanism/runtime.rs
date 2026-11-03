@@ -1866,8 +1866,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                 color: 0xFFFF_FFFF,
                 rotation: None,
                 full_bright: false,
-                scale: 1.0,
-            });
+                scale: 1.0, parts: vec![],});
             true
         });
     });
@@ -1908,8 +1907,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                     color: 0xFFFF_FFFF,
                     rotation: None,
                     full_bright: false,
-                    scale: 1.0,
-                });
+                    scale: 1.0, parts: vec![],});
             } else {
                 let (dx, dz) = match game.native_block_property(*pos, "facing").as_deref() {
                     Some("north") => (7.0 / 16.0, 6.0 / 16.0),
@@ -1928,8 +1926,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                     color: 0xFFFF_FFFF,
                     rotation: None,
                     full_bright: false,
-                    scale: 1.0,
-                });
+                    scale: 1.0, parts: vec![],});
             }
             true
         });
@@ -1967,8 +1964,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                         color: 0xFF00_0000 | rgb,
                         rotation: Some(q.to_array()),
                         full_bright: true,
-                        scale,
-                    });
+                        scale, parts: vec![],});
                 }
             }
             true
@@ -2011,8 +2007,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                         color: 0xFFFF_FFFF,
                         rotation: None,
                         full_bright: false,
-                        scale: 1.0,
-                    });
+                        scale: 1.0, parts: vec![],});
                 }
             }
             true
@@ -2036,8 +2031,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                 color: 0xFFFF_FFFF,
                 rotation: None,
                 full_bright,
-                scale: 1.0,
-            });
+                scale: 1.0, parts: vec![],});
         }
     }
     // `RenderNutritionalLiquifier`: the blade turns at 25 degrees a tick while it works.
@@ -2060,8 +2054,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                 color: 0xFFFF_FFFF,
                 rotation: None,
                 full_bright: false,
-                scale: 1.0,
-            });
+                scale: 1.0, parts: vec![],});
         }
     });
     // `RenderEnergyCube`: the core floats, bobs and turns while the cube holds energy, tinted with the tier's
@@ -2094,8 +2087,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                     color: (alpha << 24) | rgb,
                     rotation: Some(q.to_array()),
                     full_bright: true,
-                    scale: 1.0,
-                });
+                    scale: 1.0, parts: vec![],});
             }
             true
         });
@@ -19535,6 +19527,7 @@ fn robit_draw_rename(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch,
         let edit = b.get_or_insert_with(|| robit_name_field());
         [edit.x, edit.y, edit.width, edit.height] = field;
         edit.focused = true;
+        robit_drag(game, edit, 2);
         edit.draw(batch, &game.gui.atlas, None);
     });
     robit_text_button(game, batch, confirm, "Confirm");
@@ -19573,16 +19566,25 @@ fn robit_draw_skins(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
     let rows = skins.len().div_ceil(3);
     let first = ROBIT_SKIN_ROW.with(std::cell::Cell::get).min(rows.saturating_sub(3));
     let cursor = game.native_cursor();
+    let mut hovered: Option<String> = None;
     for i in 0..9 {
         let r = robit_skin_slot(i, o);
         let skin = skins.get(first * 3 + i);
         let selected = skin.is_some_and(|s| *s == picked);
         nine_slice_tinted(game, batch, if selected { "inner_screen" } else { "element_holder" }, if selected { [256.0, 256.0] } else { [32.0, 32.0] }, 6.0, r, 0xFFFF_FFFF);
         if let Some(s) = skin {
-            let name = robit_skin_name(s);
-            centred(game, batch, &name, r[0], r[2], r[1] + 20.0, if selected { 0x3CFD_3C } else { 0x40_4040 });
+            // `RobitSkinPreviewPiP`: the skin's body turning four degrees a tick, its next texture every half second.
+            let short = s.trim_start_matches("mekanism:");
+            let textures = ROBIT_SKIN_TEXTURES.iter().find(|(n, _)| *n == short).map_or(1, |(_, c)| *c);
+            let index = (game.ticks / 10) as usize % textures;
+            let suffix = if index == 0 { String::new() } else { format!("_{index}") };
+            let yaw = (game.ticks as f32 * 4.0) % 360.0;
+            let clip = [r[0], r[1], r[0] + r[2], r[1] + r[3]];
+            game.native_gui_model(batch, &format!("mekanism:robit_body_{short}{suffix}"), None, clip, 70.0, 0.5, yaw);
+            game.native_gui_model(batch, "mekanism:robit_glow", None, clip, 70.0, 0.5, yaw);
             if inside(cursor, r) {
                 game.native_fill(batch, r, 0x70FF_EA00);
+                hovered = Some(robit_skin_name(s));
             }
         }
     }
@@ -19595,7 +19597,16 @@ fn robit_draw_skins(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
     let (cancel, confirm) = robit_skin_buttons(o);
     robit_text_button(game, batch, cancel, "Cancel");
     robit_text_button(game, batch, confirm, "Confirm");
+    if let Some(name) = hovered {
+        horizon_client::ui::tooltip(batch, &game.gui.atlas, &[horizon_client::text::Text::literal(name)], (cursor[0], cursor[1]));
+    }
 }
+
+/// How many textures each skin has (`data/mekanism/mekanism/robit_skin/*.json`).
+const ROBIT_SKIN_TEXTURES: [(&str, usize); 13] = [
+    ("robit", 2), ("ace", 4), ("agender", 6), ("allay", 2), ("aro", 5), ("bi", 5), ("enby", 4),
+    ("gay", 7), ("genderfluid", 5), ("lesbian", 8), ("pan", 6), ("pride", 6), ("trans", 4),
+];
 
 /// A click while a Robit window is open: the window takes every click (`isFocusOverlay`).
 fn robit_window_click(game: &mut Game<'_>, at: [f32; 2], button: u8, window: u8) {
@@ -19617,6 +19628,7 @@ fn robit_window_click(game: &mut Game<'_>, at: [f32; 2], button: u8, window: u8)
                     e.click(&game.gui.atlas, at[0], shift, double);
                 }
             });
+            ROBIT_DRAG.with(|d| d.set(2));
         } else if inside(at, confirm) {
             robit_confirm_rename(game, id);
         }
@@ -19697,6 +19709,7 @@ fn robit_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
                 e.click(&game.gui.atlas, at[0], shift, double);
             }
         });
+        ROBIT_DRAG.with(|d| d.set(1));
         return;
     }
     if ROBIT_TAB.with(std::cell::Cell::get) != RobitTab::Main
@@ -19776,6 +19789,8 @@ thread_local! {
     static ROBIT_PICKED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     static ROBIT_UNLOCKED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     static ROBIT_SKIN_ROW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Client: the text field a press started on (1 repair name, 2 rename), while the button is held.
+    static ROBIT_DRAG: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     static ROBIT_COST: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
     /// Server: who has the inventory open, and the stack on their cursor.
     static ROBIT_WATCH: std::cell::RefCell<std::collections::HashMap<String, (u32, Option<ItemStack>)>> = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -20250,6 +20265,18 @@ fn robit_draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o
 const ROBIT_NAME_WIDTH: f32 = 103.0;
 
 /// `GuiTextField` of the repair window: borderless, white, `AnvilMenu.MAX_NAME_LENGTH` characters.
+/// `EditBox.onDrag`: the selection follows the pointer while the button is held, from a press on the field.
+fn robit_drag(game: &Game<'_>, edit: &mut horizon_client::ui::EditBox, field: u8) {
+    if ROBIT_DRAG.with(std::cell::Cell::get) != field {
+        return;
+    }
+    if game.native_mouse_down() {
+        edit.drag_to(&game.gui.atlas, game.native_cursor()[0]);
+    } else {
+        ROBIT_DRAG.with(|d| d.set(0));
+    }
+}
+
 fn robit_name_field() -> horizon_client::ui::EditBox {
     let mut edit = horizon_client::ui::EditBox::new(0.0, 0.0, ROBIT_NAME_WIDTH, 12.0);
     edit.bordered = false;
@@ -20310,6 +20337,7 @@ fn robit_draw_repair(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch,
         }
         [edit.x, edit.y, edit.width, edit.height] = [o[0] + 60.0, o[1] + 21.0, ROBIT_NAME_WIDTH, 12.0];
         edit.focused = input.is_some();
+        robit_drag(game, edit, 1);
         edit.draw(batch, &game.gui.atlas, None);
     });
     let cost = ROBIT_COST.with(std::cell::Cell::get);

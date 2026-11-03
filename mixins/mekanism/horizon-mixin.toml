@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "3cf02648f92cd87855d22d565d24a6419c8edb17"
+horizon_revision = "3a4bc25409cc8e4b2a647eff5af997684fdacdae"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]

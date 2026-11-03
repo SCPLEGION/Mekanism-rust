@@ -465,6 +465,16 @@ def build_module(ns, out):
             for name, glow in (("robit_body", False), ("robit_glow", True)):
                 part = {"elements": [e for e in data["elements"] if bool(e.get("light_emission")) == glow]}
                 worn_models.build_element_world_model(ns, name, part, skin, out, report, (8, 0, 8))
+            # The skin previews (`GuiRobitSkinSelectScroll`) turn each skin's body, one model per texture.
+            body = {"elements": [e for e in data["elements"] if not e.get("light_emission")]}
+            for skin_json in sorted({f for d in search for f in (d.parent / "data" / ns / "mekanism" / "robit_skin").glob("*.json")}, key=lambda f: f.name):
+                for index, texture_id in enumerate(json.loads(skin_json.read_text()).get("textures", [])):
+                    tex_ns, tex_name = texture_id.split(":")
+                    png = next((d / tex_ns / "textures/entity/robit" / f"{tex_name}.png" for d in search
+                                if (d / tex_ns / "textures/entity/robit" / f"{tex_name}.png").is_file()), None)
+                    if png is not None:
+                        suffix = "" if index == 0 else f"_{index}"
+                        worn_models.build_element_world_model(ns, f"robit_body_{skin_json.stem}{suffix}", body, png, out, report, (8, 0, 8))
     if ns == "mekanism":
         # Moving parts of machines (`RenderSeismicVibrator`, `RenderPigmentMixer`): their shafts are world models.
         for model_name, name, center in (("vibrator_shaft", "vibrator_shaft", (8, 8, 8)),
