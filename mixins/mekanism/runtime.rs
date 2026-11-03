@@ -1197,7 +1197,42 @@ fn tick_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     lava.insert("minecraft:lava", u64::from(g.lava));
     pull_fluid(game, pos, &mut lava, "minecraft:lava");
     g.lava = lava.amount as u32;
-    g.tick();
+    // `ITileHeatHandler.simulateAdjacent`: heat flows into every hotter-than neighbour that holds heat (here the
+    // other heat generators, the only blocks of the port with a heat capacitor of their own).
+    let own_pos = pos;
+    {
+        let mut adjacent = |heat: &mut mekanism_core::heat::HeatCapacitor| -> f64 {
+            let mut total = 0.0;
+            for d in [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]] {
+                let at = [own_pos[0] + d[0], own_pos[1] + d[1], own_pos[2] + d[2]];
+                let temp = heat.temperature();
+                let Some(taken) = game.native_with_mod_block_entity(at, |m| {
+                    if kind(&m.id) != Some(Kind::HeatGenerator) {
+                        return None;
+                    }
+                    let mut sink = mekanism_core::heat::HeatCapacitor::new(heat.capacity, heat.inverse_conduction, heat.inverse_insulation);
+                    sink.heat = get_double(&m.nbt, "heat").unwrap_or(sink.heat);
+                    let sink_temp = sink.temperature();
+                    if temp <= sink_temp {
+                        return None;
+                    }
+                    let final_temp = (temp * heat.capacity + sink_temp * sink.capacity) / (heat.capacity + sink.capacity);
+                    let to_transfer = (temp - final_temp) / (sink.inverse_conduction + heat.inverse_conduction);
+                    sink.handle_heat(to_transfer * heat.capacity);
+                    m.nbt.insert("heat".into(), Tag::Double(sink.heat.to_bits()));
+                    Some(to_transfer)
+                }).flatten() else {
+                    continue;
+                };
+                heat.handle_heat(-taken * heat.capacity);
+                if taken != 0.0 {
+                    total += taken;
+                }
+            }
+            total
+        };
+        g.tick_with(&mut adjacent);
+    }
     // The first slot charges an item from the generator (Mekanism's energy slot).
     charge_slot(entity, 0, &mut g.energy);
     push_energy(game, pos, &mut g.energy, None, false);
@@ -1208,6 +1243,7 @@ fn tick_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     put_long(&mut entity.nbt, "prod", g.producing);
     entity.nbt.insert("temp".into(), Tag::Double(g.heat.temperature().to_bits()));
     entity.nbt.insert("env".into(), Tag::Double(g.last_env.to_bits()));
+    entity.nbt.insert("transfer".into(), Tag::Double(g.last_transfer.to_bits()));
     let warm = (g.heat.temperature() - mekanism_core::heat::AMBIENT_TEMP).clamp(0.0, 200.0) as i32;
     entity.data = vec![g.lava as i32, mekanism_core::generator::TANK_CAPACITY as i32, warm, 200];
     Some(g.active)
@@ -1287,8 +1323,8 @@ fn tick_wind(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) ->
     push_energy(game, pos, &mut energy, None, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_long(&mut entity.nbt, "prod", produced);
-    // `GuiWindGenerator`: why it makes nothing (0 it does, 1 no wind in this dimension, 2 sky blocked).
-    put_int(&mut entity.nbt, "wstate", if produced > 0 { 0 } else if overworld(game) { 2 } else { 1 });
+    // `GuiWindGenerator`: why it makes nothing. Mekanism ships no dimension in `c:no_wind`, so it is always the sky.
+    put_int(&mut entity.nbt, "wstate", if produced > 0 { 0 } else { 2 });
     entity.data = vec![(energy.stored * 1000 / g::WIND_STORAGE) as i32, 1000, produced as i32, g::WIND_GENERATION_MAX as i32];
     // What the rotor needs in the world: whether it turns and how fast (`getHeightSpeedRatio`, in thousandths).
     let mut client = Compound::new();
@@ -7368,6 +7404,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
                     let temp = get_double(&entity.nbt, "temp").unwrap_or(300.0);
                     entity.data[2] = (temp * 10.0).clamp(0.0, 32_767.0) as i32;
                     entity.data[3] = (get_double(&entity.nbt, "env").unwrap_or(0.0) * 10.0).clamp(0.0, 32_767.0) as i32;
+                    entity.data[1] = (get_double(&entity.nbt, "transfer").unwrap_or(0.0) * 10.0).clamp(0.0, 32_767.0) as i32;
                 }
                 Kind::Wind => entity.data[1] = get_int(&entity.nbt, "wstate") as i32,
                 Kind::Solar(..) => entity.data[1] = get_int(&entity.nbt, "sees") as i32,
@@ -11267,7 +11304,7 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         // `GuiHeatTab`: the temperature, what it passes on and what the air takes.
         let k = |tenths: i32| mekanism_core::energy::format_unit(f64::from(tenths.max(0)) / 10.0, "K");
         lines.push(format!("Temperature: {}", k(get(2))));
-        lines.push(format!("Transferred: {}/t", k(0)));
+        lines.push(format!("Transferred: {}/t", k(get(1))));
         lines.push(format!("Dissipated: {}/t", k(get(3))));
     } else if l.power.is_some() && inside(at, [-26.0, 137.0, 26.0, 26.0]) {
         let usage = read_wide(data, DATA_USAGE);

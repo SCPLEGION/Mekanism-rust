@@ -35,6 +35,8 @@ pub struct HeatGenerator {
     pub producing: u64,
     /// Heat lost to the air in the last tick (`getLastEnvironmentLoss`).
     pub last_env: f64,
+    /// Heat given to the neighbours in the last tick (`getLastTransferLoss`).
+    pub last_transfer: f64,
 }
 
 impl Default for HeatGenerator {
@@ -56,6 +58,7 @@ impl HeatGenerator {
             active: false,
             producing: 0,
             last_env: 0.0,
+            last_transfer: 0.0,
         }
     }
 
@@ -76,6 +79,11 @@ impl HeatGenerator {
 
     /// One server tick (`onUpdateServer` then `simulate`); the passive lava boost is not modelled yet.
     pub fn tick(&mut self) {
+        self.tick_with(&mut |_| 0.0);
+    }
+
+    /// A tick where `adjacent` moves heat to the neighbours (`simulateAdjacent`) and returns the temperature it moved.
+    pub fn tick_with(&mut self, adjacent: &mut dyn FnMut(&mut HeatCapacitor) -> f64) {
         self.energy.start_tick();
         let before = self.energy.stored;
         self.active = false;
@@ -92,6 +100,7 @@ impl HeatGenerator {
         self.heat.handle_heat(-heat_lost);
         let energy = ((heat_lost.abs() * carnot) as u64).min(MAX_PRODUCTION);
         self.energy.insert(energy, crate::energy::Action::Execute);
+        self.last_transfer = adjacent(&mut self.heat);
         let mut env = self.heat.lose_to_air(0.0);
         for _ in 0..5 {
             env += self.heat.lose_to_air(INVERSE_INSULATION_COEFFICIENT);
