@@ -1318,7 +1318,7 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
         TANKS.with_borrow_mut(|t| {
             t.insert(pos);
         });
-    } else if matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation)) {
+    } else if matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation | Kind::TurbineValve)) {
         BIG_TANKS.with_borrow_mut(|t| {
             t.insert(pos);
         });
@@ -1430,7 +1430,7 @@ fn big_tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWo
             let Some((id, c)) = game.native_client_block_entity(*pos) else {
                 return false;
             };
-            if !matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation)) {
+            if !matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation | Kind::TurbineValve)) {
                 return false;
             }
             for i in 0..2 {
@@ -11103,7 +11103,8 @@ const TURBINE_VALVE: &str = "mekanismgenerators:turbine_valve";
 /// `TurbineValidator`, simplified: the frame blocks joined to `start` must be exactly the shell of a
 /// box 3 to 17 on each side, with rotors, a rotational complex, pressure dispersers, coils, condensers
 /// or air inside; the steam is below the lowest disperser. The turbine and its valves.
-fn find_turbine(game: &Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, Vec<[i32; 3]>)> {
+#[allow(clippy::type_complexity)]
+fn find_turbine(game: &Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, Vec<[i32; 3]>, [i32; 3], [i32; 3])> {
     let (lo, hi, seen) = find_box(game, start, turbine::is_frame, turbine::MIN_SIZE, turbine::MAX_SIZE)?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
     let mut t = turbine::Turbine { volume: size(0) * size(1) * size(2), ..Default::default() };
@@ -11136,7 +11137,7 @@ fn find_turbine(game: &Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, V
         }
     }
     t.lower_volume = size(0) * size(2) * (disperser_y? - lo[1]) as u64;
-    (t.rotors > 0 && t.coils > 0).then_some((t, valves))
+    (t.rotors > 0 && t.coils > 0).then_some((t, valves, lo, [size(0) as i32, size(1) as i32, size(2) as i32]))
 }
 
 /// An Industrial Turbine valve. Once a second each valve checks its turbine; the first valve runs it: it
@@ -11160,7 +11161,8 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
     if ticker == 0 {
         match find_turbine(game, pos) {
-            Some((t, valves)) => {
+            Some((t, valves, lo, size)) => {
+                entity.nbt.insert("box".into(), Tag::IntArray(vec![lo[0], lo[1], lo[2], size[0], size[1], size[2]]));
                 for (key, v) in [
                     ("rotors", t.rotors),
                     ("dispersers", t.dispersers),
@@ -11178,11 +11180,13 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
             None => {
                 put_long(&mut entity.nbt, "rotors", 0);
                 entity.nbt.remove(&JavaString::from("master"));
+                entity.nbt.remove(&JavaString::from("box"));
             }
         }
     }
     let t = turbine_of(&entity.nbt);
     if t.rotors == 0 || get_pos(&entity.nbt, "master") != Some(pos) {
+        put_fills(game, pos, entity, &[]);
         return None;
     }
     let valves: Vec<[i32; 3]> = match entity.nbt.get(&JavaString::from("valves")) {
@@ -11226,6 +11230,21 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_long(&mut entity.nbt, "production", made);
     put_long(&mut entity.nbt, "flow", used);
+    // `RenderIndustrialTurbine`: the steam fills the lower part of the inside, below the dispersers.
+    let mut fills = Vec::new();
+    if let Some(Tag::IntArray(b)) = entity.nbt.get(&JavaString::from("box")).cloned()
+        && b.len() == 6
+        && steam.amount > 0
+    {
+        let height = (t.lower_volume / (b[3].max(1) as u64 * b[5].max(1) as u64)) as i32;
+        fills.push(Fill {
+            at: [b[0] + 1, b[1] + 1, b[2] + 1],
+            size: [b[3] - 2, height, b[5] - 2],
+            scale: steam.amount as f64 / steam.capacity.max(1) as f64,
+            chemical: steam.chemical.clone(),
+        });
+    }
+    put_fills(game, pos, entity, &fills);
     Some(made > 0)
 }
 
