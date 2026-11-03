@@ -6818,7 +6818,7 @@ fn draw_nucleosynthesizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudB
             for segment in r.states(&effect, 1.0, now) {
                 for q in segment.chunks(4) {
                     let p = |v: &V3| [ox + v.0, oy + v.1];
-                    game.native_fill_quad(batch, [p(&q[0]), p(&q[1]), p(&q[2]), p(&q[3])], effect.info.color);
+                    game.native_fill_quad(batch, [p(&q[0]), p(&q[1]), p(&q[2]), p(&q[3])], effect.info.color, true);
                 }
             }
         });
