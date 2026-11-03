@@ -6584,7 +6584,7 @@ fn multiblock_data(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
         }
         Some(Kind::TurbineValve) => {
             let flow = get_long(nbt, "flow");
-            ([1, (flow & 0x7FFF) as i32, ((flow >> 15) & 0x7FFF) as i32, 0], get_long(nbt, "production"))
+            ([1, (flow & 0x7FFF) as i32, ((flow >> 15) & 0x7FFF) as i32, get_int(nbt, "dump") as i32], get_long(nbt, "production"))
         }
         Some(Kind::DynamicValve) => ([1, small(get_long(nbt, "volume")), 0, 0], 0),
         Some(Kind::SpsPort) => {
@@ -6649,6 +6649,8 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
     match kind(block) {
         Some(Kind::FissionPort) => &[([50.0, 56.0, 38.0, 16.0], "On/Off"), ([90.0, 56.0, 38.0, 16.0], "Burn+")],
         Some(Kind::FusionPort) => &[([50.0, 56.0, 38.0, 16.0], "Ignite"), ([90.0, 56.0, 38.0, 16.0], "Inject+")],
+        // `GuiGasMode`: the steam dump mode, a 10 px image button.
+        Some(Kind::TurbineValve) => &[([173.0, 72.0, 10.0, 10.0], "")],
         _ => &[],
     }
 }
@@ -6746,6 +6748,8 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
             let burn = get_long(&m.nbt, "burn").clamp(1, r.max_burn_tenths().max(1));
             put_long(&mut m.nbt, "burn", fission::next_burn(burn, r.max_burn_tenths()));
         }
+        // `GasMode.getNext`: idle, dumping excess, dumping.
+        (Some(Kind::TurbineValve), 0) => put_int(&mut m.nbt, "dump", (get_int(&m.nbt, "dump") + 1) % 3),
         (Some(Kind::FusionPort), 0) => {
             let mut plasma = fusion_plasma(&m.nbt);
             fusion::ignite(&mut plasma, fusion_injection(&m.nbt));
@@ -7312,7 +7316,22 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     for (i, line) in multiblock_lines(block, data).iter().enumerate() {
         game.native_text(batch, line, [ox + text_x, oy + 16.0 + 10.0 * i as f32], 0x40_4040, false);
     }
+    if kind(block) == Some(Kind::TurbineValve) && data.first().copied().unwrap_or(0) > 0 {
+        let mode = data.get(3).copied().unwrap_or(0);
+        let (sprite_name, text) = match mode {
+            1 => ("chemical_mode/dump_excess", "Dumping Excess"),
+            2 => ("chemical_mode/dump", "Dumping"),
+            _ => ("chemical_mode/idle", "Idle"),
+        };
+        sprite(game, batch, sprite_name, [0.0, 0.0, 10.0, 10.0], [ox + 173.0, oy + 72.0, 10.0, 10.0]);
+        // The mode's name right-aligned against the button (`TextAlignment.RIGHT`, 69 wide, 2 px of padding).
+        let tw = game.native_text_width(text);
+        game.native_text(batch, text, [ox + 171.0 - tw, oy + 73.0], 0x40_4040, false);
+    }
     for ([x, y, w, h], label) in buttons(block) {
+        if kind(block) == Some(Kind::TurbineValve) {
+            continue;
+        }
         game.native_fill(batch, [ox + x, oy + y, *w, *h], 0xFF00_0000);
         game.native_fill(batch, [ox + x + 1.0, oy + y + 1.0, w - 2.0, h - 2.0], 0xFF6F_6F6F);
         let tw = game.native_text_width(label);
@@ -7380,6 +7399,15 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
     }
     if kind(block) == Some(Kind::SpsPort) && inside(at, [7.0, 79.0, 160.0, 8.0]) {
         lines.push(format!("Progress: {:.0}%", f64::from(data.get(2).copied().unwrap_or(0).max(0)) / 10.0));
+        return;
+    }
+    if kind(block) == Some(Kind::TurbineValve) && inside(at, [173.0, 72.0, 10.0, 10.0]) {
+        match data.get(3).copied().unwrap_or(0) {
+            1 => lines.push("Dumping excess Steam".to_owned()),
+            2 => lines.push("Dumping Steam".to_owned()),
+            _ => return,
+        }
+        lines.push("§cWater will NOT be recycled".to_owned());
         return;
     }
     if kind(block) == Some(Kind::TurbineValve) && inside(at, [40.0, 13.0, 6.0, 58.0]) {
@@ -8250,6 +8278,19 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
         if water.amount > 0 {
             push_chemical(game, v, &mut water, None, u64::MAX, false);
         }
+    }
+    // `ChemicalUtils.dump`: dumping removes a share of the steam, dumping excess what is over 85% of the tank.
+    let dump = get_int(&entity.nbt, "dump");
+    if dump != 0 && steam.amount > 0 {
+        let stored = steam.amount;
+        let amount = (used * 2).max(stored / 50).min(stored);
+        let to_dump = if dump == 2 {
+            amount
+        } else {
+            let keep = (steam.capacity as f64 * 0.85) as u64;
+            if keep < stored { (stored - keep).min(amount) } else { 0 }
+        };
+        steam.extract(to_dump);
     }
     put_tank(&mut entity.nbt, "steam", &steam);
     put_tank(&mut entity.nbt, "water", &water);
