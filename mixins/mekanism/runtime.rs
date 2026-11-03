@@ -329,6 +329,20 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         });
         return;
     }
+    // The Digital Miner: its 27 internal slots after the three of the layout (slot 1 takes energy items);
+    // hoppers take what it mined from any face.
+    if let Some(Kind::DigitalMiner) = kind(block) {
+        let main: Vec<usize> = (MINER_FIRST..MINER_FIRST + MINER_SLOTS).collect();
+        let faces: Vec<usize> = std::iter::once(1).chain(main.iter().copied()).collect();
+        *container = Some(ModContainer {
+            slots: MINER_FIRST + MINER_SLOTS,
+            faces: std::array::from_fn(|_| faces.clone()),
+            inputs: vec![1],
+            outputs: main,
+            menu: Some("minecraft:generic_9x4".into()),
+        });
+        return;
+    }
     if let Some(Kind::QioImporter) = kind(block) {
         *container = Some(ModContainer { slots: 3, faces: std::array::from_fn(|_| vec![0]), inputs: vec![0], outputs: vec![], menu: Some("minecraft:furnace".into()) });
         return;
@@ -389,8 +403,6 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::EnergyCube(_)) => (vec![0, 1], vec![]),
         // The fluid tank's bucket slot and the output slot under it.
         Some(Kind::FluidTank(_)) => (vec![0], vec![1]),
-        // The miner's energy slot; what it mines goes into the container above it.
-        Some(Kind::DigitalMiner) => (vec![1], vec![]),
         // Tanks, the multiblocks' ports and the machines below open a screen with no slots of their own.
         Some(
             Kind::ChemicalTank(_)
@@ -2136,10 +2148,66 @@ fn drain_tank_into_item(entity: &mut ModBlockEntity, from: usize, tank: &mut Che
 
 // --- Digital Miner ----------------------------------------------------------------------------------
 
-/// The Digital Miner, simplified: it mines the ores (`#c:ores`) in its region, one every `ticksPerMine`
-/// (speed upgrades shorten it, energy upgrades cut the 40 FE/t), from the top down, and puts what they drop
-/// into the container above it; what does not fit drops on top of it. Mekanism mines what its filters
-/// name, into its own 27 slots, from a 3x3x2 machine.
+/// The first of the Digital Miner's 27 internal slots (`TileEntityDigitalMiner`'s `inventory`); slot 1 is its
+/// energy slot.
+const MINER_FIRST: usize = 3;
+const MINER_SLOTS: usize = 27;
+/// The searcher's states (`ThreadMinerSearch.State`): not started, searching, finished.
+const MINER_IDLE: u32 = 0;
+const MINER_SEARCHING: u32 = 1;
+const MINER_FINISHED: u32 = 2;
+
+fn miner_found(nbt: &Compound) -> Vec<i32> {
+    match nbt.get(&JavaString::from("found")) {
+        Some(Tag::IntArray(v)) => v.clone(),
+        _ => vec![],
+    }
+}
+
+/// `TileEntityDigitalMiner.reset`: forgets the search and what it found; the miner stops.
+fn miner_reset(nbt: &mut Compound) {
+    for key in ["mstate", "cursor", "running", "delay"] {
+        put_int(nbt, key, 0);
+    }
+    nbt.remove(&JavaString::from("found"));
+}
+
+/// Puts `stack` into the miner's internal slots (a stack merges into the same item first); `None` when it
+/// all fitted, else what is left.
+fn miner_insert(game: &Game<'_>, items: &mut [Option<ItemStack>], mut stack: ItemStack) -> Option<ItemStack> {
+    let max = max_stack(game, &stack.item);
+    let same = |a: &ItemStack, b: &ItemStack| a.item == b.item && a.damage == b.damage && a.extra == b.extra;
+    for slot in items.iter_mut().skip(MINER_FIRST).take(MINER_SLOTS) {
+        if let Some(have) = slot
+            && same(have, &stack)
+            && have.count < max
+        {
+            let moved = (max - have.count).min(stack.count);
+            have.count += moved;
+            stack.count -= moved;
+            if stack.count == 0 {
+                return None;
+            }
+        }
+    }
+    for slot in items.iter_mut().skip(MINER_FIRST).take(MINER_SLOTS) {
+        if slot.is_none() {
+            let moved = max.min(stack.count);
+            *slot = Some(ItemStack { count: moved, ..stack.clone() });
+            stack.count -= moved;
+            if stack.count == 0 {
+                return None;
+            }
+        }
+    }
+    Some(stack)
+}
+
+/// The Digital Miner (`TileEntityDigitalMiner`): Start searches its 21 x 21 x 61 region for the ores
+/// (`#c:ores`, until the filters are ported) and, once the search is finished, mines them from the highest
+/// index every `ticksPerMine` (speed upgrades shorten it, energy upgrades cut the 40 FE/t). What a block
+/// drops must fit in its 27 slots, else it waits; with Auto-eject on, a stack goes to the container above
+/// it every 10 ticks. Silk touch drops the block itself.
 fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
     use mekanism_core::miner;
     let u = upgrades(&entity.nbt);
@@ -2148,17 +2216,58 @@ fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
     let mut energy = EnergyContainer::new(miner::STORAGE.max(usage), u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(energy.capacity);
     discharge_slot(entity, 1, &mut energy);
+    let mut state = get_int(&entity.nbt, "mstate");
+    let mut found = miner_found(&entity.nbt);
+    // The searcher thread: a slice of the region a tick, from the top down.
+    if state == MINER_SEARCHING {
+        let cursor = get_int(&entity.nbt, "cursor");
+        let end = (cursor + miner::SCAN_LIMIT).min(miner::total_size());
+        for index in cursor..end {
+            let at = miner::position(pos, miner::total_size() - 1 - index);
+            if at == pos {
+                continue;
+            }
+            let block = game.world.block(at[0], at[1], at[2]);
+            let facts = game.res.facts().get(block);
+            if facts.hardness >= 0.0 && world_items!(game).block_in_tag(miner::ORE_TAG, &facts.name) {
+                found.push((miner::total_size() - 1 - index) as i32);
+            }
+        }
+        put_int(&mut entity.nbt, "cursor", end);
+        if end >= miner::total_size() {
+            state = MINER_FINISHED;
+            put_int(&mut entity.nbt, "mstate", state);
+        }
+        entity.nbt.insert("found".into(), Tag::IntArray(found.clone()));
+    }
+    let running = get_int(&entity.nbt, "running") == 1;
     let mut delay = get_int(&entity.nbt, "delay").min(delay_length);
-    let active = energy.consume(usage);
-    if active {
-        delay = delay.saturating_sub(1);
-        if delay == 0 {
-            mine_next(game, pos, entity);
-            delay = delay_length;
+    let mut active = false;
+    if running && state == MINER_FINISHED {
+        if found.is_empty() {
+            put_int(&mut entity.nbt, "running", 0);
+        } else if energy.consume(usage) {
+            active = true;
+            delay = delay.saturating_sub(1);
+            if delay == 0 {
+                mine_next(game, pos, entity, &mut found);
+                entity.nbt.insert("found".into(), Tag::IntArray(found.clone()));
+                delay = delay_length;
+            }
+        }
+    }
+    // Auto-eject (`doEject`): a stack to the container above, every 10 ticks.
+    if get_int(&entity.nbt, "eject") == 1 && game.ticks % 10 == 0 {
+        let above = [pos[0], pos[1] + 1, pos[2]];
+        if let Some(i) = (MINER_FIRST..MINER_FIRST + MINER_SLOTS).find(|&i| entity.items.get(i).is_some_and(|s| s.is_some())) {
+            let stack = entity.items[i].take().unwrap_or_else(|| unreachable!());
+            entity.items[i] = game.native_insert_item(above, horizon_core::geometry::Direction::Down, stack);
         }
     }
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "delay", delay);
+    put_int(&mut entity.nbt, "to_mine", found.len() as u32);
+    put_int(&mut entity.nbt, "warn", u32::from(usage > energy.stored));
     entity.data = vec![
         (energy.stored * 1000 / energy.capacity.max(1)) as i32,
         1000,
@@ -2168,49 +2277,42 @@ fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
     Some(active)
 }
 
-/// Mines the next ore of the miner's region, looking at up to `SCAN_LIMIT` positions from its cursor.
-fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+/// Mines the highest ore the search found, if its drops fit in the miner's slots.
+fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, found: &mut Vec<i32>) {
     use mekanism_core::miner;
-    let cursor = get_int(&entity.nbt, "cursor") % miner::total_size();
-    let mut looked = 0;
-    let mut found = None;
-    for index in miner::scan_order(cursor, miner::SCAN_LIMIT) {
-        looked += 1;
-        let at = miner::position(pos, index);
-        if at == pos {
-            continue;
-        }
-        let state = game.world.block(at[0], at[1], at[2]);
-        let facts = game.res.facts().get(state);
-        if facts.hardness < 0.0 || !world_items!(game).block_in_tag(miner::ORE_TAG, &facts.name) {
-            continue;
-        }
-        found = Some((at, state));
-        break;
-    }
-    put_int(&mut entity.nbt, "cursor", (cursor + looked) % miner::total_size());
-    let Some((at, state)) = found else {
+    let Some(&index) = found.last() else {
         return;
     };
-    let registry = game.pack.assets.registry;
-    let drops = match &game.world_tables {
-        Some(t) => &t.items,
-        None => game.res.items(),
+    let at = miner::position(pos, index as u32);
+    let state = game.world.block(at[0], at[1], at[2]);
+    let facts = game.res.facts().get(state);
+    // The block is gone or changed since the search saw it.
+    if facts.hardness < 0.0 || !world_items!(game).block_in_tag(miner::ORE_TAG, &facts.name) {
+        found.pop();
+        return;
     }
-    .block_drops_with(registry, state, None, &[], &mut game.world.random);
-    let block = horizon_core::position::BlockPos::new(at[0], at[1], at[2]);
-    game.with_level(|b, level, ticks| b.destroy_block(level, ticks, block, false));
-    let above = [pos[0], pos[1] + 1, pos[2]];
-    let mut lost = Vec::new();
+    let drops = if get_int(&entity.nbt, "silk") == 1 {
+        vec![stack_of(&facts.name, 1)]
+    } else {
+        let registry = game.pack.assets.registry;
+        match &game.world_tables {
+            Some(t) => &t.items,
+            None => game.res.items(),
+        }
+        .block_drops_with(registry, state, None, &[], &mut game.world.random)
+    };
+    let mut slots = entity.items.clone();
+    slots.resize(MINER_FIRST + MINER_SLOTS, None);
     for stack in drops.into_iter().filter(|s| s.count > 0 && &*s.item != "minecraft:air") {
-        if let Some(left) = game.native_insert_item(above, horizon_core::geometry::Direction::Down, stack) {
-            lost.push(Some(left));
+        // Nothing fits: it waits for room (`tryInsert` fails) and the block stays.
+        if miner_insert(game, &mut slots, stack).is_some() {
+            return;
         }
     }
-    if !lost.is_empty() {
-        let top = horizon_core::position::BlockPos::new(above[0], above[1], above[2]);
-        game.with_level(|_, level, _| level.drop_lost_contents(top, lost));
-    }
+    entity.items = slots;
+    found.pop();
+    let block = horizon_core::position::BlockPos::new(at[0], at[1], at[2]);
+    game.with_level(|b, level, ticks| b.destroy_block(level, ticks, block, false));
 }
 
 // --- Transmitter shapes -----------------------------------------------------------------------------
@@ -5134,7 +5236,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
     if tabs(&entity.id) & TAB_REDSTONE != 0 {
         entity.data.resize(DATA_GAUGES + l.gauges.len() * GAUGE_SLOTS, 0);
         let signal = get_int(&entity.nbt, "powered") & 3;
-        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2 | (if matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) { get_int(&entity.nbt, "dump") % 3 } else { get_int(&entity.nbt, "warn") & 15 }) << 4) as i32);
+        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2 | (if matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) { get_int(&entity.nbt, "dump") % 3 } else if kind(&entity.id) == Some(Kind::DigitalMiner) { miner_flags(&entity.nbt) } else { get_int(&entity.nbt, "warn") & 15 }) << 4) as i32);
         // Then, for the side configuration window, each type's faces in relative-side order and
         // which types' auto-eject is off.
         if tabs(&entity.id) & TAB_SIDES != 0 {
@@ -5162,6 +5264,12 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
             entity.data.resize(redstone_slot(&l) + 5 + 9, 0);
             entity.data.push(get_int(&entity.nbt, "sorting") as i32 & 1);
         }
+        // The miner's to-mine count, in two slots after the redstone slot.
+        if kind(&entity.id) == Some(Kind::DigitalMiner) {
+            entity.data.resize(redstone_slot(&l) + 1, 0);
+            let n = get_int(&entity.nbt, "to_mine");
+            entity.data.extend([(n & 0x7FFF) as i32, (n >> 15 & 0x7FFF) as i32]);
+        }
         // Last, the transporter window's ejector: the output colour, the six input colours (each the
         // dye + 1, or 0 for none) and strict input.
         if tabs(&entity.id) & TAB_SIDES != 0 {
@@ -5171,6 +5279,14 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
             }
         }
     }
+}
+
+/// What the miner's screen reads: the warning (bit 0), the searcher's state (bits 4-5), running (6), the
+/// Auto-eject, Auto-pull and silk touch switches (7-9) and low power (10).
+fn miner_flags(nbt: &Compound) -> u32 {
+    let flag = |key: &str, bit: u32| u32::from(get_int(nbt, key) == 1) << bit;
+    let low = u32::from(upgrades(nbt).energy_per_tick(mekanism_core::miner::ENERGY_USAGE) > mekanism_core::miner::STORAGE) << 10;
+    get_int(nbt, "warn") & 1 | (get_int(nbt, "mstate") & 3) << 4 | flag("running", 6) | flag("eject", 7) | flag("pull", 8) | flag("silk", 9) | low
 }
 
 /// A machine screen's height: the nucleosynthesizer's is 27 taller (`DEFAULT_IMAGE_HEIGHT + 27`).
@@ -5183,6 +5299,8 @@ fn screen_height(block: &str) -> f32 {
         Some(Kind::SpsPort) => 182.0,
         // `DEFAULT_IMAGE_HEIGHT + 89`.
         Some(Kind::FissionPort) => 255.0,
+        // `DEFAULT_IMAGE_HEIGHT + 76`.
+        Some(Kind::DigitalMiner) => 242.0,
         _ => 166.0,
     }
 }
@@ -5206,6 +5324,8 @@ fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
         Some(Kind::Rotary) => vec![([5.0, 25.0], "slot/normal"), ([5.0, 56.0], "slot/output")],
         // The washer's fluid slots on the holder at the right: the bucket to fill the water tank and its empty one.
         Some(Kind::Washer) => vec![([180.0, 71.0], "slot/normal"), ([180.0, 102.0], "slot/output")],
+        // The miner's 27 internal slots (`BasicInventorySlot.at(8 + 18x, 92 + 18y)`).
+        Some(Kind::DigitalMiner) => (0..MINER_SLOTS).map(|i| ([8.0 + 18.0 * (i % 9) as f32, 92.0 + 18.0 * (i / 9) as f32], "slot/normal")).collect(),
         _ => vec![],
     }
 }
@@ -5841,7 +5961,7 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
         let extra = extra_slots(block);
         if !extra.is_empty() {
             rules.resize(3, SlotRule::Any);
-            let chemical = kind(block) != Some(Kind::Washer);
+            let chemical = !matches!(kind(block), Some(Kind::Washer | Kind::DigitalMiner));
             rules.extend(extra.iter().map(|(_, sprite)| match *sprite {
                 "slot/normal" if !chemical => SlotRule::Any,
                 "slot/normal" => SlotRule::Items(chemical_item_ids()),
@@ -6790,6 +6910,16 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
         // `GuiGasMode`: the steam dump mode, a 10 px image button.
         Some(Kind::TurbineValve) => &[([173.0, 72.0, 10.0, 10.0], "")],
         Some(Kind::ChemicalTank(_)) => &[([159.0, 72.0, 10.0, 10.0], "")],
+        // `GuiDigitalMiner`: the four buttons, then the three switches (15 wide, icon underneath).
+        Some(Kind::DigitalMiner) => &[
+            ([87.0, 19.0, 61.0, 18.0], "Start"),
+            ([87.0, 36.0, 61.0, 18.0], "Stop"),
+            ([87.0, 53.0, 61.0, 18.0], "Config"),
+            ([87.0, 70.0, 61.0, 18.0], "Reset"),
+            ([19.0, 56.0, 15.0, 31.0], ""),
+            ([38.0, 56.0, 15.0, 31.0], ""),
+            ([57.0, 56.0, 15.0, 31.0], ""),
+        ],
         _ => &[],
     }
 }
@@ -6892,6 +7022,36 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
     // `GasMode.getNext` on the chemical tank's button.
     if id == 0 && matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) {
         put_int(&mut entity.nbt, "dump", (get_int(&entity.nbt, "dump") + 1) % 3);
+        return;
+    }
+    // The Digital Miner's Start, Stop, Config (with the filters), Reset and its three switches.
+    if kind(&entity.id) == Some(Kind::DigitalMiner) {
+        let (state, running) = (get_int(&entity.nbt, "mstate"), get_int(&entity.nbt, "running") == 1);
+        let flip = |nbt: &mut Compound, key: &str| put_int(nbt, key, u32::from(get_int(nbt, key) == 0));
+        match id {
+            // `start()`: the searcher starts when idle, and mining is allowed.
+            0 if state == MINER_IDLE || !running => {
+                if state == MINER_IDLE {
+                    put_int(&mut entity.nbt, "mstate", MINER_SEARCHING);
+                    put_int(&mut entity.nbt, "cursor", 0);
+                    entity.nbt.remove(&JavaString::from("found"));
+                }
+                put_int(&mut entity.nbt, "running", 1);
+            }
+            // `stop()`: a search in progress is reset, a finished one stops mining.
+            1 if state != MINER_IDLE && running => {
+                if state == MINER_SEARCHING {
+                    miner_reset(&mut entity.nbt);
+                } else {
+                    put_int(&mut entity.nbt, "running", 0);
+                }
+            }
+            3 => miner_reset(&mut entity.nbt),
+            4 => flip(&mut entity.nbt, "eject"),
+            5 => flip(&mut entity.nbt, "pull"),
+            6 => flip(&mut entity.nbt, "silk"),
+            _ => {}
+        }
         return;
     }
     if id == BUTTON_SORT && matches!(kind(&entity.id), Some(Kind::Factory(..))) {
@@ -7041,7 +7201,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
     let mut slots: Vec<Option<[f32; 2]>> = l.slots.iter().map(|s| s.map(|(at, _)| at)).collect();
     let extra = extra_slots(block);
     if !extra.is_empty() {
-        slots.resize(5, None);
+        slots.resize((3 + extra.len()).max(5), None);
         for (i, (at, _)) in extra.iter().enumerate() {
             slots[3 + i] = Some(*at);
         }
@@ -7087,6 +7247,63 @@ fn power_rect(p: PowerBar) -> [f32; 4] {
     }
 }
 
+/// What the miner's screen reads from its data (`miner_flags` and the count after it).
+struct MinerView {
+    state: u32,
+    running: bool,
+    eject: bool,
+    pull: bool,
+    silk: bool,
+    low_power: bool,
+    to_mine: u32,
+}
+
+fn miner_view(block: &str, data: &[i32]) -> MinerView {
+    let at = layout(block).map_or(0, |l| redstone_slot(&l));
+    let v = data.get(at).copied().unwrap_or(0).max(0) as u32 >> 4;
+    let n = |i: usize| data.get(at + i).copied().unwrap_or(0).max(0) as u32;
+    MinerView {
+        state: v >> 4 & 3,
+        running: v >> 6 & 1 == 1,
+        eject: v >> 7 & 1 == 1,
+        pull: v >> 8 & 1 == 1,
+        silk: v >> 9 & 1 == 1,
+        low_power: v >> 10 & 1 == 1,
+        to_mine: n(1) | n(2) << 15,
+    }
+}
+
+/// `GuiDigitalMiner`'s widgets beyond the generic ones: the four buttons (`TranslationButton`, greyed by
+/// `setCheckActive`), the three `GuiDigitalSwitch`es and the missing-block slot with its check.
+fn draw_miner_widgets(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, data: &[i32], origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let m = miner_view(block, data);
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    // Start (idle or not running), Stop (started and running), Config (idle), Reset (always).
+    let active = [m.state == 0 || !m.running, m.state != 0 && m.running, m.state == 0, true];
+    for (i, ([x, y, w, h], label)) in buttons(block).iter().take(4).enumerate() {
+        let r = [ox + x, oy + y, *w, *h];
+        draw_mek_button(game, batch, r, active[i], active[i] && inside(mouse, [*x, *y, *w, *h]));
+        let tw = game.native_text_width(label);
+        game.native_text(batch, label, [r[0] + (w - tw) / 2.0, r[1] + (h - 8.0) / 2.0], if active[i] { 0xFF_FFFF } else { 0xA0_A0A0 }, true);
+    }
+    for (i, (icon, on)) in [("switch/eject", m.eject), ("switch/input", m.pull), ("switch/silk", m.silk)].into_iter().enumerate() {
+        let (x, y) = (ox + 19.0 + 19.0 * i as f32, oy + 56.0);
+        let (top, bottom) = if on { ("switch/selected", "switch/unselected") } else { ("switch/unselected", "switch/selected") };
+        sprite(game, batch, top, [0.0, 0.0, 15.0, 8.0], [x, y, 15.0, 8.0]);
+        sprite(game, batch, bottom, [0.0, 0.0, 15.0, 8.0], [x, y + 9.0, 15.0, 8.0]);
+        sprite(game, batch, icon, [0.0, 0.0, 5.0, 5.0], [x + 5.0, y + 21.0, 5.0, 5.0]);
+        for (j, text) in ["On", "Off"].into_iter().enumerate() {
+            let tw = game.native_text_width(text) * 0.6;
+            game.native_text_scaled(batch, text, [x + (15.0 - tw) / 2.0, y + 9.0 * j as f32 + 1.0], 0xFF10_1010, 0.6);
+        }
+    }
+    // The slot that shows a replacement block the miner is missing: always the check until filters exist.
+    sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 64.0, oy + 21.0, 18.0, 18.0]);
+    sprite(game, batch, "slot/overlay/check", [0.0, 0.0, 18.0, 18.0], [ox + 64.0, oy + 21.0, 18.0, 18.0]);
+}
+
 /// What a screen draws beyond its `Layout`: progress arrows that fill while the machine is lit
 /// (`GuiProgress` on `tile::getActive`), an inner screen with text lines, and down arrows.
 struct Extras {
@@ -7108,6 +7325,7 @@ fn extras(block: &str) -> Extras {
         // `GuiTexturedElement.downArrow(imageWidth + 8, 91)` between the washer's two fluid slots.
         Some(Kind::Washer) => Extras { active_progress: vec![large(64.0, 39.0)], arrows: vec![[184.0, 91.0]], ..none },
         Some(Kind::Heater) => Extras { screen: Some([48.0, 23.0, 80.0, 42.0]), ..none },
+        Some(Kind::DigitalMiner) => Extras { screen: Some([7.0, 19.0, 77.0, 69.0]), ..none },
         // `GuiThermalEvaporationController`: the screen between the gauges and the arrows under the buckets.
         Some(Kind::BoilerValve) => Extras { screen: Some([54.0, 23.0, 110.0, 40.0]), ..none },
         Some(Kind::TurbineValve) => Extras { screen: Some([50.0, 18.0, 126.0, 50.0]), ..none },
@@ -7142,6 +7360,14 @@ fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
         }
     };
     match kind(block) {
+        Some(Kind::DigitalMiner) => {
+            let m = miner_view(block, data);
+            vec![
+                if m.low_power { "Low Power" } else if m.running { "Running" } else { "Idle" }.to_owned(),
+                ["Not ready", "Searching", "Ready", "Paused"][m.state.min(2) as usize].to_owned(),
+                format!("To mine: {}", thousands(u64::from(m.to_mine))),
+            ]
+        }
         Some(Kind::Pump) => vec![energy, fluid()],
         Some(Kind::SpsPort) if data.first().copied().unwrap_or(0) > 0 => {
             let processed = data.get(3).copied().unwrap_or(0).max(0);
@@ -7892,10 +8118,12 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
         for (i, line) in screen_lines(block, data).iter().enumerate() {
             // `GuiInnerScreen`'s default format is centred lines at 0.8 scale with 2 px of spacing;
             // the evaporation screen clears the spacing. The others here keep their own plain style.
-            let pad = if matches!(kind(block), Some(Kind::TurbineValve | Kind::SpsPort)) { 5.0 } else { 3.0 };
+            let pad = if matches!(kind(block), Some(Kind::TurbineValve | Kind::SpsPort | Kind::DigitalMiner)) { 5.0 } else { 3.0 };
             let at = |dy: f32, step: f32| [ox + x + pad, oy + y + dy + step * i as f32];
             match kind(block) {
                 Some(Kind::Evaporation) => game.native_text_scaled(batch, line, at(2.0, 9.0), 0x3C_FE9A, 0.8),
+                // `clearSpacing().clearFormat()`: top-aligned, 5 px in, 9 px a line.
+                Some(Kind::DigitalMiner) => game.native_text_scaled(batch, line, at(0.0, 9.0), 0x3C_FE9A, 0.8),
                 Some(Kind::BoilerValve) => game.native_text_scaled(batch, line, at(4.0, 11.0), 0x3C_FE9A, 0.8),
                 Some(Kind::TurbineValve) => game.native_text_scaled(batch, line, at(4.0, 11.0), 0x3C_FE9A, 0.8),
                 // Two or three lines centred in the 60 px screen: 14.5 and 3.5 px down from the middle.
@@ -8157,6 +8385,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
             sprite(game, batch, "bar/horizontal_rate", [0.0, 0.0, w, 6.0], [x + 1.0, y + 1.0, w, 6.0]);
         }
     }
+    if kind(block) == Some(Kind::DigitalMiner) {
+        draw_miner_widgets(game, batch, block, data, origin);
+    }
     draw_tabs(game, batch, block, &l, data, origin);
     let text_x = if l.gauges.len() > 2 { 50.0 } else { 30.0 };
     for (i, line) in multiblock_lines(block, data).iter().enumerate() {
@@ -8175,7 +8406,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         game.native_text(batch, text, [ox + 171.0 - tw, oy + 73.0], 0x40_4040, false);
     }
     for ([x, y, w, h], label) in buttons(block) {
-        if matches!(kind(block), Some(Kind::TurbineValve | Kind::FissionPort | Kind::ChemicalTank(_))) {
+        if matches!(kind(block), Some(Kind::TurbineValve | Kind::FissionPort | Kind::ChemicalTank(_) | Kind::DigitalMiner)) {
             continue;
         }
         game.native_fill(batch, [ox + x, oy + y, *w, *h], 0xFF00_0000);
@@ -8227,6 +8458,9 @@ fn warning_bits(block: &str, l: &Layout, data: &[i32]) -> u32 {
     }
     if let Some(Kind::Factory(n, ..)) = kind(block) {
         return (0..n).fold(0, |all, i| all | (data.get(redstone_slot(l) + 5 + i).copied().unwrap_or(0).max(0) as u32) >> 5 & 15);
+    }
+    if kind(block) == Some(Kind::DigitalMiner) {
+        return (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 15;
     }
     if !matches!(kind(block), Some(Kind::Machine(..))) {
         return 0;
@@ -8381,6 +8615,18 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
     };
     if window_tooltip(block, data, window_at(block, at), lines) || tab_tooltip(block, &l, data, at, lines) {
         return;
+    }
+    if kind(block) == Some(Kind::DigitalMiner) {
+        if inside(at, [64.0, 21.0, 18.0, 18.0]) {
+            lines.push("All is well!".to_owned());
+            return;
+        }
+        for (rect, name) in [([19.0, 56.0, 15.0, 31.0], "Auto-eject"), ([38.0, 56.0, 15.0, 31.0], "Auto-pull"), ([57.0, 56.0, 15.0, 31.0], "Silk touch")] {
+            if inside(at, rect) {
+                lines.push(name.to_owned());
+                return;
+            }
+        }
     }
     if kind(block) == Some(Kind::SpsPort) && inside(at, [7.0, 79.0, 160.0, 8.0]) {
         lines.push(format!("Progress: {:.0}%", f64::from(data.get(2).copied().unwrap_or(0).max(0)) / 10.0));
