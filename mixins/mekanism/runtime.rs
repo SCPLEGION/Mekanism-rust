@@ -633,7 +633,11 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity, false),
-            Kind::PigmentMixer => tick_chemical_infuser(game, pos, entity, true),
+            Kind::PigmentMixer => {
+                let active = tick_chemical_infuser(game, pos, entity, true);
+                put_flag(game, pos, entity, "shaft_active", active == Some(true));
+                active
+            }
             Kind::Evaporation => tick_evaporation(game, pos, entity),
             Kind::Rotary => tick_rotary(game, pos, entity),
             Kind::Transporter(pull) => {
@@ -691,7 +695,11 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::Laser | Kind::LaserAmplifier | Kind::TractorBeam => tick_laser(game, pos, entity),
-            Kind::Vibrator => tick_vibrator(game, pos, entity),
+            Kind::Vibrator => {
+                let active = tick_vibrator(game, pos, entity);
+                put_flag(game, pos, entity, "shaft_active", active == Some(true));
+                active
+            }
             // Lit for a second after it last charged something.
             Kind::Chargepad => Some((game.world.game_time.max(0) as u64).saturating_sub(get_long(&entity.nbt, "charged_at")) <= 20),
         }
@@ -1269,6 +1277,12 @@ thread_local! {
 }
 
 thread_local! {
+    /// The seismic vibrators and pigment mixers this client has heard of, with the ticks a vibrator has run
+    /// (`clientPiston`) and the tick that was counted at.
+    static SHAFTS: std::cell::RefCell<std::collections::HashMap<[i32; 3], (u64, u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+thread_local! {
     /// The nutritional liquifiers this client has heard of.
     static LIQUIFIERS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
@@ -1298,6 +1312,10 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
     } else if matches!(kind(id), Some(Kind::FluidTank(_))) {
         TANKS.with_borrow_mut(|t| {
             t.insert(pos);
+        });
+    } else if matches!(kind(id), Some(Kind::Vibrator | Kind::PigmentMixer)) {
+        SHAFTS.with_borrow_mut(|t| {
+            t.entry(pos).or_insert((0, 0));
         });
     } else if matches!(kind(id), Some(Kind::Liquifier)) {
         LIQUIFIERS.with_borrow_mut(|t| {
@@ -1421,6 +1439,67 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                 rotation: None,
                 full_bright: false,
             });
+            true
+        });
+    });
+    // `RenderSeismicVibrator` and `RenderPigmentMixer`: the vibrator's shaft rises with sin(clientPiston / 5),
+    // the mixer's turns 5 degrees a tick; both only while they work.
+    let ticks_now = game.ticks as u64;
+    let partial_now = game.clock.fraction() as f32;
+    SHAFTS.with_borrow_mut(|shafts| {
+        shafts.retain(|pos, (count, last)| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            let k = kind(id);
+            if !matches!(k, Some(Kind::Vibrator | Kind::PigmentMixer)) {
+                return false;
+            }
+            let active = get_int(c, "shaft_active") != 0;
+            if *last == 0 {
+                *last = ticks_now;
+            }
+            if active && k == Some(Kind::Vibrator) {
+                *count += ticks_now.saturating_sub(*last);
+            }
+            *last = ticks_now;
+            if !active {
+                return true;
+            }
+            let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
+            if k == Some(Kind::Vibrator) {
+                let piston = ((*count as f32 + partial_now) / 5.0).sin().max(0.0);
+                models.push(super::native_hooks::NativeWorldModel {
+                    model: "mekanism:vibrator_shaft".into(),
+                    position: [x + 0.5, y + 0.5 + 0.625 * f64::from(piston), z + 0.5],
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    roll: 0.0,
+                    light_at: [pos[0], pos[1] + 1, pos[2]],
+                    color: 0xFFFF_FFFF,
+                    rotation: None,
+                    full_bright: false,
+                });
+            } else {
+                let (dx, dz) = match game.native_block_property(*pos, "facing").as_deref() {
+                    Some("north") => (7.0 / 16.0, 6.0 / 16.0),
+                    Some("south") => (7.0 / 16.0, 0.5),
+                    Some("west") => (6.0 / 16.0, 7.0 / 16.0),
+                    _ => (0.5, 7.0 / 16.0),
+                };
+                let time = ticks_now as f32 + partial_now;
+                models.push(super::native_hooks::NativeWorldModel {
+                    model: "mekanism:pigment_mixer_shaft".into(),
+                    position: [x + dx + 1.0 / 16.0, y, z + dz + 1.0 / 16.0],
+                    yaw: -((time * 5.0) % 360.0),
+                    pitch: 0.0,
+                    roll: 0.0,
+                    light_at: [pos[0], pos[1] + 1, pos[2]],
+                    color: 0xFFFF_FFFF,
+                    rotation: None,
+                    full_bright: false,
+                });
+            }
             true
         });
     });
@@ -12705,6 +12784,13 @@ fn frequency_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
 /// Merges what one part of the port tells the screens into the block entity's `client` compound: the
 /// `owned` keys are replaced by `new`'s, the others stay (a QIO block has the frequency's, its filters'
 /// and its own). The viewers hear of it when it changed.
+/// Tells clients whether the machine works, as `key` of its client view.
+fn put_flag(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, key: &str, on: bool) {
+    let mut flag = Compound::new();
+    put_int(&mut flag, key, u32::from(on));
+    put_client(game, pos, entity, &[key], flag);
+}
+
 fn put_client(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, owned: &[&str], new: Compound) {
     let before = match entity.nbt.get(&JavaString::from("client")) {
         Some(Tag::Compound(c)) => c.clone(),

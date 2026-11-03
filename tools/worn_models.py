@@ -376,7 +376,7 @@ def rotate_point(p, rotation):
     return [q[i] + o[i] for i in range(3)]
 
 
-def build_element_world_model(ns, name, model, texture_png, out, report):
+def build_element_world_model(ns, name, model, texture_png, out, report, center=(8, 8, 8)):
     """A part tree for `native_world_models` from an element model with one texture, centred on the block's
     middle (pixels, y up), so the game can turn it about the block's centre."""
     polygons, normals = [], []
@@ -389,7 +389,7 @@ def build_element_world_model(ns, name, model, texture_png, out, report):
             for i, pick in enumerate(FACE_CORNERS[direction]):
                 p = [hi[k] if pick[k] else lo[k] for k in range(3)]
                 p = rotate_point(p, el.get("rotation", {}))
-                pts.append([(p[k] - 8) / 16 for k in range(3)])
+                pts.append([(p[k] - center[k]) / 16 for k in range(3)])
                 corner = (i + turn) % 4
                 uvs.append([(u0 if corner < 2 else u1) / 16, (v0 if corner in (0, 3) else v1) / 16])
             poly, normal = polygon(pts, uvs)

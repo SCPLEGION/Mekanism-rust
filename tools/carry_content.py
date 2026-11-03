@@ -447,6 +447,20 @@ def build_module(ns, out):
                         if (d / ns / "textures/block/nutritional_liquifier.png").is_file()), None)
         if blade is not None and texture is not None:
             worn_models.build_element_world_model(ns, "liquifier_blade", json.loads(blade.read_text()), texture, out, report)
+    if ns == "mekanism":
+        # Moving parts of machines (`RenderSeismicVibrator`, `RenderPigmentMixer`): their shafts are world models.
+        for model_name, name, center in (("vibrator_shaft", "vibrator_shaft", (8, 8, 8)),
+                                         ("pigment_mixer_shaft", "pigment_mixer_shaft", (1, 0, 1))):
+            f = next((d / ns / "models/block" / f"{model_name}.json" for d in search
+                      if (d / ns / "models/block" / f"{model_name}.json").is_file()), None)
+            if f is None:
+                continue
+            data = json.loads(f.read_text())
+            tex = next(v for k, v in data["textures"].items() if k != "particle")
+            png = next((d / tex.split(":")[0] / "textures" / (tex.split(":")[1] + ".png") for d in search
+                        if (d / tex.split(":")[0] / "textures" / (tex.split(":")[1] + ".png")).is_file()), None)
+            if png is not None:
+                worn_models.build_element_world_model(ns, name, data, png, out, report, center)
     worn = set()
     if ns == "mekanism":
         for item in worn_models.WORN:
