@@ -497,6 +497,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::EnergyCube(_)) => (vec![0, 1], vec![]),
         // The fluid tank's bucket slot and the output slot under it.
         Some(Kind::FluidTank(_) | Kind::DynamicValve) => (vec![0], vec![1]),
+        // The matrix's charge slot and discharge slot.
+        Some(Kind::InductionPort) => (vec![0, 1], vec![]),
         // Tanks, the multiblocks' ports and the machines below open a screen with no slots of their own.
         Some(
             Kind::ChemicalTank(_)
@@ -505,7 +507,6 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::FusionPort
             | Kind::BoilerValve
             | Kind::SpsPort
-            | Kind::InductionPort
             | Kind::Laser
             | Kind::LaserAmplifier
             | Kind::Sorter
@@ -531,11 +532,11 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
     };
     // The machines with a fourth slot, and those whose slots the furnace's roles would spoil (a bucket
     // output between two inputs), open a hopper's five-slot menu.
-    if !extra_slots(block).is_empty() || matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_) | Kind::DynamicValve)) {
+    if !extra_slots(block).is_empty() || matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_) | Kind::DynamicValve | Kind::InductionPort)) {
         let mut inputs = inputs;
         let mut outputs = outputs;
         let mut side = vec![1];
-        if !matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_) | Kind::DynamicValve | Kind::Evaporation)) {
+        if !matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_) | Kind::DynamicValve | Kind::InductionPort | Kind::Evaporation)) {
             for (i, (_, sprite)) in extra_slots(block).iter().enumerate() {
                 if *sprite == "slot/output" {
                     outputs.push(3 + i);
@@ -4529,6 +4530,8 @@ fn route_items(game: &mut Game<'_>, start: [i32; 3], source: [i32; 3], stack: It
 struct FormedMatrix {
     matrix: mekanism_core::matrix::Matrix,
     ports: Vec<[i32; 3]>,
+    /// Its width, height and length (`VoxelCuboid`'s x, y and z extents).
+    size: [i32; 3],
 }
 
 /// `MatrixValidator`, simplified: the frame blocks joined to `start` must be exactly the shell of a box
@@ -4578,16 +4581,27 @@ fn find_matrix(game: &Game<'_>, start: [i32; 3]) -> Option<FormedMatrix> {
             }
         }
     }
-    (matrix.capacity > 0).then_some(FormedMatrix { matrix, ports })
+    // `MatrixValidator.postcheck`: at least one cell and one provider.
+    let size = [hi[0] - lo[0] + 1, hi[1] - lo[1] + 1, hi[2] - lo[2] + 1];
+    (matrix.cells > 0 && matrix.providers > 0).then_some(FormedMatrix { matrix, ports, size })
 }
 
-/// An Induction Port. Once a second it checks its matrix and writes the matrix's capacity and rate
-/// into its NBT. The first port (`master`) holds the energy; others hand what they took in to it. A
-/// face the Configurator set to Output gives energy out, up to the matrix's rate.
+/// Adds `n` to a counter of the matrix's master (the tick's queued input or output).
+fn add_count(nbt: &mut Compound, key: &str, n: u64) {
+    let v = get_long(nbt, key);
+    put_long(nbt, key, v.saturating_add(n));
+}
+
+/// An Induction Port. Once a second it checks its matrix and writes its capacity, rate and make-up into its
+/// NBT. The first port (`master`) holds the energy and the two slots; others hand what they took in to it. A
+/// face the Configurator set to Output gives energy out. Like `MatrixEnergyContainer.tick`, the master counts
+/// what went in and out this tick (`queuedInput`, `queuedOutput`) and keeps it as the last input and output;
+/// the slots and the outputs share what is left of the rate.
 fn tick_induction_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     let ticker = get_int(&entity.nbt, "ticker");
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
     if ticker == 0 {
+        let was_master = get_long(&entity.nbt, "rate") > 0 && get_long(&entity.nbt, "master") == 1;
         let formed = find_matrix(game, pos);
         let (capacity, rate, master) = match &formed {
             Some(f) => (f.matrix.capacity, f.matrix.rate, f.ports.first().copied().unwrap_or(pos)),
@@ -4596,8 +4610,22 @@ fn tick_induction_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlock
         put_long(&mut entity.nbt, "capacity", capacity);
         put_long(&mut entity.nbt, "rate", rate);
         put_long(&mut entity.nbt, "master", u64::from(master == pos));
+        let (cells, providers, size) = formed.as_ref().map_or((0, 0, [0; 3]), |f| (f.matrix.cells, f.matrix.providers, f.size));
+        put_long(&mut entity.nbt, "cells", u64::from(cells));
+        put_long(&mut entity.nbt, "providers", u64::from(providers));
+        for (key, v) in ["dx", "dy", "dz"].into_iter().zip(size) {
+            put_long(&mut entity.nbt, key, v.max(0) as u64);
+        }
         for (key, v) in ["mx", "my", "mz"].into_iter().zip(master) {
             entity.nbt.insert(key.into(), Tag::Int(v));
+        }
+        // A new master starts counting from what it holds; an unformed port reports nothing.
+        if rate == 0 || (master == pos && !was_master) {
+            let held = get_long(&entity.nbt, "energy");
+            for key in ["acc_in", "acc_out", "last_in", "last_out"] {
+                put_long(&mut entity.nbt, key, 0);
+            }
+            put_long(&mut entity.nbt, "prev_e", held);
         }
     }
     let rate = get_long(&entity.nbt, "rate");
@@ -4611,55 +4639,103 @@ fn tick_induction_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlock
     let is_master = master == pos;
     let capacity = get_long(&entity.nbt, "capacity");
     if !is_master {
-        // Hand this port's buffer to the master.
+        // The slots belong to the whole matrix (`MatrixMultiblockData`): this port shows the master's.
+        sync_dynamic_slots(game, pos, entity, master);
+        // Hand this port's buffer to the master, no more than the rate it can still take this tick.
         let mine = get_long(&entity.nbt, "energy");
         if mine > 0 {
             let taken = game
                 .native_with_mod_block_entity(master, |m| {
                     let stored = get_long(&m.nbt, "energy");
-                    let n = mine.min(get_long(&m.nbt, "capacity").saturating_sub(stored));
+                    let left = rate.saturating_sub(get_long(&m.nbt, "acc_in"));
+                    let n = mine.min(get_long(&m.nbt, "capacity").saturating_sub(stored)).min(left);
                     put_long(&mut m.nbt, "energy", stored + n);
+                    add_count(&mut m.nbt, "acc_in", n);
                     n
                 })
                 .unwrap_or(0);
             put_long(&mut entity.nbt, "energy", mine - taken);
         }
     }
+    // What came in and went out since the master last ticked, outside of its own work: the difference of what it
+    // holds from what it held, once the ports' hand-offs are taken off.
+    let (mut queued_in, mut queued_out) = (0, 0);
+    if is_master {
+        if entity.items.len() < 2 {
+            entity.items.resize(2, None);
+        }
+        let held = get_long(&entity.nbt, "energy").min(capacity);
+        let external = i128::from(held) - i128::from(get_long(&entity.nbt, "prev_e")) - i128::from(get_long(&entity.nbt, "acc_in"))
+            + i128::from(get_long(&entity.nbt, "acc_out"));
+        queued_in = get_long(&entity.nbt, "acc_in") + external.max(0) as u64;
+        queued_out = get_long(&entity.nbt, "acc_out") + (-external).max(0) as u64;
+    }
     let sides = sides_of(&entity.nbt, Transmission::Energy);
+    let outputs = DIRECTIONS.into_iter().enumerate().filter(|(i, _)| sides.get(*i) == mekanism_core::sides::SideMode::Output).count();
+    // Only a tick that moved something or has an output to feed works the slots (`MatrixEnergyContainer.tick`).
+    if is_master && (queued_in != queued_out || outputs > 0) {
+        let mut stored = get_long(&entity.nbt, "energy").min(capacity);
+        // The first slot charges its item from the matrix, the second empties its item into it (or converts it).
+        let mut source = EnergyContainer::new(capacity, u64::MAX);
+        source.stored = stored.min(rate.saturating_sub(queued_out));
+        let before = source.stored;
+        charge_slot(entity, 0, &mut source);
+        let moved = before - source.stored;
+        stored -= moved;
+        queued_out += moved;
+        let mut target = EnergyContainer::new(capacity.min(stored.saturating_add(rate.saturating_sub(queued_in))), u64::MAX);
+        target.stored = stored;
+        discharge_slot(entity, 1, &mut target);
+        queued_in += target.stored - stored;
+        put_long(&mut entity.nbt, "energy", target.stored);
+    }
     for (i, (_, d)) in DIRECTIONS.into_iter().enumerate() {
         if sides.get(i) != mekanism_core::sides::SideMode::Output {
             continue;
         }
-        // Draw up to the rate from the matrix, offer it out of this face, and put back what is left.
-        let draw = |stored: u64| stored.min(rate);
+        // Draw what is left of the rate from the matrix, offer it out of this face, and put back what is left.
         let mut out = EnergyContainer::new(rate, u64::MAX);
         if is_master {
             let stored = get_long(&entity.nbt, "energy").min(capacity);
-            out.stored = draw(stored);
+            out.stored = stored.min(rate.saturating_sub(queued_out));
             put_long(&mut entity.nbt, "energy", stored - out.stored);
         } else {
             out.stored = game
                 .native_with_mod_block_entity(master, |m| {
                     let stored = get_long(&m.nbt, "energy");
-                    put_long(&mut m.nbt, "energy", stored - draw(stored));
-                    draw(stored)
+                    let drawn = stored.min(rate.saturating_sub(get_long(&m.nbt, "acc_out")));
+                    put_long(&mut m.nbt, "energy", stored - drawn);
+                    add_count(&mut m.nbt, "acc_out", drawn);
+                    drawn
                 })
                 .unwrap_or(0);
         }
         if out.stored == 0 {
             continue;
         }
+        let drawn = out.stored;
         push_energy(game, pos, &mut out, Some(d), false);
         let left = out.stored;
         if is_master {
             let stored = get_long(&entity.nbt, "energy");
             put_long(&mut entity.nbt, "energy", stored + left);
+            queued_out += drawn - left;
         } else {
             game.native_with_mod_block_entity(master, |m| {
                 let stored = get_long(&m.nbt, "energy");
                 put_long(&mut m.nbt, "energy", stored + left);
+                let out = get_long(&m.nbt, "acc_out");
+                put_long(&mut m.nbt, "acc_out", out.saturating_sub(left));
             });
         }
+    }
+    if is_master {
+        let held = get_long(&entity.nbt, "energy").min(capacity);
+        put_long(&mut entity.nbt, "last_in", queued_in);
+        put_long(&mut entity.nbt, "last_out", queued_out);
+        put_long(&mut entity.nbt, "acc_in", 0);
+        put_long(&mut entity.nbt, "acc_out", 0);
+        put_long(&mut entity.nbt, "prev_e", held);
     }
 }
 
@@ -7009,6 +7085,8 @@ enum PowerBar {
     Gauge([f32; 2]),
     /// A small-medium energy gauge (`GuiEnergyGauge` with `GaugeType.SMALL_MED`).
     SmallGauge([f32; 2]),
+    /// An energy gauge of its own size (`GuiEnergyGauge` with a width and a height).
+    Sized([f32; 2], [f32; 2]),
 }
 
 /// Everything a Mekanism screen draws for a block: its slots (None hides one the block does not use),
@@ -7352,7 +7430,15 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Gauge([55.0, 18.0])),
             progress: None,
         },
-        Kind::InductionPort | Kind::Laser | Kind::LaserAmplifier => Layout {
+        // `GuiInductionMatrix`: the medium energy gauge, and the two slots in the element holder (the stats
+        // gauges carry the last input and output and the make-up of the matrix; they are never drawn).
+        Kind::InductionPort => Layout {
+            slots: [Some(([146.0, 21.0], "slot/inner_holder_slot")), Some(([146.0, 51.0], "slot/inner_holder_slot")), None],
+            gauges: vec![gauge("stats_a", 1 << 58, 0.0, 0.0, SMALL), gauge("stats_b", 1 << 58, 0.0, 0.0, SMALL)],
+            power: Some(PowerBar::Sized([7.0, 16.0], [34.0, 56.0])),
+            progress: None,
+        },
+        Kind::Laser | Kind::LaserAmplifier => Layout {
             slots: [None; 3],
             gauges: vec![],
             power: Some(PowerBar::Gauge([55.0, 18.0])),
@@ -7543,6 +7629,17 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
             let p = fusion_plasma(&entity.nbt);
             tank = ChemicalTank::new(g.capacity);
             tank.insert("minecraft:lava", (if g.key == "plasma" { p.plasma } else { p.case }).max(0.0) as u64);
+        }
+        if g.key.starts_with("stats_") && kind(&entity.id) == Some(Kind::InductionPort) {
+            tank = ChemicalTank::new(g.capacity);
+            if g.key == "stats_a" {
+                // The last input in the amount and the last output in the capacity.
+                tank.insert("minecraft:lava", get_long(&entity.nbt, "last_in"));
+                tank.capacity = get_long(&entity.nbt, "last_out");
+            } else {
+                let n = |key: &str| get_long(&entity.nbt, key);
+                tank.insert("minecraft:lava", n("cells") & 0x1FFF | (n("providers") & 0x1FFF) << 13 | (n("dx") & 0x1F) << 26 | (n("dy") & 0x1F) << 31 | (n("dz") & 0x1F) << 36);
+            }
         }
         if g.key == "water" && kind(&entity.id) == Some(Kind::Evaporation) {
             tank.capacity = evap::input_capacity(get_int(&entity.nbt, "height"));
@@ -8392,6 +8489,11 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
         // The dynamic tank's output slot only gives (`OutputInventorySlot`).
         if kind(block) == Some(Kind::DynamicValve) {
             rules[1] = SlotRule::Refuse;
+        }
+        // `EnergyInventorySlot.drain` takes what can be charged, `fillOrConvert` what holds energy or turns into it.
+        if kind(block) == Some(Kind::InductionPort) {
+            rules[0] = energy();
+            rules[1] = convert();
         }
         let extra = extra_slots(block);
         if !extra.is_empty() {
@@ -9399,7 +9501,16 @@ fn multiblock_lines(block: &str, data: &[i32]) -> Vec<String> {
         Some(Kind::BoilerValve) => vec![],
         // The turbine's screen draws its own inner screen (`GuiIndustrialTurbine`).
         Some(Kind::TurbineValve) => vec![],
-        Some(Kind::InductionPort) => vec![format!("Max I/O: {}/t", fe(usage))],
+        // `GuiInductionMatrix`'s inner screen.
+        Some(Kind::InductionPort) => {
+            let (input, output) = matrix_flow(data);
+            vec![
+                format!("Energy: {}", fe(read_wide(data, DATA_STORED))),
+                format!("Capacity: {}", fe(read_wide(data, DATA_CAPACITY))),
+                format!("Input: {}/t", fe(input)),
+                format!("Output: {}/t", fe(output)),
+            ]
+        }
         // `GuiDynamicTank`: what the tank holds, then its capacity.
         Some(Kind::DynamicValve) => {
             let (amount, capacity) = (read_wide(data, DATA_GAUGES), read_wide(data, DATA_GAUGES + 4));
@@ -9466,7 +9577,7 @@ pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32;
     if kind(block) == Some(Kind::FusionPort) && fusion_click(game, block, at, right) {
         return;
     }
-    if matches!(kind(block), Some(Kind::BoilerValve | Kind::TurbineValve)) && !right && inside(at, STATS_TAB_BUTTON) {
+    if matches!(kind(block), Some(Kind::BoilerValve | Kind::TurbineValve | Kind::InductionPort)) && !right && inside(at, STATS_TAB_BUTTON) {
         if STATS_VIEW.get().is_some() {
             STATS_VIEW.set(None);
         } else if let Some((x, y, z)) = game.container {
@@ -9474,7 +9585,7 @@ pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32;
         }
         return;
     }
-    if boiler_stats_open(block) || turbine_stats_open(block) {
+    if boiler_stats_open(block) || turbine_stats_open(block) || matrix_stats_open(block) {
         return;
     }
     if kind(block) == Some(Kind::FissionPort) {
@@ -9862,6 +9973,7 @@ fn power_rect(p: PowerBar) -> [f32; 4] {
         PowerBar::Horizontal([x, y]) => [x, y, 54.0, 6.0],
         PowerBar::Gauge([x, y]) => [x, y, WIDE[0], WIDE[1]],
         PowerBar::SmallGauge([x, y]) => [x, y, SMALL_MED[0], SMALL_MED[1]],
+        PowerBar::Sized([x, y], [w, h]) => [x, y, w, h],
     }
 }
 
@@ -9949,6 +10061,8 @@ fn extras(block: &str) -> Extras {
         Some(Kind::Heater) => Extras { screen: Some([48.0, 23.0, 80.0, 42.0]), ..none },
         // `GuiDynamicTank`: the screen, and the arrow from the container slot to the output.
         Some(Kind::DynamicValve) => Extras { screen: Some([49.0, 21.0, 84.0, 46.0]), arrows: vec![[150.0, 39.0]], ..none },
+        // `GuiInductionMatrix`: the same screen, no arrow.
+        Some(Kind::InductionPort) => Extras { screen: Some([49.0, 21.0, 84.0, 46.0]), ..none },
         Some(Kind::BioGenerator) => Extras { screen: Some([48.0, 23.0, 80.0, 40.0]), ..none },
         Some(Kind::Wind) => Extras { screen: Some([48.0, 21.0, 80.0, 44.0]), ..none },
         Some(Kind::Solar(..)) => Extras { screen: Some([40.0, 23.0, 96.0, 40.0]), ..none },
@@ -10442,6 +10556,80 @@ fn draw_turbine_stats(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
     text(batch, &format!("Max Water Output: {} mB/t", thousands(condensers * turbine::CONDENSER_RATE)), 6.0, 113.0, g, false);
 }
 
+/// The matrix's last input and output (the first stats gauge's amount and capacity).
+fn matrix_flow(data: &[i32]) -> (u64, u64) {
+    (read_wide(data, DATA_GAUGES), read_wide(data, DATA_GAUGES + 4))
+}
+
+fn matrix_stats_open(block: &str) -> bool {
+    kind(block) == Some(Kind::InductionPort) && STATS_VIEW.get().is_some()
+}
+
+/// A `GuiVerticalRateBar` at (x, 13): the base and the bar filled to `level`.
+fn draw_rate_bar(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2], x: f32, level: f64) {
+    let [ox, oy] = origin;
+    nine_slice(game, batch, "bar/base", 5.0, 1.0, [ox + x, oy + 13.0, 6.0, 58.0]);
+    let h = (level.clamp(0.0, 1.0) * 56.0).floor() as f32;
+    if h > 0.0 {
+        sprite(game, batch, "bar/vertical_rate", [0.0, 56.0 - h, 4.0, h], [ox + x + 1.0, oy + 14.0 + 56.0 - h, 4.0, h]);
+    }
+}
+
+/// The rate bars' fill: `MathUtils.divideToLevel(value, transferCap)`.
+fn matrix_level(value: u64, cap: u64) -> f64 {
+    if cap == 0 { 0.0 } else { (value as f64 / cap as f64).min(1.0) }
+}
+
+/// `GuiMatrixStats`.
+fn draw_matrix_stats(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 176.0, 166.0]);
+    draw_stats_tab(game, batch, origin, "transmission/energy");
+    sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
+    let title = game.native_screen_title().unwrap_or_default();
+    // `titleLabelY -= 1`.
+    centred(game, batch, &title, ox, 176.0, oy + 3.0, 0x40_4040);
+    let (stored, capacity) = (read_wide(data, DATA_STORED), read_wide(data, DATA_CAPACITY));
+    let (input, output) = matrix_flow(data);
+    let transfer = read_wide(data, DATA_USAGE);
+    let texture = format!("{SPRITES_ROOT}gauge_fluid/energy");
+    draw_data_gauge(game, batch, origin, [6.0, 13.0], STANDARD, if capacity == 0 { 0.0 } else { stored as f32 / capacity as f32 }, (&texture, 0xFFFF_FFFF));
+    draw_rate_bar(game, batch, origin, 30.0, matrix_level(input, transfer));
+    draw_rate_bar(game, batch, origin, 38.0, matrix_level(output, transfer));
+    let fe = mekanism_core::energy::format_fe;
+    let (make, _, _) = fusion_gauge(data, 1);
+    let (cells, providers, dims) = (make & 0x1FFF, make >> 13 & 0x1FFF, [make >> 26 & 0x1F, make >> 31 & 0x1F, make >> 36 & 0x1F]);
+    let mut text = |t: &str, x: f32, y: f32, rgb: u32| game.native_text(batch, t, [ox + x, oy + y], rgb, false);
+    // `drawScrollingString` at x + 8 for each; the subheadings are 0x787878.
+    text("Input", 53.0, 26.0, 0x78_7878);
+    text(&format!("{}/{}", fe(input), fe(transfer)), 59.0, 35.0, 0x40_4040);
+    text("Output", 53.0, 46.0, 0x78_7878);
+    text(&format!("{}/{}", fe(output), fe(transfer)), 59.0, 55.0, 0x40_4040);
+    text("Dimensions:", 8.0, 82.0, 0x78_7878);
+    text(&format!("{} x {} x {}", dims[0], dims[1], dims[2]), 14.0, 91.0, 0x40_4040);
+    text("Constituents:", 8.0, 102.0, 0x78_7878);
+    text(&format!("{cells} cells"), 14.0, 111.0, 0x40_4040);
+    text(&format!("{providers} providers"), 14.0, 120.0, 0x40_4040);
+}
+
+fn matrix_tooltip(data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
+    let fe = mekanism_core::energy::format_fe;
+    let (input, output) = matrix_flow(data);
+    if inside(at, STATS_TAB_BUTTON) {
+        lines.push("Main".to_owned());
+    } else if inside(at, [-26.0, 137.0, 26.0, 26.0]) {
+        lines.push(format!("Storing: {}/{}", fe(read_wide(data, DATA_STORED)), fe(read_wide(data, DATA_CAPACITY))));
+        lines.push(format!("Input: {}/t", fe(input)));
+        lines.push(format!("Output: {}/t", fe(output)));
+    } else if inside(at, [30.0, 13.0, 6.0, 58.0]) {
+        lines.push(format!("Receiving: {}/t", fe(input)));
+    } else if inside(at, [38.0, 13.0, 6.0, 58.0]) {
+        lines.push(format!("Outputting: {}/t", fe(output)));
+    } else if inside(at, [6.0, 13.0, STANDARD[0], STANDARD[1]]) {
+        lines.push(format!("{} / {} FE", read_wide(data, DATA_STORED), read_wide(data, DATA_CAPACITY)));
+    }
+}
+
 fn boiler_stats_open(block: &str) -> bool {
     kind(block) == Some(Kind::BoilerValve) && STATS_VIEW.get().is_some()
 }
@@ -10766,9 +10954,9 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
             let at = |dy: f32, step: f32| [ox + x + pad, oy + y + dy + step * i as f32];
             match kind(block) {
                 // `GuiInnerScreen.defaultFormat`: 5 px in, 0.8 scale, 2 px between the lines, centred in the screen.
-                Some(Kind::BioGenerator | Kind::Wind | Kind::Solar(..) | Kind::DynamicValve) => {
-                    // `.spacing(1)` on the tank's screen: a line is 9 px and 1 px apart there, 2 px elsewhere.
-                    let gap = if kind(block) == Some(Kind::DynamicValve) { 1.0 } else { 2.0 };
+                Some(Kind::BioGenerator | Kind::Wind | Kind::Solar(..) | Kind::DynamicValve | Kind::InductionPort) => {
+                    // `.spacing(1)` on the tank's and the matrix's screens: a line is 9 px and 1 px apart there, 2 px elsewhere.
+                    let gap = if matches!(kind(block), Some(Kind::DynamicValve | Kind::InductionPort)) { 1.0 } else { 2.0 };
                     let n = screen_lines(block, data).len() as f32;
                     let top = ((h - ((9.0 + gap) * n - gap)) / 2.0).floor();
                     let red = kind(block) == Some(Kind::Wind) && i == 2;
@@ -10846,6 +11034,10 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
         draw_boiler_stats(game, batch, data, origin);
         return;
     }
+    if matrix_stats_open(block) {
+        draw_matrix_stats(game, batch, data, origin);
+        return;
+    }
     if turbine_stats_open(block) {
         draw_turbine_stats(game, batch, data, origin);
         return;
@@ -10915,7 +11107,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         }
     }
     // `GuiElementHolder` (141, 16, 26, 56) behind the dynamic tank's two container slots.
-    if kind(block) == Some(Kind::DynamicValve) {
+    if matches!(kind(block), Some(Kind::DynamicValve | Kind::InductionPort)) {
         nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, [ox + 141.0, oy + 16.0, 26.0, 56.0], 0xFFFF_FFFF);
     }
     let warn = warning_bits(block, &l, data);
@@ -10936,6 +11128,11 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         // `SlotOverlay.MINUS` on the fuel slot (`fuelSlot.setSlotOverlay`).
         if i == 1 && kind(block) == Some(Kind::GasGenerator) {
             sprite(game, batch, "slot/overlay/minus", [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
+        }
+        // `SlotOverlay.PLUS` on the matrix's charge slot, `MINUS` on its discharge slot.
+        if i < 2 && kind(block) == Some(Kind::InductionPort) {
+            let overlay = if i == 0 { "slot/overlay/plus" } else { "slot/overlay/minus" };
+            sprite(game, batch, overlay, [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
         }
     }
     // `renderInventoryTextAndOther`: the gas burn rate, right aligned beside the inventory label.
@@ -11044,6 +11241,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         // `GuiEnergyGauge` fills with Mekanism's energy texture.
         Some(PowerBar::Gauge(at)) => gauge(batch, at, WIDE, energy, (&format!("{SPRITES_ROOT}gauge_fluid/energy"), 0xFFFF_FFFF)),
         Some(PowerBar::SmallGauge(at)) => gauge(batch, at, SMALL_MED, energy, (&format!("{SPRITES_ROOT}gauge_fluid/energy"), 0xFFFF_FFFF)),
+        Some(PowerBar::Sized(at, size)) => gauge(batch, at, size, energy, (&format!("{SPRITES_ROOT}gauge_fluid/energy"), 0xFFFF_FFFF)),
         None => {}
     }
     if kind(block) == Some(Kind::Nucleosynthesizer) {
@@ -11127,6 +11325,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         if h > 0.0 {
             sprite(game, batch, "bar/vertical_rate", [0.0, 56.0 - h, 4.0, h], [ox + 41.0, oy + 14.0 + 56.0 - h, 4.0, h]);
         }
+    }
+    if kind(block) == Some(Kind::InductionPort) && get(0) > 0.0 {
+        draw_stats_tab(game, batch, origin, "button/stats");
     }
     if kind(block) == Some(Kind::BoilerValve) && get(0) > 0.0 {
         draw_stats_tab(game, batch, origin, "button/stats");
@@ -11320,6 +11521,24 @@ pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f3
     }
     if kind(block) == Some(Kind::FusionPort) && fusion_tooltip(block, data, at, lines) {
         return;
+    }
+    if kind(block) == Some(Kind::InductionPort) {
+        if matrix_stats_open(block) {
+            matrix_tooltip(data, at, lines);
+            return;
+        }
+        if inside(at, STATS_TAB_BUTTON) {
+            lines.push("Matrix Statistics".to_owned());
+            return;
+        }
+        if inside(at, [-26.0, 137.0, 26.0, 26.0]) {
+            let fe = mekanism_core::energy::format_fe;
+            let (input, output) = matrix_flow(data);
+            lines.push(format!("Storing: {}/{}", fe(read_wide(data, DATA_STORED)), fe(read_wide(data, DATA_CAPACITY))));
+            lines.push(format!("Input: {}/t", fe(input)));
+            lines.push(format!("Output: {}/t", fe(output)));
+            return;
+        }
     }
     if kind(block) == Some(Kind::TurbineValve) && turbine_stats_open(block) {
         if inside(at, STATS_TAB_BUTTON) {
