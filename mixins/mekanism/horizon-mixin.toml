@@ -445,3 +445,14 @@ bindings = [
   { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
   { name = "texts", ty = "&mut Vec<crate::game::native_hooks::NativeWorldText>", value = "&mut *texts" },
 ]
+
+[[injection]]
+id = "world-quads"
+hook = "world_quads"
+hook_version = 1
+kind = "HEAD"
+helper = "world_quads.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "quads", ty = "&mut Vec<crate::game::native_hooks::NativeWorldQuad>", value = "&mut *quads" },
+]

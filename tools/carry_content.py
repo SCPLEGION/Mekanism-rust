@@ -426,6 +426,7 @@ def build_module(ns, out):
     search = [d for m in MODULE_OF.values() for d in (SRC / m / "resources" / "assets",)]
     search += [SRC / "datagen" / "generated" / n / "assets" for n in NAMESPACES]
     report["composite_models"] = flatten_models.flatten_tree(out / "assets" / ns, search)
+    report["sps_textures"] = sps_textures(ns, out, search)
     if ns == "mekanismgenerators":
         # The turbine's blades (`ModelTurbine`): one pair of rings per blade index.
         turbine_png = next((d / ns / "render/turbine.png" for d in search if (d / ns / "render/turbine.png").is_file()), None)
@@ -615,6 +616,27 @@ def first_frame_png(data, size):
         if kind in (b"PLTE", b"tRNS"):
             out += chunk(kind, body)
     return out + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b"")
+
+
+def sps_textures(ns, out, search):
+    """The SPS's effects (`RenderSPS`) as GUI sprites for the native quads: the core's 4 x 4 sheet cut into
+    sixteen 64 px frames (`sps_core_N`) and the orbiting speck (`sps_orbit`)."""
+    if ns != "mekanism":
+        return 0
+    sheet = next((d / ns / "render/energy_effect.png" for d in search if (d / ns / "render/energy_effect.png").is_file()), None)
+    orbit = next((d / ns / "render/sps_orbit_effect.png" for d in search if (d / ns / "render/sps_orbit_effect.png").is_file()), None)
+    if sheet is None or orbit is None:
+        return 0
+    from PIL import Image
+    dst = out / "assets" / ns / "textures/gui"
+    dst.mkdir(parents=True, exist_ok=True)
+    image = Image.open(sheet).convert("RGBA")
+    cell = image.width // 4
+    for n in range(16):
+        x, y = n % 4 * cell, n // 4 * cell
+        image.crop((x, y, x + cell, y + cell)).resize((64, 64), Image.LANCZOS).save(dst / f"sps_core_{n}.png")
+    shutil.copyfile(orbit, dst / "sps_orbit.png")
+    return 17
 
 
 def gauge_textures(ns, out):
