@@ -182,6 +182,20 @@ pub const OXIDIZER_USAGE: u64 = 15;
 pub const OXIDIZER_TICKS: u32 = 100;
 pub const OXIDIZER_TANK: u64 = 10_000;
 
+/// `TileEntityPigmentExtractor`: 5 FE a tick for 100 ticks, into a 20,000 mB tank.
+pub const PIGMENT_EXTRACTOR_USAGE: u64 = 5;
+pub const PIGMENT_EXTRACTOR_TICKS: u32 = 100;
+pub const PIGMENT_EXTRACTOR_TANK: u64 = 20_000;
+
+/// `TileEntityPaintingMachine`: 5 FE a tick for 200 ticks, a 15,000 mB pigment tank.
+pub const PAINTING_USAGE: u64 = 5;
+pub const PAINTING_TICKS: u32 = 200;
+pub const PAINTING_TANK: u64 = 15_000;
+
+/// `TileEntityPigmentMixer`: 5 FE a tick, 1,000 mB input tanks and a 2,000 mB output tank.
+pub const PIGMENT_MIXER_USAGE: u64 = 5;
+pub const PIGMENT_MIXER_TANK: u64 = 1_000;
+
 /// `TileEntityNutritionalLiquifier`: 8 FE a tick for 100 ticks, into a 10,000 mB tank; food gives 50 mB of
 /// paste a point of nutrition.
 pub const LIQUIFIER: &str = "mekanism:nutritional_liquifier";

@@ -177,6 +177,12 @@ DISASSEMBLER_TOOL = {
 
 _SHAPES = None
 FACING4 = ("north", "east", "south", "west")
+ALL6 = FACING4 + ("up", "down")
+SIX_FACING_TEMPLATE = "minecraft:barrel"
+
+
+def faces_vertically(blockstate):
+    return any("facing=up" in key or "facing=down" in key for key in blockstate.get("variants", {}))
 # Blocks Mekanism registers with noOcclusion(): they hide nothing behind them.
 SEE_THROUGH = ("structural_glass", "reactor_glass", "laser_focus_matrix", "nutritional_liquifier")
 
@@ -202,6 +208,8 @@ def shape_declaration(ns, name, declaration, report):
     if shape and "shapes" not in declaration and template != "minecraft:lever":
         if "all" in shape:
             declaration["shape"] = shape["all"]
+        elif template == SIX_FACING_TEMPLATE and all(d in shape["facing"] for d in ALL6):
+            declaration["shapes"] = {"property": "facing", "values": {d: shape["facing"][d] for d in ALL6}}
         elif template == "minecraft:furnace":
             declaration["shapes"] = {"property": "facing", "values": {d: shape["facing"][d] for d in FACING4}}
         elif template == "minecraft:amethyst_cluster":
@@ -460,9 +468,14 @@ def build_module(ns, out):
         blocks.add(name)
         blockstate = json.loads(path.read_text())
         template = block_template(name, blockstate)
-        if template == "minecraft:furnace":
-            # The furnace's `lit` stands in for Mekanism's `active`: same meaning, same two values.
-            path.write_text(json.dumps(rename_property(blockstate, "active", "lit"), indent=2) + "\n")
+        if template == "minecraft:furnace" and faces_vertically(blockstate):
+            # Up and down need six facings: the barrel has them (and `open` where the furnace has `lit`).
+            template = SIX_FACING_TEMPLATE
+            report["six_facings"] = report.get("six_facings", 0) + 1
+        if template in ("minecraft:furnace", SIX_FACING_TEMPLATE):
+            # The template's `lit` (a barrel's `open`) stands in for Mekanism's `active`: same meaning, same two values.
+            state = "lit" if template == "minecraft:furnace" else "open"
+            path.write_text(json.dumps(rename_property(blockstate, "active", state), indent=2) + "\n")
             report["active_as_lit"] = report.get("active_as_lit", 0) + 1
         if template == "minecraft:lever":
             path.write_text(json.dumps(lever_blockstate(name, blockstate, ns), indent=2) + "\n")

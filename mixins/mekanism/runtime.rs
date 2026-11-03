@@ -22,6 +22,8 @@ use mekanism_core::entangloporter::{self as qe, Frequency};
 use mekanism_core::sorter::{self, Sorter};
 use mekanism_core::oredictionificator as od;
 use mekanism_core::formulaic as fa;
+use mekanism_core::stabilizer as st;
+use mekanism_core::security as sec;
 use mekanism_core::plenisher::{self, Plenisher, Spot};
 use mekanism_core::fission;
 use mekanism_core::frequency as freq;
@@ -67,9 +69,15 @@ enum Kind {
     /// A pressurized tube and the mB it carries in a tick.
     Tube(u64),
     Oxidizer,
+    /// A Pigment Extractor: an item into pigment, as the oxidizer makes gas.
+    PigmentExtractor,
     /// A purification chamber or osmium compressor: an item and a chemical each tick.
     Advanced(&'static chem::AdvancedMachine),
     ChemicalInfuser,
+    /// A Painting Machine: an item and pigment into a dyed item.
+    Painting,
+    /// A Pigment Mixer: two pigments into a third, as the chemical infuser does.
+    PigmentMixer,
     /// A Thermal Evaporation Plant's controller; the tower's other blocks have no block entity.
     Evaporation,
     /// A Rotary Condensentrator, decondensentrating: a fluid into its chemical.
@@ -114,6 +122,12 @@ enum Kind {
     Liquifier,
     /// The Formulaic Assemblicator: crafts from its stock by an encoded formula.
     Assemblicator,
+    /// The Dimensional Stabilizer: keeps a grid of chunks loaded for energy.
+    Stabilizer,
+    /// The Security Desk: its owner's trusted players and default mode, and the items it locks.
+    SecurityDesk,
+    /// The Modification Station: a module into an item in half a second.
+    ModificationStation,
     /// The Chargepad: charges an item of the player standing on it.
     Chargepad,
     /// The Quantum Entangloporter: shares energy, fluid and chemicals across its frequency.
@@ -194,8 +208,14 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanismgenerators:wind_generator" => return Some(Kind::Wind),
         "mekanismgenerators:gas_burning_generator" => return Some(Kind::GasGenerator),
         "mekanism:chemical_oxidizer" => return Some(Kind::Oxidizer),
+        "mekanism:pigment_extractor" => return Some(Kind::PigmentExtractor),
+        "mekanism:pigment_mixer" => return Some(Kind::PigmentMixer),
+        "mekanism:painting_machine" => return Some(Kind::Painting),
         chem::LIQUIFIER => return Some(Kind::Liquifier),
         fa::BLOCK => return Some(Kind::Assemblicator),
+        st::BLOCK => return Some(Kind::Stabilizer),
+        sec::DESK => return Some(Kind::SecurityDesk),
+        modules::STATION => return Some(Kind::ModificationStation),
         "mekanism:chemical_infuser" => return Some(Kind::ChemicalInfuser),
         "mekanism:antiprotonic_nucleosynthesizer" => return Some(Kind::Nucleosynthesizer),
         teleporter::TELEPORTER => return Some(Kind::Teleporter),
@@ -361,7 +381,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         return;
     }
     // The machines whose only slot is the energy slot (`EnergyInventorySlot`), which automation fills.
-    if matches!(kind(block), Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer)) {
+    if matches!(kind(block), Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::PigmentMixer | Kind::Washer | Kind::Stabilizer)) {
         // Their energy slot and chemical slots: a hopper's five slots, which the furnace's roles would spoil.
         let used: Vec<usize> = (0..3).filter(|&i| layout(block).is_some_and(|l| l.slots[i].is_some())).chain(3..3 + extra_slots(block).len()).collect();
         *container = Some(ModContainer {
@@ -384,6 +404,28 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             inputs: stock.into_iter().chain([fa::ENERGY_SLOT]).collect(),
             outputs,
             menu: Some("minecraft:generic_9x4".into()),
+        });
+        return;
+    }
+    // The module slot, the item to fit it into and the energy slot.
+    if kind(block) == Some(Kind::ModificationStation) {
+        *container = Some(ModContainer {
+            slots: 3,
+            faces: std::array::from_fn(|_| vec![0, 1, 2]),
+            inputs: vec![0, 1, 2],
+            outputs: vec![1],
+            menu: Some("minecraft:furnace".into()),
+        });
+        return;
+    }
+    // The desk's unlock and lock slots.
+    if kind(block) == Some(Kind::SecurityDesk) {
+        *container = Some(ModContainer {
+            slots: 3,
+            faces: std::array::from_fn(|_| vec![0, 1]),
+            inputs: vec![0, 1],
+            outputs: vec![0, 1],
+            menu: Some("minecraft:furnace".into()),
         });
         return;
     }
@@ -419,7 +461,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::Solar(..)) if block.ends_with("advanced_solar_generator") => (vec![0], vec![]),
         // The oxidizer's item goes in the first slot; the separator takes water buckets there and gives
         // the empty buckets back in the last.
-        Some(Kind::Oxidizer | Kind::Dissolution) => (vec![0, 1], vec![]),
+        Some(Kind::Oxidizer | Kind::PigmentExtractor | Kind::Dissolution) => (vec![0, 1], vec![]),
         // The food in the first slot, the energy slot, the item it leaves in the last (and a bucket's two slots after).
         Some(Kind::Liquifier) => (vec![0, 1], vec![2]),
         // The crystallizer's crystals come out of the last slot.
@@ -438,7 +480,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::Pump | Kind::Plenisher) => (vec![0, 2], vec![1]),
         Some(Kind::Rotary) => (vec![0, 1], vec![2]),
         // The item to infuse in the first slot, the infuse item (coal, redstone...) in the middle one.
-        Some(Kind::Infuser) => (vec![0, 1], vec![2]),
+        Some(Kind::Infuser | Kind::Painting) => (vec![0, 1], vec![2]),
         // An energy cube's charge slot (top) and discharge slot (bottom).
         Some(Kind::EnergyCube(_)) => (vec![0, 1], vec![]),
         // The fluid tank's bucket slot and the output slot under it.
@@ -542,9 +584,13 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 tick_cable(game, pos, entity, rate);
                 None
             }
-            Kind::Oxidizer => tick_oxidizer(game, pos, entity),
+            Kind::Oxidizer => tick_oxidizer(game, pos, entity, false),
+            Kind::PigmentExtractor => tick_oxidizer(game, pos, entity, true),
             Kind::Liquifier => tick_liquifier(game, pos, entity),
             Kind::Assemblicator => tick_assemblicator(game, pos, entity),
+            Kind::Stabilizer => tick_stabilizer(game, pos, entity),
+            Kind::SecurityDesk => tick_security_desk(entity),
+            Kind::ModificationStation => tick_station(game, pos, entity),
             Kind::Dissolution => tick_dissolution(game, pos, entity),
             Kind::Centrifuge => tick_centrifuge(game, pos, entity),
             Kind::FissionPort => {
@@ -586,7 +632,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 tick_teleporter(game, pos, entity);
                 None
             }
-            Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
+            Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity, false),
+            Kind::PigmentMixer => tick_chemical_infuser(game, pos, entity, true),
             Kind::Evaporation => tick_evaporation(game, pos, entity),
             Kind::Rotary => tick_rotary(game, pos, entity),
             Kind::Transporter(pull) => {
@@ -598,6 +645,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::Infuser => tick_infuser(game, entity),
+            Kind::Painting => tick_painting(game, entity),
             Kind::Separator => tick_separator(game, pos, entity),
             Kind::GasGenerator => tick_gas_generator(game, pos, entity),
             Kind::ChemicalTank(t) => {
@@ -655,6 +703,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     sorter_sync(game, pos, entity);
     od_sync(game, pos, entity);
     miner_sync(game, pos, entity);
+    security_sync(game, pos, entity);
     multiblock_data(game, pos, entity);
     if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Pipe(_)) {
         show_connections(game, pos, entity);
@@ -662,8 +711,14 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     if let Some(active) = active {
         let lit = if active { "true" } else { "false" };
         // Blocks without the furnace's `lit` (the solar generator's iron block) show no state.
-        if game.native_block_property(pos, "lit").is_some_and(|now| now != lit) {
-            game.native_set_block_property(pos, "lit", lit);
+        // (A barrel-based machine, one that faces up or down, has `open` instead.)
+        for key in ["lit", "open"] {
+            if let Some(now) = game.native_block_property(pos, key) {
+                if now != lit {
+                    game.native_set_block_property(pos, key, lit);
+                }
+                break;
+            }
         }
     }
 }
@@ -674,11 +729,13 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
 /// item in it: the item gives its energy to the machine's buffer before the machine runs.
 fn discharge_energy_slot(entity: &mut ModBlockEntity) {
     let index = match kind(&entity.id) {
-        Some(Kind::Oxidizer | Kind::Dissolution | Kind::Crystallizer | Kind::Separator | Kind::Rotary | Kind::Liquifier) => 1,
-        Some(Kind::Machine("combining", _) | Kind::Advanced(_) | Kind::Infuser | Kind::Nucleosynthesizer) => 3,
+        Some(Kind::Oxidizer | Kind::PigmentExtractor | Kind::Dissolution | Kind::Crystallizer | Kind::Separator | Kind::Rotary | Kind::Liquifier) => 1,
+        Some(Kind::Machine("combining", _) | Kind::Advanced(_) | Kind::Infuser | Kind::Painting | Kind::Nucleosynthesizer) => 3,
         Some(Kind::Pump | Kind::Plenisher) => 2,
         Some(Kind::Assemblicator) => fa::ENERGY_SLOT,
-        Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer | Kind::Heater | Kind::Vibrator) => 0,
+        Some(Kind::ModificationStation) => 2,
+        Some(Kind::Stabilizer) => 0,
+        Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::PigmentMixer | Kind::Washer | Kind::Heater | Kind::Vibrator) => 0,
         _ => return,
     };
     let capacity = energy_capacity(entity);
@@ -1675,6 +1732,23 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
         Kind::Tube(rate) if !from_tube => Some(("chemical", rate)),
         Kind::ChemicalTank(t) if d != [0, 1, 0] => Some(("chemical", chem::chemical_tank(t).0)),
         Kind::Advanced(m) if m.chemicals.contains(&chemical) && get_tank(nbt, "chemical", chem::ADVANCED_TANK).accepts(chemical) => Some(("chemical", chem::ADVANCED_TANK)),
+        // The pigment mixer takes the pigments some recipe uses, in the same two tanks.
+        Kind::Painting if mekanism_core::recipes::painting_pigment(chemical) && get_tank(nbt, "pigment", chem::PAINTING_TANK).accepts(chemical) => {
+            Some(("pigment", chem::PAINTING_TANK))
+        }
+        Kind::PigmentMixer if mekanism_core::recipes::pigment_mixing_input(chemical) => {
+            let cap = chem::PIGMENT_MIXER_TANK;
+            let (left, right) = (get_tank(nbt, "left", cap), get_tank(nbt, "right", cap));
+            let holds = |t: &ChemicalTank| t.chemical.as_deref() == Some(chemical);
+            let key = if holds(&left) || (!holds(&right) && left.amount == 0) {
+                "left"
+            } else if holds(&right) || right.amount == 0 {
+                "right"
+            } else {
+                return None;
+            };
+            Some((key, cap))
+        }
         // The chemical infuser fills whichever input tank holds this chemical, else an empty one.
         Kind::ChemicalInfuser if mekanism_core::recipes::infusing_input(chemical) => {
             let cap = chem::CHEMICAL_INFUSER_TANK;
@@ -1833,18 +1907,28 @@ fn push_chemical(
 
 /// The Chemical Oxidizer: an item becomes a chemical over 100 ticks at 15 FE a tick, pushed out to the
 /// tanks beside it.
-fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = chem::OXIDIZER_USAGE * u64::from(chem::OXIDIZER_TICKS);
+fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, pigment: bool) -> Option<bool> {
+    let (usage, ticks, tank_size) = if pigment {
+        (chem::PIGMENT_EXTRACTOR_USAGE, chem::PIGMENT_EXTRACTOR_TICKS, chem::PIGMENT_EXTRACTOR_TANK)
+    } else {
+        (chem::OXIDIZER_USAGE, chem::OXIDIZER_TICKS, chem::OXIDIZER_TANK)
+    };
+    let capacity = usage * u64::from(ticks);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
-    let mut tank = get_tank(&entity.nbt, "output", chem::OXIDIZER_TANK);
+    let mut tank = get_tank(&entity.nbt, "output", tank_size);
     let mut progress = get_int(&entity.nbt, "progress");
     let mut active = false;
     drain_tank_into_item(entity, 3, &mut tank);
     let recipe = entity.items.first().cloned().flatten().and_then(|stack| {
         let items = world_items!(game);
         let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
-        mekanism_core::recipes::find_oxidizing(&stack.item, stack.count, &in_tag).map(|r| (stack, *r))
+        if pigment {
+            mekanism_core::recipes::find_pigment_extracting(&stack.item, stack.count, &in_tag)
+        } else {
+            mekanism_core::recipes::find_oxidizing(&stack.item, stack.count, &in_tag)
+        }
+        .map(|r| (stack, *r))
     });
     let warn = match &recipe {
         None if entity.items.first().is_some_and(|s| s.is_some()) => 8,
@@ -1854,10 +1938,10 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     put_int(&mut entity.nbt, "warn", warn);
     match recipe {
         Some((stack, r)) if tank.accepts(r.output) && tank.amount + r.amount <= tank.capacity => {
-            if energy.consume(chem::OXIDIZER_USAGE) {
+            if energy.consume(usage) {
                 active = true;
                 progress += 1;
-                if progress >= chem::OXIDIZER_TICKS {
+                if progress >= ticks {
                     progress = 0;
                     tank.insert(r.output, r.amount);
                     let left = stack.count - r.input_count;
@@ -1876,7 +1960,7 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
         (energy.stored * 1000 / capacity) as i32,
         1000,
         progress as i32,
-        chem::OXIDIZER_TICKS as i32,
+        ticks as i32,
     ];
     Some(active)
 }
@@ -2310,27 +2394,33 @@ fn tick_nucleosynthesizer(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> O
 /// The Chemical Infuser: one operation a tick of two chemicals into a third (oxygen + sulfur dioxide →
 /// sulfur trioxide), 15 FE a tick, pushed out to the blocks beside it. Each input tank takes one of the
 /// two chemicals (`chemical_receiver`).
-fn tick_chemical_infuser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    let cap = chem::CHEMICAL_INFUSER_TANK;
-    let capacity = machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE;
+fn tick_chemical_infuser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, pigment: bool) -> Option<bool> {
+    let (cap, usage, out_cap) = if pigment {
+        (chem::PIGMENT_MIXER_TANK, chem::PIGMENT_MIXER_USAGE, chem::PIGMENT_MIXER_TANK * 2)
+    } else {
+        (chem::CHEMICAL_INFUSER_TANK, chem::CHEMICAL_INFUSER_USAGE, chem::CHEMICAL_INFUSER_TANK)
+    };
+    let valid = if pigment { mekanism_core::recipes::pigment_mixing_input } else { mekanism_core::recipes::infusing_input };
+    let find = if pigment { mekanism_core::recipes::find_pigment_mixing } else { mekanism_core::recipes::find_chemical_infusing };
+    let capacity = machine::STORAGE_MULTIPLIER * usage;
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut left = get_tank(&entity.nbt, "left", cap);
     let mut right = get_tank(&entity.nbt, "right", cap);
-    let mut out = get_tank(&entity.nbt, "output", cap);
+    let mut out = get_tank(&entity.nbt, "output", out_cap);
     let mut active = false;
-    fill_tank_from_item(entity, 1, &mut left, mekanism_core::recipes::infusing_input);
-    fill_tank_from_item(entity, 2, &mut right, mekanism_core::recipes::infusing_input);
+    fill_tank_from_item(entity, 1, &mut left, valid);
+    fill_tank_from_item(entity, 2, &mut right, valid);
     drain_tank_into_item(entity, 3, &mut out);
     if let (Some(a), Some(b)) = (left.chemical.clone(), right.chemical.clone())
-        && let Some((r, swapped)) = mekanism_core::recipes::find_chemical_infusing(&a, &b)
+        && let Some((r, swapped)) = find(&a, &b)
     {
         let (need_a, need_b) = if swapped { (r.right_amount, r.left_amount) } else { (r.left_amount, r.right_amount) };
         if left.amount >= need_a
             && right.amount >= need_b
             && out.accepts(r.output)
             && out.amount + r.amount <= out.capacity
-            && energy.consume(chem::CHEMICAL_INFUSER_USAGE)
+            && energy.consume(usage)
         {
             left.extract(need_a);
             right.extract(need_b);
@@ -2343,6 +2433,68 @@ fn tick_chemical_infuser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlo
     put_tank(&mut entity.nbt, "left", &left);
     put_tank(&mut entity.nbt, "right", &right);
     put_tank(&mut entity.nbt, "output", &out);
+    Some(active)
+}
+
+/// The Painting Machine: an item and the pigment in the tank become a dyed item after 200 ticks at 5 FE a
+/// tick; the pigment is used when the operation ends (`painting`).
+fn tick_painting(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = chem::PAINTING_USAGE * u64::from(chem::PAINTING_TICKS);
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut tank = get_tank(&entity.nbt, "pigment", chem::PAINTING_TANK);
+    let mut progress = get_int(&entity.nbt, "progress");
+    let mut active = false;
+    let items = world_items!(game);
+    let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
+    fill_tank_from_item(entity, 1, &mut tank, mekanism_core::recipes::painting_pigment);
+    let recipe = match (entity.items.first().cloned().flatten(), tank.chemical.clone()) {
+        (Some(stack), Some(pigment)) => mekanism_core::recipes::find_painting(&stack.item, stack.count, &pigment, &in_tag).map(|r| (stack, *r)),
+        _ => None,
+    };
+    let out = entity.items.get(2).cloned().flatten();
+    let has_input = entity.items.first().is_some_and(|s| s.is_some());
+    let warn = match &recipe {
+        None if has_input && tank.chemical.is_none() => 2,
+        None if has_input => 8,
+        Some((_, r)) => {
+            let max = items.get(r.output).map_or(64, |i| i.max_stack);
+            let fits = out.as_ref().is_none_or(|o| &*o.item == r.output && o.count + r.output_count <= max);
+            u32::from(tank.amount < r.chemical_amount) << 1 | u32::from(!fits) << 2
+        }
+        _ => 0,
+    };
+    put_int(&mut entity.nbt, "warn", warn);
+    match recipe {
+        Some((stack, r)) if tank.amount >= r.chemical_amount => {
+            let max = items.get(r.output).map_or(64, |i| i.max_stack);
+            let fits = out.as_ref().is_none_or(|o| &*o.item == r.output && o.count + r.output_count <= max);
+            if fits && energy.consume(chem::PAINTING_USAGE) {
+                active = true;
+                progress += 1;
+                if progress >= chem::PAINTING_TICKS {
+                    progress = 0;
+                    tank.extract(r.chemical_amount);
+                    let left = stack.count - r.input_count;
+                    entity.items[0] = (left > 0).then(|| ItemStack { count: left, ..stack });
+                    entity.items[2] = Some(match out {
+                        Some(o) => ItemStack { count: o.count + r.output_count, ..o },
+                        None => stack_of(r.output, r.output_count),
+                    });
+                }
+            }
+        }
+        _ => progress = 0,
+    }
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "progress", progress);
+    put_tank(&mut entity.nbt, "pigment", &tank);
+    entity.data = vec![
+        (energy.stored * 1000 / capacity) as i32,
+        1000,
+        progress as i32,
+        chem::PAINTING_TICKS as i32,
+    ];
     Some(active)
 }
 
@@ -3120,6 +3272,8 @@ fn serves(family: &str, kind: Kind) -> bool {
             Kind::Reaction
                 | Kind::Entangloporter
                 | Kind::Oxidizer
+                | Kind::PigmentExtractor
+                | Kind::PigmentMixer
                 | Kind::Advanced(_)
                 | Kind::Nucleosynthesizer
                 | Kind::ChemicalInfuser
@@ -3146,6 +3300,8 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Factory(..)
                 | Kind::HeatGenerator
                 | Kind::Oxidizer
+                | Kind::PigmentExtractor
+                | Kind::PigmentMixer
                 | Kind::Liquifier
                 | Kind::Assemblicator
                 | Kind::Dissolution
@@ -3155,6 +3311,8 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Evaporation
                 | Kind::Rotary
                 | Kind::Infuser
+                | Kind::Painting
+                | Kind::ModificationStation
                 | Kind::EnergyCube(_)
         ),
         _ => false,
@@ -3998,8 +4156,12 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::EnergyCube(t) if facing_away => Some(tier::energy_cube(t)),
         Kind::Cable(rate) if !from_cable => Some((rate, rate)),
         Kind::Oxidizer => Some((chem::OXIDIZER_USAGE * u64::from(chem::OXIDIZER_TICKS), u64::MAX)),
+        Kind::PigmentExtractor => Some((chem::PIGMENT_EXTRACTOR_USAGE * u64::from(chem::PIGMENT_EXTRACTOR_TICKS), u64::MAX)),
+        Kind::PigmentMixer => Some((machine::STORAGE_MULTIPLIER * chem::PIGMENT_MIXER_USAGE, u64::MAX)),
         Kind::Liquifier => Some((chem::LIQUIFIER_USAGE * u64::from(chem::LIQUIFIER_TICKS), u64::MAX)),
         Kind::Assemblicator => Some((asm_capacity(nbt), u64::MAX)),
+        Kind::Stabilizer => Some((st_capacity(nbt), u64::MAX)),
+        Kind::ModificationStation => Some((station_capacity(nbt), u64::MAX)),
         Kind::Dissolution => Some((machine::STORAGE_MULTIPLIER * nuclear::DISSOLUTION_USAGE, u64::MAX)),
         Kind::Centrifuge => Some((machine::STORAGE_MULTIPLIER * nuclear::CENTRIFUGE_USAGE, u64::MAX)),
         Kind::Washer => Some((machine::STORAGE_MULTIPLIER * nuclear::WASHER_USAGE, u64::MAX)),
@@ -4036,6 +4198,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
             Some(if get_long(nbt, "master") == 1 { (get_long(nbt, "capacity"), rate) } else { (rate, rate) })
         }
         Kind::Infuser => Some((chem::INFUSER_USAGE * u64::from(chem::INFUSER_TICKS), u64::MAX)),
+        Kind::Painting => Some((chem::PAINTING_USAGE * u64::from(chem::PAINTING_TICKS), u64::MAX)),
         // An SPS port takes energy in input mode (`TileEntitySPSPort`).
         Kind::SpsPort if get_long(nbt, "output") == 0 => Some((sps::PORT_STORAGE, u64::MAX)),
         Kind::DigitalMiner => {
@@ -4337,7 +4500,7 @@ pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         let stack = match k {
             Kind::EnergyCube(_) => {
                 let energy = get_long(&m.nbt, "energy");
-                (energy > 0).then(|| with_energy(&m.id, energy))?
+                if energy > 0 { with_energy(&m.id, energy) } else if get_string(&m.nbt, "owner").is_some() { stack_of(&m.id, 1) } else { return None }
             }
             // A bin keeps its items and lock (`BinUpgradeData` through its item's components).
             Kind::Bin(t) => {
@@ -4366,6 +4529,7 @@ pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
                 m.items.iter_mut().for_each(|i| *i = None);
                 stack
             }
+            _ if kept_tank(k).is_none() && has_security(&m.id) && get_string(&m.nbt, "owner").is_some() => stack_of(&m.id, 1),
             _ => {
                 let (key, item_key, _) = kept_tank(k)?;
                 let Some(Tag::Compound(tank)) = m.nbt.get(&JavaString::from(key)) else {
@@ -4376,6 +4540,8 @@ pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
                 stack
             }
         };
+        let mut stack = stack;
+        stamp_security(&mut stack, &m.nbt);
         Some((stack, m.items.clone()))
     });
     let Some(Some((stack, items))) = held else {
@@ -4451,16 +4617,19 @@ pub(super) fn place_bounding_blocks(game: &mut Game<'_>, stack: &ItemStack, pos:
     }
 }
 
-/// A machine broken at `pos` takes its bounding blocks with it (`removeBoundingBlocks`).
-pub(super) fn clear_bounding_blocks(game: &mut Game<'_>, pos: [i32; 3]) {
-    if !game.native_on(MOD_ID) {
+/// A machine that stopped being at `pos` (`old`, with its properties) takes its bounding blocks with it
+/// (`removeBoundingBlocks`), whatever removed it: a player, an explosion, a piston, a command.
+pub(super) fn clear_bounding_blocks(
+    game: &mut Game<'_>,
+    pos: [i32; 3],
+    old: &str,
+    old_properties: &std::collections::BTreeMap<String, String>,
+) {
+    if !game.native_on(MOD_ID) || bounding::cells(old).is_none() {
         return;
     }
-    let id = game.native_block(pos);
-    if bounding::cells(&id).is_none() {
-        return;
-    }
-    for (at, bounding_id) in bounding::fill(&id, &machine_facing(game, pos), pos) {
+    let facing = old_properties.get("facing").map_or("north", String::as_str);
+    for (at, bounding_id) in bounding::fill(old, facing, pos) {
         if game.native_block(at) == bounding_id {
             game.native_set_block(at, "minecraft:air", &[]);
         }
@@ -4482,6 +4651,7 @@ pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
     if !game.native_on(MOD_ID) {
         return;
     }
+    sec_placed(game, stack, pos);
     // Personal storage belongs to whoever placed it, unless its item names an owner already.
     if bin::is_personal(&stack.item) {
         let kept = custom_data(stack).and_then(|c| match c.get(&JavaString::from(PERSONAL_KEY)) {
@@ -4669,6 +4839,18 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     }
     if channel == SORTER_CHANNEL && game.native_on(MOD_ID) {
         sorter_payload(game, data);
+        return;
+    }
+    if channel == ST_CHANNEL && game.native_on(MOD_ID) {
+        st_payload(game, data);
+        return;
+    }
+    if channel == STN_CHANNEL && game.native_on(MOD_ID) {
+        stn_payload(game, data);
+        return;
+    }
+    if channel == SEC_CHANNEL && game.native_on(MOD_ID) {
+        sec_payload(game, data);
         return;
     }
     if channel == ASM_CHANNEL && game.native_on(MOD_ID) {
@@ -5599,6 +5781,24 @@ const CHEMICALS: &[(&str, &str, u32)] = &[
     ("mekanismgenerators:deuterium", "Deuterium", 0xFF3232),
     ("mekanismgenerators:tritium", "Tritium", 0x64FF70),
     ("mekanismgenerators:fusion_fuel", "D-T Fuel", 0x7E007D),
+        ("mekanism:aqua", "Aqua", 0x30FFF9),
+        ("mekanism:black", "Black", 0x404040),
+        ("mekanism:blue", "Blue", 0x366BD0),
+        ("mekanism:brown", "Brown", 0xA17649),
+        ("mekanism:cyan", "Cyan", 0x00F3D0),
+        ("mekanism:dark_red", "Dark Red", 0xC9071F),
+        ("mekanism:gray", "Gray", 0x7A7A7A),
+        ("mekanism:green", "Green", 0x59C15F),
+        ("mekanism:light_blue", "Light Blue", 0x559EFF),
+        ("mekanism:light_gray", "Light Gray", 0xCFCFCF),
+        ("mekanism:lime", "Lime", 0x75FF89),
+        ("mekanism:magenta", "Magenta", 0xD55ECB),
+        ("mekanism:orange", "Orange", 0xFFA160),
+        ("mekanism:pink", "Pink", 0xFFBCC4),
+        ("mekanism:purple", "Purple", 0xA460D9),
+        ("mekanism:red", "Red", 0xFF383C),
+        ("mekanism:white", "White", 0xFFFFFF),
+        ("mekanism:yellow", "Yellow", 0xFFDD4F),
 ];
 
 fn chemical_index(id: Option<&str>) -> i32 {
@@ -5682,6 +5882,34 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Horizontal([115.0, 75.0])),
             progress: large_right(64.0, 40.0),
         },
+        // TileEntityPigmentExtractor and GuiPigmentExtractor: the oxidizer's screen.
+        Kind::PigmentExtractor => Layout {
+            slots: [Some(([26.0, 36.0], "slot/normal")), Some(([152.0, 14.0], "slot/power")), None],
+            gauges: vec![gauge("output", chem::PIGMENT_EXTRACTOR_TANK, 131.0, 13.0, STANDARD)],
+            power: Some(PowerBar::Horizontal([115.0, 75.0])),
+            progress: large_right(64.0, 40.0),
+        },
+        // TileEntityDimensionalStabilizer and GuiDimensionalStabilizer: the energy slot and the power bar.
+        Kind::Stabilizer => Layout {
+            slots: [Some(([143.0, 35.0], "slot/power")), None, None],
+            gauges: vec![],
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
+            progress: None,
+        },
+        // TileEntityModificationStation and GuiModificationStation.
+        Kind::ModificationStation => Layout {
+            slots: [Some(([35.0, 118.0], "slot/normal")), Some(([125.0, 118.0], "slot/normal")), Some(([151.0, 21.0], "slot/power"))],
+            gauges: vec![],
+            power: Some(PowerBar::Vertical([156.0, 40.0])),
+            progress: Some(([65.0, 123.0], "progress/large_right", [48.0, 8.0])),
+        },
+        // TileEntitySecurityDesk and GuiSecurityDesk: the unlock slot above the lock slot, on their holder.
+        Kind::SecurityDesk => Layout {
+            slots: [Some(([146.0, 18.0], "slot/inner_holder_slot")), Some(([146.0, 97.0], "slot/inner_holder_slot")), None],
+            gauges: vec![],
+            power: None,
+            progress: None,
+        },
         // TileEntityFormulaicAssemblicator and GuiFormulaicAssemblicator: the formula slot and the first two stock
         // slots; the rest are `extra_slots`.
         Kind::Assemblicator => Layout {
@@ -5760,6 +5988,13 @@ fn layout(block: &str) -> Option<Layout> {
             gauges: vec![],
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
+        },
+        // TileEntityPaintingMachine and GuiPaintingMachine: pigment slot (6, 56), item (45, 35), output (116, 35).
+        Kind::Painting => Layout {
+            slots: [Some(([45.0, 35.0], "slot/normal")), Some(([6.0, 56.0], "slot/normal")), Some(([116.0, 35.0], "slot/output"))],
+            gauges: vec![gauge("pigment", chem::PAINTING_TANK, 25.0, 13.0, STANDARD)],
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
+            progress: large_right(64.0, 39.0),
         },
         // TileEntityMetallurgicInfuser and its screen: the infuse item (17, 35), input (51, 43), output
         // (109, 43), the infusion bar (7, 15).
@@ -5962,6 +6197,17 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Horizontal([115.0, 75.0])),
             progress: None,
         },
+        // GuiPigmentMixer: the chemical infuser's screen with 1,000 mB inputs and a 2,000 mB output.
+        Kind::PigmentMixer => Layout {
+            slots: [Some(([154.0, 14.0], "slot/power")), Some(([6.0, 56.0], "slot/normal")), Some(([154.0, 56.0], "slot/normal"))],
+            gauges: vec![
+                gauge("left", chem::PIGMENT_MIXER_TANK, 25.0, 13.0, STANDARD),
+                gauge("output", chem::PIGMENT_MIXER_TANK * 2, 79.0, 4.0, STANDARD),
+                gauge("right", chem::PIGMENT_MIXER_TANK, 133.0, 13.0, STANDARD),
+            ],
+            power: Some(PowerBar::Horizontal([115.0, 75.0])),
+            progress: None,
+        },
         // GuiChemicalWasher: water, dirty slurry, clean slurry.
         Kind::Washer => Layout {
             slots: [Some(([152.0, 14.0], "slot/power")), Some(([152.0, 56.0], "slot/normal")), None],
@@ -6005,6 +6251,8 @@ fn energy_capacity(entity: &ModBlockEntity) -> u64 {
     match kind(&entity.id) {
         Some(Kind::HeatGenerator) => HeatGenerator::new().energy.capacity,
         Some(Kind::Wind) => mekanism_core::generator::WIND_STORAGE,
+        Some(Kind::Stabilizer) => st_capacity(&entity.nbt),
+        Some(Kind::ModificationStation) => station_capacity(&entity.nbt),
         Some(Kind::BioGenerator) => mekanism_core::generator::BIO_STORAGE,
         Some(Kind::GasGenerator) => chem::GAS_GENERATOR_STORAGE,
         Some(Kind::Solar(_, storage)) => storage,
@@ -6158,6 +6406,8 @@ fn miner_flags(nbt: &Compound) -> u32 {
 fn base_usage(k: Kind) -> Option<u64> {
     Some(match k {
         Kind::Oxidizer => chem::OXIDIZER_USAGE,
+        Kind::PigmentExtractor => chem::PIGMENT_EXTRACTOR_USAGE,
+        Kind::PigmentMixer => chem::PIGMENT_MIXER_USAGE,
         Kind::Liquifier => chem::LIQUIFIER_USAGE,
         Kind::Dissolution => nuclear::DISSOLUTION_USAGE,
         Kind::Centrifuge => nuclear::CENTRIFUGE_USAGE,
@@ -6168,9 +6418,11 @@ fn base_usage(k: Kind) -> Option<u64> {
         Kind::ChemicalInfuser => chem::CHEMICAL_INFUSER_USAGE,
         Kind::Rotary => chem::ROTARY_USAGE,
         Kind::Infuser => chem::INFUSER_USAGE,
+        Kind::Painting => chem::PAINTING_USAGE,
         Kind::Advanced(m) => m.usage,
         Kind::Pump => isotopes::PUMP_USAGE,
         Kind::Plenisher => plenisher::PLENISHER_USAGE,
+        Kind::ModificationStation => modules::STATION_USAGE,
         _ => return None,
     })
 }
@@ -6199,7 +6451,7 @@ fn screen_height(block: &str) -> f32 {
         // `DEFAULT_IMAGE_HEIGHT + 64`.
         Some(Kind::Assemblicator) => 230.0,
         // `DEFAULT_IMAGE_HEIGHT + 64`.
-        Some(Kind::Oredictionificator) => 230.0,
+        Some(Kind::Oredictionificator | Kind::SecurityDesk | Kind::ModificationStation) => 230.0,
         _ => 166.0,
     }
 }
@@ -6210,11 +6462,12 @@ fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
     match kind(block) {
         Some(Kind::Machine("combining", _)) | Some(Kind::Advanced(_)) => vec![([39.0, 35.0], "slot/power")],
         Some(Kind::Infuser) => vec![([143.0, 35.0], "slot/power")],
+        Some(Kind::Painting) => vec![([144.0, 35.0], "slot/power")],
         Some(Kind::Nucleosynthesizer) => vec![([173.0, 69.0], "slot/power")],
         // The bucket slot under the water slot (`outputInputSlot`).
         Some(Kind::Evaporation) => vec![([28.0, 51.0], "slot/output")],
         // `ChemicalInventorySlot`s: the output's drain slot, the input's fill slot (`TileEntityChemical*`).
-        Some(Kind::Oxidizer) => vec![([152.0, 55.0], "slot/normal")],
+        Some(Kind::Oxidizer | Kind::PigmentExtractor) => vec![([152.0, 55.0], "slot/normal")],
         // `FluidInventorySlot.drain` (the bucket to fill) and the filled container's output slot.
         Some(Kind::Liquifier) => vec![([155.0, 25.0], "slot/normal"), ([155.0, 56.0], "slot/output")],
         Some(Kind::Assemblicator) => (2..fa::INPUTS)
@@ -6225,7 +6478,7 @@ fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
             .collect(),
         Some(Kind::Dissolution) => vec![([8.0, 65.0], "slot/normal"), ([152.0, 55.0], "slot/normal")],
         Some(Kind::Crystallizer) => vec![([8.0, 65.0], "slot/normal")],
-        Some(Kind::ChemicalInfuser) => vec![([80.0, 65.0], "slot/normal")],
+        Some(Kind::ChemicalInfuser | Kind::PigmentMixer) => vec![([80.0, 65.0], "slot/normal")],
         Some(Kind::Separator) => vec![([59.0, 52.0], "slot/normal"), ([101.0, 52.0], "slot/normal")],
         // The chemical side's drain slot and the output it moves a full item to.
         Some(Kind::Rotary) => vec![([5.0, 25.0], "slot/normal"), ([5.0, 56.0], "slot/output")],
@@ -6330,22 +6583,26 @@ fn tabs(block: &str) -> u8 {
             Kind::Machine(..)
             | Kind::Factory(..)
             | Kind::Oxidizer
+            | Kind::PigmentExtractor
+            | Kind::PigmentMixer
             | Kind::Liquifier
             | Kind::Assemblicator
             | Kind::Dissolution
             | Kind::Crystallizer
             | Kind::Separator
             | Kind::Infuser
+            | Kind::Painting
             | Kind::Advanced(_)
             | Kind::Rotary
             | Kind::Reaction
             | Kind::Nucleosynthesizer
             | Kind::ChemicalInfuser
             | Kind::Washer
-            | Kind::Centrifuge,
+            | Kind::Centrifuge
+            | Kind::ModificationStation,
         ) => all,
         Some(
-            Kind::HeatGenerator | Kind::BioGenerator | Kind::GasGenerator | Kind::Wind | Kind::Solar(..) | Kind::DigitalMiner | Kind::Pump | Kind::Plenisher,
+            Kind::HeatGenerator | Kind::BioGenerator | Kind::GasGenerator | Kind::Wind | Kind::Solar(..) | Kind::DigitalMiner | Kind::Pump | Kind::Plenisher | Kind::Stabilizer,
         ) => {
             TAB_UPGRADE | TAB_REDSTONE | TAB_SECURITY
         }
@@ -6390,14 +6647,14 @@ fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
     if matches!(kind(block), Some(Kind::Factory(..))) {
         out.push(Tab { at: [-26.0, 62.0], icon: "button/sorting", argb: 0xFFFF_FFFF, what: TabKind::Sort });
     }
-    if kind(block) == Some(Kind::DigitalMiner) {
+    if matches!(kind(block), Some(Kind::DigitalMiner | Kind::Stabilizer)) {
         out.push(Tab { at: [-26.0, 6.0], icon: "button/visuals", argb: 0xFFFF_FFFF, what: TabKind::Visuals });
     }
     if t & TAB_UPGRADE != 0 {
         out.push(Tab { at: [right, 6.0], icon: "button/upgrade", argb: 0xFFFF_FFFF, what: TabKind::Upgrade });
     }
     if t & TAB_SECURITY != 0 {
-        out.push(Tab { at: [right, 34.0], icon: "security/public", argb: 0xFFFF_A160, what: TabKind::Security });
+        out.push(Tab { at: [right, 34.0], icon: sec_tab_icon(), argb: 0xFFFF_A160, what: TabKind::Security });
     }
     if t & TAB_REDSTONE != 0 {
         let icon = redstone_of(l, data).0.sprite();
@@ -6472,14 +6729,11 @@ fn tab_tooltip(block: &str, l: &Layout, data: &[i32], at: [f32; 2], lines: &mut 
         TabKind::Sides => lines.push("Side Config".into()),
         TabKind::Transporter => lines.push("Transporter Config".into()),
         TabKind::Upgrade => lines.push("Upgrades".into()),
-        TabKind::Security => {
-            lines.push("§7Security: Public".into());
-            lines.push("No Owner".into());
-        }
+        TabKind::Security => sec_tab_tooltip(lines),
         TabKind::Redstone => lines.push(redstone_of(l, data).0.name().into()),
         TabKind::Sort => lines.push("Auto-Sort".into()),
         TabKind::Visuals => {
-            let (shown, too_big) = (miner_visuals_on(data), miner_view(block, data).radius > 64);
+            let (shown, too_big) = (miner_visuals_on(data), kind(block) == Some(Kind::DigitalMiner) && miner_view(block, data).radius > 64);
             lines.push(format!("Visuals: {}", if shown { "On" } else { "Off" }));
             if too_big {
                 lines.push("\u{a7}cArea too large to display visuals.".into());
@@ -6521,7 +6775,7 @@ fn set_window(block: &str, w: Option<Window>) {
 /// The types a block's side configuration has, in its config's order (`AttributeSideConfig`).
 fn transmissions(block: &str) -> &'static [Transmission] {
     match kind(block) {
-        Some(Kind::Machine(..) | Kind::Factory(..) | Kind::EnergyCube(_)) => &[Transmission::Item, Transmission::Energy],
+        Some(Kind::Machine(..) | Kind::Factory(..) | Kind::EnergyCube(_) | Kind::ModificationStation) => &[Transmission::Item, Transmission::Energy],
         Some(Kind::ChemicalTank(_)) => &[Transmission::Item, Transmission::Chemical],
         _ => &[Transmission::Item, Transmission::Chemical, Transmission::Energy],
     }
@@ -6865,7 +7119,8 @@ thread_local! {
 fn chemical_layout_slots(block: &str) -> &'static [usize] {
     match kind(block) {
         Some(Kind::Centrifuge) => &[1, 2],
-        Some(Kind::ChemicalInfuser) => &[1, 2],
+        Some(Kind::ChemicalInfuser | Kind::PigmentMixer) => &[1, 2],
+        Some(Kind::Painting) => &[1],
         Some(Kind::Washer) => &[1],
         _ => &[],
     }
@@ -6918,6 +7173,10 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
                 _ => energy(),
             }));
         }
+        if kind(block) == Some(Kind::ModificationStation) {
+            rules[0] = SlotRule::Items(vec![modules::MODULE_ITEM.to_owned()]);
+            rules[1] = SlotRule::Items([modules::MEKA_TOOL, modules::HELMET, modules::BODYARMOR, modules::PANTS, modules::BOOTS].map(str::to_owned).to_vec());
+        }
         if kind(block) == Some(Kind::Assemblicator) {
             rules[fa::FORMULA_SLOT] = SlotRule::Items(vec![fa::FORMULA_ITEM.to_owned()]);
         }
@@ -6931,7 +7190,13 @@ pub(super) fn screen_wheel(game: &Game<'_>, block: &str, steps: f32, taken: &mut
         let hidden = count.saturating_sub(SORTER_ROWS);
         if steps > 0.0 { first.min(hidden).saturating_sub(1) } else { (first + 1).min(hidden) }
     };
-    if miner_cfg_open(block) {
+    if kind(block) == Some(Kind::SecurityDesk) {
+        security_desk_wheel(steps);
+        *taken = true;
+    } else if kind(block) == Some(Kind::ModificationStation) {
+        station_wheel(game, steps);
+        *taken = true;
+    } else if miner_cfg_open(block) {
         if let Some(c) = miner_cfg(game)
             && MINER_UI.with_borrow(|ui| !ui.select && ui.edit.is_none())
         {
@@ -7922,6 +8187,13 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
 
 /// A press on a reactor's button (hook point `native_screen_click`, API 20).
 pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
+    if kind(block) == Some(Kind::SecurityDesk) {
+        security_desk_click(game, at, right);
+        return;
+    }
+    if kind(block) == Some(Kind::ModificationStation) && !inside(at, [-30.0, 0.0, 30.0, 300.0]) && at[0] < 176.0 {
+        station_click(game, at, right);
+    }
     if miner_cfg_open(block) {
         miner_cfg_click(game, at, right);
         return;
@@ -7986,6 +8258,9 @@ fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], r
     if is_asm(block) && open_window_id(block).is_none() && asm_click(game, at) {
         return;
     }
+    if kind(block) == Some(Kind::Stabilizer) && st_click(game, at, right) {
+        return;
+    }
     if is_qio_screen(block) {
         qio_click(game, block, at);
         return;
@@ -8009,6 +8284,7 @@ fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], r
     };
     match screen_tabs(block, &l, data).iter().find(|t| inside(at, tab_button(t))).map(|t| t.what) {
         Some(TabKind::Redstone) => *button = Some(if right { BUTTON_REDSTONE_PREVIOUS } else { BUTTON_REDSTONE_NEXT }),
+        Some(TabKind::Security) => *button = Some(if right { BUTTON_SECURITY_PREVIOUS } else { BUTTON_SECURITY_NEXT }),
         // The side configuration tab opens its window on the first type (`GuiWindowCreatorTab`).
         Some(TabKind::Sides) if !right => set_window(block, Some(Window::Sides(0))),
         Some(TabKind::Upgrade) if !right => set_window(block, Some(Window::Upgrades(None))),
@@ -8031,6 +8307,11 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         let now = RedstoneControl::from_ordinal(get_int(&entity.nbt, "control"));
         let next = if id == BUTTON_REDSTONE_NEXT { now.next() } else { now.previous() };
         put_int(&mut entity.nbt, "control", next.ordinal());
+        return;
+    }
+    // The security tab (`GuiInteraction.NEXT_SECURITY_MODE` / `PREVIOUS_SECURITY_MODE`).
+    if matches!(id, BUTTON_SECURITY_NEXT | BUTTON_SECURITY_PREVIOUS) && tabs(&entity.id) & TAB_SECURITY != 0 {
+        sec_step(game, entity, id == BUTTON_SECURITY_NEXT);
         return;
     }
     // `GasMode.getNext` on the chemical tank's button.
@@ -8266,7 +8547,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         slots,
         inventory_y: h - 82.0,
         inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(),
-        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort | Kind::FusionPort)),
+        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort | Kind::FusionPort | Kind::SecurityDesk | Kind::ModificationStation)),
         alt: None,
         ..Default::default()
     });
@@ -8374,7 +8655,7 @@ fn extras(block: &str) -> Extras {
     let large = |x, y| ([x, y], "progress/large_right", [48.0, 8.0]);
     match kind(block) {
         Some(Kind::Activator | Kind::Centrifuge) => Extras { active_progress: vec![large(64.0, 39.0)], ..none },
-        Some(Kind::ChemicalInfuser) => Extras {
+        Some(Kind::ChemicalInfuser | Kind::PigmentMixer) => Extras {
             active_progress: vec![([47.0, 39.0], "progress/small_right", [28.0, 8.0]), ([101.0, 39.0], "progress/small_left", [28.0, 8.0])],
             ..none
         },
@@ -8493,7 +8774,7 @@ thread_local! {
 
 fn draw_nucleosynthesizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
     let [ox, oy] = origin;
-    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit")).as_deref() == Some("true");
+    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit").or_else(|| game.native_block_property(p, "open"))).as_deref() == Some("true");
     let screen = [ox + 45.0, oy + 18.0, 104.0, 68.0];
     nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, screen, 0xFFFF_FFFF);
     let rate = if lit { "100%" } else { "0%" };
@@ -9167,7 +9448,7 @@ fn draw_dynamic_rate_bar(game: &Game<'_>, batch: &mut horizon_client::hud::HudBa
 fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, data: &[i32], origin: [f32; 2]) {
     let e = extras(block);
     let [ox, oy] = origin;
-    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit")).as_deref() == Some("true");
+    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit").or_else(|| game.native_block_property(p, "open"))).as_deref() == Some("true");
     for (at, name, [w, h]) in &e.active_progress {
         let state = if lit { "full" } else { "empty" };
         sprite(game, batch, &format!("{name}/{state}"), [0.0, 0.0, *w, *h], [ox + at[0], oy + at[1], *w, *h]);
@@ -9227,6 +9508,7 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
         draw_qio_select(game, batch, block, origin);
         return;
     }
+    sec_refresh(game, block);
     screen_draw_base(game, block, data, batch, origin);
     if is_qio_tile(block) {
         draw_qio_tab(game, batch, origin);
@@ -9267,6 +9549,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     let inv_dx = ((width - 176.0) / 2.0).floor();
     let height = screen_height(block);
     nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, width, height]);
+    if kind(block) == Some(Kind::SecurityDesk) {
+        draw_security_desk_back(game, batch, origin);
+    }
     if let Some(Kind::Factory(n, ..)) = kind(block) {
         draw_factory_slots(game, batch, block, n, &l, data, origin);
     }
@@ -9419,6 +9704,15 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     }
     if is_asm(block) {
         draw_asm(game, batch, origin);
+    }
+    if kind(block) == Some(Kind::Stabilizer) {
+        draw_stabilizer(game, batch, origin);
+    }
+    if kind(block) == Some(Kind::SecurityDesk) {
+        draw_security_desk(game, batch, height, origin);
+    }
+    if kind(block) == Some(Kind::ModificationStation) {
+        draw_station(game, batch, height, origin);
     }
     if let Some(Kind::ChemicalTank(t)) = kind(block) {
         draw_tank_screen(game, batch, &l, data, origin, t == BaseTier::Creative);
@@ -9699,6 +9993,15 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         return;
     }
     if is_asm(block) && open_window_id(block).is_none() && asm_tooltip(game, at, lines) {
+        return;
+    }
+    if kind(block) == Some(Kind::Stabilizer) && st_tooltip(game, at, lines) {
+        return;
+    }
+    if kind(block) == Some(Kind::SecurityDesk) && security_desk_tooltip(at, lines) {
+        return;
+    }
+    if kind(block) == Some(Kind::ModificationStation) && station_tooltip(game, at, lines) {
         return;
     }
     if is_qio_screen(block) {
@@ -10899,7 +11202,7 @@ pub(super) fn use_personal_storage(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 
 /// Only its owner breaks a personal chest or barrel.
 pub(super) fn protect_personal(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
-    use_personal_storage(game, pos)
+    use_personal_storage(game, pos) || sec_denied(game, pos)
 }
 
 // --- QIO --------------------------------------------------------------------------------------------
@@ -11287,73 +11590,6 @@ fn item_energy_of(stack: &ItemStack) -> Option<gear::ItemEnergy> {
 fn module_name(id: &str) -> String {
     let path = id.split_once(':').map_or(id, |(_, p)| p);
     path.split('_').map(|w| w[..1].to_uppercase() + &w[1..]).collect::<Vec<_>>().join(" ")
-}
-
-/// A right click on the Modification Station holding a Meka-Tool or MekaSuit piece: every module in the
-/// inventory that it takes goes in, up to each module's limit; sneaking takes them all out again
-/// (`ModificationStationContainer`, without its screen).
-pub(super) fn use_modification_station(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
-    if !game.native_on(MOD_ID) || block_name(game, pos) != modules::STATION {
-        return false;
-    }
-    let selected = game.selected;
-    let Some(held) = game.inventory.get(selected).cloned().flatten().filter(|s| modules::is_container(&s.item)) else {
-        tell(game, "Modification Station: hold a Meka-Tool or a MekaSuit piece".to_owned());
-        return true;
-    };
-    let mut installed = modules_of(&held);
-    let mut kept = match custom_data(&held).and_then(|c| c.get(&JavaString::from(MODULE_ITEMS_KEY))) {
-        Some(Tag::Compound(c)) => c.clone(),
-        _ => Compound::new(),
-    };
-    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
-    if sneaking {
-        for (id, n) in std::mem::take(&mut installed) {
-            let item = kept.get(&JavaString::from(id.as_str())).and_then(horizon_items::item_nbt::item_from_nbt);
-            if let Some(item) = item {
-                game.give_or_drop(ItemStack { count: n, ..item });
-            }
-        }
-        kept = Compound::new();
-    } else {
-        for i in 0..game.inventory.len().min(36) {
-            let Some(s) = game.inventory[i].clone() else {
-                continue;
-            };
-            let Some(id) = module_type(&s) else {
-                continue;
-            };
-            let put = modules::install(&held.item, &mut installed, &id, s.count);
-            if put > 0 {
-                kept.insert(id.as_str().into(), horizon_items::item_nbt::item_to_nbt(&ItemStack { count: 1, ..s.clone() }));
-                game.inventory[i] = (s.count > put).then(|| ItemStack { count: s.count - put, ..s });
-            }
-        }
-    }
-    let mut c = Compound::new();
-    for (id, n) in &installed {
-        c.insert(id.as_str().into(), Tag::Int(*n as i32));
-    }
-    let mut stack = held;
-    let stored = stored_energy(&stack);
-    set_custom_compound(&mut stack, MODULES_KEY, c);
-    set_custom_compound(&mut stack, MODULE_ITEMS_KEY, kept);
-    // Silk touch, fortune and frost walker units are those enchantments on the item.
-    let mut levels: Vec<(Arc<str>, u32)> =
-        stack.enchantments().iter().filter(|(e, _)| !modules::MODULE_ENCHANTMENTS.contains(&&**e)).cloned().collect();
-    levels.extend(modules::enchantments(&installed).into_iter().map(|(e, l)| (Arc::from(e), l)));
-    stack.set_crafting_enchantments(levels);
-    // Fewer energy units hold less (`ModuleEnergyUnit.onRemoved`).
-    let capacity = item_energy_of(&stack).map_or(stored, |e| e.capacity);
-    set_energy(&mut stack, stored.min(capacity));
-    let line = if installed.is_empty() {
-        "No modules installed".to_owned()
-    } else {
-        installed.iter().map(|(id, n)| format!("{} x{n}", module_name(id))).collect::<Vec<_>>().join(", ")
-    };
-    game.inventory[selected] = Some(stack);
-    tell(game, line);
-    true
 }
 
 /// The Meka-Tool's mining speed: its efficiency while it holds the energy for the block.
@@ -12271,6 +12507,12 @@ pub(super) fn screen_alt(game: &Game<'_>, block: &str, alt: &mut bool) {
         }
         return;
     }
+    if kind(block) == Some(Kind::Stabilizer) {
+        if let Some((x, y, z)) = game.container {
+            MINER_OPEN.set([x, y, z]);
+        }
+        return;
+    }
     if kind(block) == Some(Kind::DigitalMiner) {
         if let Some((x, y, z)) = game.container {
             MINER_OPEN.set([x, y, z]);
@@ -12760,6 +13002,9 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
     if is_od(block) {
         *typing |= OD_EDIT.with_borrow(|e| e.as_ref().is_some_and(|e| e.text.focused));
     }
+    if kind(block) == Some(Kind::SecurityDesk) {
+        *typing |= SEC_UI.with_borrow(|ui| ui.text.focused);
+    }
     if fission_stats_open(block) {
         *typing |= STATS_TEXT.with_borrow(|t| t.focused);
     }
@@ -12771,6 +13016,10 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
 /// A key on the selector's focused text box (hook point `native_screen_key`): Enter sets the name as
 /// a new frequency (`setEnterHandler`).
 pub(super) fn screen_key(game: &mut Game<'_>, block: &str, key: &str, text: Option<&str>) {
+    if kind(block) == Some(Kind::SecurityDesk) {
+        security_desk_key(game, key, text);
+        return;
+    }
     if miner_cfg_open(block) {
         miner_cfg_key(game, key, text);
         return;
@@ -14162,6 +14411,10 @@ pub(super) fn world_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::
         let Some((id, c)) = game.native_client_block_entity(pos) else {
             continue;
         };
+        if kind(&id) == Some(Kind::Stabilizer) {
+            stabilizer_boxes(game, pos, c, boxes);
+            continue;
+        }
         if kind(&id) != Some(Kind::DigitalMiner) {
             continue;
         }
@@ -16138,4 +16391,967 @@ fn draw_asm(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: 
         };
         draw_button(game, batch, [ox + r[0], oy + r[1], r[2], r[3]], inside(mouse, r), active, 0xFFFF_FFFF, Some((icon, r[2])));
     }
+}
+
+// --- Dimensional Stabilizer (TileEntityDimensionalStabilizer, GuiDimensionalStabilizer) ----------------------
+
+const ST_CHANNEL: &str = "mekanism:stabilizer";
+
+/// `UpgradeUtils.getMaxEnergy` of a chunk's usage times the storage multiplier; energy upgrades only add storage.
+fn st_capacity(nbt: &Compound) -> u64 {
+    upgrades(nbt).max_energy(st::STORAGE).max(st::USAGE)
+}
+
+fn st_grid(nbt: &Compound) -> st::Grid {
+    st::decode(&get_string(nbt, "st_grid").unwrap_or_default())
+}
+
+/// A player's click, on the server: a chunk toggled, or a ring enabled or disabled (`PacketGuiInteract`).
+fn st_payload(game: &mut Game<'_>, data: &[u8]) {
+    let (Some((op, pos)), Some(player)) = (st::decode_request(data), game.native_acting_player()) else {
+        return;
+    };
+    let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    if !near || kind(block_name(game, pos)) != Some(Kind::Stabilizer) {
+        return;
+    }
+    game.native_with_mod_block_entity(pos, |m| {
+        let mut grid = st_grid(&m.nbt);
+        let changed = match op {
+            st::Op::Toggle(i) => st::toggle(&mut grid, usize::from(i)),
+            st::Op::Enable(r) => st::adjust_radius(&mut grid, i32::from(r), true),
+            st::Op::Disable(r) => st::adjust_radius(&mut grid, i32::from(r), false),
+        };
+        if changed {
+            m.nbt.insert("st_grid".into(), Tag::String(st::encode(&grid).as_str().into()));
+        }
+    });
+}
+
+fn st_send(game: &Game<'_>, op: st::Op) {
+    if let Some((x, y, z)) = game.container {
+        game.native_send_to_server(ST_CHANNEL, &st::encode_request(op, [x, y, z]));
+    }
+}
+
+/// The stabilizer every tick: it takes the energy for its chunks (`onUpdateServer`), and the grid goes to the viewers.
+fn tick_stabilizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = st_capacity(&entity.nbt);
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let grid = st_grid(&entity.nbt);
+    let per_tick = st::energy_per_tick(&grid);
+    // The chunks stay loaded only while the whole usage can be paid.
+    let active = energy.consume(per_tick);
+    put_int(&mut entity.nbt, "warn", u32::from(per_tick > energy.stored + if active { per_tick } else { 0 }));
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    entity.data = vec![(energy.stored * 1000 / capacity) as i32, 1000, 0, 0];
+    let mut client = Compound::new();
+    client.insert("st_grid".into(), Tag::String(st::encode(&grid).as_str().into()));
+    put_client(game, pos, entity, &["st_grid"], client);
+    Some(active)
+}
+
+fn st_client_grid(game: &Game<'_>) -> Option<st::Grid> {
+    let (x, y, z) = game.container?;
+    let (_, c) = game.native_client_block_entity([x, y, z])?;
+    Some(st::decode(&get_string(c, "st_grid").unwrap_or_default()))
+}
+
+/// The chunk buttons: a 10 px square at (63, 19) for each cell.
+fn st_cell(x: usize, z: usize) -> [f32; 4] {
+    [63.0 + 10.0 * x as f32, 19.0 + 10.0 * z as f32, 10.0, 10.0]
+}
+
+fn st_cell_at(at: [f32; 2]) -> Option<(usize, usize)> {
+    (0..st::DIAMETER).flat_map(|x| (0..st::DIAMETER).map(move |z| (x, z))).find(|&(x, z)| inside(at, st_cell(x, z)))
+}
+
+fn st_click(game: &Game<'_>, at: [f32; 2], right: bool) -> bool {
+    let Some((x, z)) = st_cell_at(at) else {
+        return false;
+    };
+    let Some(grid) = st_client_grid(game) else {
+        return true;
+    };
+    let centre = st::MAX_LOAD_RADIUS as usize;
+    if (x, z) == (centre, centre) {
+        // Left click enables the next ring, right click disables the outermost loaded one.
+        let op = if right { st::next_to_disable(&grid).map(|r| st::Op::Disable(r as u8)) } else { st::next_to_enable(&grid).map(|r| st::Op::Enable(r as u8)) };
+        if let Some(op) = op {
+            st_send(game, op);
+        }
+    } else {
+        st_send(game, st::Op::Toggle((x * st::DIAMETER + z) as u8));
+    }
+    true
+}
+
+/// The chunk's own coordinates for the tooltips: the block's chunk plus the cell's offset.
+fn st_chunk(game: &Game<'_>, x: usize, z: usize) -> Option<(i32, i32)> {
+    let (bx, _, bz) = game.container?;
+    let r = st::MAX_LOAD_RADIUS;
+    Some((bx.div_euclid(16) + x as i32 - r, bz.div_euclid(16) + z as i32 - r))
+}
+
+fn st_tooltip(game: &Game<'_>, at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    let Some((x, z)) = st_cell_at(at) else {
+        return false;
+    };
+    let (Some(grid), Some((cx, cz))) = (st_client_grid(game), st_chunk(game, x, z)) else {
+        return true;
+    };
+    let centre = st::MAX_LOAD_RADIUS as usize;
+    if (x, z) == (centre, centre) {
+        lines.push(format!("Chunk at (\u{a7}9{cx}\u{a7}7, \u{a7}9{cz}\u{a7}7) is always loaded."));
+        if let Some(r) = st::next_to_enable(&grid) {
+            lines.push(" ".into());
+            lines.push(format!("Left click to enable chunk loading for all chunks with a radius of \u{a7}9{r}\u{a7}7 around (\u{a7}9{cx}\u{a7}7, \u{a7}9{cz}\u{a7}7)."));
+        }
+        if let Some(r) = st::next_to_disable(&grid) {
+            lines.push(" ".into());
+            lines.push(format!("Right click to disable chunk loading for all chunks with a radius of \u{a7}9{r}\u{a7}7 around (\u{a7}9{cx}\u{a7}7, \u{a7}9{cz}\u{a7}7)."));
+        }
+    } else {
+        let on = grid[x * st::DIAMETER + z];
+        lines.push(format!(
+            "Toggle chunk loading {} at (\u{a7}9{cx}\u{a7}7, \u{a7}9{cz}\u{a7}7)",
+            if on { "\u{a7}aOn" } else { "\u{a7}cOff" }
+        ));
+    }
+    true
+}
+
+/// The chunk buttons (`TooltipColorButton`, dark blue when loaded), the up arrow and the north mark.
+fn draw_stabilizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    let grid = st_client_grid(game).unwrap_or_else(st::new_grid);
+    for x in 0..st::DIAMETER {
+        for z in 0..st::DIAMETER {
+            let r = st_cell(x, z);
+            let rect = [ox + r[0], oy + r[1], r[2], r[3]];
+            let on = grid[x * st::DIAMETER + z];
+            draw_button(game, batch, rect, inside(mouse, r), true, if on { 0xFF6F_97E0 } else { 0xFFFF_FFFF }, None);
+            if on {
+                game.native_fill(batch, [rect[0] + 1.0, rect[1] + 1.0, rect[2] - 2.0, rect[3] - 2.0], 0xFF36_6BD0);
+            }
+        }
+    }
+    sprite(game, batch, "arrow/up", [0.0, 0.0, 8.0, 10.0], [ox + 52.0, oy + 28.0, 8.0, 10.0]);
+    let w = game.native_text_width("N");
+    game.native_text(batch, "N", [ox + 49.0 - w / 2.0, oy + 41.0], 0x40_4040, false);
+}
+
+/// The loaded chunks as translucent columns (`RenderDimensionalStabilizer`): a wall wherever no loaded chunk
+/// stands beside, the whole height of the world, none on top or below.
+fn stabilizer_boxes(game: &Game<'_>, pos: [i32; 3], c: &Compound, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    let grid = st::decode(&get_string(c, "st_grid").unwrap_or_default());
+    let r = st::MAX_LOAD_RADIUS;
+    // `ARGB.white(0.78)` for east and west, `0.82` for north and south.
+    let (east_west, north_south) = (0xC7FF_FFFF, 0xD1FF_FFFF);
+    let (min_y, max_y) = (f64::from(game.world.bottom_y()), f64::from(game.world.top_y()));
+    for x in 0..st::DIAMETER {
+        for z in 0..st::DIAMETER {
+            if !grid[x * st::DIAMETER + z] {
+                continue;
+            }
+            let [east, west, south, north] = st::exposed(&grid, x, z);
+            let side = |shown: bool, colour: u32| if shown { colour } else { 0 };
+            let chunk_x = pos[0].div_euclid(16) + x as i32 - r;
+            let chunk_z = pos[2].div_euclid(16) + z as i32 - r;
+            let min = [f64::from(chunk_x * 16) + 0.01, min_y, f64::from(chunk_z * 16) + 0.01];
+            let max = [min[0] + 15.98, max_y, min[2] + 15.98];
+            boxes.push(super::native_hooks::NativeWorldBox {
+                min,
+                max,
+                colors: [side(east, east_west), side(west, east_west), 0, 0, side(south, north_south), side(north, north_south)],
+            });
+        }
+    }
+}
+
+// --- Security (SecurityFrequency, TileEntitySecurityDesk, GuiSecurityDesk, GuiSecurityTab) -------------------
+//
+// A block's owner and mode live in its NBT ("owner", "owner_name", "sec_mode"); the owner's default mode,
+// override and trusted players are one `sec::Data` per owner, kept by their Security Desk (its "sec") and
+// shared through `SEC_DATA`. The desk locks and unlocks the items in its slots.
+
+const SEC_CHANNEL: &str = "mekanism:security";
+const BUTTON_SECURITY_NEXT: i32 = 330;
+const BUTTON_SECURITY_PREVIOUS: i32 = 331;
+
+/// The security data of each owner (uuid text), as their desk last had it.
+static SEC_DATA: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, sec::Data>>> = std::sync::LazyLock::new(Default::default);
+
+fn sec_data(owner: &str) -> Option<sec::Data> {
+    SEC_DATA.lock().ok()?.get(owner).cloned()
+}
+
+/// Whether a block carries security: its screen has the tab, or it is the desk.
+fn has_security(block: &str) -> bool {
+    tabs(block) & TAB_SECURITY != 0 || block == sec::DESK
+}
+
+fn sec_mode_of(nbt: &Compound) -> sec::Mode {
+    sec::Mode::from_ordinal(i64::from(get_int(nbt, "sec_mode")))
+}
+
+/// A block's mode as `SecurityUtils.getEffectiveSecurityMode` has it, and whether its owner's override set it.
+fn sec_effective_of(nbt: &Compound) -> (sec::Mode, bool) {
+    let data = get_string(nbt, "owner").and_then(|o| sec_data(&o));
+    sec::effective(sec_mode_of(nbt), data.as_ref())
+}
+
+/// The security an item carries in its custom data: owner uuid, owner name and mode.
+fn item_security(stack: &ItemStack) -> Option<(String, String, sec::Mode)> {
+    let Some(Tag::Compound(c)) = custom_data(stack)?.get(&JavaString::from(sec::KEY)) else {
+        return None;
+    };
+    Some((get_string(c, "owner")?, get_string(c, "owner_name").unwrap_or_default(), sec::Mode::from_ordinal(i64::from(get_int(c, "mode")))))
+}
+
+fn set_item_security(stack: &mut ItemStack, owner: &str, name: &str, mode: sec::Mode) {
+    let mut c = Compound::new();
+    c.insert("owner".into(), Tag::String(owner.into()));
+    c.insert("owner_name".into(), Tag::String(name.into()));
+    put_int(&mut c, "mode", u32::from(mode.ordinal()));
+    set_custom_compound(stack, sec::KEY, c);
+}
+
+/// An item without its security; its custom data goes when nothing else is in it.
+fn clear_item_security(stack: &mut ItemStack) {
+    let Some(extra) = stack.extra.as_mut() else {
+        return;
+    };
+    for (key, data) in extra.other.iter_mut() {
+        if key == "minecraft:custom_data"
+            && let Tag::Compound(c) = data
+        {
+            c.remove(&JavaString::from(sec::KEY));
+        }
+    }
+    extra.other.retain(|(key, data)| key != "minecraft:custom_data" || !matches!(data, Tag::Compound(c) if c.is_empty()));
+}
+
+/// Gives the stack the owner and mode of the block it comes from.
+fn stamp_security(stack: &mut ItemStack, nbt: &Compound) {
+    if !has_security(&stack.item)
+        && !matches!(kind(&stack.item), Some(Kind::EnergyCube(_)))
+    {
+        return;
+    }
+    if let Some(owner) = get_string(nbt, "owner") {
+        set_item_security(stack, &owner, &get_string(nbt, "owner_name").unwrap_or_default(), sec_mode_of(nbt));
+    }
+}
+
+/// A block placed: its owner is the player who placed it, or the one its item was locked to (`SecurityUtils`
+/// through `BlockSecurityUtils.claimOwnership`).
+pub(super) fn sec_placed(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
+    if !has_security(&stack.item) {
+        return;
+    }
+    let kept = item_security(stack);
+    let player = game.native_acting_player();
+    game.native_with_mod_block_entity(pos, |m| {
+        let owner = match kept {
+            Some((uuid, name, mode)) => Some((uuid, name, Some(mode))),
+            None => player.map(|p| (uuid_text(p.uuid), p.name, None)),
+        };
+        if let Some((uuid, name, mode)) = owner {
+            m.nbt.insert("owner".into(), Tag::String(uuid.as_str().into()));
+            m.nbt.insert("owner_name".into(), Tag::String(name.as_str().into()));
+            if let Some(mode) = mode {
+                put_int(&mut m.nbt, "sec_mode", u32::from(mode.ordinal()));
+            }
+        }
+    });
+}
+
+/// Whether the acting player may not use the block at `pos` (`SecurityUtils.canAccess`): it is private or
+/// trusted-only, and they are not its owner (nor, for trusted, on the owner's list).
+fn sec_denied(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || !has_security(block_name(game, pos)) {
+        return false;
+    }
+    let Some(player) = game.native_acting_player() else {
+        return false;
+    };
+    let me = uuid_text(player.uuid);
+    let verdict = game.native_with_mod_block_entity(pos, |m| {
+        let owner = get_string(&m.nbt, "owner")?;
+        let (mode, _) = sec_effective_of(&m.nbt);
+        let data = sec_data(&owner);
+        (!sec::can_access(mode, &owner, &me, data.as_ref())).then(|| get_string(&m.nbt, "owner_name").unwrap_or_default())
+    });
+    match verdict.flatten() {
+        Some(_) => {
+            tell(game, "You don't have access.".to_owned());
+            true
+        }
+        None => false,
+    }
+}
+
+/// A right click or a break by someone the block's security shuts out.
+pub(super) fn protect_security(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    sec_denied(game, pos)
+}
+
+/// The security tab's press, on the server (`GuiInteraction.NEXT_SECURITY_MODE` and `PREVIOUS_SECURITY_MODE`):
+/// the owner steps the block's mode.
+fn sec_step(game: &mut Game<'_>, entity: &mut ModBlockEntity, forward: bool) {
+    let (Some(player), Some(owner)) = (game.native_acting_player(), get_string(&entity.nbt, "owner")) else {
+        return;
+    };
+    if owner == uuid_text(player.uuid) {
+        let next = sec::step(sec_mode_of(&entity.nbt), forward).ordinal();
+        put_int(&mut entity.nbt, "sec_mode", u32::from(next));
+    }
+}
+
+const SEC_KEYS: [&str; 7] = ["sec_name", "sec_eff", "sec_ovr", "sec_fmode", "sec_fovr", "sec_trusted", "sec_online"];
+
+/// What the screens need of a block's security, sent with its other client data.
+fn security_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    if !has_security(&entity.id) {
+        return;
+    }
+    let mut client = Compound::new();
+    if let Some(name) = get_string(&entity.nbt, "owner_name") {
+        client.insert("sec_name".into(), Tag::String(name.as_str().into()));
+    }
+    let (mode, overridden) = sec_effective_of(&entity.nbt);
+    put_int(&mut client, "sec_eff", u32::from(mode.ordinal()));
+    put_int(&mut client, "sec_ovr", u32::from(overridden));
+    if entity.id == sec::DESK
+        && let Some(data) = get_string(&entity.nbt, "owner").and_then(|o| sec_data(&o))
+    {
+        put_int(&mut client, "sec_fmode", u32::from(data.mode.ordinal()));
+        put_int(&mut client, "sec_fovr", u32::from(data.overridden));
+        put_int(&mut client, "sec_online", 1);
+        client.insert("sec_trusted".into(), string_list(&data.names()));
+    }
+    put_client(game, pos, entity, &SEC_KEYS, client);
+}
+
+fn is_secure_item(item: &str) -> bool {
+    has_security(item) || matches!(kind(item), Some(Kind::EnergyCube(_)))
+}
+
+/// The desk every tick (`TileEntitySecurityDesk.onUpdateServer`): its owner's data is kept (made when there is
+/// none), the item in the lock slot takes the owner and their mode, the one in the unlock slot loses its
+/// security when it is theirs.
+fn tick_security_desk(entity: &mut ModBlockEntity) -> Option<bool> {
+    let (Some(owner), name) = (get_string(&entity.nbt, "owner"), get_string(&entity.nbt, "owner_name").unwrap_or_default()) else {
+        return None;
+    };
+    let data = {
+        let Ok(mut all) = SEC_DATA.lock() else {
+            return None;
+        };
+        let loaded = get_string(&entity.nbt, "sec").map(|t| sec::Data::load(&t));
+        let data = all.entry(owner.clone()).or_insert_with(|| loaded.unwrap_or_default());
+        entity.nbt.insert("sec".into(), Tag::String(data.save().as_str().into()));
+        data.clone()
+    };
+    if let Some(stack) = entity.items.get_mut(0).and_then(Option::as_mut)
+        && item_security(stack).is_some_and(|(o, ..)| o == owner)
+    {
+        clear_item_security(stack);
+    }
+    if let Some(stack) = entity.items.get_mut(1).and_then(Option::as_mut)
+        && is_secure_item(&stack.item)
+    {
+        match item_security(stack) {
+            None => set_item_security(stack, &owner, &name, data.mode),
+            Some((o, _, mode)) if o == owner && mode != data.mode => set_item_security(stack, &owner, &name, data.mode),
+            Some(_) => {}
+        }
+    }
+    None
+}
+
+/// A press on the desk's screen, on the server (`PacketGuiInteract.SECURITY_DESK_MODE`, `OVERRIDE_BUTTON`,
+/// `REMOVE_TRUSTED`, `PacketAddTrusted`): only its owner, and only within reach.
+fn sec_payload(game: &mut Game<'_>, data: &[u8]) {
+    let (Some((op, pos)), Some(player)) = (sec::decode_request(data), game.native_acting_player()) else {
+        return;
+    };
+    let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    if !near || block_name(game, pos) != sec::DESK {
+        return;
+    }
+    let me = uuid_text(player.uuid);
+    // A name is looked up among the players online, else by the offline id its server would give it.
+    let trusted = match &op {
+        sec::Op::Add(name) if sec::valid_name(name) => {
+            let found = game.native_server_players().into_iter().find(|p| p.name.eq_ignore_ascii_case(name));
+            Some(found.map_or_else(|| (uuid_text(horizon_protocol::crypto::offline_uuid(name)), name.clone()), |p| (uuid_text(p.uuid), p.name)))
+        }
+        _ => None,
+    };
+    game.native_with_mod_block_entity(pos, |m| {
+        let Some(owner) = get_string(&m.nbt, "owner").filter(|o| *o == me) else {
+            return;
+        };
+        let Ok(mut all) = SEC_DATA.lock() else {
+            return;
+        };
+        let data = all.entry(owner).or_insert_with(|| get_string(&m.nbt, "sec").map(|t| sec::Data::load(&t)).unwrap_or_default());
+        match op {
+            sec::Op::SetMode(mode) => data.mode = mode,
+            sec::Op::ToggleOverride => data.overridden = !data.overridden,
+            sec::Op::Remove(i) => {
+                data.remove_trusted(usize::from(i));
+            }
+            sec::Op::Add(_) => {
+                if let Some((uuid, name)) = &trusted {
+                    data.add_trusted(uuid, name);
+                }
+            }
+        }
+        m.nbt.insert("sec".into(), Tag::String(data.save().as_str().into()));
+    });
+}
+
+fn sec_send(game: &Game<'_>, op: &sec::Op) {
+    if let Some((x, y, z)) = game.container {
+        game.native_send_to_server(SEC_CHANNEL, &sec::encode_request(op, [x, y, z]));
+    }
+}
+
+/// What the open screen shows of its block's security.
+#[derive(Clone, Default)]
+struct SecView {
+    /// The owner's name, if the block has one.
+    name: Option<String>,
+    /// Whether the viewer is the owner.
+    mine: bool,
+    mode: u8,
+    overridden: bool,
+    /// The desk's frequency: its mode, override and trusted names; None while offline.
+    freq: Option<(u8, bool, Vec<String>)>,
+}
+
+thread_local! {
+    static SEC_VIEW: std::cell::RefCell<SecView> = std::cell::RefCell::new(SecView::default());
+    static SEC_UI: std::cell::RefCell<SecUi> = std::cell::RefCell::new(SecUi::default());
+}
+
+#[derive(Default)]
+struct SecUi {
+    pos: [i32; 3],
+    text: freq::TextBox,
+    selected: Option<usize>,
+    scroll: usize,
+}
+
+/// Reads the block's security from its client data, once a frame, for the tab and the desk.
+fn sec_refresh(game: &Game<'_>, block: &str) {
+    if !has_security(block) {
+        return;
+    }
+    let Some((x, y, z)) = game.container else {
+        return;
+    };
+    let view = game.native_client_block_entity([x, y, z]).map(|(_, c)| {
+        let name = get_string(c, "sec_name");
+        let freq = (get_int(c, "sec_online") == 1).then(|| (get_int(c, "sec_fmode") as u8, get_int(c, "sec_fovr") == 1, strings_of(c, "sec_trusted")));
+        SecView {
+            mine: name.as_deref().is_some_and(|n| n == game.options.player_name()),
+            name,
+            mode: get_int(c, "sec_eff") as u8,
+            overridden: get_int(c, "sec_ovr") == 1,
+            freq,
+        }
+    });
+    SEC_VIEW.set(view.unwrap_or_default());
+    SEC_UI.with_borrow_mut(|ui| {
+        if ui.pos != [x, y, z] {
+            *ui = SecUi { pos: [x, y, z], ..Default::default() };
+        }
+    });
+}
+
+/// The overlay of a security tab, by the mode it shows (`GuiSecurityTab.getOverlay`).
+fn sec_tab_icon() -> &'static str {
+    match SEC_VIEW.with_borrow(|v| v.mode) {
+        1 => "security/private",
+        2 => "security/protected",
+        _ => "security/public",
+    }
+}
+
+/// `OwnerDisplay`: "Owner: name", or "No Owner" in red.
+fn owner_line(view: &SecView, coloured: bool) -> String {
+    match &view.name {
+        None => "\u{a7}cNo Owner".to_owned(),
+        Some(n) if coloured => format!("\u{a7}8Owner: {}{n}", if view.mine { "\u{a7}a" } else { "\u{a7}c" }),
+        Some(n) => format!("\u{a7}8Owner: {n}"),
+    }
+}
+
+/// The security tab's tooltip (`GuiSecurityTab.updateTooltip`).
+fn sec_tab_tooltip(lines: &mut Vec<String>) {
+    let view = SEC_VIEW.with_borrow(Clone::clone);
+    lines.push(format!("\u{a7}7Security: {}", sec::Mode::from_ordinal(i64::from(view.mode)).name()));
+    lines.push(owner_line(&view, true));
+    if view.overridden {
+        lines.push("\u{a7}c(Overridden)".to_owned());
+    }
+}
+
+// The desk's screen, from `GuiSecurityDesk`.
+const SEC_LIST: [f32; 4] = [13.0, 13.0, 122.0, 42.0];
+const SEC_ROWS: usize = 4;
+const SEC_REMOVE: [f32; 4] = [13.0, 81.0, 122.0, 20.0];
+const SEC_FIELD: [f32; 4] = [35.0, 68.0, 99.0, 11.0];
+const SEC_CHECK: [f32; 4] = [123.0, 68.0, 11.0, 11.0];
+const SEC_MODES: [[f32; 4]; 3] = [[13.0, 113.0, 40.0, 16.0], [54.0, 113.0, 40.0, 16.0], [95.0, 113.0, 40.0, 16.0]];
+const SEC_OVERRIDE: [f32; 4] = [146.0, 59.0, 16.0, 16.0];
+
+fn sec_trusted(view: &SecView) -> &[String] {
+    view.freq.as_ref().map_or(&[], |f| f.2.as_slice())
+}
+
+fn draw_security_desk_back(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    for r in [[141.0, 13.0, 26.0, 37.0], [141.0, 54.0, 26.0, 34.0], [141.0, 92.0, 26.0, 37.0]] {
+        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, [ox + r[0], oy + r[1], r[2], r[3]], 0xFFFF_FFFF);
+    }
+}
+
+fn draw_security_desk(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, height: f32, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let at = |r: [f32; 4]| [ox + r[0], oy + r[1], r[2], r[3]];
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    let view = SEC_VIEW.with_borrow(Clone::clone);
+    let owned = view.name.is_some();
+    let title = game.native_screen_title().unwrap_or_default();
+    centred(game, batch, &title, ox, 176.0, oy + 4.0, 0x40_4040);
+    // `renderInventoryTextAndOther`: the label, and the owner at its right.
+    let label_y = oy + height - 94.0;
+    game.native_text(batch, "Inventory", [ox + 8.0, label_y], 0x40_4040, false);
+    let owner = owner_line(&view, false);
+    let w = game.native_text_width(&owner);
+    game.native_text(batch, &owner, [ox + 170.0 - w, label_y], 0x40_4040, false);
+    sprite(game, batch, "security/public", [0.0, 0.0, 18.0, 18.0], at([145.0, 32.0, 18.0, 18.0]));
+    sprite(game, batch, "security/private", [0.0, 0.0, 18.0, 18.0], at([145.0, 111.0, 18.0, 18.0]));
+    // The light: on while the override is, off when it is not, nothing for those who are not the owner.
+    let light = if view.mine && view.freq.is_some() { if view.freq.as_ref().is_some_and(|f| f.1) { "enabled" } else { "disabled" } } else { "not_applicable" };
+    sprite(game, batch, &format!("light/security/{light}"), [0.0, 0.0, 6.0, 6.0], at([144.0, 77.0, 6.0, 6.0]));
+    // Trusted Players, over the list.
+    centred(game, batch, "Trusted Players", ox + 13.0, 122.0, oy + 57.0, 0x40_4040);
+    let (mode_text, red) = match &view.freq {
+        Some((m, ..)) => (format!("Security: {}", sec::Mode::from_ordinal(i64::from(*m)).name()), false),
+        None => ("Security Offline".to_owned(), true),
+    };
+    game.native_text(batch, &mode_text, [ox + 13.0, oy + 103.0], if red { 0xFF_5555 } else { 0x40_4040 }, false);
+    let add_w = game.native_text_width("Add:");
+    game.native_text(batch, "Add:", [ox + 34.0 - add_w, oy + 70.0], 0x40_4040, false);
+    // The list (`GuiTextScrollList`).
+    let names = sec_trusted(&view);
+    SEC_UI.with_borrow_mut(|ui| {
+        let hidden = names.len().saturating_sub(SEC_ROWS);
+        ui.scroll = ui.scroll.min(hidden);
+        if ui.selected.is_some_and(|s| s >= names.len()) {
+            ui.selected = None;
+        }
+        let [lx, ly, lw, lh] = SEC_LIST;
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, at(SEC_LIST), 0xFFFF_FFFF);
+        if hidden > 0 {
+            let (bar_x, bar_y, bar_max) = (lx + lw - 6.0, ly + 2.0, lh - 4.0);
+            nine_slice_tinted(game, batch, "scroll/list_border", [6.0, 6.0], 2.0, [ox + bar_x - 1.0, oy + bar_y - 1.0, 6.0, bar_max + 2.0], 0xFFFF_FFFF);
+            let thumb = (ui.scroll as f32 / hidden as f32 * (bar_max - 4.0)).round();
+            sprite(game, batch, "scroll/list_bar", [0.0, 0.0, 4.0, 4.0], [ox + bar_x, oy + bar_y + thumb, 4.0, 4.0]);
+        }
+        if let Some(sel) = ui.selected.filter(|s| (ui.scroll..ui.scroll + SEC_ROWS).contains(s)) {
+            let y = ly + 1.0 + (sel - ui.scroll) as f32 * 10.0;
+            sprite(game, batch, "scroll/list_selection", [0.0, 0.0, 2.0, 2.0], [ox + lx + 1.0, oy + y, lw - 8.0, 10.0]);
+        }
+        for (i, n) in names.iter().skip(ui.scroll).take(SEC_ROWS).enumerate() {
+            game.native_text_scaled(batch, n, [ox + lx + 2.0, oy + ly + 2.0 + 10.0 * i as f32], 0x3C_FE9A, 0.8);
+        }
+        // Remove, active with a selection.
+        let can_remove = ui.selected.is_some() && view.mine;
+        draw_mek_button(game, batch, at(SEC_REMOVE), can_remove, can_remove && inside(mouse, SEC_REMOVE));
+        let w = game.native_text_width("Remove");
+        let rgb = if can_remove { 0xFF_FFFF } else { 0xA0_A0A0 };
+        game.native_text(batch, "Remove", [ox + SEC_REMOVE[0] + (SEC_REMOVE[2] - w) / 2.0, oy + SEC_REMOVE[1] + (SEC_REMOVE[3] - 8.0) / 2.0], rgb, true);
+        // The name field over an inner screen, with its caret and its checkmark.
+        let [fx, fy, fw, fh] = SEC_FIELD;
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, [ox + fx - 1.0, oy + fy - 1.0, fw + 2.0, fh + 2.0], 0xFFFF_FFFF);
+        let text_at = [ox + fx + 2.0, oy + fy + 2.0];
+        game.native_text_scaled(batch, &ui.text.value, text_at, 0xE0_E0E0, 0.8);
+        if ui.text.focused && (game.ticks / 6) % 2 == 0 {
+            let before: String = ui.text.value.chars().take(ui.text.cursor).collect();
+            game.native_text_scaled(batch, "_", [text_at[0] + game.native_text_width(&before) * 0.8, text_at[1]], 0xE0_E0E0, 0.8);
+        }
+        let typed = !ui.text.value.is_empty();
+        draw_mek_button(game, batch, at(SEC_CHECK), typed, typed && inside(mouse, SEC_CHECK));
+        sprite(game, batch, "button/checkmark", [0.0, 0.0, 12.0, 12.0], at(SEC_CHECK));
+    });
+    // The mode buttons: the frequency's mode is inactive, as everything is for a viewer who is not the owner.
+    let current = view.freq.as_ref().map(|f| f.0);
+    for (i, (mode, r)) in sec::Mode::ALL.into_iter().zip(SEC_MODES).enumerate() {
+        let active = owned && view.mine && view.freq.is_some() && current != Some(i as u8);
+        draw_mek_button(game, batch, at(r), active, active && inside(mouse, r));
+        sprite(game, batch, &format!("security/button_{}", mode.name().to_lowercase()), [0.0, 0.0, 40.0, 16.0], at(r));
+    }
+    draw_mek_button(game, batch, at(SEC_OVERRIDE), view.mine, view.mine && inside(mouse, SEC_OVERRIDE));
+    sprite(game, batch, "button/exclamation", [0.0, 0.0, 16.0, 16.0], at(SEC_OVERRIDE));
+}
+
+fn security_desk_click(game: &Game<'_>, at: [f32; 2], right: bool) {
+    let view = SEC_VIEW.with_borrow(Clone::clone);
+    let names = sec_trusted(&view).len();
+    SEC_UI.with_borrow_mut(|ui| {
+        ui.text.focused = inside(at, SEC_FIELD) && !inside(at, SEC_CHECK);
+        if right {
+            return;
+        }
+        let [lx, ly, lw, lh] = SEC_LIST;
+        if names > SEC_ROWS && inside(at, [lx + lw - 6.0, ly, 6.0, lh]) {
+            let hidden = names - SEC_ROWS;
+            let f = ((at[1] - ly - 2.0) / (lh - 4.0)).clamp(0.0, 1.0);
+            ui.scroll = ((hidden as f32 + 0.5) * f) as usize;
+        } else if inside(at, [lx + 1.0, ly + 1.0, lw - 8.0, lh - 2.0]) {
+            let row = ui.scroll + ((at[1] - ly - 1.0) / 10.0) as usize;
+            ui.selected = (row < names).then_some(row);
+        } else if inside(at, SEC_REMOVE) {
+            if let (Some(i), true) = (ui.selected, view.mine) {
+                sec_send(game, &sec::Op::Remove(i as u8));
+                ui.selected = None;
+            }
+        } else if inside(at, SEC_CHECK) {
+            sec_submit(game, ui, &view);
+        }
+    });
+    if right {
+        return;
+    }
+    if view.mine && view.freq.is_some() {
+        for (i, r) in SEC_MODES.into_iter().enumerate() {
+            if inside(at, r) && view.freq.as_ref().map(|f| f.0) != Some(i as u8) {
+                sec_send(game, &sec::Op::SetMode(sec::Mode::from_ordinal(i as i64)));
+            }
+        }
+    }
+    if view.mine && inside(at, SEC_OVERRIDE) {
+        sec_send(game, &sec::Op::ToggleOverride);
+    }
+}
+
+/// The name in the field is added (`GuiSecurityDesk.setTrusted`): the owner's, and a valid player name.
+fn sec_submit(game: &Game<'_>, ui: &mut SecUi, view: &SecView) {
+    let name = ui.text.value.trim().to_owned();
+    if view.mine {
+        if sec::valid_name(&name) {
+            sec_send(game, &sec::Op::Add(name));
+        }
+        ui.text = freq::TextBox { focused: ui.text.focused, ..Default::default() };
+    }
+}
+
+fn security_desk_tooltip(at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    let view = SEC_VIEW.with_borrow(Clone::clone);
+    if let Some(i) = SEC_MODES.iter().position(|r| inside(at, *r)) {
+        lines.push(["Public Mode", "Private Mode", "Trusted Mode"][i].to_owned());
+        return true;
+    }
+    if inside(at, SEC_OVERRIDE) {
+        let on = view.freq.as_ref().is_some_and(|f| f.1);
+        lines.push(format!("Security Override: {}", if on { "On" } else { "Off" }));
+        return true;
+    }
+    false
+}
+
+fn security_desk_key(game: &Game<'_>, key: &str, text: Option<&str>) {
+    let view = SEC_VIEW.with_borrow(Clone::clone);
+    SEC_UI.with_borrow_mut(|ui| {
+        if !ui.text.focused {
+            return;
+        }
+        if ui.text.key(key, text, sec::valid_char, sec::MAX_NAME) == freq::Typed::Enter {
+            sec_submit(game, ui, &view);
+        }
+    });
+}
+
+fn security_desk_wheel(steps: f32) {
+    let names = SEC_VIEW.with_borrow(|v| sec_trusted(v).len());
+    let hidden = names.saturating_sub(SEC_ROWS);
+    SEC_UI.with_borrow_mut(|ui| {
+        let first = ui.scroll.min(hidden);
+        ui.scroll = if steps > 0.0 { first.saturating_sub(1) } else { (first + 1).min(hidden) };
+    });
+}
+
+// --- Modification Station (TileEntityModificationStation, GuiModificationStation) ------------------------------
+
+const STN_CHANNEL: &str = "mekanism:modification_station";
+const STN_LIST: [f32; 4] = [28.0, 20.0, 120.0, 74.0];
+const STN_ROWS: usize = 6;
+const STN_REMOVE: [f32; 4] = [28.0, 96.0, 120.0, 17.0];
+const STN_KEYS: [&str; 2] = ["stn_item", "stn_mods"];
+
+thread_local! {
+    static STN_UI: std::cell::RefCell<StnUi> = std::cell::RefCell::new(StnUi::default());
+}
+
+#[derive(Default)]
+struct StnUi {
+    pos: [i32; 3],
+    selected: Option<String>,
+    scroll: usize,
+}
+
+/// `MachineEnergyContainer`: four ticks of the usage, grown by energy upgrades.
+fn station_capacity(nbt: &Compound) -> u64 {
+    upgrades(nbt).max_energy(machine::STORAGE_MULTIPLIER * modules::STATION_USAGE)
+}
+
+fn module_items_of(stack: &ItemStack) -> Compound {
+    match custom_data(stack).and_then(|c| c.get(&JavaString::from(MODULE_ITEMS_KEY))) {
+        Some(Tag::Compound(c)) => c.clone(),
+        _ => Compound::new(),
+    }
+}
+
+/// An item with `installed` modules (and the module items they came from, for taking them out again): the
+/// enchantments some modules are, and the energy it can hold with its energy units.
+fn write_modules(stack: &mut ItemStack, installed: &modules::Installed, kept: Compound) {
+    let mut c = Compound::new();
+    for (id, n) in installed {
+        c.insert(id.as_str().into(), Tag::Int(*n as i32));
+    }
+    let stored = stored_energy(stack);
+    set_custom_compound(stack, MODULES_KEY, c);
+    set_custom_compound(stack, MODULE_ITEMS_KEY, kept);
+    // Silk touch, fortune and frost walker units are those enchantments on the item.
+    let mut levels: Vec<(Arc<str>, u32)> = stack.enchantments().iter().filter(|(e, _)| !modules::MODULE_ENCHANTMENTS.contains(&&**e)).cloned().collect();
+    levels.extend(modules::enchantments(installed).into_iter().map(|(e, l)| (Arc::from(e), l)));
+    stack.set_crafting_enchantments(levels);
+    // Fewer energy units hold less (`ModuleEnergyUnit.onRemoved`).
+    let capacity = item_energy_of(stack).map_or(stored, |e| e.capacity);
+    set_energy(stack, stored.min(capacity));
+}
+
+/// The station every tick (`onUpdateServer`): a module in its first slot goes into the item in the second,
+/// one install each half second, for 10 FE a tick; the item and its modules go to the viewers.
+fn tick_station(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let capacity = station_capacity(&entity.nbt);
+    let (usage, ticks_required) = (upgrades(&entity.nbt).energy_per_tick(modules::STATION_USAGE), upgrades(&entity.nbt).ticks(modules::STATION_TICKS));
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let mut progress = get_int(&entity.nbt, "progress");
+    let module = entity.items.first().cloned().flatten().and_then(|s| module_type(&s).map(|id| (s, id)));
+    let held = entity.items.get(1).cloned().flatten().filter(|s| modules::is_container(&s.item));
+    let mut active = false;
+    match (module, held) {
+        (Some((slot, id)), Some(mut held)) => {
+            let mut installed = modules_of(&held);
+            let room = modules::max_installed(&held.item, &id).saturating_sub(installed.get(&id).copied().unwrap_or(0));
+            if room > 0 && energy.consume(usage) {
+                active = true;
+                progress += 1;
+                if progress >= ticks_required {
+                    progress = 0;
+                    let put = modules::install(&held.item, &mut installed, &id, slot.count);
+                    if put > 0 {
+                        let mut kept = module_items_of(&held);
+                        kept.insert(id.as_str().into(), horizon_items::item_nbt::item_to_nbt(&ItemStack { count: 1, ..slot.clone() }));
+                        write_modules(&mut held, &installed, kept);
+                        entity.items[1] = Some(held.clone());
+                        entity.items[0] = (slot.count > put).then(|| ItemStack { count: slot.count - put, ..slot });
+                    }
+                }
+            } else {
+                progress = 0;
+            }
+        }
+        _ => progress = 0,
+    }
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "progress", progress);
+    entity.data = vec![(energy.stored * 1000 / capacity) as i32, 1000, progress as i32, ticks_required as i32];
+    let mut client = Compound::new();
+    if let Some(Some(held)) = entity.items.get(1) {
+        client.insert("stn_item".into(), Tag::String(held.item.as_ref().into()));
+        let listed: Vec<String> = modules_of(held).into_iter().map(|(id, n)| format!("{id}={n}")).collect();
+        client.insert("stn_mods".into(), Tag::String(listed.join(";").as_str().into()));
+    }
+    put_client(game, pos, entity, &STN_KEYS, client);
+    Some(active)
+}
+
+/// A press on Remove, on the server (`PacketRemoveModule`): one module of the type goes to the player's
+/// inventory, or all of them.
+fn stn_payload(game: &mut Game<'_>, data: &[u8]) {
+    if data.len() < 14 {
+        return;
+    }
+    let int = |i: usize| i32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+    let (pos, all) = ([int(1), int(5), int(9)], data[0] == 1);
+    let Ok(id) = std::str::from_utf8(&data[13..]) else {
+        return;
+    };
+    let Some(player) = game.native_acting_player() else {
+        return;
+    };
+    let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    if !near || block_name(game, pos) != modules::STATION {
+        return;
+    }
+    let out = game.native_with_mod_block_entity(pos, |m| {
+        let held = m.items.get_mut(1)?.as_mut().filter(|s| modules::is_container(&s.item))?;
+        let mut installed = modules_of(held);
+        let mut kept = module_items_of(held);
+        let item = kept.get(&JavaString::from(id)).and_then(horizon_items::item_nbt::item_from_nbt)?;
+        let took = modules::uninstall(&mut installed, id, if all { u32::MAX } else { 1 });
+        if took == 0 {
+            return None;
+        }
+        if !installed.contains_key(id) {
+            kept.remove(&JavaString::from(id));
+        }
+        write_modules(held, &installed, kept);
+        Some(ItemStack { count: took, ..item })
+    });
+    if let Some(Some(stack)) = out {
+        game.give_or_drop(stack);
+    }
+}
+
+/// The station's installed modules, from its client data: the item in its second slot and what it holds.
+fn stn_view(game: &Game<'_>) -> Option<(Option<String>, modules::Installed)> {
+    let (x, y, z) = game.container?;
+    let (_, c) = game.native_client_block_entity([x, y, z])?;
+    let installed = strings_of_text(&get_string(c, "stn_mods").unwrap_or_default());
+    Some((get_string(c, "stn_item"), installed))
+}
+
+fn strings_of_text(text: &str) -> modules::Installed {
+    text.split(';').filter_map(|e| e.split_once('=')).filter_map(|(id, n)| Some((id.to_owned(), n.parse().ok()?))).collect()
+}
+
+fn stn_row(i: usize) -> [f32; 4] {
+    [STN_LIST[0] + 1.0, STN_LIST[1] + 1.0 + 12.0 * i as f32, STN_LIST[2] - 8.0, 12.0]
+}
+
+fn stn_types(item: &Option<String>) -> Vec<&'static str> {
+    item.as_deref().map(modules::supported).unwrap_or_default()
+}
+
+fn draw_station(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, height: f32, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let at = |r: [f32; 4]| [ox + r[0], oy + r[1], r[2], r[3]];
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    let (item, installed) = stn_view(game).unwrap_or_default();
+    let types = stn_types(&item);
+    let title = game.native_screen_title().unwrap_or_default();
+    centred(game, batch, &title, ox + 24.0, 152.0, oy + 4.0, 0x40_4040);
+    game.native_text(batch, "Inventory", [ox + 8.0, oy + height - 92.0], 0x40_4040, false);
+    sprite(game, batch, "slot/overlay/module", [0.0, 0.0, 16.0, 16.0], [ox + 35.0, oy + 118.0, 16.0, 16.0]);
+    nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, at(STN_LIST), 0xFFFF_FFFF);
+    STN_UI.with_borrow_mut(|ui| {
+        let hidden = types.len().saturating_sub(STN_ROWS);
+        ui.scroll = ui.scroll.min(hidden);
+        if ui.selected.as_deref().is_some_and(|s| !types.contains(&s)) {
+            ui.selected = None;
+        }
+        let [lx, ly, lw, lh] = STN_LIST;
+        if hidden > 0 {
+            let (bar_x, bar_y, bar_max) = (lx + lw - 6.0, ly + 2.0, lh - 4.0);
+            nine_slice_tinted(game, batch, "scroll/list_border", [6.0, 6.0], 2.0, [ox + bar_x - 1.0, oy + bar_y - 1.0, 6.0, bar_max + 2.0], 0xFFFF_FFFF);
+            let thumb = (ui.scroll as f32 / hidden as f32 * (bar_max - 4.0)).round();
+            sprite(game, batch, "scroll/list_bar", [0.0, 0.0, 4.0, 4.0], [ox + bar_x, oy + bar_y + thumb, 4.0, 4.0]);
+        }
+        for (i, id) in types.iter().skip(ui.scroll).take(STN_ROWS).enumerate() {
+            let row = stn_row(i);
+            let chosen = ui.selected.as_deref() == Some(*id);
+            let hovered = inside(mouse, row);
+            let (base, slot) = if chosen {
+                ("list/selected", "list/slot_selected")
+            } else if hovered {
+                ("list/hovered", "list/slot_hovered")
+            } else {
+                ("list/base", "list/slot")
+            };
+            nine_slice_tinted(game, batch, base, [12.0, 12.0], 1.0, at(row), 0xFFFF_FFFF);
+            sprite(game, batch, slot, [0.0, 0.0, 10.0, 10.0], [ox + row[0] + 1.0, oy + row[1] + 1.0, 10.0, 10.0]);
+            game.native_item(batch, modules::MODULE_ITEM, [ox + row[0] + 2.0, oy + row[1] + 2.0], 8.0);
+            if installed.contains_key(*id) {
+                game.native_text_scaled(batch, &module_name(id), [ox + lx + 13.0, oy + ly + 3.0 + 12.0 * i as f32], 0x40_4040, 0.7);
+            }
+        }
+        let can = ui.selected.as_deref().is_some_and(|s| installed.contains_key(s));
+        draw_mek_button(game, batch, at(STN_REMOVE), can, can && inside(mouse, STN_REMOVE));
+        let w = game.native_text_width("Remove");
+        let rgb = if can { 0xFF_FFFF } else { 0xA0_A0A0 };
+        game.native_text(batch, "Remove", [ox + STN_REMOVE[0] + (STN_REMOVE[2] - w) / 2.0, oy + STN_REMOVE[1] + (STN_REMOVE[3] - 8.0) / 2.0], rgb, true);
+    });
+}
+
+fn station_click(game: &Game<'_>, at: [f32; 2], right: bool) {
+    if right {
+        return;
+    }
+    let (item, installed) = stn_view(game).unwrap_or_default();
+    let types = stn_types(&item);
+    STN_UI.with_borrow_mut(|ui| {
+        let hidden = types.len().saturating_sub(STN_ROWS);
+        let [lx, ly, lw, lh] = STN_LIST;
+        if hidden > 0 && inside(at, [lx + lw - 6.0, ly, 6.0, lh]) {
+            let f = ((at[1] - ly - 2.0) / (lh - 4.0)).clamp(0.0, 1.0);
+            ui.scroll = ((hidden as f32 + 0.5) * f) as usize;
+        } else if let Some(i) = (0..STN_ROWS).find(|i| inside(at, stn_row(*i))) {
+            ui.selected = types.get(ui.scroll + i).map(|s| (*s).to_owned());
+        } else if inside(at, STN_REMOVE)
+            && let Some(id) = ui.selected.clone().filter(|s| installed.contains_key(s))
+            && let Some((x, y, z)) = game.container
+        {
+            let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+            let mut out = vec![u8::from(shift)];
+            for c in [x, y, z] {
+                out.extend(c.to_be_bytes());
+            }
+            out.extend(id.as_bytes());
+            game.native_send_to_server(STN_CHANNEL, &out);
+        }
+    });
+}
+
+fn station_tooltip(game: &Game<'_>, at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    if inside(at, STN_REMOVE) {
+        lines.push("Removes a single module, hold shift to remove all.".to_owned());
+        return true;
+    }
+    let (item, installed) = stn_view(game).unwrap_or_default();
+    let types = stn_types(&item);
+    let scroll = STN_UI.with_borrow(|ui| ui.scroll);
+    if let Some(i) = (0..STN_ROWS).find(|i| inside(at, stn_row(*i)))
+        && let Some(id) = types.get(scroll + i)
+        && let Some(n) = installed.get(*id)
+    {
+        let max = modules::max_installed(item.as_deref().unwrap_or(""), id);
+        lines.push(format!("Installed: \u{a7}7{n}/{max}"));
+        return true;
+    }
+    false
+}
+
+fn station_wheel(game: &Game<'_>, steps: f32) {
+    let (item, _) = stn_view(game).unwrap_or_default();
+    let hidden = stn_types(&item).len().saturating_sub(STN_ROWS);
+    STN_UI.with_borrow_mut(|ui| {
+        let first = ui.scroll.min(hidden);
+        ui.scroll = if steps > 0.0 { first.saturating_sub(1) } else { (first + 1).min(hidden) };
+    });
 }

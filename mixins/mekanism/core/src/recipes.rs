@@ -7,6 +7,10 @@ pub enum Ingredient {
     Item(&'static str),
     Tag(&'static str),
     Any(&'static [Ingredient]),
+    /// All of several (`neoforge:intersection`): an item in every tag.
+    All(&'static [Ingredient]),
+    /// The first without the second (`neoforge:difference`).
+    Except(&'static Ingredient, &'static Ingredient),
 }
 
 impl Ingredient {
@@ -16,6 +20,8 @@ impl Ingredient {
             Ingredient::Item(id) => *id == item,
             Ingredient::Tag(tag) => in_tag(tag, item),
             Ingredient::Any(all) => all.iter().any(|i| i.matches(item, in_tag)),
+            Ingredient::All(all) => all.iter().all(|i| i.matches(item, in_tag)),
+            Ingredient::Except(base, minus) => base.matches(item, in_tag) && !minus.matches(item, in_tag),
         }
     }
 }
@@ -218,6 +224,54 @@ pub fn find_chemical_infusing(a: &str, b: &str) -> Option<(&'static InfusingReci
     })
 }
 
+/// `pigment_mixing`: two pigments become a third, in either order.
+pub fn find_pigment_mixing(a: &str, b: &str) -> Option<(&'static InfusingRecipe, bool)> {
+    crate::recipe_table::PIGMENT_MIXING.iter().find_map(|r| {
+        if r.left == a && r.right == b {
+            Some((r, false))
+        } else if r.left == b && r.right == a {
+            Some((r, true))
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether `chemical` is either input of some `pigment_mixing` recipe.
+pub fn pigment_mixing_input(chemical: &str) -> bool {
+    crate::recipe_table::PIGMENT_MIXING
+        .iter()
+        .any(|r| r.left == chemical || r.right == chemical)
+}
+
+/// `pigment_extracting`: an item put in the extractor becomes pigment.
+pub fn find_pigment_extracting(
+    item: &str,
+    count: u32,
+    in_tag: &dyn Fn(&str, &str) -> bool,
+) -> Option<&'static ChemicalRecipe> {
+    crate::recipe_table::PIGMENT_EXTRACTING
+        .iter()
+        .find(|r| count >= r.input_count && r.input.matches(item, in_tag))
+}
+
+/// Whether `pigment` is the pigment of some `painting` recipe.
+pub fn painting_pigment(pigment: &str) -> bool {
+    crate::recipe_table::PAINTING.iter().any(|r| r.chemical == pigment)
+}
+
+/// `painting`: an item and pigment (used per operation) make a dyed item.
+pub fn find_painting(
+    item: &str,
+    count: u32,
+    pigment: &str,
+    in_tag: &dyn Fn(&str, &str) -> bool,
+) -> Option<&'static ItemChemicalRecipe> {
+    crate::recipe_table::PAINTING
+        .iter()
+        .find(|r| r.chemical == pigment && count >= r.input_count && r.input.matches(item, in_tag))
+}
+
 /// Whether `chemical` is either input of some `chemical_infusing` recipe.
 pub fn infusing_input(chemical: &str) -> bool {
     crate::recipe_table::CHEMICAL_INFUSING
@@ -386,5 +440,20 @@ mod tests {
         .expect("a recipe");
         assert_eq!((r.output, r.output_count), ("mekanism:shard_osmium", 4));
         assert_eq!(r.chemical, "mekanism:hydrogen_chloride");
+    }
+
+    #[test]
+    fn pigments_extract_mix_and_paint() {
+        let tags = |tag: &str, item: &str| tag == "c:dyes/red" && item == "minecraft:red_dye";
+        let r = find_pigment_extracting("minecraft:red_dye", 1, &tags);
+        assert!(r.is_none_or(|r| r.output == "mekanism:red"));
+        let (mix, swapped) = find_pigment_mixing("mekanism:yellow", "mekanism:aqua").expect("a mix");
+        assert_eq!(mix.output, "mekanism:lime");
+        assert!(swapped);
+        assert!(pigment_mixing_input("mekanism:black"));
+        // Painting skips an item already of the colour (`neoforge:difference`).
+        let in_banners = |tag: &str, item: &str| tag == "mekanism:colorable/banners" && item.ends_with("_banner");
+        assert!(find_painting("minecraft:white_banner", 1, "mekanism:black", &in_banners).is_some());
+        assert!(find_painting("minecraft:black_banner", 1, "mekanism:black", &in_banners).is_none());
     }
 }

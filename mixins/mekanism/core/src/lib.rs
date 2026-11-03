@@ -18,6 +18,8 @@ pub mod evaporation;
 pub mod factory;
 pub mod fission;
 pub mod formulaic;
+pub mod security;
+pub mod stabilizer;
 pub mod frequency;
 pub mod fusion;
 pub mod gear;
