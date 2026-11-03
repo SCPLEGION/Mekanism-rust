@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "64309b619d9b9c6fff2d01044a67426d4c8d2257"
+horizon_revision = "fa24aadf55f74d7f8066819f6875cd33ad0d007d"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -422,4 +422,42 @@ helper = "slot_rules.rs"
 bindings = [
   { name = "block", ty = "&str", value = "block" },
   { name = "rules", ty = "&mut Vec<horizon_client::lan::menu::SlotRule>", value = "&mut *rules" },
+]
+
+[[injection]]
+id = "ui-draw"
+hook = "ui_draw"
+hook_version = 1
+kind = "HEAD"
+helper = "ui_draw.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "id", ty = "&str", value = "id" },
+  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+]
+
+[[injection]]
+id = "ui-click"
+hook = "ui_click"
+hook_version = 1
+kind = "HEAD"
+helper = "ui_click.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "id", ty = "&str", value = "id" },
+  { name = "at", ty = "[f32; 2]", value = "at" },
+  { name = "button", ty = "u8", value = "button" },
+  { name = "pressed", ty = "bool", value = "pressed" },
+]
+
+[[injection]]
+id = "ui-wheel"
+hook = "ui_wheel"
+hook_version = 1
+kind = "HEAD"
+helper = "ui_wheel.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "id", ty = "&str", value = "id" },
+  { name = "steps", ty = "f32", value = "steps" },
 ]
