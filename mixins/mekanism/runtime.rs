@@ -5327,6 +5327,32 @@ thread_local! {
 }
 
 /// The window open on `block`'s screen, as an index into `WindowMoves`.
+/// What each container slot of a machine's menu takes (hook point `native_slot_rules`): the energy slot
+/// only items that hold energy (`EnergyInventorySlot`), the output slots nothing (`OutputInventorySlot`).
+pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu::SlotRule>) {
+    use horizon_client::lan::menu::SlotRule;
+    let energy = || SlotRule::Items(gear::energy_item_ids());
+    if let Some(Kind::Factory(n, ..)) = kind(block) {
+        *rules = vec![SlotRule::Any; FACTORY_ENERGY + 1];
+        for i in 0..factory_slots(n).len() {
+            rules[FACTORY_ROW + i] = SlotRule::Refuse;
+        }
+        rules[FACTORY_ENERGY] = energy();
+    } else if kind(block) == Some(Kind::Teleporter) {
+        *rules = vec![energy(), SlotRule::Any, SlotRule::Any];
+    } else if let Some(l) = layout(block) {
+        *rules = l
+            .slots
+            .iter()
+            .map(|s| match s.map(|(_, sprite)| sprite) {
+                Some("slot/power") => energy(),
+                Some(sprite) if sprite.starts_with("slot/output") => SlotRule::Refuse,
+                _ => SlotRule::Any,
+            })
+            .collect();
+    }
+}
+
 /// Escape on a screen (hook point `native_screen_escape`): it closes the open window and not the screen.
 pub(super) fn screen_escape(block: &str, consumed: &mut bool) {
     if is_filter_screen(block) {
