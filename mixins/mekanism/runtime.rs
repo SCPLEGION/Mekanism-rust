@@ -1318,7 +1318,7 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
         TANKS.with_borrow_mut(|t| {
             t.insert(pos);
         });
-    } else if matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve)) {
+    } else if matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation)) {
         BIG_TANKS.with_borrow_mut(|t| {
             t.insert(pos);
         });
@@ -1430,7 +1430,7 @@ fn big_tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWo
             let Some((id, c)) = game.native_client_block_entity(*pos) else {
                 return false;
             };
-            if !matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve)) {
+            if !matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation)) {
                 return false;
             }
             for i in 0..2 {
@@ -3944,6 +3944,7 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     };
     let Some(tower) = tower else {
         entity.data = vec![0, 1000, 0, 1000];
+        put_fills(game, pos, entity, &[]);
         return Some(false);
     };
     let mut water = get_tank(&entity.nbt, "water", evap::input_capacity(tower.height));
@@ -3999,6 +4000,18 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     put_tank(&mut entity.nbt, "water", &water);
     put_tank(&mut entity.nbt, "brine", &brine);
     put_int(&mut entity.nbt, "progress", progress);
+    // `RenderThermalEvaporationPlant`: the input tank fills the inside of the tower (2 by 2, between the floor and the roof).
+    let fills = if water.amount > 0 && tower.height > 2 {
+        vec![Fill {
+            at: [tower.origin[0] + 1, tower.origin[1] + 1, tower.origin[2] + 1],
+            size: [2, tower.height as i32 - 2, 2],
+            scale: (water.amount as f64 / water.capacity.max(1) as f64).min(1.0),
+            chemical: water.chemical.clone(),
+        }]
+    } else {
+        Vec::new()
+    };
+    put_fills(game, pos, entity, &fills);
     entity.nbt.insert("temperature".into(), Tag::Double(temperature.to_bits()));
     // `lastGain` (what the screen shows, in hundredths) and `lastEnvironmentLoss` (heat units, in hundredths of a kelvin).
     let multiplier = evap::temp_multiplier(temperature, tower.height);
