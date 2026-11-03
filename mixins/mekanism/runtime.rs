@@ -6883,6 +6883,12 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
             rules[0] = SlotRule::Items(vec![modules::MODULE_ITEM.to_owned()]);
             rules[1] = SlotRule::Items([modules::MEKA_TOOL, modules::HELMET, modules::BODYARMOR, modules::PANTS, modules::BOOTS].map(str::to_owned).to_vec());
         }
+        // `InputInventorySlot` with the filterable-tag validator (known once one has ticked).
+        if kind(block) == Some(Kind::Oredictionificator)
+            && let Some(items) = OD_INPUT.get()
+        {
+            rules[0] = SlotRule::Items(items.clone());
+        }
         if kind(block) == Some(Kind::Assemblicator) {
             rules[fa::FORMULA_SLOT] = SlotRule::Items(vec![fa::FORMULA_ITEM.to_owned()]);
         }
@@ -9398,7 +9404,27 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         }
         let done = if warning_bits(block, &l, data) & 8 != 0 { 0.0 } else { (get(2) / get(3).max(1.0)).clamp(0.0, 1.0) * w };
         if done > 0.0 {
-            sprite(game, batch, &format!("{name}/full"), [0.0, 0.0, done, h], [ox + at[0], oy + at[1], done, h]);
+            // `GuiProgress.colored`: the Pigment Extractor's arrow runs from white to the pigment in its tank.
+            let tint = (kind(block) == Some(Kind::PigmentExtractor) && read_wide(data, DATA_GAUGES) > 0)
+                .then(|| usize::try_from(data.get(DATA_GAUGES + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c)).map(|c| c.2))
+                .flatten();
+            match tint {
+                Some(rgb) => {
+                    let progress = done / w;
+                    let lerp = |a: u32, b: u32, t: f32| {
+                        let ch = |s: u32| ((a >> s & 0xFF) as f32 + ((b >> s & 0xFF) as f32 - (a >> s & 0xFF) as f32) * t).round() as u32;
+                        0xFF00_0000 | ch(16) << 16 | ch(8) << 8 | ch(0)
+                    };
+                    let end = lerp(0xFFFFFF, rgb, progress);
+                    let texture = format!("{SPRITES}{name}/full");
+                    for x in 0..done.ceil() as i32 {
+                        let width = (done - x as f32).min(1.0);
+                        let argb = lerp(0xFFFFFF, end, (x as f32 + 0.5) / done);
+                        game.native_sprite_tinted(batch, &texture, [x as f32, 0.0, width, h], [ox + at[0] + x as f32, oy + at[1], width, h], argb);
+                    }
+                }
+                None => sprite(game, batch, &format!("{name}/full"), [0.0, 0.0, done, h], [ox + at[0], oy + at[1], done, h]),
+            }
         }
     }
     if l.power.is_some() {
@@ -15200,9 +15226,26 @@ fn od_item_tags(items: &horizon_client::items::Items, item: &str) -> Vec<String>
     tags
 }
 
+/// The items the Oredictionificator's input slot takes (those with a tag `validOredictionificatorFilters` allows),
+/// worked out once from the item tags and kept for the slot rules (which see no game).
+static OD_INPUT: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn od_input_items(items: &horizon_client::items::Items) -> &'static [String] {
+    OD_INPUT.get_or_init(|| {
+        let mut all: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (tag, members) in &items.item_tags {
+            if od::valid_tag(tag) {
+                all.extend(members.iter().map(|m| m.to_string()));
+            }
+        }
+        all.into_iter().collect()
+    })
+}
+
 /// The Oredictionificator, every tick: an item of a tag a filter names becomes the filter's item, as
 /// much as the output slot has room for.
 fn tick_oredictionificator(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool> {
+    od_input_items(world_items!(game));
     let filters = od_filters(&entity.nbt);
     let mut did = false;
     if let Some(Some(input)) = entity.items.first().cloned()
