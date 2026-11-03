@@ -4043,16 +4043,19 @@ pub(super) fn place_bounding_blocks(game: &mut Game<'_>, stack: &ItemStack, pos:
     }
 }
 
-/// A machine broken at `pos` takes its bounding blocks with it (`removeBoundingBlocks`).
-pub(super) fn clear_bounding_blocks(game: &mut Game<'_>, pos: [i32; 3]) {
-    if !game.native_on(MOD_ID) {
+/// A machine that stopped being at `pos` (`old`, with its properties) takes its bounding blocks with it
+/// (`removeBoundingBlocks`), whatever removed it: a player, an explosion, a piston, a command.
+pub(super) fn clear_bounding_blocks(
+    game: &mut Game<'_>,
+    pos: [i32; 3],
+    old: &str,
+    old_properties: &std::collections::BTreeMap<String, String>,
+) {
+    if !game.native_on(MOD_ID) || bounding::cells(old).is_none() {
         return;
     }
-    let id = game.native_block(pos);
-    if bounding::cells(&id).is_none() {
-        return;
-    }
-    for (at, bounding_id) in bounding::fill(&id, &machine_facing(game, pos), pos) {
+    let facing = old_properties.get("facing").map_or("north", String::as_str);
+    for (at, bounding_id) in bounding::fill(old, facing, pos) {
         if game.native_block(at) == bounding_id {
             game.native_set_block(at, "minecraft:air", &[]);
         }
