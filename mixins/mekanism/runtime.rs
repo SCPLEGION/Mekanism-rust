@@ -5173,6 +5173,7 @@ pub(super) fn screen_overlay(game: &Game<'_>, block: &str, data: &[i32], batch: 
         return;
     };
     follow_drag(game, id, origin);
+    save_moves(game);
     let off = window_offset(id);
     let moved = [origin[0] + off[0], origin[1] + off[1]];
     draw_window(game, block, data, batch, moved);
@@ -5323,6 +5324,42 @@ struct WindowMoves {
 }
 
 thread_local! {
+    /// The window places changed since they were saved.
+    static MOVES_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Where the windows were and which were pinned, in the mod's folder (Mekanism keeps them in its client
+/// config): per window `x y pinned`, one line each.
+const WINDOWS_FILE: &str = "windows";
+
+fn load_moves(game: &Game<'_>) {
+    let Some(text) = game.native_setting(MOD_ID, WINDOWS_FILE) else {
+        return;
+    };
+    MOVES.with_borrow_mut(|m| {
+        for (i, line) in text.lines().take(5).enumerate() {
+            let v: Vec<&str> = line.split_whitespace().collect();
+            if let [x, y, p] = v[..]
+                && let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>())
+            {
+                m.offsets[i] = [x, y];
+                m.pinned[i] = p == "1";
+            }
+        }
+    });
+}
+
+fn save_moves(game: &Game<'_>) {
+    if !MOVES_DIRTY.replace(false) {
+        return;
+    }
+    let text = MOVES.with_borrow(|m| {
+        (0..5).map(|i| format!("{} {} {}\n", m.offsets[i][0], m.offsets[i][1], u8::from(m.pinned[i]))).collect::<String>()
+    });
+    game.native_set_setting(MOD_ID, WINDOWS_FILE, &text);
+}
+
+thread_local! {
     static MOVES: std::cell::RefCell<WindowMoves> = std::cell::RefCell::new(WindowMoves::default());
 }
 
@@ -5452,6 +5489,7 @@ fn follow_drag(game: &Game<'_>, id: usize, origin: [f32; 2]) {
         };
         if dragged != id || !game.native_mouse_down() {
             m.drag = None;
+            MOVES_DIRTY.set(true);
             return;
         }
         let cursor = game.native_cursor();
@@ -5474,6 +5512,7 @@ fn pin_click(block: &str, at: [f32; 2]) -> bool {
         return false;
     }
     MOVES.with_borrow_mut(|m| m.pinned[id] = !m.pinned[id]);
+    MOVES_DIRTY.set(true);
     true
 }
 
@@ -6390,18 +6429,6 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
         return;
     }
     screen_base(block, screen);
-    // A pinned window opens again with the screen (`GuiMekanism` restores the pinned windows).
-    if screen.is_some() && window(block).is_none() && !is_filter_screen(block) {
-        let t = tabs(block);
-        let (sides, upgrades) = MOVES.with_borrow(|m| (m.pinned[WINDOW_SIDES], m.pinned[WINDOW_UPGRADES]));
-        if sides && t & TAB_SIDES != 0 {
-            set_window(block, Some(Window::Sides(0)));
-        } else if upgrades && t & TAB_UPGRADE != 0 {
-            set_window(block, Some(Window::Upgrades(None)));
-        } else if MOVES.with_borrow(|m| m.pinned[WINDOW_TRANSPORTER]) && t & TAB_SIDES != 0 {
-            set_window(block, Some(Window::Transporter));
-        }
-    }
     // The QIO blocks swap to the selector's layout while their tab's screen is open: 176 x 155, none
     // of the inventory (it is moved out of the way).
     if is_qio_tile(block) && let Some(s) = screen.as_mut() {
@@ -9167,9 +9194,39 @@ const QIO_TAB: [f32; 4] = [-26.0, 6.0, 26.0, 26.0];
 const QIO_TAB_BUTTON: [f32; 4] = [-22.0, 10.0, 18.0, 18.0];
 const QIO_BACK: [f32; 4] = [6.0, 6.0, 14.0, 14.0];
 
+thread_local! {
+    /// The screen asked for last: its block's position and the tick it was last asked.
+    static OPEN_SEEN: std::cell::Cell<Option<([i32; 3], u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Asked every frame a screen is open: the first time for a screen, the saved window places load and
+/// the pinned window opens again (`GuiMekanism` restores the pinned windows).
+fn screen_opened(game: &Game<'_>, block: &str) {
+    let now = game.ticks as u64;
+    let here = game.container.map(|(x, y, z)| [x, y, z]);
+    let seen = OPEN_SEEN.get();
+    OPEN_SEEN.set(here.map(|p| (p, now)));
+    if here.is_none() || seen.is_some_and(|(p, t)| Some(p) == here && now.saturating_sub(t) <= 10) {
+        return;
+    }
+    load_moves(game);
+    if window(block).is_none() && !is_filter_screen(block) {
+        let t = tabs(block);
+        let (sides, upgrades, transporter) = MOVES.with_borrow(|m| (m.pinned[WINDOW_SIDES], m.pinned[WINDOW_UPGRADES], m.pinned[WINDOW_TRANSPORTER]));
+        if sides && t & TAB_SIDES != 0 {
+            set_window(block, Some(Window::Sides(0)));
+        } else if upgrades && t & TAB_UPGRADE != 0 {
+            set_window(block, Some(Window::Upgrades(None)));
+        } else if transporter && t & TAB_SIDES != 0 {
+            set_window(block, Some(Window::Transporter));
+        }
+    }
+}
+
 /// Whether the open QIO block shows its selector now; a selector left open on a screen that closed
 /// (not asked for a few ticks) or on another block is dropped. Asked every frame.
 pub(super) fn screen_alt(game: &Game<'_>, block: &str, alt: &mut bool) {
+    screen_opened(game, block);
     if !is_qio_tile(block) {
         return;
     }
