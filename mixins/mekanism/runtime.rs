@@ -18585,6 +18585,7 @@ pub(super) fn ui_draw(game: &Game<'_>, id: &str, batch: &mut horizon_client::hud
             RobitTab::Main => robit_draw(game, batch),
             tab => robit_draw_inventory(game, batch, o, tab),
         }
+        robit_tooltip(game, batch, o);
     }
 }
 
@@ -18973,6 +18974,12 @@ pub(super) fn use_robit(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     let owner = game.options.player_name().to_string();
     let mut data = Compound::new();
     data.insert("owner_name".into(), Tag::String(owner.as_str().into()));
+    if let Some(player) = game.native_acting_player() {
+        // `EntityRobit.setOwnerUUID`: the owner's uuid and their default mode (`SecurityUtils`).
+        let uuid = uuid_text(player.uuid);
+        put_int(&mut data, "sec_mode", sec_data(&uuid).map_or(0, |d| u32::from(d.mode.ordinal())));
+        data.insert("owner".into(), Tag::String(uuid.as_str().into()));
+    }
     put_long(&mut data, "energy", stored_energy(&held).min(robit::MAX_ENERGY));
     for (k, v) in ["home_x", "home_y", "home_z"].into_iter().zip(pos) {
         data.insert(k.into(), Tag::Int(v));
@@ -19222,6 +19229,9 @@ struct RobitView {
     /// `EntityRobit.getName`'s custom name, and the skin worn.
     name: String,
     skin: String,
+    /// The mode the security tab shows (`getEffectiveSecurityMode`) and whether the owner's override set it.
+    sec_mode: u8,
+    sec_over: bool,
     owner: String,
 }
 
@@ -19243,6 +19253,9 @@ fn send_robit_states(game: &mut Game<'_>, players: &[RobitPlayer]) {
             out.push(s.len().min(255) as u8);
             out.extend(s.bytes().take(255));
         }
+        let (mode, overridden) = sec_effective_of(&data);
+        out.push(mode.ordinal());
+        out.push(u8::from(overridden));
         out.extend(get_string(&data, "owner_name").unwrap_or_default().bytes());
         for p in players {
             game.native_send_to_player(p.uuid, ROBIT_STATE_CHANNEL, &out);
@@ -19264,6 +19277,8 @@ fn robit_state_payload(data: &[u8]) {
         progress: data[13],
         name: String::new(),
         skin: String::new(),
+        sec_mode: 0,
+        sec_over: false,
         owner: String::new(),
     };
     let mut at = 14;
@@ -19274,9 +19289,13 @@ fn robit_state_payload(data: &[u8]) {
         Some(s)
     };
     let (name, skin) = (read().unwrap_or_default(), read().unwrap_or_default());
+    let (sec_mode, sec_over) = (data.get(at).copied().unwrap_or(0), data.get(at + 1).copied().unwrap_or(0) != 0);
+    at += 2;
     let view = RobitView {
         name,
         skin,
+        sec_mode,
+        sec_over,
         owner: String::from_utf8_lossy(data.get(at..).unwrap_or_default()).into_owned(),
         ..view
     };
@@ -19287,7 +19306,48 @@ fn robit_state_payload(data: &[u8]) {
 
 /// A button on the Robit's screen, on the server: go home, toggle pickup, toggle following
 /// (`GuiInteractionEntity.GO_HOME`, `PICKUP_DROPS`, `FOLLOW`).
+/// `IEntitySecurityUtils.canAccess`: whether the acting player may use the Robit (a Robit with no owner
+/// uuid, from before it was kept, is open).
+fn robit_allowed(game: &mut Game<'_>, id: u32) -> bool {
+    let Some(player) = game.native_acting_player() else {
+        return false;
+    };
+    let me = uuid_text(player.uuid);
+    game.native_with_mob(id, |m| {
+        let data = robit_data(m);
+        let Some(owner) = get_string(&data, "owner") else {
+            return true;
+        };
+        let (mode, _) = sec_effective_of(&data);
+        sec::can_access(mode, &owner, &me, sec_data(&owner).as_ref())
+    })
+    .unwrap_or(false)
+}
+
 fn robit_op_payload(game: &mut Game<'_>, data: &[u8]) {
+    if data.len() >= 5 && data[0] != 5 {
+        let id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+        if !robit_allowed(game, id) {
+            tell(game, "You don't have access.".to_owned());
+            return;
+        }
+    }
+    if data.len() == 6 && data[0] == 11 {
+        // `NEXT_SECURITY_MODE` and `PREVIOUS_SECURITY_MODE`: only the owner steps the mode.
+        let id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+        if let Some(player) = game.native_acting_player() {
+            let me = uuid_text(player.uuid);
+            game.native_with_mob(id, |m| {
+                let mut d = robit_data(m);
+                if get_string(&d, "owner").is_some_and(|o| o == me) {
+                    let next = sec::step(sec_mode_of(&d), data[5] != 0).ordinal();
+                    put_int(&mut d, "sec_mode", u32::from(next));
+                    m.extra.mod_data = Some(d);
+                }
+            });
+        }
+        return;
+    }
     if data.len() == 8 && data[0] == 4 {
         let how = match data[6] {
             0 => slot_click::Click::Left,
@@ -19590,6 +19650,17 @@ fn robit_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
         return;
     }
     let o = ROBIT_ORIGIN.with_borrow(|o| *o);
+    if button <= 1 && inside(at, robit_security_tab(o)) {
+        if let Some(id) = ROBIT_UI.with_borrow(|u| *u)
+            && ROBIT_VIEWS.with_borrow(|v| v.get(&id).is_some_and(|v| v.owner == game.options.player_name()))
+        {
+            let mut out = vec![11];
+            out.extend(id.to_be_bytes());
+            out.push(u8::from(button == 0));
+            game.native_send_to_server(ROBIT_CHANNEL, &out);
+        }
+        return;
+    }
     for (i, (_, tab)) in ROBIT_TABS.iter().enumerate() {
         if button == 0 && inside(at, robit_tab_rect(i, o)) {
             if ROBIT_TAB.with(std::cell::Cell::get) != *tab {
@@ -20091,8 +20162,63 @@ fn robit_inv_cell(tab: RobitTab, slot: usize, o: [f32; 2]) -> Option<[f32; 4]> {
     }
 }
 
+/// The tooltips of the Robit's tabs and buttons (`GuiRobitMain`'s `setTooltip`s, the security tab's).
+fn robit_tooltip(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2]) {
+    if ROBIT_WIN.with(std::cell::Cell::get) != 0 {
+        return;
+    }
+    let cursor = game.native_cursor();
+    let mut lines: Vec<String> = vec![];
+    for (i, (_, tab)) in ROBIT_TABS.iter().enumerate() {
+        if inside(cursor, robit_tab_rect(i, o)) {
+            lines.push(match tab {
+                RobitTab::Main => "Robit",
+                RobitTab::Crafting => "Robit Crafting",
+                RobitTab::Inventory => "Robit Inventory",
+                RobitTab::Smelting => "Robit Smelting",
+                RobitTab::Repair => "Robit Repair",
+            }.to_owned());
+        }
+    }
+    if ROBIT_TAB.with(std::cell::Cell::get) == RobitTab::Main {
+        for (_, r, op) in ROBIT_BUTTONS {
+            if inside(cursor, [o[0] + r[0], o[1] + r[1], r[2], r[3]]) {
+                lines.push(match op {
+                    1 => "Teleport back home",
+                    101 => "Rename this Robit",
+                    102 => "Change this Robit's appearance",
+                    2 => "Toggle 'drop pickup' mode",
+                    _ => "Toggle 'follow' mode",
+                }.to_owned());
+            }
+        }
+    }
+    if inside(cursor, robit_security_tab(o)) {
+        let view = ROBIT_UI.with_borrow(|u| *u).and_then(|id| ROBIT_VIEWS.with_borrow(|v| v.get(&id).cloned())).unwrap_or_default();
+        let mine = view.owner == game.options.player_name();
+        lines.push(format!("\u{a7}7Security: {}", sec::Mode::from_ordinal(i64::from(view.sec_mode)).name()));
+        lines.push(format!("\u{a7}8Owner: {}{}", if mine { "\u{a7}a" } else { "\u{a7}c" }, view.owner));
+        if view.sec_over {
+            lines.push("\u{a7}c(Overridden)".to_owned());
+        }
+    }
+    if !lines.is_empty() {
+        let text: Vec<horizon_client::text::Text> = lines.iter().map(|l| horizon_client::text::Text::legacy(l)).collect();
+        horizon_client::ui::tooltip(batch, &game.gui.atlas, &text, (cursor[0], cursor[1]));
+    }
+}
+
+/// `GuiSecurityTab(this, robit, 120)`: the tab right of the window at y 120, its icon the mode's.
+fn robit_security_tab(o: [f32; 2]) -> [f32; 4] {
+    [o[0] + ROBIT_WINDOW[0] + 4.0, o[1] + 124.0, 18.0, 18.0]
+}
+
 fn robit_draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2]) {
     let cursor = game.native_cursor();
+    let view = ROBIT_UI.with_borrow(|u| *u).and_then(|id| ROBIT_VIEWS.with_borrow(|v| v.get(&id).cloned())).unwrap_or_default();
+    nine_slice_tinted(game, batch, "holder_right", [26.0, 9.0], 4.0, [o[0] + ROBIT_WINDOW[0], o[1] + 120.0, 26.0, 26.0], 0xFFFF_A160);
+    let sec = robit_security_tab(o);
+    draw_button(game, batch, sec, inside(cursor, sec), true, 0xFFFF_FFFF, Some((match view.sec_mode { 1 => "security/private", 2 => "security/protected", _ => "security/public" }, 18.0)));
     nine_slice_tinted(game, batch, "holder_left", [26.0, 9.0], 4.0, [o[0] + ROBIT_WINDOW[0] - 4.0, o[1] + 6.0, 30.0, 106.0], 0xFFFF_FFFF);
     let current = ROBIT_TAB.with(std::cell::Cell::get);
     for (i, (icon, tab)) in ROBIT_TABS.iter().enumerate() {
@@ -20190,7 +20316,14 @@ fn robit_draw_inventory(game: &Game<'_>, batch: &mut horizon_client::hud::HudBat
     nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [o[0] - 3.0, o[1] - 3.0, ROBIT_WINDOW[0] + 6.0, ROBIT_WINDOW[1] + 6.0], 0xBFFF_FFFF);
     nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [o[0], o[1], ROBIT_WINDOW[0], ROBIT_WINDOW[1]], 0xFFFF_FFFF);
     robit_draw_tabs(game, batch, o);
-    centred(game, batch, if tab == RobitTab::Repair { "Repair" } else { "Robit" }, o[0] + if tab == RobitTab::Repair { 60.0 } else { 0.0 }, if tab == RobitTab::Repair { 107.0 } else { ROBIT_WINDOW[0] }, o[1] + 5.0, 0x40_4040);
+    let title = match tab {
+        RobitTab::Crafting => "Robit Crafting",
+        RobitTab::Inventory => "Robit Inventory",
+        RobitTab::Smelting => "Robit Smelting",
+        RobitTab::Repair => "Robit Repair",
+        RobitTab::Main => "Robit",
+    };
+    centred(game, batch, title, o[0] + if tab == RobitTab::Repair { 60.0 } else { 0.0 }, if tab == RobitTab::Repair { 107.0 } else { ROBIT_WINDOW[0] }, o[1] + 5.0, 0x40_4040);
     game.native_text(batch, "Inventory", [o[0] + 8.0, o[1] + 73.0], 0x40_4040, false);
     if tab == RobitTab::Crafting {
         sprite(game, batch, "arrow/right", [0.0, 0.0, 22.0, 15.0], [o[0] + 90.0, o[1] + 35.0, 22.0, 15.0]);
