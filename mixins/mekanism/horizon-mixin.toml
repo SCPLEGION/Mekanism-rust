@@ -355,6 +355,17 @@ bindings = [
 ]
 
 [[injection]]
+id = "world-boxes"
+hook = "world_boxes"
+hook_version = 1
+kind = "HEAD"
+helper = "screen_world_boxes.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "boxes", ty = "&mut Vec<crate::game::native_hooks::NativeWorldBox>", value = "&mut *boxes" },
+]
+
+[[injection]]
 id = "slot-rules"
 hook = "slot_rules"
 hook_version = 1
