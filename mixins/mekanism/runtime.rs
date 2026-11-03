@@ -3666,6 +3666,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
         adapter_payload(game, data);
         return;
     }
+    if channel == FUSION_CHANNEL && game.native_on(MOD_ID) {
+        fusion_payload(game, data);
+        return;
+    }
     if channel == FISSION_CHANNEL && game.native_on(MOD_ID) {
         fission_payload(game, data);
         return;
@@ -4358,11 +4362,14 @@ fn put_fusion_plasma(nbt: &mut Compound, p: &fusion::Plasma) {
 }
 
 fn fusion_injection(nbt: &Compound) -> u64 {
-    match get_long(nbt, "injection") {
-        0 => fusion::DEFAULT_INJECTION,
-        n => n.min(fusion::MAX_INJECTION),
+    match nbt.get(&JavaString::from("injection")) {
+        None => fusion::DEFAULT_INJECTION,
+        Some(_) => get_long(nbt, "injection").min(fusion::MAX_INJECTION),
     }
 }
+
+/// `GuiFusionReactorHeat.MAX_LEVEL`.
+const FUSION_MAX_TEMP: u64 = 500_000_000;
 
 /// A Fusion Reactor port. Once a second each port checks its reactor; the first port runs it: it takes
 /// deuterium and tritium from the tubes and chemical tanks beside the ports and water from the pipes and
@@ -4814,6 +4821,10 @@ fn layout(block: &str) -> Option<Layout> {
                 gauge("tritium", fusion::FUEL_CAPACITY, 27.0, 13.0, STANDARD),
                 gauge("water", 0, 131.0, 13.0, STANDARD),
                 gauge("steam", 0, 151.0, 13.0, STANDARD),
+                // The D-T fuel, and the plasma's and the case's temperatures in kelvin (a `GuiNumberGauge`).
+                gauge("fuel", fusion::FUEL_CAPACITY, 84.0, 50.0, STANDARD),
+                gauge("plasma", FUSION_MAX_TEMP, 12.0, 50.0, STANDARD),
+                gauge("case", FUSION_MAX_TEMP, 66.0, 50.0, STANDARD),
             ],
             power: None,
             progress: None,
@@ -5025,6 +5036,11 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
             tank = ChemicalTank::new(g.capacity);
             tank.insert("minecraft:lava", u64::from(get_int(&entity.nbt, "lava")));
         }
+        if matches!(g.key, "plasma" | "case") && kind(&entity.id) == Some(Kind::FusionPort) {
+            let p = fusion_plasma(&entity.nbt);
+            tank = ChemicalTank::new(g.capacity);
+            tank.insert("minecraft:lava", (if g.key == "plasma" { p.plasma } else { p.case }).max(0.0) as u64);
+        }
         if g.key == "water" && kind(&entity.id) == Some(Kind::Evaporation) {
             tank.capacity = evap::input_capacity(get_int(&entity.nbt, "height"));
         }
@@ -5121,6 +5137,8 @@ fn screen_width(block: &str) -> f32 {
         Some(Kind::TurbineValve) => 190.0,
         // `DEFAULT_IMAGE_WIDTH + 19`.
         Some(Kind::FissionPort) => 195.0,
+        // `DEFAULT_IMAGE_WIDTH + 10`.
+        Some(Kind::FusionPort) => 186.0,
         _ => 176.0,
     }
 }
@@ -6524,7 +6542,12 @@ fn multiblock_capacity(entity: &ModBlockEntity, key: &str) -> u64 {
         }
         Some(Kind::FusionPort) => {
             let injection = fusion_injection(nbt);
-            if key == "water" { fusion::water_capacity(injection) } else { fusion::steam_capacity(injection) }
+            match key {
+                "water" => fusion::water_capacity(injection),
+                "steam" => fusion::steam_capacity(injection),
+                "plasma" | "case" => FUSION_MAX_TEMP,
+                _ => fusion::FUEL_CAPACITY,
+            }
         }
         Some(Kind::BoilerValve) => {
             let b = boiler_of(nbt);
@@ -6662,7 +6685,8 @@ fn multiblock_lines(block: &str, data: &[i32]) -> Vec<String> {
 fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
     match kind(block) {
         Some(Kind::FissionPort) => &[([6.0, 75.0, 81.0, 16.0], "Activate"), ([89.0, 75.0, 81.0, 16.0], "SCRAM")],
-        Some(Kind::FusionPort) => &[([50.0, 56.0, 38.0, 16.0], "Ignite"), ([90.0, 56.0, 38.0, 16.0], "Inject+")],
+        // The port has no lasers or hohlraum, so a button ignites the reactor.
+        Some(Kind::FusionPort) => &[([63.0, 36.0, 60.0, 16.0], "Ignite")],
         // `GuiGasMode`: the steam dump mode, a 10 px image button.
         Some(Kind::TurbineValve) => &[([173.0, 72.0, 10.0, 10.0], "")],
         _ => &[],
@@ -6671,6 +6695,9 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
 
 /// A press on a reactor's button (hook point `native_screen_click`, API 20).
 pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
+    if kind(block) == Some(Kind::FusionPort) && fusion_click(game, block, at, right) {
+        return;
+    }
     if kind(block) == Some(Kind::FissionPort) {
         if fission_stats_open(block) {
             fission_stats_click(game, data, at, right);
@@ -6798,10 +6825,10 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
     screen_base(block, screen);
     // The QIO blocks swap to the selector's layout while their tab's screen is open: 176 x 155, none
     // of the inventory (it is moved out of the way).
-    if kind(block) == Some(Kind::FissionPort) && let Some(s) = screen.as_mut() {
-        // `GuiFissionReactorStats`: the default 176 x 166 with no inventory.
+    if matches!(kind(block), Some(Kind::FissionPort | Kind::FusionPort)) && let Some(s) = screen.as_mut() {
+        // `GuiFissionReactorStats` (the default 176 x 166), `GuiFusionReactorInfo` (186 wide): no inventory.
         s.alt = Some(Box::new(super::native_hooks::NativeScreen {
-            width: 176.0,
+            width: if kind(block) == Some(Kind::FusionPort) { 186.0 } else { 176.0 },
             height: 166.0,
             slots: vec![None; s.slots.len()],
             inventory_y: 4000.0,
@@ -6904,7 +6931,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         slots,
         inventory_y: h - 82.0,
         inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(),
-        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort)),
+        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort | Kind::FusionPort)),
         alt: None,
     });
 }
@@ -7102,6 +7129,262 @@ fn draw_nucleosynthesizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudB
 
 /// `GuiDynamicHorizontalRateBar`: the dynamic-rate sprite multiplied by a colour that runs from
 /// (60, 45, 74) to (100, 30, 170) along the bar.
+// --- Fusion Reactor screens (GuiFusionReactorController, ...Heat, ...Fuel) ---------------------------------
+
+/// The injection rate packet: the port's position and the rate (a byte).
+const FUSION_CHANNEL: &str = "mekanism:fusion_injection";
+const FUSION_TAB_Y: [f32; 2] = [6.0, 34.0];
+const FUSION_BACK: [f32; 4] = [6.0, 6.0, 14.0, 14.0];
+const FUSION_FIELD: [f32; 4] = [103.0, 115.0, 26.0, 11.0];
+
+thread_local! {
+    /// The Fusion Reactor screen open beside the main one: the port, the tick it was last drawn and the view
+    /// (1 heat, 2 fuel).
+    static FUSION_VIEW: std::cell::Cell<Option<([i32; 3], u64, u8)>> = const { std::cell::Cell::new(None) };
+    static FUSION_TEXT: std::cell::RefCell<freq::TextBox> = std::cell::RefCell::new(freq::TextBox::default());
+}
+
+fn fusion_view(block: &str) -> Option<u8> {
+    if kind(block) != Some(Kind::FusionPort) {
+        return None;
+    }
+    FUSION_VIEW.get().map(|v| v.2)
+}
+
+/// The tabs a view shows (view numbers 1 heat, 2 fuel): the others', at their own heights.
+fn fusion_tabs(view: u8) -> Vec<(u8, f32)> {
+    (1..=2u8).filter(|&v| v != view).map(|v| (v, FUSION_TAB_Y[usize::from(v) - 1])).collect()
+}
+
+fn fusion_tab_icon(view: u8) -> String {
+    if view == 1 { format!("{SPRITES}transmission/heat") } else { "mekanismgenerators:gui/sprites/button/fuel".to_owned() }
+}
+
+fn draw_fusion_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2], view: u8) {
+    for (v, y) in fusion_tabs(view) {
+        draw_tab(game, batch, origin, y, &fusion_tab_icon(v));
+    }
+    let [ox, oy] = origin;
+    sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
+    sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
+}
+
+/// The controller: the title, the formed line and the tabs.
+fn draw_fusion_main(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2], width: f32, height: f32) {
+    let [ox, oy] = origin;
+    let title = game.native_screen_title().unwrap_or_default();
+    centred(game, batch, &title, ox, width, oy + 3.0, 0x40_4040);
+    game.native_text(batch, "Inventory", [ox + 13.0, oy + height - 94.0], 0x40_4040, false);
+    game.native_text(batch, "Multiblock formed", [ox + 13.0, oy + 16.0], 0x40_4040, false);
+    draw_fusion_tabs(game, batch, origin, 0);
+}
+
+/// A gauge of the master's data: its box, the fill and the overlay.
+fn draw_data_gauge(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2], at: [f32; 2], size: [f32; 2], fill: f32, (texture, argb): (&str, u32)) {
+    let [x, y] = [origin[0] + at[0], origin[1] + at[1]];
+    nine_slice(game, batch, "gauge/normal", 5.0, 2.0, [x, y, size[0], size[1]]);
+    let h = (size[1] - 2.0) * fill.clamp(0.0, 1.0);
+    if h > 0.0 {
+        fill_tiled(game, batch, texture, [x + 1.0, y + size[1] - 1.0 - h, size[0] - 2.0, h], argb);
+    }
+    let overlay = match size {
+        SMALL => "small",
+        SMALL_MED => "small_med",
+        WIDE => "wide",
+        _ => "standard",
+    };
+    sprite(game, batch, &format!("gauge/overlay/{overlay}"), [0.0, 0.0, size[0] - 2.0, size[1] - 2.0], [x + 1.0, y + 1.0, size[0] - 2.0, size[1] - 2.0]);
+}
+
+/// The Fusion Reactor layout's gauge `index` in the data: amount, capacity and its chemical.
+fn fusion_gauge(data: &[i32], index: usize) -> (u64, u64, Option<&'static (&'static str, &'static str, u32)>) {
+    let at = DATA_GAUGES + index * GAUGE_SLOTS;
+    let chemical = usize::try_from(data.get(at + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c));
+    (read_wide(data, at), read_wide(data, at + 4).max(1), chemical)
+}
+
+fn draw_fusion_chemical_gauge(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2], index: usize, at: [f32; 2], size: [f32; 2]) {
+    let (amount, capacity, chemical) = fusion_gauge(data, index);
+    let (texture, argb) = gauge_texture(chemical);
+    draw_data_gauge(game, batch, origin, at, size, amount as f32 / capacity as f32, (&texture, argb));
+}
+
+/// `GuiFusionReactorHeat` and `GuiFusionReactorFuel`.
+fn draw_fusion_view(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2], view: u8) {
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 186.0, 166.0]);
+    let title = game.native_screen_title().unwrap_or_default();
+    centred(game, batch, &title, ox + 18.0, 168.0, oy + 3.0, 0x40_4040);
+    draw_mek_button(game, batch, [ox + FUSION_BACK[0], oy + FUSION_BACK[1], 14.0, 14.0], true, inside(mouse, FUSION_BACK));
+    sprite(game, batch, "button/back", [0.0, 0.0, 14.0, 14.0], [ox + FUSION_BACK[0], oy + FUSION_BACK[1], 14.0, 14.0]);
+    draw_fusion_tabs(game, batch, origin, view);
+    let progress = |name: &str, at: [f32; 2], full: bool| {
+        sprite(game, batch, &format!("progress/{name}/{}", if full { "full" } else { "empty" }), [0.0, 0.0, 28.0, 8.0], [ox + at[0], oy + at[1], 28.0, 8.0]);
+    };
+    if view == 1 {
+        let (plasma, _, _) = fusion_gauge(data, 5);
+        let (case, _, _) = fusion_gauge(data, 6);
+        let lava = ("block/lava_still", 0xFFFF_FFFF);
+        draw_data_gauge(game, batch, origin, [12.0, 50.0], STANDARD, (plasma as f64 / FUSION_MAX_TEMP as f64).min(1.0) as f32, lava);
+        draw_data_gauge(game, batch, origin, [66.0, 50.0], STANDARD, (case as f64 / FUSION_MAX_TEMP as f64).min(1.0) as f32, lava);
+        let (water, _, _) = fusion_gauge(data, 2);
+        let (steam, steam_cap, _) = fusion_gauge(data, 3);
+        progress("small_right", [34.0, 76.0], plasma > case);
+        progress("small_right", [88.0, 61.0], case > 0);
+        progress("small_right", [88.0, 91.0], case > 0 && water > 0 && steam < steam_cap);
+        draw_fusion_chemical_gauge(game, batch, data, origin, 2, [120.0, 84.0], SMALL);
+        draw_fusion_chemical_gauge(game, batch, data, origin, 3, [156.0, 84.0], SMALL);
+        let capacity = read_wide(data, DATA_CAPACITY).max(1);
+        let energy = (read_wide(data, DATA_STORED) as f32 / capacity as f32).clamp(0.0, 1.0);
+        draw_data_gauge(game, batch, origin, [120.0, 46.0], SMALL, energy, (&format!("{SPRITES_ROOT}gauge_fluid/energy"), 0xFFFF_FFFF));
+        return;
+    }
+    let burning = data.get(1).copied().unwrap_or(0) == 1;
+    draw_fusion_chemical_gauge(game, batch, data, origin, 0, [30.0, 64.0], SMALL);
+    draw_fusion_chemical_gauge(game, batch, data, origin, 4, [84.0, 50.0], STANDARD);
+    draw_fusion_chemical_gauge(game, batch, data, origin, 1, [138.0, 64.0], SMALL);
+    progress("small_right", [52.0, 76.0], burning);
+    progress("small_left", [106.0, 76.0], burning);
+    centred(game, batch, &format!("Injection Rate: {}", data.get(2).copied().unwrap_or(0)), ox + 16.0, 154.0, oy + 35.0, 0x40_4040);
+    let label = "Edit Rate:";
+    game.native_text(batch, label, [ox + 101.0 - game.native_text_width(label), oy + 117.0], 0x40_4040, false);
+    let [fx, fy, fw, fh] = FUSION_FIELD;
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + fx - 1.0, oy + fy - 1.0, fw + 2.0, fh + 2.0], 0xFFFF_FFFF);
+    FUSION_TEXT.with_borrow(|t| {
+        let text_at = [ox + fx + 2.0, oy + fy + 2.0];
+        game.native_text(batch, &t.value, text_at, 0xE0_E0E0, true);
+        if t.focused && (game.ticks / 6) % 2 == 0 {
+            let before: String = t.value.chars().take(t.cursor).collect();
+            game.native_text(batch, "_", [text_at[0] + game.native_text_width(&before), text_at[1]], 0xE0_E0E0, true);
+        }
+    });
+}
+
+/// Clicks on the controller's tabs and the other views. True when it took the click.
+fn fusion_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool) -> bool {
+    let Some((x, y, z)) = game.container else {
+        return false;
+    };
+    let view = fusion_view(block).unwrap_or(0);
+    let open = |v: u8| FUSION_VIEW.set(Some(([x, y, z], game.ticks as u64, v)));
+    if !right {
+        for (v, ty) in fusion_tabs(view) {
+            if inside(at, [STATS_TAB_BUTTON[0], ty + 4.0, 18.0, 18.0]) {
+                open(v);
+                return true;
+            }
+        }
+        if view != 0 && inside(at, FUSION_BACK) {
+            FUSION_VIEW.set(None);
+            return true;
+        }
+    }
+    if view == 2 {
+        FUSION_TEXT.with_borrow_mut(|t| t.focused = !right && inside(at, FUSION_FIELD));
+    }
+    view != 0
+}
+
+fn fusion_key(game: &Game<'_>, key: &str, text: Option<&str>) {
+    let Some((pos, ..)) = FUSION_VIEW.get() else {
+        return;
+    };
+    FUSION_TEXT.with_borrow_mut(|t| {
+        if t.key(key, text, |c| c.is_ascii_digit(), 2) == freq::Typed::Enter && !t.value.is_empty() {
+            if let Ok(rate) = t.value.parse::<u8>() {
+                let mut data = Vec::new();
+                for c in pos {
+                    data.extend(c.to_be_bytes());
+                }
+                data.push(rate);
+                game.native_send_to_server(FUSION_CHANNEL, &data);
+            }
+            *t = freq::TextBox { focused: true, ..Default::default() };
+        }
+    });
+}
+
+/// `setInjectionRate`: an even rate from 0 up to the maximum.
+fn fusion_payload(game: &mut Game<'_>, data: &[u8]) {
+    let (Some(pos), Some(&rate), Some(player)) = (data.get(..12), data.get(12), game.native_acting_player()) else {
+        return;
+    };
+    let int = |i: usize| i32::from_be_bytes([pos[i], pos[i + 1], pos[i + 2], pos[i + 3]]);
+    let pos = [int(0), int(4), int(8)];
+    let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    if !near || kind(block_name(game, pos)) != Some(Kind::FusionPort) {
+        return;
+    }
+    let Some(Some(master)) = game.native_with_mod_block_entity(pos, |m| multiblock_master(m, pos)) else {
+        return;
+    };
+    let rate = u64::from(rate - rate % 2).min(fusion::MAX_INJECTION);
+    game.native_with_mod_block_entity(master, |m| put_long(&mut m.nbt, "injection", rate));
+}
+
+/// The tooltips of the tabs, the back button and the gauges. True when it wrote some.
+fn fusion_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    let view = fusion_view(block).unwrap_or(0);
+    for (v, ty) in fusion_tabs(view) {
+        if inside(at, [STATS_TAB_BUTTON[0], ty + 4.0, 18.0, 18.0]) {
+            lines.push(if v == 1 { "Heat" } else { "Fuel" }.to_owned());
+            return true;
+        }
+    }
+    if view != 0 && inside(at, FUSION_BACK) {
+        lines.push("Back".to_owned());
+        return true;
+    }
+    if inside(at, [-26.0, 137.0, 26.0, 26.0]) {
+        lines.push(format!("Storing: {}", mekanism_core::energy::format_fe(read_wide(data, DATA_STORED))));
+        lines.push(format!("Producing: {}/t", mekanism_core::energy::format_fe(read_wide(data, DATA_USAGE))));
+        return true;
+    }
+    let chemical = |index: usize, lines: &mut Vec<String>| {
+        let (amount, capacity, chem) = fusion_gauge(data, index);
+        lines.push(match (amount, chem) {
+            (0, _) => "Empty".to_owned(),
+            (_, Some(c)) => format!("{}: {amount} mB", c.1),
+            (_, None) => format!("{amount} mB"),
+        });
+        lines.push(format!("§7Capacity: {capacity} mB"));
+    };
+    let hit = |x: f32, y: f32, size: [f32; 2]| inside(at, [x, y, size[0], size[1]]);
+    match view {
+        1 => {
+            if hit(12.0, 50.0, STANDARD) || hit(66.0, 50.0, STANDARD) {
+                let plasma = hit(12.0, 50.0, STANDARD);
+                let (t, ..) = fusion_gauge(data, if plasma { 5 } else { 6 });
+                lines.push(format!("{}: {}", if plasma { "Plasma" } else { "Case" }, mekanism_core::energy::format_unit(t as f64, "K")));
+            } else if hit(120.0, 84.0, SMALL) {
+                chemical(2, lines);
+            } else if hit(156.0, 84.0, SMALL) {
+                chemical(3, lines);
+            } else if hit(120.0, 46.0, SMALL) {
+                lines.push(format!(
+                    "{} / {} FE",
+                    read_wide(data, DATA_STORED),
+                    read_wide(data, DATA_CAPACITY)
+                ));
+            }
+            true
+        }
+        2 => {
+            if hit(30.0, 64.0, SMALL) {
+                chemical(0, lines);
+            } else if hit(84.0, 50.0, STANDARD) {
+                chemical(4, lines);
+            } else if hit(138.0, 64.0, SMALL) {
+                chemical(1, lines);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// The fission rate limit packet: the port's position and the limit as a big-endian f64.
 const FISSION_CHANNEL: &str = "mekanism:fission_limit";
 /// The tab (`GuiTabElementType`: at -26, 6) and its button.
@@ -7114,13 +7397,19 @@ fn fission_stats_open(block: &str) -> bool {
 }
 
 fn draw_stats_tab(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2], icon: &str) {
+    draw_tab(game, batch, origin, 6.0, &format!("{SPRITES}{icon}"));
+}
+
+/// A `GuiTabElementType` at (-26, y): the holder and its 18 px button with the icon (a full sprite name).
+fn draw_tab(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2], y: f32, icon: &str) {
     let [ox, oy] = origin;
     let cursor = game.native_cursor();
-    nine_slice_tinted(game, batch, "holder_left", [26.0, 9.0], 4.0, [ox - 26.0, oy + 6.0, 26.0, 26.0], 0xFFFF_FFFF);
-    let hovered = inside([cursor[0] - ox, cursor[1] - oy], STATS_TAB_BUTTON);
-    let b = [ox + STATS_TAB_BUTTON[0] + 1.0, oy + STATS_TAB_BUTTON[1], 18.0, 18.0];
+    nine_slice_tinted(game, batch, "holder_left", [26.0, 9.0], 4.0, [ox - 26.0, oy + y, 26.0, 26.0], 0xFFFF_FFFF);
+    let button = [STATS_TAB_BUTTON[0], y + 4.0, 18.0, 18.0];
+    let hovered = inside([cursor[0] - ox, cursor[1] - oy], button);
+    let b = [ox + button[0] + 1.0, oy + button[1], 18.0, 18.0];
     nine_slice_tinted(game, batch, if hovered { "button_focus" } else { "button" }, [200.0, 20.0], 2.0, b, 0xFFFF_FFFF);
-    sprite(game, batch, icon, [0.0, 0.0, 18.0, 18.0], b);
+    game.native_sprite(batch, icon, [0.0, 0.0, 18.0, 18.0], b);
 }
 
 /// `GuiFissionReactorStats`: the title, the fuel statistics, the current burn rate bar and the rate limit
@@ -7373,6 +7662,10 @@ pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mu
         draw_fission_stats(game, batch, data, origin);
         return;
     }
+    if let Some(view) = fusion_view(block) {
+        draw_fusion_view(game, batch, data, origin, view);
+        return;
+    }
     if qio_select_open(block) {
         draw_qio_select(game, batch, block, origin);
         return;
@@ -7481,7 +7774,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         };
         sprite(game, batch, &format!("gauge/overlay/{overlay}"), [0.0, 0.0, size[0] - 2.0, size[1] - 2.0], [x + 1.0, y + 1.0, size[0] - 2.0, size[1] - 2.0]);
     };
-    for (i, g) in l.gauges.iter().enumerate() {
+    for (i, g) in l.gauges.iter().enumerate().filter(|_| kind(block) != Some(Kind::FusionPort)) {
         let at = DATA_GAUGES + i * GAUGE_SLOTS;
         let (amount, capacity) = (read_wide(data, at), read_wide(data, at + 4).max(1));
         let chemical = usize::try_from(data.get(at + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c));
@@ -7537,6 +7830,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     draw_extras(game, batch, block, data, origin);
     if kind(block) == Some(Kind::FissionPort) && get(0) > 0.0 {
         draw_fission(game, batch, data, origin);
+    }
+    if kind(block) == Some(Kind::FusionPort) && get(0) > 0.0 {
+        draw_fusion_main(game, batch, origin, width, height);
     }
     if kind(block) == Some(Kind::SpsPort) && get(0) > 0.0 {
         draw_dynamic_rate_bar(game, batch, [ox + 7.0, oy + 79.0], 160.0, (get(2) / 1000.0).clamp(0.0, 1.0));
@@ -7621,6 +7917,9 @@ pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f3
     }
     if is_qio_tile(block) && inside(at, QIO_TAB_BUTTON) {
         lines.push("Set Frequency".to_owned());
+        return;
+    }
+    if kind(block) == Some(Kind::FusionPort) && fusion_tooltip(block, data, at, lines) {
         return;
     }
     if kind(block) == Some(Kind::FissionPort) {
@@ -7717,7 +8016,7 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         }
     }
     let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0);
-    for (i, g) in l.gauges.iter().enumerate() {
+    for (i, g) in l.gauges.iter().enumerate().filter(|_| kind(block) != Some(Kind::FusionPort)) {
         if inside(at, [g.at[0], g.at[1], g.size[0], g.size[1]]) {
             let d = DATA_GAUGES + i * GAUGE_SLOTS;
             let amount = read_wide(data, d);
@@ -10133,6 +10432,18 @@ fn screen_opened(game: &Game<'_>, block: &str) {
 pub(super) fn screen_alt(game: &Game<'_>, block: &str, alt: &mut bool) {
     screen_opened(game, block);
     let now = game.ticks as u64;
+    if kind(block) == Some(Kind::FusionPort) {
+        if let Some((pos, seen, _)) = FUSION_VIEW.get() {
+            let here = game.container.map(|(x, y, z)| [x, y, z]);
+            if here != Some(pos) || now.saturating_sub(seen) > 10 {
+                FUSION_VIEW.set(None);
+            } else {
+                FUSION_VIEW.set(Some((pos, now, FUSION_VIEW.get().map_or(1, |v| v.2))));
+                *alt = true;
+            }
+        }
+        return;
+    }
     if kind(block) == Some(Kind::FissionPort) {
         if let Some((pos, seen)) = STATS_VIEW.get() {
             let here = game.container.map(|(x, y, z)| [x, y, z]);
@@ -10611,6 +10922,9 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
     if fission_stats_open(block) {
         *typing |= STATS_TEXT.with_borrow(|t| t.focused);
     }
+    if fusion_view(block) == Some(2) {
+        *typing |= FUSION_TEXT.with_borrow(|t| t.focused);
+    }
 }
 
 /// A key on the selector's focused text box (hook point `native_screen_key`): Enter sets the name as
@@ -10618,6 +10932,10 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
 pub(super) fn screen_key(game: &mut Game<'_>, block: &str, key: &str, text: Option<&str>) {
     if fission_stats_open(block) {
         fission_stats_key(game, key, text);
+        return;
+    }
+    if fusion_view(block) == Some(2) {
+        fusion_key(game, key, text);
         return;
     }
     let select = qio_select_open(block);
