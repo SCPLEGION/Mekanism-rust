@@ -5002,41 +5002,96 @@ fn pull_from_carriers(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTan
 
 /// A fluid tank takes from every side and gives out of its bottom at its tier's rate, as a chemical
 /// tank does.
-/// `FluidInventorySlot.input` / `HybridInventorySlot.input` with the container edit mode (`handleContainer`):
-/// an empty bucket fills from the tank, a full one empties into it (and, on a dynamic tank, a chemical tank
-/// item takes or gives the tank's chemical). In Both a bucket that can do neither goes to the output slot;
-/// Fill only fills containers from the tank, Empty only empties them into it.
+/// `FluidInventorySlot.input` / `HybridInventorySlot.input` with the container edit mode (`handleContainer`,
+/// `ResourceHandlerSlot`): Fill only drains the tank into the container and Empty only fills the tank from
+/// it. In Both the slot remembers its last transfer direction (`lastDirectionJournal`, key `dirn`: 0 unknown,
+/// 1 draining into the item, 2 filling from it): unknown tries to drain first and else to fill, moving an item
+/// the tank could never take anything from to the output slot; once filling it keeps filling or moving, once
+/// draining it keeps draining (a draining item never moves on). A dynamic tank's slot takes chemical tank
+/// items too (`HybridInventorySlot`).
 fn container_slots(game: &Game<'_>, entity: &mut ModBlockEntity, tank: &mut ChemicalTank) {
-    let held = entity.items.first().cloned().flatten();
     let edit = get_int(&entity.nbt, "emode") % 3;
-    let Some(bucket) = held else {
+    let mut dir = get_int(&entity.nbt, "dirn");
+    let Some(held) = entity.items.first().cloned().flatten() else {
+        put_int(&mut entity.nbt, "dirn", 0);
         return;
     };
-    if kind(&entity.id) == Some(Kind::DynamicValve) && chemical_item_capacity(&bucket.item).is_some() {
-        let mut done = false;
-        if edit != 2 && tank.chemical.as_deref().is_some_and(|c| !FLUIDS.contains(&c)) {
-            done = drain_tank_into_item(entity, 0, tank);
+    let chemical_item = kind(&entity.id) == Some(Kind::DynamicValve) && chemical_item_capacity(&held.item).is_some();
+    let drain = |entity: &mut ModBlockEntity, tank: &mut ChemicalTank| -> bool {
+        if chemical_item {
+            tank.chemical.as_deref().is_some_and(|c| !FLUIDS.contains(&c)) && drain_tank_into_item(entity, 0, tank)
+        } else if &*held.item == "minecraft:bucket" {
+            drain_tank_into_bucket(game, entity, 0, Some(1), tank)
+        } else {
+            false
         }
-        if !done && edit != 1 {
-            fill_tank_from_item(entity, 0, tank, |c| !FLUIDS.contains(&c));
-        }
-        return;
-    }
-    let empty = &*bucket.item == "minecraft:bucket";
-    if matches!((empty, edit), (true, 2) | (false, 1)) {
-        return;
-    }
-    let done = if empty {
-        drain_tank_into_bucket(game, entity, 0, Some(1), tank)
-    } else {
-        fill_tank_from_bucket(game, entity, 0, Some(1), tank, |f| FLUIDS.contains(&f))
     };
-    let can_fill = bucket_fluid(&bucket.item).is_some_and(|f| tank.chemical.as_deref().is_none_or(|c| c == f));
-    // Nothing to take from the tank, or a bucket of something else than the tank holds.
-    let stuck = if empty { tank.amount < 1_000 } else { !can_fill };
-    if edit == 0 && !done && stuck && (empty || bucket_fluid(&bucket.item).is_some()) && put_item(game, entity, 1, &bucket.item) {
-        take_one(entity, 0);
+    let fill = |entity: &mut ModBlockEntity, tank: &mut ChemicalTank| -> bool {
+        if chemical_item {
+            fill_tank_from_item(entity, 0, tank, |c| !FLUIDS.contains(&c))
+        } else if &*held.item != "minecraft:bucket" {
+            fill_tank_from_bucket(game, entity, 0, Some(1), tank, |f| FLUIDS.contains(&f))
+        } else {
+            false
+        }
+    };
+    // `tryFillOrMove`'s test: the tank holds nothing, or the item holds none of what the tank does.
+    let invalid = |tank: &ChemicalTank| -> bool {
+        let Some(stored) = tank.chemical.as_deref().filter(|_| tank.amount > 0) else {
+            return true;
+        };
+        if chemical_item {
+            let held_chemical = chemical_item_capacity(&held.item).and_then(|cap| item_tank(&held, CHEMICAL_KEY, cap)).and_then(|t| t.chemical.filter(|_| t.amount > 0));
+            held_chemical.as_deref() != Some(stored)
+        } else {
+            bucket_fluid(&held.item).is_none_or(|f| f != stored)
+        }
+    };
+    let fill_or_move = |entity: &mut ModBlockEntity, tank: &mut ChemicalTank| -> bool {
+        if fill(entity, tank) {
+            return true;
+        }
+        if invalid(tank) && put_item(game, entity, 1, &held.item) {
+            take_one(entity, 0);
+            return true;
+        }
+        false
+    };
+    match edit {
+        1 => {
+            dir = 1;
+            drain(entity, tank);
+        }
+        2 => {
+            dir = 2;
+            fill(entity, tank);
+        }
+        _ => match dir {
+            2 => {
+                if !fill_or_move(entity, tank) {
+                    dir = 0;
+                }
+            }
+            1 => {
+                drain(entity, tank);
+            }
+            _ => {
+                if drain(entity, tank) {
+                    dir = 1;
+                } else {
+                    dir = 2;
+                    if !fill_or_move(entity, tank) {
+                        dir = 0;
+                    }
+                }
+            }
+        },
     }
+    // An emptied slot forgets its direction (`onContentsChanged`).
+    if entity.items.first().is_none_or(Option::is_none) {
+        dir = 0;
+    }
+    put_int(&mut entity.nbt, "dirn", dir);
 }
 
 fn tick_fluid_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, tier: BaseTier) {
@@ -9516,7 +9571,16 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
     // The container edit mode tab (`NEXT_MODE` / `PREVIOUS_MODE`).
     if matches!(id, BUTTON_EDIT_NEXT | BUTTON_EDIT_PREVIOUS) && tabs(&entity.id) & TAB_EDIT_MODE != 0 {
         let now = get_int(&entity.nbt, "emode") % 3;
-        put_int(&mut entity.nbt, "emode", if id == BUTTON_EDIT_NEXT { (now + 1) % 3 } else { (now + 2) % 3 });
+        let next = if id == BUTTON_EDIT_NEXT { (now + 1) % 3 } else { (now + 2) % 3 };
+        // `setContainerEditMode`: the slot forgets its last transfer direction. A dynamic tank's mode is its master's.
+        put_int(&mut entity.nbt, "emode", next);
+        put_int(&mut entity.nbt, "dirn", 0);
+        if let Some(master) = get_pos(&entity.nbt, "master").filter(|m| *m != pos && kind(&entity.id) == Some(Kind::DynamicValve)) {
+            game.native_with_mod_block_entity(master, |m| {
+                put_int(&mut m.nbt, "emode", next);
+                put_int(&mut m.nbt, "dirn", 0);
+            });
+        }
         return;
     }
     // The security tab (`GuiInteraction.NEXT_SECURITY_MODE` / `PREVIOUS_SECURITY_MODE`).
@@ -11756,6 +11820,35 @@ fn valve_takes(nbt: &Compound, chemical: &str) -> bool {
 
 /// A Dynamic Tank's valve. Once a second each valve checks the tank; the first valve holds it, takes in
 /// what the other valves' buffers caught, and gives out through valves in output mode.
+thread_local! {
+    /// What each non-master dynamic valve last agreed with its master about the slots.
+    static DYNAMIC_SYNC: std::cell::RefCell<std::collections::HashMap<[i32; 3], Vec<Option<ItemStack>>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Makes a valve's two slots, edit mode and transfer direction those of the master: a change made in this
+/// valve's menu since the last agreement goes to the master, else the master's state comes here.
+fn sync_dynamic_slots(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, master: [i32; 3]) {
+    if entity.items.len() < 2 {
+        entity.items.resize(2, None);
+    }
+    let last = DYNAMIC_SYNC.with_borrow(|m| m.get(&pos).cloned());
+    let changed_here = last.as_ref().is_some_and(|l| *l != entity.items);
+    if changed_here {
+        let mine = entity.items.clone();
+        game.native_with_mod_block_entity(master, |m| {
+            m.items = mine;
+            put_int(&mut m.nbt, "dirn", 0);
+        });
+    }
+    if let Some((items, mode, dir)) = game.native_with_mod_block_entity(master, |m| (m.items.clone(), get_int(&m.nbt, "emode"), get_int(&m.nbt, "dirn"))) {
+        entity.items = items;
+        entity.items.resize(2, None);
+        put_int(&mut entity.nbt, "emode", mode);
+        put_int(&mut entity.nbt, "dirn", dir);
+    }
+    DYNAMIC_SYNC.with_borrow_mut(|m| m.insert(pos, entity.items.clone()));
+}
+
 fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     let ticker = get_int(&entity.nbt, "ticker");
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
@@ -11774,16 +11867,12 @@ fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
             }
         }
     }
-    // The container slots (`TankMultiblockData.tick`: `inputSlot.handleTank`) work on the tank of the master.
+    // The container slots and their edit mode belong to the multiblock (`TankMultiblockData`): the master keeps
+    // them, and every other valve shows the same slots, passing on what a player changed in its menu.
     if let Some(master) = get_pos(&entity.nbt, "master")
         && master != pos
     {
-        if entity.items.first().is_some_and(Option::is_some)
-            && let Some(mut tank) = game.native_with_mod_block_entity(master, |m| get_tank(&m.nbt, "fluid", dynamic_tank::capacity(get_long(&m.nbt, "volume"))))
-        {
-            container_slots(game, entity, &mut tank);
-            game.native_with_mod_block_entity(master, |m| put_tank(&mut m.nbt, "fluid", &tank));
-        }
+        sync_dynamic_slots(game, pos, entity, master);
     }
     if get_pos(&entity.nbt, "master") != Some(pos) {
         // Only the master draws the tank's contents.
@@ -11791,6 +11880,9 @@ fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
         return;
     }
     let mut tank = get_tank(&entity.nbt, "fluid", dynamic_tank::capacity(get_long(&entity.nbt, "volume")));
+    if entity.items.len() < 2 {
+        entity.items.resize(2, None);
+    }
     container_slots(game, entity, &mut tank);
     // Each valve's buffer into the tank.
     let drain = |nbt: &mut Compound, tank: &mut ChemicalTank| {
