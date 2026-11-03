@@ -1227,6 +1227,10 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
         TANKS.with_borrow_mut(|t| {
             t.insert(pos);
         });
+    } else if id == "mekanism:teleporter" {
+        PORTALS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
     }
 }
 
@@ -9582,6 +9586,69 @@ fn tick_teleporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
     }
     let status = teleporter_status(game, pos, entity);
     put_int(&mut entity.nbt, "status", status);
+    // The portal, for `RenderTeleporter`: where the frame is, whether it is turned, and the frequency's colour,
+    // shown while the teleporter is ready (`shouldRender`).
+    let mut portal = Compound::new();
+    if let (Some(d), 0) = (dir, status) {
+        let is_frame = |o: &[i32; 3]| block_name(game, [pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]]) == teleporter::FRAME;
+        let rotated = !teleporter::frame_offsets(d, false).iter().all(is_frame);
+        let direction = DIRECTIONS.iter().position(|(_, v)| *v == d).map_or(0, |i| i + 1);
+        let color = freq::COLORS.get(get_int(&entity.nbt, "freq_color") as usize).map_or(0xFFFF_FF, |c| c.1);
+        put_int(&mut portal, "portal", direction as u32);
+        put_int(&mut portal, "portal_rotated", u32::from(rotated));
+        put_int(&mut portal, "portal_color", color);
+    } else {
+        put_int(&mut portal, "portal", 0);
+    }
+    put_client(game, pos, entity, &["portal", "portal_rotated", "portal_color"], portal);
+}
+
+/// The portals this client has heard of, drawn as `RenderTeleporter` does: a translucent sheet of the
+/// portal texture tinted with the frequency's colour, between the teleporter's frame.
+thread_local! {
+    static PORTALS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+fn portal_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    PORTALS.with_borrow_mut(|portals| {
+        portals.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if id != "mekanism:teleporter" {
+                return false;
+            }
+            let Some((_, d)) = usize::try_from(get_int(c, "portal")).ok().and_then(|i| i.checked_sub(1)).and_then(|i| DIRECTIONS.get(i)) else {
+                return true;
+            };
+            let rotated = get_int(c, "portal_rotated") != 0;
+            let argb = (191u32 << 24) | (get_int(c, "portal_color") & 0xFF_FFFF);
+            // `setBounds`: the sheet is 0.08 thick (0.46..0.54) across one of the two axes the frame spans.
+            let (lo, hi) = if d[0] + d[1] + d[2] > 0 { (1.0, 3.0) } else { (-2.0, 0.0) };
+            let (thin, flat) = (0.46, 0.54);
+            let (min, max): ([f64; 3], [f64; 3]) = match d.iter().position(|v| *v != 0) {
+                Some(0) if rotated => ([lo, thin, 0.0], [hi, flat, 1.0]),
+                Some(0) => ([lo, 0.0, thin], [hi, 1.0, flat]),
+                Some(1) if rotated => ([thin, lo, 0.0], [flat, hi, 1.0]),
+                Some(1) => ([0.0, lo, thin], [1.0, hi, flat]),
+                _ if rotated => ([0.0, thin, lo], [1.0, flat, hi]),
+                _ => ([thin, 0.0, lo], [flat, 1.0, hi]),
+            };
+            let at = |p: [f64; 3], q: [f64; 3]| -> ([f64; 3], [f64; 3]) {
+                (std::array::from_fn(|i| f64::from(pos[i]) + p[i]), std::array::from_fn(|i| f64::from(pos[i]) + q[i]))
+            };
+            let (min, max) = at(min, max);
+            // East, west, up, down, south, north; the horizontal frame shows its top and bottom only.
+            let colors = if d[1] == 0 { [0, 0, argb, argb, 0, 0] } else if rotated { [argb, argb, 0, 0, 0, 0] } else { [0, 0, 0, 0, argb, argb] };
+            boxes.push(super::native_hooks::NativeWorldBox {
+                min,
+                max,
+                colors,
+                sprite: Some(format!("{SPRITES_ROOT}gauge_fluid/teleporter_portal")),
+            });
+            true
+        });
+    });
 }
 
 /// The closest other formed teleporter on `frequency` in this dimension, and where a player arrives:
@@ -13841,6 +13908,7 @@ pub(super) fn world_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::
         boxes.push(super::native_hooks::NativeWorldBox { min, max, colors: [east_west, east_west, up_down, up_down, north_south, north_south], sprite: None });
     }
     tank_boxes(game, boxes);
+    portal_boxes(game, boxes);
 }
 
 /// Opens the config screen from the main one, and keeps it open while the screen is.

@@ -550,6 +550,11 @@ def gauge_textures(ns, out):
         dst.mkdir(parents=True, exist_ok=True)
         (dst / texture.name).write_bytes(first_frame_png(texture.read_bytes(), 16))
         count += 1
+    portal = out / "assets" / ns / "textures/block/teleporter_portal.png"
+    if portal.is_file():
+        dst.mkdir(parents=True, exist_ok=True)
+        (dst / "teleporter_portal.png").write_bytes(first_frame_png(portal.read_bytes(), 16))
+        count += 1
     return count
 
 
