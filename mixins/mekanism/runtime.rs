@@ -1283,6 +1283,11 @@ thread_local! {
 }
 
 thread_local! {
+    /// The dynamic tank valves this client has heard of (the master draws the tank).
+    static BIG_TANKS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
     /// The nutritional liquifiers this client has heard of.
     static LIQUIFIERS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
@@ -1311,6 +1316,10 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
         });
     } else if matches!(kind(id), Some(Kind::FluidTank(_))) {
         TANKS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    } else if matches!(kind(id), Some(Kind::DynamicValve)) {
+        BIG_TANKS.with_borrow_mut(|t| {
             t.insert(pos);
         });
     } else if matches!(kind(id), Some(Kind::Vibrator | Kind::PigmentMixer)) {
@@ -1361,6 +1370,50 @@ fn tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldB
                     min: [x + MIN_XZ, y + MIN_Y, z + MIN_XZ],
                     max: [x + MAX_XZ, y + top, z + MAX_XZ],
                     colors: faces,
+                    sprite: Some(sprite),
+                });
+            }
+            true
+        });
+    });
+}
+
+/// The fluid in each formed dynamic tank (`RenderDynamicTank`): a box of the still texture inset 0.01 inside the
+/// casing, as tall as its stage of `1000 * height` says (all of it for a gas), from the floor of the interior.
+fn big_tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    const GASES: [&str; 7] = [
+        "mekanism:steam",
+        "mekanism:hydrogen",
+        "mekanism:oxygen",
+        "mekanism:sulfur_dioxide",
+        "mekanism:sulfur_trioxide",
+        "mekanism:hydrogen_chloride",
+        "mekanism:ethene",
+    ];
+    BIG_TANKS.with_borrow_mut(|set| {
+        set.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::DynamicValve)) {
+                return false;
+            }
+            let (sx, sy, sz) = (get_int(c, "tank_box_size_x") as i32, get_int(c, "tank_box_size_y") as i32, get_int(c, "tank_box_size_z") as i32);
+            // The interior: the casing is one block thick on every side.
+            let (length, height, width) = (sx - 2, sy - 2, sz - 2);
+            if sx > 0 && length > 0 && height > 0 && width > 0 {
+                let chemical = usize::try_from(get_int(c, "tank_box_fluid") as i32).ok().and_then(|i| CHEMICALS.get(i));
+                let gaseous = chemical.is_some_and(|(n, ..)| GASES.contains(n));
+                let max_stages = (height * 1000).max(1);
+                let scale = f64::from(get_int(c, "tank_box_scale")) / 1_000_000.0;
+                let stage = if gaseous { max_stages } else { max_stages.min((scale * f64::from(max_stages)) as i32) };
+                let max_y = (f64::from(height) * f64::from(stage) / f64::from(max_stages) - 0.02).max(0.02);
+                let (sprite, argb) = gauge_texture(chemical);
+                let (x, y, z) = (f64::from(get_int(c, "tank_box_x") as i32 + 1), f64::from(get_int(c, "tank_box_y") as i32 + 1), f64::from(get_int(c, "tank_box_z") as i32 + 1));
+                boxes.push(super::native_hooks::NativeWorldBox {
+                    min: [x + 0.01, y + 0.01, z + 0.01],
+                    max: [x + f64::from(length) - 0.01, y + max_y, z + f64::from(width) - 0.01],
+                    colors: [argb; 6],
                     sprite: Some(sprite),
                 });
             }
@@ -10465,7 +10518,7 @@ fn portable_teleporter_use(game: &mut Game<'_>, claimed: &mut bool) {
 
 /// `TankValidator`: the casing, valves and glass joined to `start` make the shell of a box 3 to 18 on
 /// each side, its edges casing, with air inside. The box's volume and its valves.
-fn find_dynamic_tank(game: &Game<'_>, start: [i32; 3]) -> Option<(u64, Vec<[i32; 3]>)> {
+fn find_dynamic_tank(game: &Game<'_>, start: [i32; 3]) -> Option<(u64, Vec<[i32; 3]>, [i32; 3], [i32; 3])> {
     let (lo, hi, seen) = find_box(game, start, dynamic_tank::is_frame, dynamic_tank::MIN_SIZE, dynamic_tank::MAX_SIZE)?;
     let size = [0, 1, 2].map(|k| hi[k] - lo[k] + 1);
     let mut valves = Vec::new();
@@ -10490,7 +10543,7 @@ fn find_dynamic_tank(game: &Game<'_>, start: [i32; 3]) -> Option<(u64, Vec<[i32;
         }
     }
     let volume = size.iter().map(|&s| s as u64).product();
-    (!valves.is_empty()).then_some((volume, valves))
+    (!valves.is_empty()).then_some((volume, valves, lo, size))
 }
 
 /// Whether a valve's buffer takes `chemical` from a pipe or tube: input mode, and the buffer empty or
@@ -10506,18 +10559,22 @@ fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
     if ticker == 0 {
         match find_dynamic_tank(game, pos) {
-            Some((volume, valves)) => {
+            Some((volume, valves, lo, size)) => {
                 put_long(&mut entity.nbt, "volume", volume);
+                entity.nbt.insert("box".into(), Tag::IntArray(vec![lo[0], lo[1], lo[2], size[0], size[1], size[2]]));
                 entity.nbt.insert("master".into(), Tag::IntArray(valves[0].to_vec()));
                 entity.nbt.insert("valves".into(), Tag::IntArray(valves.concat()));
             }
             None => {
                 put_long(&mut entity.nbt, "volume", 0);
                 entity.nbt.remove(&JavaString::from("master"));
+                entity.nbt.remove(&JavaString::from("box"));
             }
         }
     }
     if get_pos(&entity.nbt, "master") != Some(pos) {
+        // Only the master draws the tank's contents.
+        put_flag(game, pos, entity, "tank_box_size_x", false);
         return;
     }
     let mut tank = get_tank(&entity.nbt, "fluid", dynamic_tank::capacity(get_long(&entity.nbt, "volume")));
@@ -10551,6 +10608,22 @@ fn tick_dynamic_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
         }
     }
     put_tank(&mut entity.nbt, "fluid", &tank);
+    // `RenderDynamicTank`: the box inside the casing, how full it is and with what, for the master to draw.
+    let mut shown = Compound::new();
+    if let Some(Tag::IntArray(b)) = entity.nbt.get(&JavaString::from("box")).cloned()
+        && b.len() == 6
+        && tank.amount > 0
+    {
+        for (k, v) in ["tank_box_x", "tank_box_y", "tank_box_z", "tank_box_size_x", "tank_box_size_y", "tank_box_size_z"].iter().zip(b.iter()) {
+            put_int(&mut shown, k, *v as u32);
+        }
+        let scale = tank.amount as f64 / tank.capacity.max(1) as f64;
+        put_int(&mut shown, "tank_box_scale", (scale * 1_000_000.0) as u32);
+        put_int(&mut shown, "tank_box_fluid", chemical_index(tank.chemical.as_deref()) as u32);
+    } else {
+        put_int(&mut shown, "tank_box_size_x", 0);
+    }
+    put_client(game, pos, entity, &["tank_box_x", "tank_box_y", "tank_box_z", "tank_box_size_x", "tank_box_size_y", "tank_box_size_z", "tank_box_scale", "tank_box_fluid"], shown);
 }
 
 /// A sneaking right click with an empty hand on a dynamic valve switches it between filling the tank
@@ -14518,6 +14591,7 @@ pub(super) fn world_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::
     tank_boxes(game, boxes);
     portal_boxes(game, boxes);
     liquifier_boxes(game, boxes);
+    big_tank_boxes(game, boxes);
 }
 
 /// Opens the config screen from the main one, and keeps it open while the screen is.
