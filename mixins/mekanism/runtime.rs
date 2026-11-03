@@ -4865,8 +4865,8 @@ fn layout(block: &str) -> Option<Layout> {
         Kind::SpsPort => Layout {
             slots: [None; 3],
             gauges: vec![
-                gauge("input", sps::INPUT_CAPACITY, 7.0, 13.0, STANDARD),
-                gauge("output", sps::OUTPUT_CAPACITY, 151.0, 13.0, STANDARD),
+                gauge("input", sps::INPUT_CAPACITY, 7.0, 17.0, STANDARD),
+                gauge("output", sps::OUTPUT_CAPACITY, 151.0, 17.0, STANDARD),
             ],
             power: None,
             progress: None,
@@ -5068,6 +5068,8 @@ fn screen_height(block: &str) -> f32 {
         Some(Kind::Nucleosynthesizer) => 193.0,
         // `DEFAULT_IMAGE_HEIGHT + 5`.
         Some(Kind::Reaction) => 171.0,
+        // `DEFAULT_IMAGE_HEIGHT + 16`.
+        Some(Kind::SpsPort) => 182.0,
         _ => 166.0,
     }
 }
@@ -6636,12 +6638,8 @@ fn multiblock_lines(block: &str, data: &[i32]) -> Vec<String> {
         Some(Kind::TurbineValve) => vec![],
         Some(Kind::InductionPort) => vec![format!("Max I/O: {}/t", fe(usage))],
         Some(Kind::DynamicValve) => vec![format!("Volume: {} blocks", get(1))],
-        Some(Kind::SpsPort) => vec![
-            format!("Coils: {}", get(1)),
-            format!("Progress: {:.1}%", get(2) as f64 / 10.0),
-            format!("Polonium: {} mB/t", get(3)),
-            format!("Energy: {}/t", fe(usage)),
-        ],
+        // The SPS screen draws its own inner screen (`GuiSPS`).
+        Some(Kind::SpsPort) => vec![],
         _ => vec![],
     }
 }
@@ -6867,7 +6865,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         slots,
         inventory_y: h - 82.0,
         inventory_x: 8.0 + (w - 176.0) / 2.0,
-        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve)),
+        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort)),
         alt: None,
     });
 }
@@ -6924,6 +6922,7 @@ fn extras(block: &str) -> Extras {
         // `GuiThermalEvaporationController`: the screen between the gauges and the arrows under the buckets.
         Some(Kind::BoilerValve) => Extras { screen: Some([54.0, 23.0, 110.0, 40.0]), ..none },
         Some(Kind::TurbineValve) => Extras { screen: Some([50.0, 18.0, 126.0, 50.0]), ..none },
+        Some(Kind::SpsPort) => Extras { screen: Some([27.0, 17.0, 122.0, 60.0]), ..none },
         Some(Kind::Evaporation) => Extras { screen: Some([48.0, 19.0, 100.0, 40.0]), arrows: vec![[32.0, 39.0], [156.0, 39.0]], ..none },
         Some(Kind::FuelwoodHeater) => Extras {
             screen: Some([48.0, 23.0, 80.0, 28.0]),
@@ -6955,6 +6954,16 @@ fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
     };
     match kind(block) {
         Some(Kind::Pump) => vec![energy, fluid()],
+        Some(Kind::SpsPort) if data.first().copied().unwrap_or(0) > 0 => {
+            let processed = data.get(3).copied().unwrap_or(0).max(0);
+            let active = processed > 0;
+            let mut lines = vec![format!("Status: {}", if active { "Active" } else { "Idle" })];
+            if active {
+                lines.push(format!("Energy Input: {}/t", fe(read_wide(data, DATA_USAGE))));
+                lines.push(format!("Process Rate: {} mB/t", java_double(f64::from(processed) / 1000.0)));
+            }
+            lines
+        }
         Some(Kind::TurbineValve) if data.first().copied().unwrap_or(0) > 0 => {
             let flow = (data.get(1).copied().unwrap_or(0) as u64 & 0x7FFF) | (data.get(2).copied().unwrap_or(0) as u64 & 0x7FFF) << 15;
             let max = (data.get(DATA_SPEED).copied().unwrap_or(0) as u64 & 0x7FFF) | (data.get(DATA_ENERGY_UPGRADES).copied().unwrap_or(0) as u64 & 0x7FFF) << 15;
@@ -7048,13 +7057,16 @@ fn draw_nucleosynthesizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudB
             }
         });
     }
-    // `GuiDynamicHorizontalRateBar`: the dynamic-rate sprite multiplied by a colour that runs from
-    // (60, 45, 74) to (100, 30, 170) along the bar.
-    let (x, y, bar_w) = (ox + 5.0, oy + 88.0, 183.0);
-    nine_slice(game, batch, "bar/base", 5.0, 1.0, [x, y, bar_w, 8.0]);
     let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0) as f32;
-    let progress = (get(2) / get(3).max(1.0)).clamp(0.0, 1.0);
-    let inner = bar_w - 2.0;
+    draw_dynamic_rate_bar(game, batch, [ox + 5.0, oy + 88.0], 183.0, (get(2) / get(3).max(1.0)).clamp(0.0, 1.0));
+}
+
+/// `GuiDynamicHorizontalRateBar`: the dynamic-rate sprite multiplied by a colour that runs from
+/// (60, 45, 74) to (100, 30, 170) along the bar.
+fn draw_dynamic_rate_bar(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, at: [f32; 2], width: f32, progress: f32) {
+    let [x, y] = at;
+    nine_slice(game, batch, "bar/base", 5.0, 1.0, [x, y, width, 8.0]);
+    let inner = width - 2.0;
     let filled = (progress * inner).floor() as u32;
     for i in 0..filled {
         let f = i as f32 / inner;
@@ -7079,12 +7091,18 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
         for (i, line) in screen_lines(block, data).iter().enumerate() {
             // `GuiInnerScreen`'s default format is centred lines at 0.8 scale with 2 px of spacing;
             // the evaporation screen clears the spacing. The others here keep their own plain style.
-            let pad = if kind(block) == Some(Kind::TurbineValve) { 5.0 } else { 3.0 };
+            let pad = if matches!(kind(block), Some(Kind::TurbineValve | Kind::SpsPort)) { 5.0 } else { 3.0 };
             let at = |dy: f32, step: f32| [ox + x + pad, oy + y + dy + step * i as f32];
             match kind(block) {
                 Some(Kind::Evaporation) => game.native_text_scaled(batch, line, at(2.0, 9.0), 0x3C_FE9A, 0.8),
                 Some(Kind::BoilerValve) => game.native_text_scaled(batch, line, at(4.0, 11.0), 0x3C_FE9A, 0.8),
                 Some(Kind::TurbineValve) => game.native_text_scaled(batch, line, at(4.0, 11.0), 0x3C_FE9A, 0.8),
+                // Two or three lines centred in the 60 px screen: 14.5 and 3.5 px down from the middle.
+                Some(Kind::SpsPort) => {
+                    let n = screen_lines(block, data).len() as f32;
+                    let top = ((60.0 - (11.0 * n - 2.0)) / 2.0).floor();
+                    game.native_text_scaled(batch, line, at(top, 11.0), 0x3C_FE9A, 0.8)
+                }
                 _ => game.native_text(batch, line, at(3.0, 10.0), 0x3C_FE9A, false),
             }
         }
@@ -7151,6 +7169,12 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         let title = game.native_screen_title().unwrap_or_default();
         centred(game, batch, &title, ox, width, oy + 4.0, 0x40_4040);
         game.native_text(batch, "Inventory", [ox + 8.0, oy + height - 93.0], 0x40_4040, false);
+    }
+    if kind(block) == Some(Kind::SpsPort) {
+        // `inventoryLabelY += 2`.
+        let title = game.native_screen_title().unwrap_or_default();
+        centred(game, batch, &title, ox, width, oy + 4.0, 0x40_4040);
+        game.native_text(batch, "Inventory", [ox + 8.0, oy + height - 92.0], 0x40_4040, false);
     }
     if kind(block) == Some(Kind::TurbineValve) {
         let title = game.native_screen_title().unwrap_or_default();
@@ -7245,6 +7269,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
     }
     draw_extras(game, batch, block, data, origin);
+    if kind(block) == Some(Kind::SpsPort) && get(0) > 0.0 {
+        draw_dynamic_rate_bar(game, batch, [ox + 7.0, oy + 79.0], 160.0, (get(2) / 1000.0).clamp(0.0, 1.0));
+    }
     if kind(block) == Some(Kind::TurbineValve) && get(0) > 0.0 {
         // The steam input's `GuiVerticalRateBar` at (40, 13).
         let flow = (data.get(1).copied().unwrap_or(0) as u64 & 0x7FFF) | (data.get(2).copied().unwrap_or(0) as u64 & 0x7FFF) << 15;
@@ -7349,6 +7376,10 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         return;
     };
     if window_tooltip(block, data, window_at(block, at), lines) || tab_tooltip(block, &l, data, at, lines) {
+        return;
+    }
+    if kind(block) == Some(Kind::SpsPort) && inside(at, [7.0, 79.0, 160.0, 8.0]) {
+        lines.push(format!("Progress: {:.0}%", f64::from(data.get(2).copied().unwrap_or(0).max(0)) / 10.0));
         return;
     }
     if kind(block) == Some(Kind::TurbineValve) && inside(at, [40.0, 13.0, 6.0, 58.0]) {
