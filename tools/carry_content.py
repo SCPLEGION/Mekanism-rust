@@ -439,6 +439,8 @@ def build_module(ns, out):
                      if (d / ns / "textures/block/energy_core.png").is_file()), None)
         if core is not None:
             worn_models.build_cube_world_model(ns, "energy_core", 0.2, core, out, report)
+            # The fusion reactor's three cores are the same cube at full size (`RenderFusionReactor`).
+            worn_models.build_cube_world_model(ns, "fusion_core", 0.5, core, out, report)
     if ns == "mekanism":
         # The liquifier's blade turns, so the native code draws it (`RenderNutritionalLiquifier`).
         blade = next((d / ns / "models/block/liquifier_blade.json" for d in search

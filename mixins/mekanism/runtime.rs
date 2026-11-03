@@ -1283,6 +1283,11 @@ thread_local! {
 }
 
 thread_local! {
+    /// The fusion reactor ports this client has heard of (the master draws the plasma).
+    static FUSIONS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
     /// The dynamic tank valves this client has heard of (the master draws the tank).
     static BIG_TANKS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
@@ -1316,6 +1321,10 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
         });
     } else if matches!(kind(id), Some(Kind::FluidTank(_))) {
         TANKS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    } else if matches!(kind(id), Some(Kind::FusionPort)) {
+        FUSIONS.with_borrow_mut(|t| {
             t.insert(pos);
         });
     } else if matches!(kind(id), Some(Kind::DynamicValve | Kind::BoilerValve | Kind::Evaporation | Kind::TurbineValve)) {
@@ -1531,6 +1540,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                 color: 0xFFFF_FFFF,
                 rotation: None,
                 full_bright: false,
+                scale: 1.0,
             });
             true
         });
@@ -1572,6 +1582,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                     color: 0xFFFF_FFFF,
                     rotation: None,
                     full_bright: false,
+                    scale: 1.0,
                 });
             } else {
                 let (dx, dz) = match game.native_block_property(*pos, "facing").as_deref() {
@@ -1591,7 +1602,48 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                     color: 0xFFFF_FFFF,
                     rotation: None,
                     full_bright: false,
+                    scale: 1.0,
                 });
+            }
+            true
+        });
+    });
+    // `RenderFusionReactor`: three cores, each scaled, turned about Y and then about (0, 1/√2, 1/√2).
+    let animation = ticks_now as f32 + partial_now;
+    FUSIONS.with_borrow_mut(|set| {
+        set.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::FusionPort)) {
+                return false;
+            }
+            if get_int(c, "fus_on") != 0 {
+                let scaled = get_int(c, "fus_scaled") as f32;
+                let sin = |degrees: f32| ((degrees % 360.0).to_radians()).sin();
+                let axis = glam::Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2);
+                let ctrl = [get_int(c, "fus_x") as i32, get_int(c, "fus_y") as i32, get_int(c, "fus_z") as i32];
+                // (colour, scale, Y multiplier, axis multiplier, Y shift, axis shift)
+                for (rgb, scale, m1, m2, s1, s2) in [
+                    (0xFF383C_u32, 1.0 + 0.7 * sin(3.14 * scaled + 135.0), -6.0, -7.0, 0.0, 36.0),
+                    (0xD55ECB, 1.0 + 0.8 * sin(3.0 * scaled), 4.0, 4.0, 0.0, 36.0),
+                    (0xFFA160, 1.0 - 0.9 * sin(4.0 * scaled + 90.0), 5.0, -3.0, -35.0, 106.0),
+                ] {
+                    let q = glam::Quat::from_axis_angle(glam::Vec3::Y, (animation * m1 + s1).to_radians())
+                        * glam::Quat::from_axis_angle(axis, (animation * m2 + s2).to_radians());
+                    models.push(super::native_hooks::NativeWorldModel {
+                        model: "mekanism:fusion_core".into(),
+                        position: [f64::from(ctrl[0]) + 0.5, f64::from(ctrl[1]) - 1.5, f64::from(ctrl[2]) + 0.5],
+                        yaw: 0.0,
+                        pitch: 0.0,
+                        roll: 0.0,
+                        light_at: ctrl,
+                        color: 0xFF00_0000 | rgb,
+                        rotation: Some(q.to_array()),
+                        full_bright: true,
+                        scale,
+                    });
+                }
             }
             true
         });
@@ -1616,6 +1668,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                 color: 0xFFFF_FFFF,
                 rotation: None,
                 full_bright: false,
+                scale: 1.0,
             });
         }
     });
@@ -1649,6 +1702,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                     color: (alpha << 24) | rgb,
                     rotation: Some(q.to_array()),
                     full_bright: true,
+                    scale: 1.0,
                 });
             }
             true
@@ -5747,9 +5801,10 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
     if ticker == 0 {
         match find_fusion(game, pos) {
-            Some((_, ports)) => {
+            Some((lo, ports)) => {
                 entity.nbt.insert("master".into(), Tag::IntArray(ports[0].to_vec()));
                 entity.nbt.insert("ports".into(), Tag::IntArray(ports.concat()));
+                entity.nbt.insert("controller".into(), Tag::IntArray(vec![lo[0] + 2, lo[1] + fusion::SIZE - 1, lo[2] + 2]));
             }
             None => {
                 entity.nbt.remove(&JavaString::from("master"));
@@ -5757,6 +5812,7 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         }
     }
     if get_pos(&entity.nbt, "master") != Some(pos) {
+        put_flag(game, pos, entity, "fus_on", false);
         return;
     }
     let ports: Vec<[i32; 3]> = match entity.nbt.get(&JavaString::from("ports")) {
@@ -5812,6 +5868,21 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     }
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_long(&mut entity.nbt, "production", out.energy);
+    // `RenderFusionReactor`: the plasma shows while the reactor burns; its size follows the temperature
+    // in units of 100 million kelvin, at the controller.
+    let mut core = Compound::new();
+    put_int(&mut core, "fus_on", u32::from(plasma.burning));
+    put_int(&mut core, "fus_scaled", (plasma.plasma / 100_000_000.0).round().clamp(0.0, 1_000_000.0) as u32);
+    if let Some(Tag::IntArray(c)) = entity.nbt.get(&JavaString::from("controller")).cloned()
+        && c.len() == 3
+    {
+        for (k, v) in ["fus_x", "fus_y", "fus_z"].iter().zip(c.iter()) {
+            put_int(&mut core, k, *v as u32);
+        }
+    } else {
+        put_int(&mut core, "fus_on", 0);
+    }
+    put_client(game, pos, entity, &["fus_on", "fus_scaled", "fus_x", "fus_y", "fus_z"], core);
 }
 
 /// A right click with an empty hand on a Fusion Reactor's controller or port: sneaking ignites the
