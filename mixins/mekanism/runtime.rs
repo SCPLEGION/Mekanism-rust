@@ -794,28 +794,38 @@ fn tick_machine(game: &mut Game<'_>, entity: &mut ModBlockEntity, recipe: &str, 
     let mut input = slot(entity.items.first().cloned().flatten());
     let mut middle = slot(entity.items.get(1).cloned().flatten());
     let mut output = slot(entity.items.get(2).cloned().flatten());
-    // The sawmill's secondary output waits in the machine until the output slot takes it; the machine
-    // stops meanwhile, as a full secondary slot stops it in Mekanism.
-    let mut waiting = secondary(&entity.nbt);
-    if let Some((item, count)) = waiting.clone() {
+    // The sawmill's secondary output slot (index 3): an output the old versions kept in the machine moves
+    // into it when there is room.
+    let mut second = slot(entity.items.get(3).cloned().flatten());
+    if recipe == "sawing"
+        && let Some((item, count)) = secondary(&entity.nbt)
+    {
         let max = max_stack(game, &item);
-        let fits = output.item.as_ref().is_none_or(|i| *i == item) && output.count + count <= max;
-        if fits {
-            output.item = Some(item);
-            output.count += count;
-            waiting = None;
+        if second.item.as_ref().is_none_or(|i| *i == item) && second.count + count <= max {
+            second.item = Some(item);
+            second.count += count;
+            set_secondary(&mut entity.nbt, None);
         }
     }
-    let (operation, max_stack, chance) = if waiting.is_some() {
-        (None, 64, None)
-    } else {
-        find_operation(game, recipe, entity.items.first().cloned().flatten(), &middle)
-    };
+    let limit = |id: &str| max_stack(game, id);
+    let (mut operation, max_stack, chance) = find_operation(game, recipe, entity.items.first().cloned().flatten(), &middle);
+    // `NOT_ENOUGH_SPACE_SECONDARY_OUTPUT_ERROR`: the sawmill stops while the secondary slot cannot take its output.
+    let mut second_full = false;
+    if let Some((item, count, _)) = &chance
+        && operation.is_some()
+    {
+        let max = limit(item);
+        if !(second.item.as_ref().is_none_or(|i| i == item) && second.count + count <= max) {
+            operation = None;
+            second_full = true;
+        }
+    }
     let before = output.count;
     // The issues the warning tab lists (`RecipeError`): bit 0 energy, 1 input, 2 output room, 3 input without a recipe.
     let mut warn = 0;
     match &operation {
-        None if input.item.is_some() && waiting.is_none() => warn |= 8,
+        None if second_full => warn |= 4,
+        None if input.item.is_some() => warn |= 8,
         None => {}
         Some(op) => {
             let fits = match &output.item {
@@ -831,9 +841,6 @@ fn tick_machine(game: &mut Game<'_>, entity: &mut ModBlockEntity, recipe: &str, 
             }
         }
     }
-    if waiting.is_some() {
-        warn |= 4;
-    }
     put_int(&mut entity.nbt, "warn", warn);
     let extra = (recipe == "combining").then_some(&mut middle);
     m.tick(&mut input, &mut output, extra, operation.as_ref(), max_stack);
@@ -841,7 +848,8 @@ fn tick_machine(game: &mut Game<'_>, entity: &mut ModBlockEntity, recipe: &str, 
         && let Some((item, count, p)) = chance
         && roll(entity) < p
     {
-        waiting = Some((item, count));
+        second.item = Some(item);
+        second.count += count;
     }
     set_slot(entity, 0, &input);
     if recipe == "combining" {
@@ -850,7 +858,9 @@ fn tick_machine(game: &mut Game<'_>, entity: &mut ModBlockEntity, recipe: &str, 
     set_slot(entity, 2, &output);
     put_long(&mut entity.nbt, "energy", m.energy.stored);
     put_int(&mut entity.nbt, "progress", m.progress);
-    set_secondary(&mut entity.nbt, waiting.as_ref());
+    if recipe == "sawing" {
+        set_slot(entity, 3, &second);
+    }
     // The furnace menu's bars: the flame shows stored energy, the arrow the progress. Data slots are
     // 16 bits, so energy goes as thousandths of the capacity.
     entity.data = vec![
@@ -6955,6 +6965,14 @@ fn layout(block: &str) -> Option<Layout> {
             progress: large_right(94.0, 119.0),
         },
         // TileEntityElectricMachine and GuiElectricMachine.
+        // GuiPrecisionSawmill: the input and energy slots 8 px further left, the progress bar at (78, 38).
+        Kind::Machine("sawing", _) => Layout {
+            slots: [Some(([56.0, 17.0], "slot/normal")), Some(([56.0, 53.0], "slot/power")), Some(([116.0, 35.0], "slot/output"))],
+            gauges: vec![],
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
+            progress: Some(([78.0, 38.0], "progress/bar", [25.0, 9.0])),
+        },
+        // GuiElectricMachine's power bar is at y 16; the combiner's (GuiCombiner) at 15.
         Kind::Machine(recipe, _) => Layout {
             slots: [
                 Some(([64.0, 17.0], "slot/normal")),
@@ -6962,7 +6980,7 @@ fn layout(block: &str) -> Option<Layout> {
                 Some(([116.0, 35.0], "slot/output")),
             ],
             gauges: vec![],
-            power: Some(PowerBar::Vertical([164.0, 16.0])),
+            power: Some(PowerBar::Vertical([164.0, if recipe == "combining" { 15.0 } else { 16.0 }])),
             progress: Some(([86.0, 38.0], "progress/bar", [25.0, 9.0])),
         },
         // TileEntityChemicalOxidizer and GuiChemicalOxidizer.
@@ -7573,6 +7591,8 @@ fn screen_height(block: &str) -> f32 {
 fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
     match kind(block) {
         Some(Kind::Machine("combining", _)) | Some(Kind::Advanced(_)) => vec![([39.0, 35.0], "slot/power")],
+        // The sawmill's secondary output slot (`TileEntityPrecisionSawmill`).
+        Some(Kind::Machine("sawing", _)) => vec![([132.0, 35.0], "slot/output")],
         Some(Kind::Infuser) => vec![([143.0, 35.0], "slot/power")],
         Some(Kind::Painting) => vec![([144.0, 35.0], "slot/power")],
         Some(Kind::Nucleosynthesizer) => vec![([173.0, 69.0], "slot/power")],
@@ -10648,6 +10668,11 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
         game.native_sprite(batch, "mekanismgenerators:gui/sprites/state/holder", [0.0, 0.0, 16.0, 16.0], [ox + 18.0, oy + 35.0, 16.0, 16.0]);
         game.native_sprite(batch, &format!("mekanismgenerators:gui/sprites/state/{}", if lit { on } else { off }), [0.0, 0.0, 12.0, 12.0], [ox + 20.0, oy + 37.0, 12.0, 12.0]);
     }
+    // `GuiTexturedElement.upArrow`: between the input and the energy slot of the electric machines and the combiner.
+    if let Some(Kind::Machine(recipe, _)) = kind(block) {
+        let x = if recipe == "sawing" { 60.0 } else { 68.0 };
+        sprite(game, batch, "arrow/up", [0.0, 0.0, 8.0, 10.0], [ox + x, oy + 38.0, 8.0, 10.0]);
+    }
     for [x, y] in &e.arrows {
         sprite(game, batch, "arrow/down", [0.0, 0.0, 8.0, 9.0], [ox + x, oy + y, 8.0, 9.0]);
     }
@@ -10746,6 +10771,14 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     for (i, (at, name)) in slots {
         // `GuiSlot.warning`: the input slot without a recipe or enough input, the output slot without room.
         let name = if (i == 0 && warn & 2 != 0) || (i == 2 && warn & 4 != 0) { &"slot/warning" } else { name };
+        // The sawmill's two output slots sit in one wide frame (`GuiSlot(OUTPUT, 111, 30, 42, 26)`).
+        if matches!(kind(block), Some(Kind::Machine("sawing", _))) && (i == 2 || i == 9) {
+            if i == 2 {
+                let wide = if warn & 4 != 0 { "slot/warning" } else { "slot/output" };
+                nine_slice(game, batch, wide, 18.0, 1.0, [ox + 111.0, oy + 30.0, 42.0, 26.0]);
+            }
+            continue;
+        }
         sprite(game, batch, name, [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
         // `SlotOverlay.MINUS` on the fuel slot (`fuelSlot.setSlotOverlay`).
         if i == 1 && kind(block) == Some(Kind::GasGenerator) {
