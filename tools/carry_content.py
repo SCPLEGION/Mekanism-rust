@@ -431,6 +431,14 @@ def build_module(ns, out):
                      if (d / ns / "textures/block/energy_core.png").is_file()), None)
         if core is not None:
             worn_models.build_cube_world_model(ns, "energy_core", 0.2, core, out, report)
+    if ns == "mekanism":
+        # The liquifier's blade turns, so the native code draws it (`RenderNutritionalLiquifier`).
+        blade = next((d / ns / "models/block/liquifier_blade.json" for d in search
+                      if (d / ns / "models/block/liquifier_blade.json").is_file()), None)
+        texture = next((d / ns / "textures/block/nutritional_liquifier.png" for d in search
+                        if (d / ns / "textures/block/nutritional_liquifier.png").is_file()), None)
+        if blade is not None and texture is not None:
+            worn_models.build_element_world_model(ns, "liquifier_blade", json.loads(blade.read_text()), texture, out, report)
     worn = set()
     if ns == "mekanism":
         for item in worn_models.WORN:

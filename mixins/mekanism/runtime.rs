@@ -1212,6 +1212,11 @@ thread_local! {
 }
 
 thread_local! {
+    /// The nutritional liquifiers this client has heard of.
+    static LIQUIFIERS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
     /// The bins this client has heard of.
     static BINS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
@@ -1235,6 +1240,10 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
         });
     } else if matches!(kind(id), Some(Kind::FluidTank(_))) {
         TANKS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    } else if matches!(kind(id), Some(Kind::Liquifier)) {
+        LIQUIFIERS.with_borrow_mut(|t| {
             t.insert(pos);
         });
     } else if matches!(kind(id), Some(Kind::Bin(_))) {
@@ -1276,6 +1285,35 @@ fn tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldB
                 boxes.push(super::native_hooks::NativeWorldBox {
                     min: [x + MIN_XZ, y + MIN_Y, z + MIN_XZ],
                     max: [x + MAX_XZ, y + top, z + MAX_XZ],
+                    colors: faces,
+                    sprite: Some(sprite),
+                });
+            }
+            true
+        });
+    });
+}
+
+/// The paste in each liquifier (`RenderNutritionalLiquifier`): a box of the still texture from 0.313 up by
+/// its stage of 40, not drawn on the down face.
+fn liquifier_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    LIQUIFIERS.with_borrow_mut(|set| {
+        set.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::Liquifier)) {
+                return false;
+            }
+            let stage = get_int(c, "liq_stage");
+            if stage > 0 {
+                let paste = CHEMICALS.iter().find(|(n, ..)| *n == chem::NUTRITIONAL_PASTE);
+                let (sprite, argb) = gauge_texture(paste);
+                let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
+                let faces = [argb, argb, argb, 0, argb, argb];
+                boxes.push(super::native_hooks::NativeWorldBox {
+                    min: [x + 0.001, y + 0.313, z + 0.001],
+                    max: [x + 0.999, y + 0.313 + 0.624 * f64::from(stage) / 40.0, z + 0.999],
                     colors: faces,
                     sprite: Some(sprite),
                 });
@@ -1329,10 +1367,32 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
             true
         });
     });
+    // `RenderNutritionalLiquifier`: the blade turns at 25 degrees a tick while it works.
+    let time = game.ticks as f32 + game.clock.fraction() as f32;
+    LIQUIFIERS.with_borrow(|set| {
+        for pos in set {
+            let Some((_, c)) = game.native_client_block_entity(*pos) else {
+                continue;
+            };
+            if get_int(c, "liq_active") == 0 {
+                continue;
+            }
+            models.push(super::native_hooks::NativeWorldModel {
+                model: "mekanism:liquifier_blade".into(),
+                position: [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5],
+                yaw: (time * 25.0) % 360.0,
+                pitch: 0.0,
+                roll: 0.0,
+                light_at: *pos,
+                color: 0xFFFF_FFFF,
+                rotation: None,
+                full_bright: false,
+            });
+        }
+    });
     // `RenderEnergyCube`: the core floats, bobs and turns while the cube holds energy, tinted with the tier's
     // colour and the fill as alpha.
     const TIER_RGB: [u32; 5] = [0x5FFFB8, 0xFF806A, 0x4BF8FF, 0xF787FF, 0x585858];
-    let time = game.ticks as f32 + game.clock.fraction() as f32;
     CORES.with_borrow_mut(|cores| {
         cores.retain(|pos| {
             let Some((id, c)) = game.native_client_block_entity(*pos) else {
@@ -1441,12 +1501,35 @@ fn bin_faces(game: &Game<'_>) -> Vec<BinFace> {
 
 /// The items on the bins' fronts (hook point `native_world_items`, API 44).
 pub(super) fn world_items(game: &Game<'_>, items: &mut Vec<super::native_hooks::NativeWorldItem>) {
+    // The liquifier's food, at 0.6 up, turning at 10 degrees a tick while it works (GROUND display).
+    let time = game.ticks as f32 + game.clock.fraction() as f32;
+    LIQUIFIERS.with_borrow(|set| {
+        for pos in set {
+            let Some((_, c)) = game.native_client_block_entity(*pos) else {
+                continue;
+            };
+            let Some(item) = get_string(c, "liq_item").filter(|i| !i.is_empty()) else {
+                continue;
+            };
+            let spin = if get_int(c, "liq_active") != 0 { f64::from((time * 10.0) % 360.0) } else { 0.0 };
+            let matrix = glam::DMat4::from_translation(glam::DVec3::new(f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.6, f64::from(pos[2]) + 0.5))
+                * glam::DMat4::from_rotation_y(spin.to_radians());
+            items.push(super::native_hooks::NativeWorldItem {
+                item,
+                matrix: matrix.to_cols_array(),
+                light_at: *pos,
+                seed: (i64::from(pos[0]) * 3129871 ^ i64::from(pos[2]) * 116129781 ^ i64::from(pos[1])) as i32,
+                ground: true,
+            });
+        }
+    });
     for f in bin_faces(game) {
         items.push(super::native_hooks::NativeWorldItem {
             item: f.item,
             matrix: f.item_pose.to_cols_array(),
             light_at: f.cover,
             seed: (i64::from(f.pos[0]) * 3129871 ^ i64::from(f.pos[2]) * 116129781 ^ i64::from(f.pos[1])) as i32,
+            ground: false,
         });
     }
 }
@@ -1851,6 +1934,17 @@ fn tick_liquifier(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
         _ => progress = 0,
     }
     push_chemical(game, pos, &mut tank, None, u64::MAX, false);
+    // `RenderNutritionalLiquifier`: the paste's stage (of 40), whether it works, and the last food it ate.
+    if active && let Some(Some(food)) = entity.items.first() {
+        let item = food.item.to_string();
+        entity.nbt.insert("last_item".into(), Tag::String(item.as_str().into()));
+    }
+    let mut shown = Compound::new();
+    let scale = if tank.capacity == 0 { 0.0 } else { tank.amount as f64 / tank.capacity as f64 };
+    put_int(&mut shown, "liq_stage", if tank.amount == 0 { 0 } else { ((scale * 39.0) as u32).min(39) });
+    put_int(&mut shown, "liq_active", u32::from(active));
+    shown.insert("liq_item".into(), Tag::String(get_string(&entity.nbt, "last_item").unwrap_or_default().as_str().into()));
+    put_client(game, pos, entity, &["liq_stage", "liq_active", "liq_item"], shown);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "output", &tank);
@@ -14084,6 +14178,7 @@ pub(super) fn world_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::
     }
     tank_boxes(game, boxes);
     portal_boxes(game, boxes);
+    liquifier_boxes(game, boxes);
 }
 
 /// Opens the config screen from the main one, and keeps it open while the screen is.
