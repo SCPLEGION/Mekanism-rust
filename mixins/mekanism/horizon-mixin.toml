@@ -97,6 +97,18 @@ bindings = [
 ]
 
 [[injection]]
+id = "block-redirect"
+hook = "block_redirect"
+hook_version = 1
+kind = "HEAD"
+helper = "block_redirect.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "to", ty = "&mut Option<[i32; 3]>", value = "&mut *to" },
+]
+
+[[injection]]
 id = "place-block"
 hook = "place_block"
 hook_version = 1

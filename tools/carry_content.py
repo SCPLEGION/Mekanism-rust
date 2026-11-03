@@ -29,7 +29,8 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import block_shapes  # noqa: E402
+import block_shapes
+import bounding  # noqa: E402
 import flatten_models  # noqa: E402
 import worn_models  # noqa: E402
 
@@ -421,6 +422,15 @@ def build_module(ns, out):
             declaration = {"template": "minecraft:amethyst_cluster", "properties": {"light": 15}}
         declaration = shape_declaration(ns, name, declaration, report)
         write_json(declared / "block" / f"{name}.json", declaration)
+    # Bounding blocks: the cells beyond a multi-block machine's own (native code places and clears them).
+    for (bns, bname), decl in bounding.declarations(shape_table()).items():
+        if bns != ns:
+            continue
+        write_json(out / "assets" / ns / "blockstates" / f"{bname}.json",
+                   {"variants": {"": {"model": "mekanism:block/nothing"}}})
+        write_json(declared / "block" / f"{bname}.json", decl)
+        blocks.add(bname)
+        report["bounding_blocks"] = report.get("bounding_blocks", 0) + 1
     items = 0
     for path in sorted((out / "assets" / ns / "items").glob("*.json")):
         if path.stem in blocks:
