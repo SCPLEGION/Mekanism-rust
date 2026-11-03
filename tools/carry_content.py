@@ -469,14 +469,42 @@ def build_module(ns, out):
             worn_models.build_element_world_model(ns, "liquifier_blade", json.loads(blade.read_text()), texture, out, report)
     if ns == "mekanism":
         # The Robit (`RenderRobit`): its element model, the glowing eyes and back light apart from the body.
-        robit = next((d / ns / "models/robit/robit.json" for d in search if (d / ns / "models/robit/robit.json").is_file()), None)
-        skin = next((d / ns / "textures/entity/robit/robit.png" for d in search
-                     if (d / ns / "textures/entity/robit/robit.png").is_file()), None)
-        if robit is not None and skin is not None:
-            data = json.loads(robit.read_text())
-            for name, glow in (("robit_body", False), ("robit_glow", True)):
-                part = {"elements": [e for e in data["elements"] if bool(e.get("light_emission")) == glow]}
-                worn_models.build_element_world_model(ns, name, part, skin, out, report, (8, 0, 8))
+        # The Robit item (`RenderRobitItem`) draws its base skin model; Horizon has no such special model, so the item
+        # shows the same elements as a plain item model with the base texture.
+        robit_model = next((d / ns / "models/robit/robit.json" for d in search if (d / ns / "models/robit/robit.json").is_file()), None)
+        robit_skin = next((d / ns / "textures/entity/robit/robit.png" for d in search
+                           if (d / ns / "textures/entity/robit/robit.png").is_file()), None)
+        if robit_model is not None and robit_skin is not None:
+            item_model = json.loads(robit_model.read_text())
+            item_model["textures"] = {"robit": f"{ns}:item/robit_skin", "particle": f"{ns}:item/robit_skin"}
+            write_json(out / "assets" / ns / "models" / "item" / "robit_flat.json", item_model)
+            (out / "assets" / ns / "textures" / "item").mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(robit_skin, out / "assets" / ns / "textures" / "item" / "robit_skin.png")
+            write_json(out / "assets" / ns / "items" / "robit.json", {"model": {"type": "minecraft:model", "model": f"{ns}:item/robit_flat"}})
+            report["robit_item"] = 1
+        # The skins (`MekanismRobitSkins`, their datapack JSON): per skin and texture the body and the glowing parts,
+        # `robit_body_<skin>[_<n>]` and `robit_glow_<skin>[_<n>]` (the Robit in the world, the previews in its screen);
+        # a skin's `custom_model` replaces the base model. The texture index moves while the Robit walks.
+        body_glow = {}
+        for skin_json in sorted({f for d in search for f in (d.parent / "data" / ns / "mekanism" / "robit_skin").glob("*.json")}, key=lambda f: f.name):
+            skin_data = json.loads(skin_json.read_text())
+            model_id = skin_data.get("custom_model", f"{ns}:robit/robit")
+            model_ns, model_path = model_id.split(":")
+            model_file = next((d / model_ns / "models" / f"{model_path}.json" for d in search
+                               if (d / model_ns / "models" / f"{model_path}.json").is_file()), None)
+            if model_file is None:
+                continue
+            elements = json.loads(model_file.read_text())["elements"]
+            for index, texture_id in enumerate(skin_data.get("textures", [])):
+                tex_ns, tex_name = texture_id.split(":")
+                png = next((d / tex_ns / "textures/entity/robit" / f"{tex_name}.png" for d in search
+                            if (d / tex_ns / "textures/entity/robit" / f"{tex_name}.png").is_file()), None)
+                if png is None:
+                    continue
+                suffix = "" if index == 0 else f"_{index}"
+                for part_name, glow in (("body", False), ("glow", True)):
+                    part = {"elements": [e for e in elements if bool(e.get("light_emission")) == glow]}
+                    worn_models.build_element_world_model(ns, f"robit_{part_name}_{skin_json.stem}{suffix}", part, png, out, report, (8, 0, 8))
     if ns == "mekanism":
         # The Personal Chest (`RenderPersonalChest`): vanilla's chest parts in Mekanism's skin, the lid turned.
         chest = next((d / ns / "textures/block/models/personal_chest.png" for d in search
