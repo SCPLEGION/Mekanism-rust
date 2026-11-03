@@ -6927,6 +6927,8 @@ const SMALL_MED: [f32; 2] = [18.0, 48.0];
 #[derive(Clone, Copy)]
 enum PowerBar {
     Vertical([f32; 2]),
+    /// A vertical bar of its own height (`GuiVerticalPowerBar` with a height).
+    Tall([f32; 2], f32),
     Horizontal([f32; 2]),
     /// The energy cube's wide energy gauge.
     Gauge([f32; 2]),
@@ -6951,7 +6953,8 @@ fn layout(block: &str) -> Option<Layout> {
         Kind::Factory(..) => Layout {
             slots: [None, None, None],
             gauges: vec![],
-            power: Some(PowerBar::Vertical([screen_width(block) - 12.0, 16.0])),
+            // `GuiVerticalPowerBar(imageWidth - 12, 16, sawing ? 73 : 52)`.
+            power: Some(PowerBar::Tall([screen_width(block) - 12.0, 16.0], if matches!(kind(block), Some(Kind::Factory(_, "sawing", _))) { 73.0 } else { 52.0 })),
             progress: None,
         },
         // The frequency screens (`draw_frequency_screen`): the teleporter's power bar.
@@ -9730,6 +9733,7 @@ fn sprite(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, name: &str
 fn power_rect(p: PowerBar) -> [f32; 4] {
     match p {
         PowerBar::Vertical([x, y]) => [x, y, 6.0, 54.0],
+        PowerBar::Tall([x, y], h) => [x, y, 6.0, h],
         PowerBar::Horizontal([x, y]) => [x, y, 54.0, 6.0],
         PowerBar::Gauge([x, y]) => [x, y, WIDE[0], WIDE[1]],
         PowerBar::SmallGauge([x, y]) => [x, y, SMALL_MED[0], SMALL_MED[1]],
@@ -10879,7 +10883,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         (get(0) / get(1).max(1.0)).clamp(0.0, 1.0)
     };
     match l.power {
-        Some(p @ PowerBar::Vertical(_)) => {
+        Some(p @ (PowerBar::Vertical(_) | PowerBar::Tall(..))) => {
             let [x, y, w, h] = power_rect(p);
             nine_slice(game, batch, "bar/base", 5.0, 1.0, [ox + x, oy + y, w, h]);
             // `GuiBar.warning`: the warning background behind the contents (not enough energy).
