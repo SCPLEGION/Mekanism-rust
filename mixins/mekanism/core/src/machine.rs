@@ -160,6 +160,7 @@ mod tests {
                 speed: 8,
                 energy: 0,
                 filter: 0,
+                anchor: 0,
             },
         );
         assert_eq!(
@@ -176,6 +177,7 @@ mod tests {
                 speed: 8,
                 energy: 0,
                 filter: 0,
+                anchor: 0,
             },
         );
         let mut dust = Slot {
