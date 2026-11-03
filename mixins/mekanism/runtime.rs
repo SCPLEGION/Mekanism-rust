@@ -20866,6 +20866,8 @@ use mekanism_core::flamethrower;
 
 /// A flame the server flies (`EntityFlame`).
 struct Flame {
+    /// Who fired it, so the flame never burns them.
+    owner: Option<u128>,
     pos: [f64; 3],
     vel: [f64; 3],
     age: u32,
@@ -20950,7 +20952,8 @@ pub(super) fn using_tick(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut b
         [rng.gaussian(), rng.gaussian(), rng.gaussian()]
     });
     let start = flamethrower::start(eye, player.yaw, player.pitch, true);
-    let flame = Flame { pos: start, vel: flamethrower::velocity(player.yaw, player.pitch, shooter, noise), age: 0, mode };
+    let owner = game.native_acting_player().map(|p| p.uuid);
+    let flame = Flame { owner, pos: start, vel: flamethrower::velocity(player.yaw, player.pitch, shooter, noise), age: 0, mode };
     // Between the eyes and where the flame starts a block hit it at once, so it cannot shoot through a wall.
     let from = [eye[0], eye[1] - 0.1, eye[2]];
     if let Some((_, block, face)) = game.native_clip(from, start) {
@@ -20977,6 +20980,10 @@ fn flames_tick(game: &mut Game<'_>) {
         // The nearest mob or dropped item the flame's path meets, within a third of a block.
         let lo = [0, 1, 2].map(|i| f.pos[i].min(end[i]) - 0.3);
         let hi = [0, 1, 2].map(|i| f.pos[i].max(end[i]) + 0.3);
+        // A player in the way is burned unless it is the one who fired (the `pvp` rule decides).
+        if flame_hits_player(game, f.owner, lo, hi) {
+            return false;
+        }
         let hit = game.native_entities_in(lo, hi, f.pos).into_iter().next();
         if let Some(entity) = hit {
             flame_hits_entity(game, entity.id, &entity.kind, f.mode);
@@ -20989,6 +20996,7 @@ fn flames_tick(game: &mut Game<'_>) {
         // Water and lava put the flame out.
         let at = [target[0].floor() as i32, target[1].floor() as i32, target[2].floor() as i32];
         if matches!(block_name(game, at), "minecraft:water" | "minecraft:lava") {
+            flame_smoke(game, at);
             return false;
         }
         f.pos = target;
@@ -21033,6 +21041,44 @@ fn flames_payload(data: &[u8]) {
     FLAME_VIEW.with_borrow_mut(|v| *v = view);
 }
 
+/// `EntityFlame.onHitEntity` for a player: ten damage and five seconds of fire, if `pvp` is on and they are not
+/// in creative or spectator mode. True when a player took the flame.
+fn flame_hits_player(game: &mut Game<'_>, owner: Option<u128>, lo: [f64; 3], hi: [f64; 3]) -> bool {
+    use horizon_core::geometry::Vec3;
+    let reach = horizon_core::geometry::Aabb::new(Vec3::new(lo[0], lo[1], lo[2]), Vec3::new(hi[0], hi[1], hi[2]));
+    let host_uuid = game.lan.as_ref().map(|h| h.host_uuid);
+    let guest_uuids: Vec<(u32, u128)> = game.lan.as_ref().map_or_else(Vec::new, |h| h.hub.guests.iter().map(|g| (g.conn, g.uuid)).collect());
+    let uuid_of = |who: super::dragon::FightWho| match who {
+        super::dragon::FightWho::Host => host_uuid,
+        super::dragon::FightWho::Guest(conn) => guest_uuids.iter().find(|(c, _)| *c == conn).map(|(_, u)| *u),
+    };
+    let Some(target) = game
+        .fight_players()
+        .into_iter()
+        .find(|p| p.alive && owner.is_none_or(|o| uuid_of(p.who) != Some(o)) && p.bounds.intersects(reach))
+    else {
+        return false;
+    };
+    // Creative and spectator players cannot be harmed (`hurt_player_by` refuses creative on its own).
+    if !game.ui.rules.bool("pvp") {
+        return true;
+    }
+    game.as_fight_player(target.who, |g| {
+        g.hurt_player_by("mekanism:flamethrower", flamethrower::DAMAGE);
+        if let Some(p) = g.player.as_mut() {
+            let _ = p.ignite_for_ticks(flamethrower::BURN_TICKS);
+        }
+    });
+    true
+}
+
+/// Smoke over `pos` (`EntityFlame.spawnParticlesAt`): ten puffs within half a block.
+fn flame_smoke(game: &mut Game<'_>, pos: [i32; 3]) {
+    let options = horizon_client::particles::ParticleOptions::simple(horizon_client::particles::ParticleType::Smoke);
+    let dimension = game.native_player().map_or("minecraft:overworld", |p| p.dimension);
+    game.lan_send_particles(dimension, &options, None, [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5], [0.5, 0.5, 0.5], 0.0, 10);
+}
+
 /// `EntityFlame.onHitEntity`: a mob burns (ten damage and five seconds of fire) unless it is fire immune; a dropped
 /// item is smelted by the heat mode once it is five seconds old, and burns up otherwise.
 fn flame_hits_entity(game: &mut Game<'_>, id: u32, kind: &str, mode: flamethrower::Mode) {
@@ -21047,6 +21093,8 @@ fn flame_hits_entity(game: &mut Game<'_>, id: u32, kind: &str, mode: flamethrowe
                     let item = &mut game.dropped[at];
                     item.stack = stack_of(&cooking.result.item.to_string(), cooking.result.count * stack.count);
                     item.ticks = 0;
+                    let at = [item.position.x.floor() as i32, item.position.y.floor() as i32, item.position.z.floor() as i32];
+                    flame_smoke(game, at);
                 } else if flamethrower::DESTROY_ITEMS {
                     game.dropped.remove(at);
                 }
@@ -21078,6 +21126,7 @@ fn flame_hits_block(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3], mode: fl
             };
             let (result, count) = (cooking.result.item.to_string(), cooking.result.count);
             let is_block = world_items!(game).get(&result).is_some_and(|i| i.block.is_some());
+            flame_smoke(game, pos);
             if is_block {
                 game.native_set_block(pos, &result, &[]);
             } else {
@@ -21087,6 +21136,12 @@ fn flame_hits_block(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3], mode: fl
             }
         }
         flamethrower::Mode::Inferno => {
+            // TNT is primed where it stood (`TntBlock.onCaughtFire`).
+            if name == "minecraft:tnt" {
+                game.spawn_primed_tnt(horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]), false);
+                game.native_set_block(pos, "minecraft:air", &[]);
+                return;
+            }
             // Campfires and candles light; otherwise fire goes in the air on the face that was hit.
             if let Some(lit) = game.native_block_property(pos, "lit") {
                 let lightable = name.ends_with("campfire") || name.ends_with("candle") || name.ends_with("candle_cake");
