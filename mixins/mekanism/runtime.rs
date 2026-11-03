@@ -18221,38 +18221,64 @@ fn robit_inventory_click(game: &mut Game<'_>, id: u32, slot: usize, how: slot_cl
         _ => true,
     };
     if slot == robit::CRAFT_RESULT {
-        // `ResultSlot`: taking the result uses up one of each ingredient and leaves the remainders.
-        let grid: Vec<Option<ItemStack>> = (0..9).map(|i| slots[robit::CRAFT_GRID + i].as_ref().map(|w| w.stack.clone())).collect();
-        let found = world_recipes!(game).find(&grid, 3).map(|(rid, res)| (rid.to_owned(), res));
-        if let Some((rid, result)) = found {
-            let left = world_recipes!(game).remainders(&rid, &grid, 3);
-            let fits = match (&cursor, how) {
-                (_, slot_click::Click::Shift) => true,
-                (None, _) => true,
-                (Some(c), _) => c.stack.item == result.item && c.stack.count + result.count <= c.max,
+        // `ResultSlot` and `quickMoveStack`: a shift-click crafts again and again while the result fits
+        // the player's inventory; a plain click takes one result onto the cursor.
+        let shift = how == slot_click::Click::Shift;
+        for _ in 0..if shift { 64 * 9 } else { 1 } {
+            let grid: Vec<Option<ItemStack>> = (0..9).map(|i| slots[robit::CRAFT_GRID + i].as_ref().map(|w| w.stack.clone())).collect();
+            let found = world_recipes!(game).find(&grid, 3).map(|(rid, res)| (rid.to_owned(), res));
+            let Some((rid, result)) = found else {
+                break;
             };
-            if fits {
-                if how == slot_click::Click::Shift {
-                    game.give_or_drop(result.clone());
-                } else if let Some(c) = cursor.as_mut() {
-                    c.stack.count += result.count;
-                } else {
-                    cursor = Some(max(game, result.clone()));
-                }
-                for i in 0..9 {
-                    let cell = &mut slots[robit::CRAFT_GRID + i];
-                    if let Some(w) = cell.as_mut() {
-                        w.stack.count -= 1;
-                        if w.stack.count == 0 {
-                            *cell = None;
+            let left = world_recipes!(game).remainders(&rid, &grid, 3);
+            let m = max_stack(game, &result.item);
+            if shift {
+                // Fill the player's partial stacks, then the empty slots.
+                let mut need = result.count;
+                for pass in 0..2 {
+                    for i in 0..36 {
+                        let cell = &mut slots[ROBIT_INV_ROBIT + i];
+                        match cell {
+                            Some(w) if pass == 0 && w.stack.item == result.item && w.stack.count < m => {
+                                let add = need.min(m - w.stack.count);
+                                w.stack.count += add;
+                                need -= add;
+                            }
+                            None if pass == 1 && need > 0 => {
+                                let add = need.min(m);
+                                let mut s = result.clone();
+                                s.count = add;
+                                *cell = Some(max(game, s));
+                                need -= add;
+                            }
+                            _ => {}
                         }
                     }
-                    if let Some(rem) = left.get(i).cloned().flatten() {
-                        match cell {
-                            None => *cell = Some(max(game, rem)),
-                            Some(w) if w.stack.item == rem.item => w.stack.count += rem.count,
-                            Some(_) => game.give_or_drop(rem),
-                        }
+                }
+                if need > 0 {
+                    // No room for it: nothing was crafted past this point (what went in stays, as in vanilla).
+                    break;
+                }
+            } else {
+                match cursor.as_mut() {
+                    None => cursor = Some(max(game, result.clone())),
+                    Some(c) if c.stack.item == result.item && c.stack.count + result.count <= c.max => c.stack.count += result.count,
+                    Some(_) => break,
+                }
+            }
+            for i in 0..9 {
+                let cell = &mut slots[robit::CRAFT_GRID + i];
+                if let Some(w) = cell.as_mut() {
+                    w.stack.count -= 1;
+                    if w.stack.count == 0 {
+                        *cell = None;
+                    }
+                }
+                if let Some(rem) = left.get(i).cloned().flatten() {
+                    match cell {
+                        None => *cell = Some(max(game, rem)),
+                        Some(w) if w.stack.item == rem.item => w.stack.count += rem.count,
+                        Some(_) => game.give_or_drop(rem),
                     }
                 }
             }
@@ -18392,6 +18418,9 @@ fn robit_draw_inventory(game: &Game<'_>, batch: &mut horizon_client::hud::HudBat
     robit_draw_tabs(game, batch, o);
     centred(game, batch, "Robit", o[0], ROBIT_WINDOW[0], o[1] + 5.0, 0x40_4040);
     game.native_text(batch, "Inventory", [o[0] + 8.0, o[1] + 73.0], 0x40_4040, false);
+    if tab == RobitTab::Crafting {
+        sprite(game, batch, "progress/tall_right/empty", [0.0, 0.0, 22.0, 15.0], [o[0] + 90.0, o[1] + 35.0, 22.0, 15.0]);
+    }
     if tab == RobitTab::Smelting {
         let id = ROBIT_UI.with_borrow(|u| *u).unwrap_or(0);
         let view = ROBIT_VIEWS.with_borrow(|v| v.get(&id).cloned()).unwrap_or_default();
