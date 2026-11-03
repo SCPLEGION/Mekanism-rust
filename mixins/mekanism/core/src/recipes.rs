@@ -255,6 +255,11 @@ pub fn find_pigment_extracting(
         .find(|r| count >= r.input_count && r.input.matches(item, in_tag))
 }
 
+/// Whether `pigment` is the pigment of some `painting` recipe.
+pub fn painting_pigment(pigment: &str) -> bool {
+    crate::recipe_table::PAINTING.iter().any(|r| r.chemical == pigment)
+}
+
 /// `painting`: an item and pigment (used per operation) make a dyed item.
 pub fn find_painting(
     item: &str,
