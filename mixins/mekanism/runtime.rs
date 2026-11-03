@@ -21,6 +21,7 @@ use mekanism_core::chargepad;
 use mekanism_core::entangloporter::{self as qe, Frequency};
 use mekanism_core::sorter::{self, Sorter};
 use mekanism_core::oredictionificator as od;
+use mekanism_core::formulaic as fa;
 use mekanism_core::plenisher::{self, Plenisher, Spot};
 use mekanism_core::fission;
 use mekanism_core::frequency as freq;
@@ -111,6 +112,8 @@ enum Kind {
     Oredictionificator,
     /// The Nutritional Liquifier: food becomes nutritional paste.
     Liquifier,
+    /// The Formulaic Assemblicator: crafts from its stock by an encoded formula.
+    Assemblicator,
     /// The Chargepad: charges an item of the player standing on it.
     Chargepad,
     /// The Quantum Entangloporter: shares energy, fluid and chemicals across its frequency.
@@ -192,6 +195,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanismgenerators:gas_burning_generator" => return Some(Kind::GasGenerator),
         "mekanism:chemical_oxidizer" => return Some(Kind::Oxidizer),
         chem::LIQUIFIER => return Some(Kind::Liquifier),
+        fa::BLOCK => return Some(Kind::Assemblicator),
         "mekanism:chemical_infuser" => return Some(Kind::ChemicalInfuser),
         "mekanism:antiprotonic_nucleosynthesizer" => return Some(Kind::Nucleosynthesizer),
         teleporter::TELEPORTER => return Some(Kind::Teleporter),
@@ -369,6 +373,20 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         });
         return;
     }
+    // The formula, 18 stock slots, the 3 x 3 grid, 6 outputs and the energy slot in a nine by four menu.
+    if kind(block) == Some(Kind::Assemblicator) {
+        let stock: Vec<usize> = (fa::INPUT_FIRST..fa::INPUT_FIRST + fa::INPUTS).collect();
+        let outputs: Vec<usize> = (fa::OUTPUT_FIRST..fa::OUTPUT_FIRST + fa::OUTPUTS).collect();
+        let side: Vec<usize> = stock.iter().copied().chain([fa::ENERGY_SLOT, fa::FORMULA_SLOT]).collect();
+        *container = Some(ModContainer {
+            slots: fa::SLOTS,
+            faces: [outputs.clone(), stock.clone(), side.clone(), side.clone(), side.clone(), side],
+            inputs: stock.into_iter().chain([fa::ENERGY_SLOT]).collect(),
+            outputs,
+            menu: Some("minecraft:generic_9x4".into()),
+        });
+        return;
+    }
     // The input in the first slot (the furnace menu's), the result out of the last.
     if kind(block) == Some(Kind::Oredictionificator) {
         *container = Some(ModContainer {
@@ -526,6 +544,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             }
             Kind::Oxidizer => tick_oxidizer(game, pos, entity),
             Kind::Liquifier => tick_liquifier(game, pos, entity),
+            Kind::Assemblicator => tick_assemblicator(game, pos, entity),
             Kind::Dissolution => tick_dissolution(game, pos, entity),
             Kind::Centrifuge => tick_centrifuge(game, pos, entity),
             Kind::FissionPort => {
@@ -658,6 +677,7 @@ fn discharge_energy_slot(entity: &mut ModBlockEntity) {
         Some(Kind::Oxidizer | Kind::Dissolution | Kind::Crystallizer | Kind::Separator | Kind::Rotary | Kind::Liquifier) => 1,
         Some(Kind::Machine("combining", _) | Kind::Advanced(_) | Kind::Infuser | Kind::Nucleosynthesizer) => 3,
         Some(Kind::Pump | Kind::Plenisher) => 2,
+        Some(Kind::Assemblicator) => fa::ENERGY_SLOT,
         Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer | Kind::Heater | Kind::Vibrator) => 0,
         _ => return,
     };
@@ -2747,6 +2767,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::HeatGenerator
                 | Kind::Oxidizer
                 | Kind::Liquifier
+                | Kind::Assemblicator
                 | Kind::Dissolution
                 | Kind::Crystallizer
                 | Kind::Separator
@@ -3592,6 +3613,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Cable(rate) if !from_cable => Some((rate, rate)),
         Kind::Oxidizer => Some((chem::OXIDIZER_USAGE * u64::from(chem::OXIDIZER_TICKS), u64::MAX)),
         Kind::Liquifier => Some((chem::LIQUIFIER_USAGE * u64::from(chem::LIQUIFIER_TICKS), u64::MAX)),
+        Kind::Assemblicator => Some((asm_capacity(nbt), u64::MAX)),
         Kind::Dissolution => Some((machine::STORAGE_MULTIPLIER * nuclear::DISSOLUTION_USAGE, u64::MAX)),
         Kind::Centrifuge => Some((machine::STORAGE_MULTIPLIER * nuclear::CENTRIFUGE_USAGE, u64::MAX)),
         Kind::Washer => Some((machine::STORAGE_MULTIPLIER * nuclear::WASHER_USAGE, u64::MAX)),
@@ -4261,6 +4283,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     }
     if channel == SORTER_CHANNEL && game.native_on(MOD_ID) {
         sorter_payload(game, data);
+        return;
+    }
+    if channel == ASM_CHANNEL && game.native_on(MOD_ID) {
+        asm_payload(game, data);
         return;
     }
     if channel == OD_CHANNEL && game.native_on(MOD_ID) {
@@ -5270,6 +5296,14 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Horizontal([115.0, 75.0])),
             progress: large_right(64.0, 40.0),
         },
+        // TileEntityFormulaicAssemblicator and GuiFormulaicAssemblicator: the formula slot and the first two stock
+        // slots; the rest are `extra_slots`.
+        Kind::Assemblicator => Layout {
+            slots: [Some(([6.0, 26.0], "slot/normal")), Some(([8.0, 98.0], "slot/normal")), Some(([26.0, 98.0], "slot/normal"))],
+            gauges: vec![],
+            power: Some(PowerBar::Vertical([159.0, 15.0])),
+            progress: Some(([86.0, 43.0], "progress/tall_right", [22.0, 15.0])),
+        },
         // TileEntityNutritionalLiquifier and GuiNutritionalLiquifier.
         Kind::Liquifier => Layout {
             slots: [Some(([26.0, 36.0], "slot/normal")), Some(([155.0, 5.0], "slot/power")), Some(([110.0, 36.0], "slot/output"))],
@@ -5777,6 +5811,8 @@ fn screen_height(block: &str) -> f32 {
         // `DEFAULT_IMAGE_HEIGHT + 76`.
         Some(Kind::DigitalMiner) => 242.0,
         // `DEFAULT_IMAGE_HEIGHT + 64`.
+        Some(Kind::Assemblicator) => 230.0,
+        // `DEFAULT_IMAGE_HEIGHT + 64`.
         Some(Kind::Oredictionificator) => 230.0,
         _ => 166.0,
     }
@@ -5795,6 +5831,12 @@ fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
         Some(Kind::Oxidizer) => vec![([152.0, 55.0], "slot/normal")],
         // `FluidInventorySlot.drain` (the bucket to fill) and the filled container's output slot.
         Some(Kind::Liquifier) => vec![([155.0, 25.0], "slot/normal"), ([155.0, 56.0], "slot/output")],
+        Some(Kind::Assemblicator) => (2..fa::INPUTS)
+            .map(|i| ([8.0 + 18.0 * (i % 9) as f32, 98.0 + 18.0 * (i / 9) as f32], "slot/normal"))
+            .chain((0..fa::GRID).map(|i| ([26.0 + 18.0 * (i % 3) as f32, 17.0 + 18.0 * (i / 3) as f32], "slot/normal")))
+            .chain((0..fa::OUTPUTS).map(|i| ([116.0 + 18.0 * (i % 2) as f32, 17.0 + 18.0 * (i / 2) as f32], "slot/output")))
+            .chain([([152.0, 76.0], "slot/power")])
+            .collect(),
         Some(Kind::Dissolution) => vec![([8.0, 65.0], "slot/normal"), ([152.0, 55.0], "slot/normal")],
         Some(Kind::Crystallizer) => vec![([8.0, 65.0], "slot/normal")],
         Some(Kind::ChemicalInfuser) => vec![([80.0, 65.0], "slot/normal")],
@@ -5903,6 +5945,7 @@ fn tabs(block: &str) -> u8 {
             | Kind::Factory(..)
             | Kind::Oxidizer
             | Kind::Liquifier
+            | Kind::Assemblicator
             | Kind::Dissolution
             | Kind::Crystallizer
             | Kind::Separator
@@ -6480,13 +6523,17 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
         let extra = extra_slots(block);
         if !extra.is_empty() {
             rules.resize(3, SlotRule::Any);
-            let chemical = !matches!(kind(block), Some(Kind::Washer | Kind::DigitalMiner));
+            let chemical = !matches!(kind(block), Some(Kind::Washer | Kind::DigitalMiner | Kind::Liquifier | Kind::Assemblicator));
             rules.extend(extra.iter().map(|(_, sprite)| match *sprite {
                 "slot/normal" if !chemical => SlotRule::Any,
                 "slot/normal" => SlotRule::Items(chemical_item_ids()),
                 "slot/output" => SlotRule::Refuse,
+                _ if kind(block) == Some(Kind::Assemblicator) => convert(),
                 _ => energy(),
             }));
+        }
+        if kind(block) == Some(Kind::Assemblicator) {
+            rules[fa::FORMULA_SLOT] = SlotRule::Items(vec![fa::FORMULA_ITEM.to_owned()]);
         }
     }
 }
@@ -7548,6 +7595,9 @@ fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], r
         return;
     }
     if is_od(block) && od_click(game, block, at) {
+        return;
+    }
+    if is_asm(block) && open_window_id(block).is_none() && asm_click(game, at) {
         return;
     }
     if is_qio_screen(block) {
@@ -8981,6 +9031,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     if is_od(block) {
         draw_od_list(game, batch, origin);
     }
+    if is_asm(block) {
+        draw_asm(game, batch, origin);
+    }
     if let Some(Kind::ChemicalTank(t)) = kind(block) {
         draw_tank_screen(game, batch, &l, data, origin, t == BaseTier::Creative);
     }
@@ -9112,7 +9165,7 @@ fn warning_bits(block: &str, l: &Layout, data: &[i32]) -> u32 {
     if is_od(block) {
         return ((data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 1) << 4;
     }
-    if kind(block).is_some_and(|k| base_usage(k).is_some()) {
+    if kind(block).is_some_and(|k| base_usage(k).is_some() || k == Kind::Assemblicator) {
         return (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 15;
     }
     if !matches!(kind(block), Some(Kind::Machine(..))) {
@@ -9257,6 +9310,9 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         return;
     }
     if is_od(block) && (od_edit_open() || open_window_id(block).is_none()) && od_tooltip(game, window_at(block, at), lines) {
+        return;
+    }
+    if is_asm(block) && open_window_id(block).is_none() && asm_tooltip(game, at, lines) {
         return;
     }
     if is_qio_screen(block) {
@@ -15166,4 +15222,462 @@ fn od_key(game: &Game<'_>, key: &str, text: Option<&str>) {
         }
     }
     OD_EDIT.with_borrow_mut(|slot| *slot = edit);
+}
+
+// --- Formulaic Assemblicator (TileEntityFormulaicAssemblicator, GuiFormulaicAssemblicator) -----------------
+
+const ASM_CHANNEL: &str = "mekanism:assemblicator";
+
+fn is_asm(block: &str) -> bool {
+    kind(block) == Some(Kind::Assemblicator)
+}
+
+/// An encoded crafting formula (`RecipeFormula`): the nine ingredients of its recipe and that recipe.
+struct Formula {
+    cells: Vec<Option<String>>,
+    recipe: String,
+}
+
+fn asm_cells_grid(cells: &[Option<String>]) -> Vec<Option<ItemStack>> {
+    cells.iter().map(|c| c.as_deref().map(|i| stack_of(i, 1))).collect()
+}
+
+fn asm_grid(entity: &ModBlockEntity) -> Vec<Option<ItemStack>> {
+    (0..fa::GRID).map(|i| entity.items.get(fa::GRID_FIRST + i).cloned().flatten()).collect()
+}
+
+/// The formula in the formula slot (`checkFormula`), when it is encoded and its recipe exists.
+fn asm_formula(game: &Game<'_>, entity: &ModBlockEntity) -> Option<Formula> {
+    let stack = entity.items.get(fa::FORMULA_SLOT)?.as_ref()?;
+    if *stack.item != *fa::FORMULA_ITEM {
+        return None;
+    }
+    let cells = fa::decode(&get_string(custom_data(stack)?, "formula")?);
+    if cells.iter().all(Option::is_none) {
+        return None;
+    }
+    let (id, _) = world_recipes!(game).find(&asm_cells_grid(&cells), 3)?;
+    Some(Formula { cells, recipe: id.to_owned() })
+}
+
+/// `RecipeFormula.isIngredientInPos`: whether `item` (or nothing) is right at grid position `i`.
+fn asm_in_pos(game: &Game<'_>, f: &Formula, item: Option<&str>, i: usize) -> bool {
+    let Some(item) = item else {
+        return f.cells[i].is_none();
+    };
+    match &f.cells[i] {
+        None => false,
+        Some(c) if c == item => true,
+        Some(_) => {
+            let mut cells = f.cells.clone();
+            cells[i] = Some(item.to_owned());
+            world_recipes!(game).recipe_matches(&f.recipe, &asm_cells_grid(&cells), 3)
+        }
+    }
+}
+
+/// What the grid crafts now (with the formula's recipe when there is one): the recipe, what it makes and what
+/// it leaves (`lastOutputStack`, `lastRemainingItems`).
+struct Craft {
+    result: ItemStack,
+    rest: Vec<ItemStack>,
+}
+
+fn asm_craft(game: &Game<'_>, entity: &ModBlockEntity, f: Option<&Formula>) -> Option<Craft> {
+    let grid = asm_grid(entity);
+    let recipes = world_recipes!(game);
+    let (id, result) = recipes.find(&grid, 3)?;
+    if let Some(f) = f
+        && !recipes.recipe_matches(&f.recipe, &grid, 3)
+    {
+        return None;
+    }
+    let rest = recipes.remainders(id, &grid, 3).into_iter().flatten().collect();
+    Some(Craft { result, rest })
+}
+
+/// Inserts a stack into slots, stacking before using empty ones; what did not fit.
+fn asm_insert(game: &Game<'_>, slots: &mut [Option<ItemStack>], stack: &ItemStack) -> u32 {
+    let max = world_items!(game).get(&stack.item).map_or(64, |i| i.max_stack);
+    let mut left = stack.count;
+    for s in slots.iter_mut().flatten() {
+        if left > 0 && s.item == stack.item && s.extra == stack.extra && s.count < max {
+            let n = left.min(max - s.count);
+            s.count += n;
+            left -= n;
+        }
+    }
+    for s in slots.iter_mut() {
+        if left > 0 && s.is_none() {
+            let n = left.min(max);
+            *s = Some(ItemStack { count: n, ..stack.clone() });
+            left -= n;
+        }
+    }
+    left
+}
+
+/// `doSingleCraft`: the result and what remains go to the output slots, one of each grid item is used. Nothing
+/// happens when they do not all fit.
+fn asm_single_craft(game: &Game<'_>, entity: &mut ModBlockEntity, f: Option<&Formula>) -> bool {
+    let Some(craft) = asm_craft(game, entity, f) else {
+        return false;
+    };
+    let end = fa::OUTPUT_FIRST + fa::OUTPUTS;
+    let mut outputs: Vec<Option<ItemStack>> = entity.items[fa::OUTPUT_FIRST..end].to_vec();
+    if asm_insert(game, &mut outputs, &craft.result) > 0 || craft.rest.iter().any(|r| asm_insert(game, &mut outputs, r) > 0) {
+        return false;
+    }
+    entity.items[fa::OUTPUT_FIRST..end].clone_from_slice(&outputs);
+    for i in 0..fa::GRID {
+        take_one(entity, fa::GRID_FIRST + i);
+    }
+    if let Some(f) = f {
+        asm_move_to_grid(game, entity, f);
+    }
+    true
+}
+
+/// `moveItemsToGrid`: each grid slot holding the wrong thing gives it back to the stock and takes the right
+/// ingredient from there. False when some slot could not be set.
+fn asm_move_to_grid(game: &Game<'_>, entity: &mut ModBlockEntity, f: &Formula) -> bool {
+    let mut ok = true;
+    for i in 0..fa::GRID {
+        let current = entity.items[fa::GRID_FIRST + i].clone();
+        if asm_in_pos(game, f, current.as_ref().map(|s| &*s.item), i) {
+            continue;
+        }
+        if !asm_try_move(game, entity, f, i) {
+            ok = false;
+        }
+    }
+    ok
+}
+
+fn asm_try_move(game: &Game<'_>, entity: &mut ModBlockEntity, f: &Formula, i: usize) -> bool {
+    let end = fa::INPUT_FIRST + fa::INPUTS;
+    if let Some(current) = entity.items[fa::GRID_FIRST + i].clone() {
+        let mut inputs: Vec<Option<ItemStack>> = entity.items[fa::INPUT_FIRST..end].to_vec();
+        if asm_insert(game, &mut inputs, &current) > 0 {
+            return false;
+        }
+        entity.items[fa::INPUT_FIRST..end].clone_from_slice(&inputs);
+        entity.items[fa::GRID_FIRST + i] = None;
+    }
+    for s in fa::INPUT_FIRST..end {
+        if let Some(stock) = entity.items[s].clone()
+            && asm_in_pos(game, f, Some(&stock.item), i)
+        {
+            take_one(entity, s);
+            entity.items[fa::GRID_FIRST + i] = Some(ItemStack { count: 1, ..stock });
+            return true;
+        }
+    }
+    false
+}
+
+/// `moveItemsToInput`: the grid goes back to the stock (all of it when `force`, else what the formula does not want).
+fn asm_move_to_input(game: &Game<'_>, entity: &mut ModBlockEntity, f: Option<&Formula>, force: bool) {
+    let end = fa::INPUT_FIRST + fa::INPUTS;
+    for i in 0..fa::GRID {
+        let Some(current) = entity.items[fa::GRID_FIRST + i].clone() else {
+            continue;
+        };
+        if force || f.is_some_and(|f| !asm_in_pos(game, f, Some(&current.item), i)) {
+            let mut inputs: Vec<Option<ItemStack>> = entity.items[fa::INPUT_FIRST..end].to_vec();
+            let left = asm_insert(game, &mut inputs, &current);
+            entity.items[fa::INPUT_FIRST..end].clone_from_slice(&inputs);
+            entity.items[fa::GRID_FIRST + i] = (left > 0).then(|| ItemStack { count: left, ..current });
+        }
+    }
+}
+
+/// `organizeStock`: the stock slots a formula assigns to its ingredients.
+fn asm_organize(game: &Game<'_>, entity: &mut ModBlockEntity, f: &Formula) {
+    let end = fa::INPUT_FIRST + fa::INPUTS;
+    let items = world_items!(game);
+    // Stacks that carry data stay as they are: only plain items are moved between slots.
+    if entity.items[fa::INPUT_FIRST..end].iter().flatten().any(|s| s.extra.is_some()) {
+        return;
+    }
+    let slots: Vec<Option<(String, u32)>> = entity.items[fa::INPUT_FIRST..end].iter().map(|s| s.as_ref().map(|s| (s.item.to_string(), s.count))).collect();
+    let map = fa::stock_map(&f.cells);
+    if let Some(done) = fa::organize(&slots, &map, &|i| items.get(i).map_or(64, |x| x.max_stack)) {
+        for (k, slot) in done.into_iter().enumerate() {
+            entity.items[fa::INPUT_FIRST + k] = slot.map(|(item, count)| stack_of(&item, count));
+        }
+    }
+}
+
+fn asm_capacity(nbt: &Compound) -> u64 {
+    let u = upgrades(nbt);
+    u.max_energy(fa::USAGE * u64::from(fa::BASE_TICKS)).max(u.energy_per_tick(fa::USAGE))
+}
+
+/// A player's button, on the server: kept for the machine's next tick, which has the recipes at hand.
+fn asm_payload(game: &mut Game<'_>, data: &[u8]) {
+    let (Some((op, pos)), Some(player)) = (fa::decode_request(data), game.native_acting_player()) else {
+        return;
+    };
+    let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    if !near || !is_asm(block_name(game, pos)) {
+        return;
+    }
+    let n = match op {
+        fa::Op::Encode => 1,
+        fa::Op::StockControl => 2,
+        fa::Op::FillEmpty => 3,
+        fa::Op::CraftSingle => 4,
+        fa::Op::CraftAll => 5,
+        fa::Op::Auto => 6,
+    };
+    game.native_with_mod_block_entity(pos, |m| put_int(&mut m.nbt, "asm_op", n));
+}
+
+fn asm_send(game: &Game<'_>, op: fa::Op) {
+    if let Some((x, y, z)) = game.container {
+        game.native_send_to_server(ASM_CHANNEL, &fa::encode_request(op, [x, y, z]));
+    }
+}
+
+/// The Formulaic Assemblicator, every tick: the button pressed, the stock organised, and in auto mode the
+/// grid filled and crafted (`onUpdateServer`).
+fn tick_assemblicator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    let u = upgrades(&entity.nbt);
+    let ticks_required = u.ticks(fa::BASE_TICKS);
+    let per_tick = u.energy_per_tick(fa::USAGE);
+    let capacity = asm_capacity(&entity.nbt);
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    let formula = asm_formula(game, entity);
+    let mut auto = get_int(&entity.nbt, "auto") == 1;
+    let mut stock = get_int(&entity.nbt, "stock") == 1;
+    let mut progress = get_int(&entity.nbt, "progress");
+    let op = get_int(&entity.nbt, "asm_op");
+    entity.nbt.remove(&JavaString::from("asm_op"));
+    let craft_single = |game: &Game<'_>, entity: &mut ModBlockEntity| {
+        // `craftSingle`: a grid the formula does not match is filled first.
+        let right = formula.as_ref().is_none_or(|f| world_recipes!(game).recipe_matches(&f.recipe, &asm_grid(entity), 3));
+        let can = right || formula.as_ref().is_some_and(|f| asm_move_to_grid(game, entity, f));
+        can && asm_single_craft(game, entity, formula.as_ref())
+    };
+    match op {
+        1 => {
+            // `encodeFormula`: a formula with nothing on it takes the grid's recipe.
+            let craft = asm_craft(game, entity, None);
+            if !auto && craft.is_some() && formula.is_none() {
+                let cells: Vec<Option<String>> = asm_grid(entity).iter().map(|s| s.as_ref().map(|s| s.item.to_string())).collect();
+                if let Some(Some(stack)) = entity.items.get_mut(fa::FORMULA_SLOT)
+                    && *stack.item == *fa::FORMULA_ITEM
+                    && custom_data(stack).and_then(|c| get_string(c, "formula")).is_none()
+                {
+                    set_custom_string(stack, "formula", &fa::encode(&cells));
+                }
+            }
+        }
+        2 if formula.is_some() => stock = !stock,
+        3 if !auto => match &formula {
+            Some(f) => {
+                asm_move_to_grid(game, entity, f);
+            }
+            None => asm_move_to_input(game, entity, None, true),
+        },
+        4 if !auto => {
+            craft_single(game, entity);
+        }
+        5 if !auto => {
+            for _ in 0..10_000 {
+                if !craft_single(game, entity) {
+                    break;
+                }
+            }
+        }
+        6 => {
+            if auto {
+                progress = 0;
+                auto = false;
+            } else if let Some(f) = &formula {
+                asm_move_to_input(game, entity, Some(f), false);
+                auto = true;
+            }
+        }
+        _ => {}
+    }
+    let formula = asm_formula(game, entity);
+    if let Some(f) = &formula
+        && stock
+    {
+        asm_organize(game, entity, f);
+    }
+    if auto && formula.is_none() {
+        auto = false;
+    }
+    let mut used = false;
+    let mut warn = 0;
+    if auto && let Some(f) = &formula {
+        let mut can = true;
+        if asm_craft(game, entity, Some(f)).is_none() {
+            can = asm_move_to_grid(game, entity, f);
+        }
+        if can && asm_craft(game, entity, Some(f)).is_some() {
+            if progress >= ticks_required {
+                if asm_single_craft(game, entity, Some(f)) {
+                    progress = 0;
+                }
+            } else if energy.consume(per_tick) {
+                used = true;
+                progress += 1;
+            } else {
+                warn = 1;
+            }
+        } else {
+            progress = 0;
+        }
+    } else {
+        progress = 0;
+    }
+    let craft = asm_craft(game, entity, formula.as_ref());
+    let encodable = !auto
+        && craft.is_some()
+        && formula.is_none()
+        && entity.items[fa::FORMULA_SLOT].as_ref().is_some_and(|s| *s.item == *fa::FORMULA_ITEM && custom_data(s).and_then(|c| get_string(c, "formula")).is_none());
+    // The ingredients the grid shows as ghosts (`checkValidity`): the formula's, where the slot holds something else.
+    let mut ghosts = vec![None; fa::GRID];
+    if let Some(f) = &formula {
+        for i in 0..fa::GRID {
+            let current = entity.items[fa::GRID_FIRST + i].as_ref().map(|s| &*s.item);
+            if f.cells[i].is_some() && !asm_in_pos(game, f, current, i) {
+                ghosts[i] = f.cells[i].clone();
+            }
+        }
+    }
+    put_long(&mut entity.nbt, "energy", energy.stored);
+    put_int(&mut entity.nbt, "progress", progress);
+    put_int(&mut entity.nbt, "auto", u32::from(auto));
+    put_int(&mut entity.nbt, "stock", u32::from(stock));
+    put_int(&mut entity.nbt, "warn", warn);
+    let mut client = Compound::new();
+    for (k, v) in [("asm_auto", auto), ("asm_recipe", craft.is_some()), ("asm_valid", formula.is_some()), ("asm_stock", stock), ("asm_used", used), ("asm_encode", encodable)] {
+        put_int(&mut client, k, u32::from(v));
+    }
+    client.insert("asm_ghosts".into(), Tag::String(fa::encode(&ghosts).as_str().into()));
+    put_client(game, pos, entity, &["asm_auto", "asm_recipe", "asm_valid", "asm_stock", "asm_used", "asm_encode", "asm_ghosts"], client);
+    entity.data = vec![(energy.stored * 1000 / capacity.max(1)) as i32, 1000, progress as i32, ticks_required as i32];
+    Some(used)
+}
+
+/// What the screen reads from the machine.
+struct AsmView {
+    auto: bool,
+    recipe: bool,
+    valid: bool,
+    stock: bool,
+    encode: bool,
+    ghosts: Vec<Option<String>>,
+}
+
+fn asm_view(game: &Game<'_>) -> Option<AsmView> {
+    let (x, y, z) = game.container?;
+    let (_, c) = game.native_client_block_entity([x, y, z])?;
+    let flag = |k: &str| get_int(c, k) == 1;
+    Some(AsmView {
+        auto: flag("asm_auto"),
+        recipe: flag("asm_recipe"),
+        valid: flag("asm_valid"),
+        stock: flag("asm_stock"),
+        encode: flag("asm_encode"),
+        ghosts: fa::decode(&get_string(c, "asm_ghosts").unwrap_or_default()),
+    })
+}
+
+const ASM_ENCODE: [f32; 4] = [7.0, 45.0, 14.0, 14.0];
+const ASM_STOCK: [f32; 4] = [26.0, 75.0, 16.0, 16.0];
+const ASM_FILL: [f32; 4] = [44.0, 75.0, 16.0, 16.0];
+const ASM_SINGLE: [f32; 4] = [71.0, 75.0, 16.0, 16.0];
+const ASM_ALL: [f32; 4] = [89.0, 75.0, 16.0, 16.0];
+const ASM_AUTO: [f32; 4] = [107.0, 75.0, 16.0, 16.0];
+
+/// The buttons, their op, and whether each is active (`setCheckActive`).
+fn asm_buttons(v: &AsmView) -> [([f32; 4], fa::Op, bool); 6] {
+    [
+        (ASM_ENCODE, fa::Op::Encode, v.encode),
+        (ASM_STOCK, fa::Op::StockControl, v.valid),
+        (ASM_FILL, fa::Op::FillEmpty, !v.auto),
+        (ASM_SINGLE, fa::Op::CraftSingle, !v.auto && v.recipe),
+        (ASM_ALL, fa::Op::CraftAll, !v.auto && v.recipe),
+        (ASM_AUTO, fa::Op::Auto, v.valid),
+    ]
+}
+
+fn asm_click(game: &Game<'_>, at: [f32; 2]) -> bool {
+    let Some(v) = asm_view(game) else {
+        return false;
+    };
+    for (r, op, active) in asm_buttons(&v) {
+        if inside(at, r) {
+            if active {
+                asm_send(game, op);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn asm_tooltip(game: &Game<'_>, at: [f32; 2], lines: &mut Vec<String>) -> bool {
+    let Some(v) = asm_view(game) else {
+        return false;
+    };
+    let on = |b: bool| if b { "\u{a7}aOn" } else { "\u{a7}cOff" };
+    for (r, op, _) in asm_buttons(&v) {
+        if inside(at, r) {
+            lines.push(
+                match op {
+                    fa::Op::Encode => "Encode Formula".to_owned(),
+                    fa::Op::StockControl => format!("Stock Control: {}", on(v.stock)),
+                    fa::Op::FillEmpty => (if v.valid { "Fill Grid" } else { "Empty Grid" }).to_owned(),
+                    fa::Op::CraftSingle => "Craft Single Item".to_owned(),
+                    fa::Op::CraftAll => "Craft Available Items".to_owned(),
+                    fa::Op::Auto => format!("Auto-Mode: {}", on(v.auto)),
+                },
+            );
+            return true;
+        }
+    }
+    false
+}
+
+/// The parts of the screen past the slots: the formula slot's overlay, the one slot the six outputs share, the
+/// recipe check, the grid's ghost ingredients and the buttons.
+fn draw_asm(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    let v = asm_view(game);
+    sprite(game, batch, "slot/overlay/formula", [0.0, 0.0, 18.0, 18.0], [ox + 5.0, oy + 25.0, 18.0, 18.0]);
+    nine_slice_tinted(game, batch, "slot/output", [18.0, 18.0], 1.0, [ox + 115.0, oy + 16.0, 36.0, 54.0], 0xFFFF_FFFF);
+    sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 88.0, oy + 22.0, 18.0, 18.0]);
+    let recipe = v.as_ref().is_some_and(|v| v.recipe);
+    sprite(game, batch, if recipe { "slot/overlay/check" } else { "slot/overlay/x" }, [0.0, 0.0, 18.0, 18.0], [ox + 88.0, oy + 22.0, 18.0, 18.0]);
+    let Some(v) = v else {
+        return;
+    };
+    for (i, ghost) in v.ghosts.iter().enumerate().take(fa::GRID) {
+        if let Some(item) = ghost {
+            let at = [ox + 26.0 + 18.0 * (i % 3) as f32, oy + 17.0 + 18.0 * (i / 3) as f32];
+            game.native_item(batch, item, at, 16.0);
+            game.native_fill(batch, [at[0], at[1], 16.0, 16.0], 0x998B_8B8B);
+        }
+    }
+    for (r, op, active) in asm_buttons(&v) {
+        let icon = match op {
+            fa::Op::Encode => "button/encode_formula",
+            fa::Op::StockControl => "button/stock_control",
+            fa::Op::FillEmpty => if v.valid { "button/empty" } else { "button/fill" },
+            fa::Op::CraftSingle => "button/craft_single",
+            fa::Op::CraftAll => "button/craft_available",
+            fa::Op::Auto => "button/auto_toggle",
+        };
+        draw_button(game, batch, [ox + r[0], oy + r[1], r[2], r[3]], inside(mouse, r), active, 0xFFFF_FFFF, Some((icon, r[2])));
+    }
 }
