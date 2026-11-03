@@ -336,7 +336,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
     // The machines whose only slot is the energy slot (`EnergyInventorySlot`), which automation fills.
     if matches!(
         kind(block),
-        Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer | Kind::Pump | Kind::Plenisher | Kind::Heater | Kind::Vibrator)
+        Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer | Kind::Heater | Kind::Vibrator)
     ) {
         *container = Some(ModContainer {
             slots: 3,
@@ -370,18 +370,21 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::Reaction) => (vec![0, 1], vec![2]),
         // Water buckets in the first slot (empty buckets out of the last), and an empty bucket in the
         // middle one fills with brine.
-        Some(Kind::Evaporation) => (vec![0, 1], vec![2]),
+        Some(Kind::Evaporation) => (vec![0, 1], vec![2, 3]),
+        // Buckets in the first slot; the pump's and the plenisher's energy slot is the last.
+        Some(Kind::Pump | Kind::Plenisher) => (vec![0, 2], vec![1]),
         Some(Kind::Rotary) => (vec![0, 1], vec![2]),
         // The item to infuse in the first slot, the infuse item (coal, redstone...) in the middle one.
         Some(Kind::Infuser) => (vec![0, 1], vec![2]),
         // An energy cube's charge slot (top) and discharge slot (bottom).
         Some(Kind::EnergyCube(_)) => (vec![0, 1], vec![]),
+        // The fluid tank's bucket slot and the output slot under it.
+        Some(Kind::FluidTank(_)) => (vec![0], vec![1]),
         // The miner's energy slot; what it mines goes into the container above it.
         Some(Kind::DigitalMiner) => (vec![1], vec![]),
         // Tanks, the multiblocks' ports and the machines below open a screen with no slots of their own.
         Some(
             Kind::ChemicalTank(_)
-            | Kind::FluidTank(_)
             | Kind::FissionPort
             | Kind::TurbineValve
             | Kind::FusionPort
@@ -411,10 +414,13 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         }
         _ => return,
     };
-    // The machines with a fourth slot (energy) open a hopper's five-slot menu.
-    if !extra_slots(block).is_empty() {
+    // The machines with a fourth slot, and those whose slots the furnace's roles would spoil (a bucket
+    // output between two inputs), open a hopper's five-slot menu.
+    if !extra_slots(block).is_empty() || matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_))) {
         let mut inputs = inputs;
-        inputs.push(3);
+        if !matches!(kind(block), Some(Kind::Pump | Kind::Plenisher | Kind::FluidTank(_) | Kind::Evaporation)) {
+            inputs.push(3);
+        }
         *container = Some(ModContainer {
             slots: 5,
             faces: [vec![2], vec![0], vec![1, 3], vec![1, 3], vec![1, 3], vec![1, 3]],
@@ -595,7 +601,8 @@ fn discharge_energy_slot(entity: &mut ModBlockEntity) {
     let index = match kind(&entity.id) {
         Some(Kind::Oxidizer | Kind::Dissolution | Kind::Crystallizer | Kind::Separator | Kind::Rotary) => 1,
         Some(Kind::Machine("combining", _) | Kind::Advanced(_) | Kind::Infuser | Kind::Nucleosynthesizer) => 3,
-        Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer | Kind::Pump | Kind::Plenisher | Kind::Heater | Kind::Vibrator) => 0,
+        Some(Kind::Pump | Kind::Plenisher) => 2,
+        Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer | Kind::Heater | Kind::Vibrator) => 0,
         _ => return,
     };
     let capacity = energy_capacity(entity);
@@ -1786,20 +1793,8 @@ fn tick_separator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     let mut fluid = get_tank(&entity.nbt, "fluid", chem::SEPARATOR_FLUID);
     // FluidInventorySlot.fill: a bucket empties into the tank when it fits and the bucket has
     // somewhere to go.
-    let bucket_fluid = |item: &str| match item {
-        "minecraft:water_bucket" => Some("minecraft:water"),
-        "mekanism:brine_bucket" => Some("mekanism:brine"),
-        _ => None,
-    };
-    if let Some(Some(bucket)) = entity.items.first().cloned()
-        && let Some(f) = bucket_fluid(&bucket.item)
-        && fluid.accepts(f)
-        && fluid.amount + 1_000 <= fluid.capacity
-        && give_back_bucket(entity)
-    {
-        fluid.insert(f, 1_000);
-        entity.items[0] = None;
-    }
+    // The empty bucket stays in the slot (there is no output slot for it).
+    fill_tank_from_bucket(game, entity, 0, None, &mut fluid, |f| matches!(f, "minecraft:water" | "mekanism:brine"));
     let mut left = get_tank(&entity.nbt, "left", chem::SEPARATOR_GAS);
     let mut right = get_tank(&entity.nbt, "right", chem::SEPARATOR_GAS);
     let active = chem::separate(&mut fluid, &mut left, &mut right, &mut energy);
@@ -1894,6 +1889,78 @@ fn give_back_bucket(entity: &mut ModBlockEntity) -> bool {
         }
         Some(_) => return false,
     }
+    true
+}
+
+/// One of `item` into slot `index`, when it is empty or holds the same item with room.
+fn put_item(game: &Game<'_>, entity: &mut ModBlockEntity, index: usize, item: &str) -> bool {
+    match entity.items.get(index).cloned().flatten() {
+        None => match entity.items.get_mut(index) {
+            Some(slot) => *slot = Some(stack_of(item, 1)),
+            None => return false,
+        },
+        Some(s) if &*s.item == item && s.count < max_stack(game, item) => entity.items[index] = Some(ItemStack { count: s.count + 1, ..s }),
+        Some(_) => return false,
+    }
+    true
+}
+
+/// One item out of slot `index`.
+fn take_one(entity: &mut ModBlockEntity, index: usize) {
+    if let Some(Some(s)) = entity.items.get(index).cloned() {
+        entity.items[index] = (s.count > 1).then(|| ItemStack { count: s.count - 1, ..s });
+    }
+}
+
+/// `FluidInventorySlot.fill`: a full bucket in slot `from` empties into `tank` (1000 mB, when `accepts`
+/// the fluid and it fits). The empty bucket goes to slot `out`, or stays in `from` without one.
+fn fill_tank_from_bucket(game: &Game<'_>, entity: &mut ModBlockEntity, from: usize, out: Option<usize>, tank: &mut ChemicalTank, accepts: impl Fn(&str) -> bool) -> bool {
+    let Some(Some(bucket)) = entity.items.get(from).cloned() else {
+        return false;
+    };
+    let Some(fluid) = bucket_fluid(&bucket.item) else {
+        return false;
+    };
+    if !accepts(&fluid) || !tank.accepts(&fluid) || tank.amount + 1_000 > tank.capacity {
+        return false;
+    }
+    match out {
+        Some(o) => {
+            if !put_item(game, entity, o, "minecraft:bucket") {
+                return false;
+            }
+            take_one(entity, from);
+        }
+        None if bucket.count == 1 => entity.items[from] = Some(stack_of("minecraft:bucket", 1)),
+        None => return false,
+    }
+    tank.insert(&fluid, 1_000);
+    true
+}
+
+/// `FluidInventorySlot.drain`: an empty bucket in slot `from` fills from `tank` (1000 mB). The full
+/// bucket goes to slot `out`, or replaces a lone empty one in `from` without one.
+fn drain_tank_into_bucket(game: &Game<'_>, entity: &mut ModBlockEntity, from: usize, out: Option<usize>, tank: &mut ChemicalTank) -> bool {
+    let Some(Some(bucket)) = entity.items.get(from).cloned() else {
+        return false;
+    };
+    if &*bucket.item != "minecraft:bucket" || tank.amount < 1_000 {
+        return false;
+    }
+    let Some(full) = tank.chemical.as_deref().and_then(fluid_bucket) else {
+        return false;
+    };
+    match out {
+        Some(o) => {
+            if !put_item(game, entity, o, &full) {
+                return false;
+            }
+            take_one(entity, from);
+        }
+        None if bucket.count == 1 => entity.items[from] = Some(stack_of(&full, 1)),
+        None => return false,
+    }
+    tank.extract(1_000);
     true
 }
 
@@ -2537,20 +2604,8 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     };
     let mut water = get_tank(&entity.nbt, "water", evap::input_capacity(tower.height));
     let mut brine = get_tank(&entity.nbt, "brine", evap::OUTPUT_TANK);
-    let bucket_fluid = |item: &str| match item {
-        "minecraft:water_bucket" => Some("minecraft:water"),
-        "mekanism:brine_bucket" => Some("mekanism:brine"),
-        _ => None,
-    };
-    if let Some(Some(bucket)) = entity.items.first().cloned()
-        && let Some(f) = bucket_fluid(&bucket.item)
-        && water.accepts(f)
-        && water.amount + 1_000 <= water.capacity
-        && give_back_bucket(entity)
-    {
-        water.insert(f, 1_000);
-        entity.items[0] = None;
-    }
+    // FluidInventorySlot.fill (28, 20): the empty bucket goes to the slot below it (28, 51).
+    fill_tank_from_bucket(game, entity, 0, Some(3), &mut water, |f| evap::evaporating(f).is_some());
     // The top corners: an Advanced Solar Generator that sees the sun heats the tower.
     let [x0, y0, z0] = tower.origin;
     let top = y0 + tower.height as i32;
@@ -2578,16 +2633,8 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         water.extract(ops * evap::WATER_PER_BRINE);
         brine.insert(out, ops);
     }
-    // FluidInventorySlot.drain: an empty bucket in the middle slot fills with a bucket of brine.
-    if let Some(Some(bucket)) = entity.items.get(1).cloned()
-        && &*bucket.item == "minecraft:bucket"
-        && bucket.count == 1
-        && brine.chemical.as_deref() == Some("mekanism:brine")
-        && brine.amount >= 1_000
-    {
-        brine.extract(1_000);
-        entity.items[1] = Some(stack_of("mekanism:brine_bucket", 1));
-    }
+    // FluidInventorySlot.drain (152, 20): an empty bucket fills with brine into the slot below it (152, 51).
+    drain_tank_into_bucket(game, entity, 1, Some(2), &mut brine);
     // Valves take water from the pipes and fluid tanks beside them and give brine to the pipes, tanks
     // and separators beside them.
     let valves: Vec<[i32; 3]> =
@@ -2747,10 +2794,27 @@ fn pull_from_carriers(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTan
 fn tick_fluid_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, tier: BaseTier) {
     let (capacity, rate) = tier::fluid_tank(tier);
     let mut tank = get_tank(&entity.nbt, "fluid", capacity);
+    // `FluidInventorySlot.input` with the edit mode Both (`handleContainer`): an empty bucket fills from
+    // the tank, a full one empties into it, and a bucket that can do neither goes to the output slot.
+    let held = entity.items.first().cloned().flatten();
+    if let Some(bucket) = held {
+        let empty = &*bucket.item == "minecraft:bucket";
+        let done = if empty {
+            drain_tank_into_bucket(game, entity, 0, Some(1), &mut tank)
+        } else {
+            fill_tank_from_bucket(game, entity, 0, Some(1), &mut tank, |f| FLUIDS.contains(&f))
+        };
+        let can_fill = bucket_fluid(&bucket.item).is_some_and(|f| tank.chemical.as_deref().is_none_or(|c| c == f));
+        // Nothing to take from the tank, or a bucket of something else than the tank holds.
+        let stuck = if empty { tank.amount < 1_000 } else { !can_fill };
+        if !done && stuck && (empty || bucket_fluid(&bucket.item).is_some()) && put_item(game, entity, 1, &bucket.item) {
+            take_one(entity, 0);
+        }
+    }
     if tank.amount > 0 {
         push_chemical(game, pos, &mut tank, Some([0, -1, 0]), rate, false);
-        put_tank(&mut entity.nbt, "fluid", &tank);
     }
+    put_tank(&mut entity.nbt, "fluid", &tank);
 }
 
 /// A right click on a fluid tank (`BlockFluidTank.useItemOn`): a full bucket empties into it, an empty
@@ -3876,6 +3940,8 @@ fn tick_pump(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) ->
         }
         _ => progress = 0,
     }
+    // FluidInventorySlot.drain (28, 20): an empty bucket fills from the tank into the slot below (28, 51).
+    drain_tank_into_bucket(game, entity, 0, Some(1), &mut tank);
     if tank.amount > 0 {
         push_chemical(game, pos, &mut tank, Some([0, 1, 0]), u64::MAX, false);
     }
@@ -3974,6 +4040,9 @@ fn tick_plenisher(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut tank = get_tank(&entity.nbt, "fluid", plenisher::PLENISHER_TANK);
+    // FluidInventorySlot.fill (28, 20): the empty bucket goes to the slot below it (28, 51).
+    fill_tank_from_bucket(game, entity, 0, Some(1), &mut tank, |f| plenisher::placeable(f).is_some());
+    put_tank(&mut entity.nbt, "fluid", &tank);
     let mut progress = get_int(&entity.nbt, "progress");
     let mut active = false;
     let block = tank.chemical.as_deref().and_then(plenisher::placeable);
@@ -4472,7 +4541,7 @@ fn layout(block: &str) -> Option<Layout> {
         },
         // TileEntityElectrolyticSeparator and its screen; the empty buckets come out below the full one.
         Kind::Separator => Layout {
-            slots: [Some(([26.0, 35.0], "slot/normal")), Some(([143.0, 35.0], "slot/power")), Some(([26.0, 56.0], "slot/output"))],
+            slots: [Some(([26.0, 35.0], "slot/normal")), Some(([143.0, 35.0], "slot/power")), None],
             gauges: vec![
                 gauge("fluid", chem::SEPARATOR_FLUID, 5.0, 10.0, STANDARD),
                 gauge("left", chem::SEPARATOR_GAS, 58.0, 18.0, SMALL),
@@ -4576,7 +4645,7 @@ fn layout(block: &str) -> Option<Layout> {
             progress: None,
         },
         Kind::FluidTank(t) => Layout {
-            slots: [None; 3],
+            slots: [Some(([146.0, 19.0], "slot/normal")), Some(([146.0, 51.0], "slot/output")), None],
             gauges: vec![gauge("fluid", tier::fluid_tank(t).0, 79.0, 13.0, STANDARD)],
             power: None,
             progress: None,
@@ -4713,13 +4782,13 @@ fn layout(block: &str) -> Option<Layout> {
         },
         // GuiElectricPump and GuiFluidicPlenisher: the tank on the left, a screen in the middle.
         Kind::Pump => Layout {
-            slots: [Some(([143.0, 35.0], "slot/power")), None, None],
+            slots: [Some(([28.0, 20.0], "slot/normal")), Some(([28.0, 51.0], "slot/output")), Some(([143.0, 35.0], "slot/power"))],
             gauges: vec![gauge("fluid", isotopes::PUMP_TANK, 6.0, 13.0, STANDARD)],
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
         },
         Kind::Plenisher => Layout {
-            slots: [Some(([143.0, 35.0], "slot/power")), None, None],
+            slots: [Some(([28.0, 20.0], "slot/normal")), Some(([28.0, 51.0], "slot/output")), Some(([143.0, 35.0], "slot/power"))],
             gauges: vec![gauge("fluid", plenisher::PLENISHER_TANK, 6.0, 13.0, STANDARD)],
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
@@ -4860,6 +4929,8 @@ fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
         Some(Kind::Machine("combining", _)) | Some(Kind::Advanced(_)) => vec![([39.0, 35.0], "slot/power")],
         Some(Kind::Infuser) => vec![([143.0, 35.0], "slot/power")],
         Some(Kind::Nucleosynthesizer) => vec![([173.0, 69.0], "slot/power")],
+        // The bucket slot under the water slot (`outputInputSlot`).
+        Some(Kind::Evaporation) => vec![([28.0, 51.0], "slot/output")],
         _ => vec![],
     }
 }
