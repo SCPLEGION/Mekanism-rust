@@ -4806,7 +4806,14 @@ fn layout(block: &str) -> Option<Layout> {
         },
         Kind::BoilerValve => Layout {
             slots: [None; 3],
-            gauges: vec![gauge("water", 0, 7.0, 13.0, STANDARD), gauge("steam", 0, 151.0, 13.0, STANDARD)],
+            // `GuiThermoelectricBoiler`: the heated coolant and water tanks on the left, the steam and cooled
+            // coolant tanks on the right (the port has no coolant, so those two stay empty).
+            gauges: vec![
+                gauge("heated_coolant", 0, 6.0, 13.0, STANDARD),
+                gauge("water", 0, 26.0, 13.0, STANDARD),
+                gauge("steam", 0, 174.0, 13.0, STANDARD),
+                gauge("cooled_coolant", 0, 194.0, 13.0, STANDARD),
+            ],
             power: None,
             progress: None,
         },
@@ -5089,6 +5096,8 @@ fn screen_width(block: &str) -> f32 {
         Some(Kind::Factory(9, ..)) => 210.0,
         // `DEFAULT_IMAGE_WIDTH + 20`.
         Some(Kind::Nucleosynthesizer | Kind::Evaporation) => 196.0,
+        // `DEFAULT_IMAGE_WIDTH + 42`.
+        Some(Kind::BoilerValve) => 218.0,
         _ => 176.0,
     }
 }
@@ -6496,7 +6505,11 @@ fn multiblock_capacity(entity: &ModBlockEntity, key: &str) -> u64 {
         }
         Some(Kind::BoilerValve) => {
             let b = boiler_of(nbt);
-            if key == "water" { b.water_capacity() } else { b.steam_capacity() }
+            match key {
+                "water" => b.water_capacity(),
+                "steam" => b.steam_capacity(),
+                _ => 0,
+            }
         }
         Some(Kind::TurbineValve) => turbine_of(nbt).steam_capacity(),
         Some(Kind::DynamicValve) => dynamic_tank::capacity(get_long(nbt, "volume")),
@@ -6560,7 +6573,7 @@ fn multiblock_data(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
         Some(Kind::BoilerValve) => {
             let b = boiler_of(nbt);
             let heat = get_double(nbt, "heat").unwrap_or(b.heat_capacity() * boiler::BOIL_TEMP);
-            ([1, small((heat / b.heat_capacity().max(1.0)) as u64), small(b.elements), 0], get_long(nbt, "boil_rate"))
+            ([1, small((heat / b.heat_capacity().max(1.0)) as u64), small(b.elements), small(b.max_boil(heat))], get_long(nbt, "boil_rate"))
         }
         Some(Kind::TurbineValve) => ([1, 0, 0, 0], get_long(nbt, "production")),
         Some(Kind::DynamicValve) => ([1, small(get_long(nbt, "volume")), 0, 0], 0),
@@ -6603,11 +6616,8 @@ fn multiblock_lines(block: &str, data: &[i32]) -> Vec<String> {
             format!("{}/t", fe(usage)),
             format!("Stored: {}", fe(read_wide(data, DATA_STORED))),
         ],
-        Some(Kind::BoilerValve) => vec![
-            format!("Temp: {} K", get(1)),
-            format!("Boiling: {usage} mB/t"),
-            format!("Superheaters: {}", get(2)),
-        ],
+        // The boiler's screen draws its own lines (`GuiThermoelectricBoiler`'s inner screen).
+        Some(Kind::BoilerValve) => vec![],
         Some(Kind::TurbineValve) => vec![format!("Producing: {}/t", fe(usage)), format!("Stored: {}", fe(read_wide(data, DATA_STORED)))],
         Some(Kind::InductionPort) => vec![format!("Max I/O: {}/t", fe(usage))],
         Some(Kind::DynamicValve) => vec![format!("Volume: {} blocks", get(1))],
@@ -6842,7 +6852,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         slots,
         inventory_y: h - 82.0,
         inventory_x: 8.0 + (w - 176.0) / 2.0,
-        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation)),
+        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve)),
         alt: None,
     });
 }
@@ -6897,6 +6907,7 @@ fn extras(block: &str) -> Extras {
         Some(Kind::Pump | Kind::Plenisher) => Extras { screen: Some([54.0, 23.0, 80.0, 42.0]), arrows: vec![[32.0, 39.0]], ..none },
         Some(Kind::Heater) => Extras { screen: Some([48.0, 23.0, 80.0, 42.0]), ..none },
         // `GuiThermalEvaporationController`: the screen between the gauges and the arrows under the buckets.
+        Some(Kind::BoilerValve) => Extras { screen: Some([54.0, 23.0, 110.0, 40.0]), ..none },
         Some(Kind::Evaporation) => Extras { screen: Some([48.0, 19.0, 100.0, 40.0]), arrows: vec![[32.0, 39.0], [156.0, 39.0]], ..none },
         Some(Kind::FuelwoodHeater) => Extras {
             screen: Some([48.0, 23.0, 80.0, 28.0]),
@@ -6928,6 +6939,11 @@ fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
     };
     match kind(block) {
         Some(Kind::Pump) => vec![energy, fluid()],
+        Some(Kind::BoilerValve) => vec![
+            format!("Temp: {}", mekanism_core::energy::format_unit(f64::from(data.get(1).copied().unwrap_or(0).max(0)), "K")),
+            format!("Boil Rate: {}", read_wide(data, DATA_USAGE)),
+            format!("Max Boil: {}", data.get(3).copied().unwrap_or(0).max(0)),
+        ],
         Some(Kind::Evaporation) => {
             let kelvin = f64::from(data.get(2).copied().unwrap_or(3000).max(0)) / 10.0;
             let gain = f64::from(data.get(3).copied().unwrap_or(0).max(0)) / 100.0;
@@ -7035,9 +7051,14 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
     if let Some([x, y, w, h]) = e.screen {
         nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + x, oy + y, w, h], 0xFFFF_FFFF);
         for (i, line) in screen_lines(block, data).iter().enumerate() {
-            // The evaporation screen has no spacing between lines (`clearSpacing`): the font's nine pixels.
-            let step = if kind(block) == Some(Kind::Evaporation) { 9.0 } else { 10.0 };
-            game.native_text(batch, line, [ox + x + 3.0, oy + y + 3.0 + step * i as f32], 0x3C_FE9A, false);
+            // `GuiInnerScreen`'s default format is centred lines at 0.8 scale with 2 px of spacing;
+            // the evaporation screen clears the spacing. The others here keep their own plain style.
+            let at = |dy: f32, step: f32| [ox + x + 3.0, oy + y + dy + step * i as f32];
+            match kind(block) {
+                Some(Kind::Evaporation) => game.native_text_scaled(batch, line, at(2.0, 9.0), 0x3C_FE9A, 0.8),
+                Some(Kind::BoilerValve) => game.native_text_scaled(batch, line, at(4.0, 11.0), 0x3C_FE9A, 0.8),
+                _ => game.native_text(batch, line, at(3.0, 10.0), 0x3C_FE9A, false),
+            }
         }
     }
     for [x, y] in &e.arrows {
@@ -7102,6 +7123,12 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         let title = game.native_screen_title().unwrap_or_default();
         centred(game, batch, &title, ox, width, oy + 4.0, 0x40_4040);
         game.native_text(batch, "Inventory", [ox + 8.0, oy + height - 93.0], 0x40_4040, false);
+    }
+    if kind(block) == Some(Kind::BoilerValve) {
+        // `titleLabelY -= 1`, the inventory label 21 px in and 2 px down.
+        let title = game.native_screen_title().unwrap_or_default();
+        centred(game, batch, &title, ox, width, oy + 3.0, 0x40_4040);
+        game.native_text(batch, "Inventory", [ox + 29.0, oy + height - 92.0], 0x40_4040, false);
     }
     if kind(block) == Some(Kind::Evaporation) {
         // `renderTitleTextWithOffset(inputGauge.getRelativeRight(), OUTPUT_GAUGE_X)`: centred between the two
@@ -7181,10 +7208,24 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
     }
     // The heaters' heat tab (`GuiHeatTab`, in kelvin) above the energy tab.
-    if matches!(kind(block), Some(Kind::Heater | Kind::FuelwoodHeater | Kind::Evaporation)) {
+    if matches!(kind(block), Some(Kind::Heater | Kind::FuelwoodHeater | Kind::Evaporation | Kind::BoilerValve)) {
         sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
     }
     draw_extras(game, batch, block, data, origin);
+    if kind(block) == Some(Kind::BoilerValve) && get(0) > 0.0 {
+        // The two `GuiVerticalRateBar`s: the boil rate over the max, and the max over what the elements carry.
+        let boil = read_wide(data, DATA_USAGE) as f64;
+        let max = f64::from(get(3));
+        let elements = get(2) as u64;
+        let level2 = if elements == 0 { 0.0 } else { max * 10.0 / (elements as f64 * 16_000_000.0) };
+        for (bx, level) in [(44.0, if max > 0.0 { boil / max } else { 0.0 }), (166.0, level2)] {
+            nine_slice(game, batch, "bar/base", 5.0, 1.0, [ox + bx, oy + 13.0, 6.0, 58.0]);
+            let h = (level.clamp(0.0, 1.0) * 56.0).floor() as f32;
+            if h > 0.0 {
+                sprite(game, batch, "bar/vertical_rate", [0.0, 56.0 - h, 4.0, h], [ox + bx + 1.0, oy + 14.0 + 56.0 - h, 4.0, h]);
+            }
+        }
+    }
     if kind(block) == Some(Kind::Evaporation) {
         // `GuiHorizontalRateBar` at (58, 62): the temperature over 3,000 K.
         let (x, y) = (ox + 58.0, oy + 62.0);
@@ -7265,6 +7306,16 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
     };
     if window_tooltip(block, data, window_at(block, at), lines) || tab_tooltip(block, &l, data, at, lines) {
         return;
+    }
+    if kind(block) == Some(Kind::BoilerValve) {
+        if inside(at, [44.0, 13.0, 6.0, 58.0]) {
+            lines.push(format!("Boil Rate: {} mB/t", read_wide(data, DATA_USAGE)));
+            return;
+        }
+        if inside(at, [166.0, 13.0, 6.0, 58.0]) {
+            lines.push(format!("Max Boil: {} mB/t", data.get(3).copied().unwrap_or(0).max(0)));
+            return;
+        }
     }
     if kind(block) == Some(Kind::Evaporation) {
         if inside(at, [-26.0, 109.0, 26.0, 26.0]) {
