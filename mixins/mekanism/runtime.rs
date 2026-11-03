@@ -667,9 +667,9 @@ fn tick_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize, reci
 }
 
 /// `TileEntityFactory.sortInventory`, once a second: each kind of input item is spread evenly over the
-/// slots that hold it and the empty ones it can fill (`factory::sort_counts`; a slot needs one item at
-/// least, where Mekanism asks for the recipe's input amount).
-fn sort_factory_inputs(game: &Game<'_>, entity: &mut ModBlockEntity, n: usize, _recipe: &str) {
+/// slots that hold it and the empty ones it can fill (`factory::sort_counts`; a slot needs the recipe's
+/// input amount at least).
+fn sort_factory_inputs(game: &Game<'_>, entity: &mut ModBlockEntity, n: usize, recipe: &str) {
     let key = |s: &ItemStack| format!("{:?}", ItemStack { count: 1, ..s.clone() });
     let mut kinds: Vec<(String, Vec<usize>, u64)> = vec![];
     let mut empties = vec![];
@@ -696,7 +696,11 @@ fn sort_factory_inputs(game: &Game<'_>, entity: &mut ModBlockEntity, n: usize, _
             continue;
         }
         let spare = std::mem::take(&mut empties);
-        let counts = factory::sort_counts(total, slots.len(), spare.len(), 1);
+        // A slot needs the recipe's input amount to run it (`getRecipe(...).getInput().getNeededAmount`);
+        // an item with no recipe is split as if one item were enough.
+        let sample = ItemStack { count: total.min(u64::from(max_stack(game, &proto.item))) as u32, ..proto.clone() };
+        let min = find_operation(game, recipe, Some(sample), &Slot::default()).0.map_or(1, |o| u64::from(o.input_count));
+        let counts = factory::sort_counts(total, slots.len(), spare.len(), min);
         let mut targets = slots.clone();
         let mut left = spare;
         while targets.len() < counts.len() {
