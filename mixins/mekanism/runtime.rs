@@ -1753,6 +1753,7 @@ pub(super) fn world_quads(game: &Game<'_>, quads: &mut Vec<super::native_hooks::
     let (right, up) = game.native_camera_axes();
     let (right, up) = (right.map(|v| v as f32), up.map(|v| v as f32));
     let corner = |c: [f32; 3], x: f32, y: f32| -> [f64; 3] { std::array::from_fn(|k| f64::from(c[k] + right[k] * x + up[k] * y)) };
+    laser_beam_quads(ticks, quads);
     // `RenderFlame`: two crossed planes along the flight, fading over the flame's life.
     FLAME_VIEW.with_borrow_mut(|view| {
         for f in view.iter_mut() {
@@ -5853,6 +5854,11 @@ fn loop_sounds(game: &mut Game<'_>) {
         }
     }
     let ticks = game.ticks as u64;
+    // A laser sounds from its front while it fires (a beam arrived in the last ticks).
+    let beams: Vec<[f64; 3]> = LASER_BEAMS.with_borrow(|b| b.iter().filter(|b| b.arrived != u64::MAX && ticks <= b.arrived + 1).map(|b| b.from).collect());
+    for from in beams {
+        game.native_loop_sound(&format!("mekanism:laser:{:?}", from.map(|v| (v * 2.0) as i64)), "mekanism:tile.machine.laser", Some(from), 1.0, 1.0);
+    }
     let flame = FLAME_VIEW.with_borrow(|view| view.iter().find(|f| f.arrived != u64::MAX && ticks <= f.arrived + 2).map(|f| f.pos));
     if let Some(at) = flame {
         game.native_loop_sound("mekanism:flame", "mekanism:item.flamethrower.active", Some(at), 1.0, 1.0);
@@ -13513,6 +13519,7 @@ fn tick_laser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
         let k = (0..3).map(|i| (at[i] - pos[i]) * d[i]).sum::<i32>();
         f64::from(k) - 1.002
     });
+    laser_beam_send(game, pos, d, length, firing);
     let firing = laser_hit_entities(game, entity, pos, d, length, firing);
     if firing == 0 {
         return Some(true);
@@ -19749,6 +19756,9 @@ pub(super) fn client_payload(channel: &str, data: &[u8]) {
     if channel == FLAME_CHANNEL {
         flames_payload(data);
     }
+    if channel == LASER_CHANNEL {
+        laser_beam_payload(data);
+    }
     if channel == ROBIT_STATE_CHANNEL {
         robit_state_payload(data);
     }
@@ -21080,6 +21090,82 @@ struct FlameView {
     vel: [f64; 3],
     age: u32,
     arrived: u64,
+}
+
+const LASER_CHANNEL: &str = "mekanism:laser_beam";
+
+/// `sendLaserDataToPlayers`: the beam from the laser's front for `length` blocks, to every player.
+fn laser_beam_send(game: &mut Game<'_>, pos: [i32; 3], d: [i32; 3], length: f64, firing: u64) {
+    let scale = (firing as f32 / laser::LASER_USAGE as f32 / 10.0).min(0.6);
+    let mut data = Vec::with_capacity(21);
+    for k in 0..3 {
+        data.extend(((f64::from(pos[k]) + 0.5 + f64::from(d[k]) * 0.5) as f32).to_be_bytes());
+    }
+    data.extend((d.iter().position(|v| *v != 0).unwrap_or(0) as u8 * 2 + u8::from(d.iter().any(|v| *v < 0))).to_be_bytes());
+    data.extend((length as f32).to_be_bytes());
+    data.extend(scale.to_be_bytes());
+    for p in robit_players(game) {
+        game.native_send_to_player(p.uuid, LASER_CHANNEL, &data);
+    }
+}
+
+struct LaserBeam {
+    from: [f64; 3],
+    axis: usize,
+    sign: f64,
+    length: f64,
+    scale: f32,
+    arrived: u64,
+}
+
+thread_local! {
+    static LASER_BEAMS: std::cell::RefCell<Vec<LaserBeam>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A beam reached the window (21 bytes): it is drawn for five ticks (`LaserParticle`'s lifetime).
+fn laser_beam_payload(data: &[u8]) {
+    if data.len() != 21 {
+        return;
+    }
+    let f = |i: usize| f64::from(f32::from_be_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]]));
+    let code = usize::from(data[12]);
+    LASER_BEAMS.with_borrow_mut(|b| {
+        b.push(LaserBeam { from: [f(0), f(1), f(2)], axis: code / 2, sign: if code % 2 == 1 { -1.0 } else { 1.0 }, length: f(4), scale: f(5) as f32, arrived: u64::MAX });
+    });
+}
+
+/// `LaserFeatureRenderer`: two crossed planes along the beam, `scale` blocks to each side of its axis.
+fn laser_beam_quads(ticks: u64, quads: &mut Vec<super::native_hooks::NativeWorldQuad>) {
+    LASER_BEAMS.with_borrow_mut(|beams| {
+        for b in beams.iter_mut() {
+            if b.arrived == u64::MAX {
+                b.arrived = ticks;
+            }
+        }
+        beams.retain(|b| ticks < b.arrived + 5);
+        for b in beams.iter() {
+            let (u, v) = ((b.axis + 1) % 3, (b.axis + 2) % 3);
+            let half = b.length / 2.0;
+            let mut centre = b.from;
+            centre[b.axis] += b.sign * half;
+            let w = f64::from(b.scale);
+            for (wu, wv) in [(1.0, 1.0), (1.0, -1.0)] {
+                let at = |side: f64, end: f64| {
+                    let mut p = centre;
+                    p[b.axis] += b.sign * end * half;
+                    p[u] += side * w * wu * std::f64::consts::FRAC_1_SQRT_2;
+                    p[v] += side * w * wv * std::f64::consts::FRAC_1_SQRT_2;
+                    p
+                };
+                quads.push(super::native_hooks::NativeWorldQuad {
+                    corners: [at(-1.0, -1.0), at(1.0, -1.0), at(1.0, 1.0), at(-1.0, 1.0)],
+                    color: 0xFFFF_FFFF,
+                    sprite: Some("mekanism:gui/laser_beam".into()),
+                    uv: [0.0, 0.0, 1.0, 1.0],
+                });
+            }
+        }
+    });
 }
 
 const FLAME_CHANNEL: &str = "mekanism:flames";

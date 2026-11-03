@@ -706,7 +706,11 @@ def sps_textures(ns, out, search):
     flame = next((d / ns / "render/flame.png" for d in search if (d / ns / "render/flame.png").is_file()), None)
     if flame is not None:
         shutil.copyfile(flame, dst / "flame.png")
-    return 18
+    # The Laser's beam (`LaserParticle`) draws this sprite.
+    beam = SRC / "main/resources/assets/mekanism/textures/particle/laser.png"
+    if ns == "mekanism" and beam.is_file():
+        shutil.copyfile(beam, dst / "laser_beam.png")
+    return 19
 
 
 def sound_files(ns, out):
