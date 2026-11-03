@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "05b39271ddf0004986aa854770da0ce49b35ba61"
+horizon_revision = "80e680d6f2ead844893ac1c35ce64ed4cb1738ea"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -316,4 +316,16 @@ bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "absorbed", ty = "f32", value = "absorbed" },
   { name = "share", ty = "&mut f32", value = "&mut *share" },
+]
+
+[[injection]]
+id = "screen-alt"
+hook = "screen_alt"
+hook_version = 1
+kind = "HEAD"
+helper = "screen_alt.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "block", ty = "&str", value = "block" },
+  { name = "alt", ty = "&mut bool", value = "&mut *alt" },
 ]
