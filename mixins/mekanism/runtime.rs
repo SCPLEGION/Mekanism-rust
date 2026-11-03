@@ -7376,6 +7376,7 @@ fn layout(block: &str) -> Option<Layout> {
                 gauge("steam", 0, 6.0, 13.0, MEDIUM),
                 gauge("stats_a", 1 << 58, 0.0, 0.0, SMALL),
                 gauge("stats_b", 1 << 58, 0.0, 0.0, SMALL),
+                gauge("stats_c", 1 << 58, 0.0, 0.0, SMALL),
             ],
             power: Some(PowerBar::Vertical([178.0, 16.0])),
             progress: None,
@@ -7619,7 +7620,9 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
         if g.key.starts_with("stats_") && kind(&entity.id) == Some(Kind::TurbineValve) {
             let t = turbine_of(&entity.nbt);
             let max_production = (t.energy_multiplier() * t.max_flow()).clamp(0.0, f64::from(i32::MAX)) as u64;
-            let packed = if g.key == "stats_a" {
+            let packed = if g.key == "stats_c" {
+                get_long(&entity.nbt, "last_in")
+            } else if g.key == "stats_a" {
                 t.lower_volume & 0xF_FFFF | (t.dispersers & 0xFFF) << 20 | (t.vents & 0xFFF) << 32 | (t.blades() & 0xFF) << 44
             } else {
                 t.coils & 0xFFF | (t.condensers & 0xFFF) << 12 | max_production << 24
@@ -9444,7 +9447,7 @@ fn multiblock_data(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
         Some(Kind::BoilerValve) => {
             let b = boiler_of(nbt);
             let heat = get_double(nbt, "heat").unwrap_or(b.heat_capacity() * boiler::BOIL_TEMP);
-            ([1, small((heat / b.heat_capacity().max(1.0)) as u64), small(b.elements), small(b.max_boil(heat))], get_long(nbt, "boil_rate"))
+            ([1, small((heat / b.heat_capacity().max(1.0)) as u64), small(b.elements), small((get_double(nbt, "env_loss").unwrap_or(0.0) * 100.0) as u64)], get_long(nbt, "boil_rate"))
         }
         Some(Kind::TurbineValve) => {
             let flow = get_long(nbt, "flow");
@@ -10127,15 +10130,15 @@ fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
             let max = (data.get(DATA_SPEED).copied().unwrap_or(0) as u64 & 0x7FFF) | (data.get(DATA_ENERGY_UPGRADES).copied().unwrap_or(0) as u64 & 0x7FFF) << 15;
             vec![
                 format!("Production: {}", fe(read_wide(data, DATA_USAGE))),
-                format!("Flow rate: {flow} mB/t"),
-                format!("Capacity: {} mB", read_wide(data, DATA_GAUGES + 4)),
-                format!("Max flow: {max} mB/t"),
+                format!("Flow rate: {} mB/t", thousands(flow)),
+                format!("Capacity: {} mB", thousands(read_wide(data, DATA_GAUGES + 4))),
+                format!("Max flow: {} mB/t", thousands(max)),
             ]
         }
         Some(Kind::BoilerValve) => vec![
             format!("Temp: {}", mekanism_core::energy::format_unit(f64::from(data.get(1).copied().unwrap_or(0).max(0)), "K")),
-            format!("Boil Rate: {}", read_wide(data, DATA_USAGE)),
-            format!("Max Boil: {}", data.get(3).copied().unwrap_or(0).max(0)),
+            format!("Boil Rate: {} mB/t", thousands(read_wide(data, DATA_USAGE))),
+            format!("Max Boil: {} mB/t", thousands(wide_max(data))),
         ],
         Some(Kind::Evaporation) => {
             let kelvin = f64::from(data.get(2).copied().unwrap_or(3000).max(0)) / 10.0;
@@ -10546,12 +10549,12 @@ fn draw_turbine_stats(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
             game.native_text(batch, "(Limiting)", [ox + x + game.native_text_width(t) + game.native_text_width(" "), oy + y], 0xAA_0000, false);
         }
     };
-    let (g, h) = (0x40_4040, 0x20_2020);
+    let g = 0x40_4040;
     text(batch, &format!("Tank Volume: {volume}"), 6.0, 26.0, g, false);
-    text(batch, "Steam Flow", 6.0, 40.0, h, false);
+    text(batch, "Steam Flow", 6.0, 40.0, 0x78_7878, false);
     text(batch, &format!("Dispersers: {dispersers}"), 10.0, 49.0, g, dispersers_limiting);
     text(batch, &format!("Vents: {vents}"), 10.0, 58.0, g, vents_limiting);
-    text(batch, "Production", 6.0, 72.0, h, false);
+    text(batch, "Production", 6.0, 72.0, 0x78_7878, false);
     text(batch, &format!("Blades: {blades}"), 10.0, 81.0, g, coils * per_coil > blades);
     text(batch, &format!("Coils: {coils}"), 10.0, 90.0, g, coils * per_coil < blades);
     text(batch, &format!("Max Production: {}", mekanism_core::energy::format_fe(max_production)), 6.0, 104.0, g, false);
@@ -10632,6 +10635,20 @@ fn matrix_tooltip(data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
     }
 }
 
+/// The steam the turbine took in last tick (`lastSteamInput`, the third stats gauge).
+fn turbine_last_in(data: &[i32]) -> u64 {
+    read_wide(data, DATA_GAUGES + 3 * GAUGE_SLOTS)
+}
+
+/// `getEnergyMultiplier` of the turbine the stats gauges describe, with the flow it runs at.
+fn turbine_producing(data: &[i32], flow: u64) -> u64 {
+    let (a, _, _) = fusion_gauge(data, 1);
+    let (b, _, _) = fusion_gauge(data, 2);
+    let (blades, coils) = (a >> 44 & 0xFF, b & 0xFFF);
+    let multiplier = turbine::JOULES_PER_STEAM / turbine::MAX_BLADES as f64 * blades.min(coils * turbine::BLADES_PER_COIL) as f64;
+    (multiplier * flow as f64).clamp(0.0, i64::MAX as f64) as u64
+}
+
 fn boiler_stats_open(block: &str) -> bool {
     kind(block) == Some(Kind::BoilerValve) && STATS_VIEW.get().is_some()
 }
@@ -10672,7 +10689,7 @@ fn draw_boiler_stats(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch,
     let mut text = |t: &str, x: f32, y: f32, rgb: u32| game.native_text(batch, t, [ox + x, oy + y], rgb, false);
     text(&format!("Max Water: {} mB", thousands(water_cap)), 8.0, 26.0, 0x40_4040);
     text(&format!("Max Steam: {} mB", thousands(steam_cap)), 8.0, 35.0, 0x40_4040);
-    text("Heat Transfer", 8.0, 49.0, 0x20_2020);
+    text("Heat Transfer", 8.0, 49.0, 0x78_7878);
     text(&format!("Superheaters: {elements}"), 14.0, 58.0, 0x40_4040);
     text(&format!("Boil Capacity: {} mB/t", thousands(capacity)), 8.0, 72.0, 0x40_4040);
     BOILER_GRAPH.with_borrow_mut(|(last, rates, maxes, scale)| {
@@ -11322,7 +11339,8 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         let flow = (data.get(1).copied().unwrap_or(0) as u64 & 0x7FFF) | (data.get(2).copied().unwrap_or(0) as u64 & 0x7FFF) << 15;
         let max = (data.get(DATA_SPEED).copied().unwrap_or(0) as u64 & 0x7FFF) | (data.get(DATA_ENERGY_UPGRADES).copied().unwrap_or(0) as u64 & 0x7FFF) << 15;
         nine_slice(game, batch, "bar/base", 5.0, 1.0, [ox + 40.0, oy + 13.0, 6.0, 58.0]);
-        let level = if max == 0 { 0.0 } else { (flow as f64 / max as f64).min(1.0) };
+        let _ = flow;
+        let level = if max == 0 { 0.0 } else { (turbine_last_in(data) as f64 / max as f64).min(1.0) };
         let h = (level * 56.0).floor() as f32;
         if h > 0.0 {
             sprite(game, batch, "bar/vertical_rate", [0.0, 56.0 - h, 4.0, h], [ox + 41.0, oy + 14.0 + 56.0 - h, 4.0, h]);
@@ -11502,6 +11520,19 @@ fn warning_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<Stri
 }
 
 pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
+    screen_tooltip_inner(game, block, data, at, lines);
+    // `GuiEnergyTab` and `GuiHeatTab` end their tooltips with the unit in use.
+    let energy_tab = layout(block).is_some_and(|l| l.power.is_some()) || matches!(kind(block), Some(Kind::TurbineValve | Kind::InductionPort));
+    if energy_tab && !lines.is_empty() && inside(at, [-26.0, 137.0, 26.0, 26.0]) && !lines.iter().any(|l| l.starts_with("Unit:")) {
+        lines.push("Unit: FE".to_owned());
+    }
+    let heat_tab = matches!(kind(block), Some(Kind::Heater | Kind::FuelwoodHeater | Kind::Evaporation | Kind::BoilerValve | Kind::HeatGenerator));
+    if heat_tab && !lines.is_empty() && inside(at, [-26.0, 109.0, 26.0, 26.0]) && !lines.iter().any(|l| l.starts_with("Unit:")) {
+        lines.push("Unit: Kelvin".to_owned());
+    }
+}
+
+fn screen_tooltip_inner(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
     if miner_cfg_open(block) {
         miner_cfg_tooltip(game, at, lines);
         return;
@@ -11546,12 +11577,21 @@ pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f3
         if inside(at, STATS_TAB_BUTTON) {
             lines.push("Main".to_owned());
         } else if inside(at, [-26.0, 137.0, 26.0, 26.0]) {
-            lines.push(format!("Storing: {}", mekanism_core::energy::format_fe(read_wide(data, DATA_STORED))));
+            let fe = mekanism_core::energy::format_fe;
+            let flow = (data.get(1).copied().unwrap_or(0) as u64 & 0x7FFF) | (data.get(2).copied().unwrap_or(0) as u64 & 0x7FFF) << 15;
+            lines.push(format!("Storing: {}/{}", fe(read_wide(data, DATA_STORED)), fe(read_wide(data, DATA_CAPACITY))));
+            lines.push(format!("Producing: {}/t", fe(turbine_producing(data, flow))));
         }
         return;
     }
     if kind(block) == Some(Kind::TurbineValve) && inside(at, STATS_TAB_BUTTON) {
         lines.push("Turbine Statistics".to_owned());
+        return;
+    }
+    if kind(block) == Some(Kind::TurbineValve) && inside(at, [-26.0, 137.0, 26.0, 26.0]) {
+        let fe = mekanism_core::energy::format_fe;
+        lines.push(format!("Storing: {}/{}", fe(read_wide(data, DATA_STORED)), fe(read_wide(data, DATA_CAPACITY))));
+        lines.push(format!("Producing: {}/t", fe(read_wide(data, DATA_USAGE))));
         return;
     }
     if kind(block) == Some(Kind::BoilerValve) {
@@ -11560,6 +11600,12 @@ pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f3
             return;
         }
         if boiler_stats_open(block) {
+            if inside(at, [-26.0, 109.0, 26.0, 26.0]) {
+                let loss = mekanism_core::energy::format_unit(f64::from(data.get(3).copied().unwrap_or(0).max(0)) / 100.0, "K");
+                lines.push(format!("Dissipated: {loss}/t"));
+                lines.push("Unit: Kelvin".to_owned());
+                return;
+            }
             boiler_graph_tooltip(at, lines);
             return;
         }
@@ -11658,17 +11704,23 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         return;
     }
     if kind(block) == Some(Kind::TurbineValve) && inside(at, [40.0, 13.0, 6.0, 58.0]) {
-        let flow = (data.get(1).copied().unwrap_or(0) as u64 & 0x7FFF) | (data.get(2).copied().unwrap_or(0) as u64 & 0x7FFF) << 15;
-        lines.push(format!("Steam Input: {flow} mB/t"));
+        lines.push(format!("Steam Input: {} mB/t", thousands(turbine_last_in(data))));
         return;
     }
     if kind(block) == Some(Kind::BoilerValve) {
         if inside(at, [44.0, 13.0, 6.0, 58.0]) {
-            lines.push(format!("Boil Rate: {} mB/t", read_wide(data, DATA_USAGE)));
+            lines.push(format!("Boil Rate: {} mB/t", thousands(read_wide(data, DATA_USAGE))));
             return;
         }
         if inside(at, [166.0, 13.0, 6.0, 58.0]) {
-            lines.push(format!("Max Boil: {} mB/t", wide_max(data)));
+            lines.push(format!("Max Boil: {} mB/t", thousands(wide_max(data))));
+            return;
+        }
+        // `GuiHeatTab`: what the casing gave to the air this tick, then the unit.
+        if inside(at, [-26.0, 109.0, 26.0, 26.0]) {
+            let loss = mekanism_core::energy::format_unit(f64::from(data.get(3).copied().unwrap_or(0).max(0)) / 100.0, "K");
+            lines.push(format!("Dissipated: {loss}/t"));
+            lines.push("Unit: Kelvin".to_owned());
             return;
         }
     }
@@ -11699,8 +11751,12 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
             return;
         }
     }
-    if l.power.is_some_and(|p| inside(at, power_rect(p))) {
-        lines.push(format!("{} / {} FE", read_wide(data, DATA_STORED), read_wide(data, DATA_CAPACITY)));
+    if let Some(p) = l.power.filter(|p| inside(at, power_rect(*p))) {
+        // `GuiEnergyGauge`: "Empty" with nothing in it; the bars show `EnergyDisplay.of(container)`.
+        let fe = mekanism_core::energy::format_fe;
+        let (stored, capacity) = (read_wide(data, DATA_STORED), read_wide(data, DATA_CAPACITY));
+        let gauge = matches!(p, PowerBar::Gauge(_) | PowerBar::SmallGauge(_) | PowerBar::Sized(..));
+        lines.push(if gauge && stored == 0 { "Empty".to_owned() } else if capacity == 0 { fe(stored) } else { format!("{}/{}", fe(stored), fe(capacity)) });
     } else if let Some((p, _, [w, h])) = l.progress
         && inside(at, [p[0], p[1], w, h])
     {
@@ -11715,15 +11771,10 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         lines.push(format!("Transferred: {}/t", k(get(1))));
         lines.push(format!("Dissipated: {}/t", k(get(3))));
     } else if l.power.is_some() && inside(at, [-26.0, 137.0, 26.0, 26.0]) {
-        let usage = read_wide(data, DATA_USAGE);
-        if usage > 0 {
-            lines.push(format!("Using: {usage} FE/t"));
-        }
-        lines.push(format!("Stored: {} FE", read_wide(data, DATA_STORED)));
-        if matches!(kind(block), Some(Kind::Machine(..))) {
-            lines.push(format!("§7Speed upgrades: {}/8", get(DATA_SPEED) & 0x3FFF));
-            lines.push(format!("§7Energy upgrades: {}/8", get(DATA_ENERGY_UPGRADES)));
-        }
+        // `GuiEnergyTab` of a machine: what it uses a tick and what its buffer still needs.
+        let fe = mekanism_core::energy::format_fe;
+        lines.push(format!("Using: {}/t", fe(read_wide(data, DATA_USAGE))));
+        lines.push(format!("Needed: {}", fe(read_wide(data, DATA_CAPACITY).saturating_sub(read_wide(data, DATA_STORED)))));
     }
 }
 
@@ -12503,7 +12554,9 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
         });
         casing.handle_heat(given.unwrap_or(0.0));
     }
-    casing.lose_to_air(boiler::CASING_INVERSE_INSULATION);
+    // `lastEnvironmentLoss`: the temperature the casing gave to the air.
+    let lost = casing.lose_to_air(boiler::CASING_INVERSE_INSULATION);
+    entity.nbt.insert("env_loss".into(), Tag::Double(lost.to_bits()));
     let water_in = if water.accepts("minecraft:water") { water.amount } else { 0 };
     let room = if steam.accepts("mekanism:steam") { steam.capacity - steam.amount } else { 0 };
     let boiled = b.boil(&mut casing.heat, water_in, room);
@@ -12723,9 +12776,12 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     let mut water = get_tank(&entity.nbt, "water", (t.condensers * turbine::CONDENSER_RATE).max(1_000));
     let mut energy = EnergyContainer::new(t.energy_capacity(), u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(energy.capacity);
+    // `lastSteamInput`: the steam the valves took in this tick.
+    let mut last_in = 0u64;
     for &v in &valves {
-        pull_from_carriers(game, v, &mut steam, "mekanism:steam");
+        last_in += pull_from_carriers(game, v, &mut steam, "mekanism:steam");
     }
+    put_long(&mut entity.nbt, "last_in", last_in);
     let (used, made, condensed) = t.tick(steam.amount, energy.capacity - energy.stored);
     steam.extract(used);
     energy.insert(made, Action::Execute);
@@ -12742,7 +12798,8 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     let dump = get_int(&entity.nbt, "dump");
     if dump != 0 && steam.amount > 0 {
         let stored = steam.amount;
-        let amount = (used * 2).max(stored / 50).min(stored);
+        // `Math.clamp(lastSteamInput * 2, stored / 50, stored)`.
+        let amount = (last_in * 2).clamp(stored / 50, stored);
         let to_dump = if dump == 2 {
             amount
         } else {
