@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "80e680d6f2ead844893ac1c35ce64ed4cb1738ea"
+horizon_revision = "28cd4f8cb161236f05316556dda87f7666903ed3"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -328,4 +328,15 @@ bindings = [
   { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
   { name = "block", ty = "&str", value = "block" },
   { name = "alt", ty = "&mut bool", value = "&mut *alt" },
+]
+
+[[injection]]
+id = "screen-escape"
+hook = "screen_escape"
+hook_version = 1
+kind = "HEAD"
+helper = "screen_escape.rs"
+bindings = [
+  { name = "block", ty = "&str", value = "block" },
+  { name = "consumed", ty = "&mut bool", value = "&mut *consumed" },
 ]
