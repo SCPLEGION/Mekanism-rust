@@ -25,9 +25,11 @@ import json
 import shutil
 import sys
 import zipfile
+
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import block_shapes  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -137,6 +139,47 @@ DISASSEMBLER_TOOL = {
     + [{"blocks": f"#minecraft:mineable/{t}", "correct_for_drops": True} for t in ("pickaxe", "axe", "shovel", "hoe")],
     "default_mining_speed": 1.0,
 }
+
+
+_SHAPES = None
+FACING4 = ("north", "east", "south", "west")
+# Blocks Mekanism registers with noOcclusion(): they hide nothing behind them.
+SEE_THROUGH = ("structural_glass", "reactor_glass", "laser_focus_matrix", "nutritional_liquifier")
+
+
+def shape_table():
+    """Mekanism's shapes read from the Java source, turned to the orientation of each block's model."""
+    global _SHAPES
+    if _SHAPES is None:
+        _SHAPES = block_shapes.collect(SRC)
+        block_shapes.fit(_SHAPES, block_shapes.assets_of(ROOT), [])
+    return _SHAPES
+
+
+def see_through(name):
+    return name in SEE_THROUGH or name.endswith("glass") or "_transparent" in name or "_glass_" in name
+
+
+def shape_declaration(ns, name, declaration, report):
+    """`declaration` with the block's outline and collision shape from Mekanism's Java, and `occludes: false` where
+    Mekanism calls noOcclusion()."""
+    template = declaration["template"]
+    shape = shape_table().get(ns, {}).get(name)
+    if shape and "shapes" not in declaration and template != "minecraft:lever":
+        if "all" in shape:
+            declaration["shape"] = shape["all"]
+        elif template == "minecraft:furnace":
+            declaration["shapes"] = {"property": "facing", "values": {d: shape["facing"][d] for d in FACING4}}
+        elif template == "minecraft:amethyst_cluster":
+            declaration["shapes"] = {"property": "facing", "values": shape["facing"]}
+        else:
+            # A template without a facing: the shape of the model the blockstate shows.
+            declaration["shape"] = shape["facing"]["north"]
+        report["shapes"] = report.get("shapes", 0) + 1
+    if see_through(name):
+        declaration.setdefault("properties", {})["occludes"] = False
+        report["see_through"] = report.get("see_through", 0) + 1
+    return declaration
 
 
 def block_template(name, blockstate):
@@ -362,6 +405,10 @@ def build_module(ns, out):
             if size:
                 declaration = pipe_declaration(size)
                 report["pipes"] = report.get("pipes", 0) + 1
+        if name.endswith("_glow_panel"):
+            # Six facings (the side it sits on) and a light: the amethyst cluster has both.
+            declaration = {"template": "minecraft:amethyst_cluster", "properties": {"light": 15}}
+        declaration = shape_declaration(ns, name, declaration, report)
         write_json(declared / "block" / f"{name}.json", declaration)
     items = 0
     for path in sorted((out / "assets" / ns / "items").glob("*.json")):
