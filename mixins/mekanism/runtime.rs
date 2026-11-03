@@ -7112,7 +7112,7 @@ fn layout(block: &str) -> Option<Layout> {
                 Some(([17.0, 35.0], "slot/normal")),
                 Some(([109.0, 43.0], "slot/output")),
             ],
-            gauges: vec![gauge("infuse", chem::INFUSER_TANK, 7.0, 15.0, [6.0, 54.0])],
+            gauges: vec![gauge("infuse", chem::INFUSER_TANK, 7.0, 15.0, [4.0, 52.0])],
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: Some(([72.0, 47.0], "progress/right", [32.0, 8.0])),
         },
@@ -7124,7 +7124,7 @@ fn layout(block: &str) -> Option<Layout> {
                 Some(([64.0, 53.0], "slot/normal")),
                 Some(([116.0, 35.0], "slot/output")),
             ],
-            gauges: vec![gauge("chemical", chem::ADVANCED_TANK, 68.0, 36.0, [8.0, 14.0])],
+            gauges: vec![gauge("chemical", chem::ADVANCED_TANK, 68.0, 36.0, [6.0, 12.0])],
             power: Some(PowerBar::Vertical([164.0, 16.0])),
             progress: Some(([86.0, 38.0], "progress/bar", [25.0, 9.0])),
         },
@@ -9315,6 +9315,8 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
         // `GuiGasMode`: the steam dump mode, a 10 px image button.
         Some(Kind::TurbineValve) => &[([173.0, 72.0, 10.0, 10.0], "")],
         Some(Kind::ChemicalTank(_)) => &[([159.0, 72.0, 10.0, 10.0], "")],
+        // `GuiDumpButton`: empties the infusion tank.
+        Some(Kind::Infuser) => &[([16.0, 59.0, 21.0, 10.0], "")],
         // `GuiDigitalMiner`: the four buttons, then the three switches (15 wide, icon underneath).
         Some(Kind::DigitalMiner) => &[
             ([87.0, 19.0, 61.0, 18.0], "Start"),
@@ -9462,6 +9464,11 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
     if id == 0 && matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) {
         let next = (get_int(&entity.nbt, "dump") + 1) % 3;
         put_int(&mut entity.nbt, "dump", next);
+        return;
+    }
+    // `TileEntityMetallurgicInfuser.dump`: the infusion tank is emptied.
+    if id == 0 && kind(&entity.id) == Some(Kind::Infuser) {
+        put_tank(&mut entity.nbt, "infuse", &ChemicalTank::new(chem::INFUSER_TANK));
         return;
     }
     // The Digital Miner's Start, Stop, Config (with the filters), Reset and its three switches.
@@ -10648,16 +10655,24 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
             }
         }
     }
-    // `GuiFluidBar` (7, 15, 4 by 52): the bio-generator's bioethanol, from the bottom up.
-    if kind(block) == Some(Kind::BioGenerator) {
+    // `GuiFluidBar` / `GuiChemicalBar`: a thin bar filled from the bottom up (the bio-generator's bioethanol,
+    // the infuser's infusion, the advanced machines' chemical).
+    if matches!(kind(block), Some(Kind::BioGenerator | Kind::Advanced(_) | Kind::Infuser))
+        && let Some(g) = layout(block).and_then(|l| l.gauges.into_iter().next())
+    {
         let (amount, capacity) = (read_wide(data, DATA_GAUGES), read_wide(data, DATA_GAUGES + 4).max(1));
         let chemical = usize::try_from(data.get(DATA_GAUGES + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c));
         let (texture, argb) = gauge_texture(chemical);
-        nine_slice(game, batch, "bar/base", 5.0, 1.0, [ox + 7.0, oy + 15.0, 4.0, 52.0]);
-        let h = 50.0 * (amount as f32 / capacity as f32).clamp(0.0, 1.0);
+        let [bx, by, bw, bh] = [ox + g.at[0], oy + g.at[1], g.size[0], g.size[1]];
+        nine_slice(game, batch, "bar/base", 5.0, 1.0, [bx, by, bw, bh]);
+        let h = (bh - 2.0) * (amount as f32 / capacity as f32).clamp(0.0, 1.0);
         if h > 0.0 {
-            fill_tiled(game, batch, &texture, [ox + 8.0, oy + 66.0 - h, 2.0, h], argb);
+            fill_tiled(game, batch, &texture, [bx + 1.0, by + bh - 1.0 - h, bw - 2.0, h], argb);
         }
+    }
+    // `GuiDumpButton` (16, 59): the infuser's dump button, the image alone.
+    if kind(block) == Some(Kind::Infuser) {
+        sprite(game, batch, "button/dump", [0.0, 0.0, 21.0, 10.0], [ox + 16.0, oy + 59.0, 21.0, 10.0]);
     }
     // `GuiStateTexture` (18, 35): the holder with the state's 12 px sprite inside.
     if let Some((on, off, lit)) = match kind(block) {
@@ -10849,7 +10864,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         };
         sprite(game, batch, &format!("gauge/overlay/{overlay}"), [0.0, 0.0, size[0] - 2.0, size[1] - 2.0], [x + 1.0, y + 1.0, size[0] - 2.0, size[1] - 2.0]);
     };
-    for (i, g) in l.gauges.iter().enumerate().filter(|(_, g)| !matches!(kind(block), Some(Kind::FusionPort | Kind::ChemicalTank(_) | Kind::BioGenerator)) && !g.key.starts_with("stats_")) {
+    for (i, g) in l.gauges.iter().enumerate().filter(|(_, g)| !matches!(kind(block), Some(Kind::FusionPort | Kind::ChemicalTank(_) | Kind::BioGenerator | Kind::Advanced(_) | Kind::Infuser)) && !g.key.starts_with("stats_")) {
         let at = DATA_GAUGES + i * GAUGE_SLOTS;
         let (amount, capacity) = (read_wide(data, at), read_wide(data, at + 4).max(1));
         let chemical = usize::try_from(data.get(at + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c));
