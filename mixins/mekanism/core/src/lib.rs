@@ -30,6 +30,7 @@ pub mod laser;
 pub mod machine;
 pub mod matrix;
 pub mod miner;
+pub mod module_config;
 pub mod modules;
 pub mod nuclear;
 pub mod oredictionificator;
