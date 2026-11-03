@@ -3002,6 +3002,7 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Rotary
                 | Kind::Infuser
                 | Kind::Painting
+                | Kind::ModificationStation
                 | Kind::EnergyCube(_)
         ),
         _ => false,
@@ -3844,7 +3845,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Liquifier => Some((chem::LIQUIFIER_USAGE * u64::from(chem::LIQUIFIER_TICKS), u64::MAX)),
         Kind::Assemblicator => Some((asm_capacity(nbt), u64::MAX)),
         Kind::Stabilizer => Some((st_capacity(nbt), u64::MAX)),
-        Kind::ModificationStation => Some((machine::STORAGE_MULTIPLIER * modules::STATION_USAGE, u64::MAX)),
+        Kind::ModificationStation => Some((station_capacity(nbt), u64::MAX)),
         Kind::Dissolution => Some((machine::STORAGE_MULTIPLIER * nuclear::DISSOLUTION_USAGE, u64::MAX)),
         Kind::Centrifuge => Some((machine::STORAGE_MULTIPLIER * nuclear::CENTRIFUGE_USAGE, u64::MAX)),
         Kind::Washer => Some((machine::STORAGE_MULTIPLIER * nuclear::WASHER_USAGE, u64::MAX)),
@@ -5935,6 +5936,7 @@ fn energy_capacity(entity: &ModBlockEntity) -> u64 {
         Some(Kind::HeatGenerator) => HeatGenerator::new().energy.capacity,
         Some(Kind::Wind) => mekanism_core::generator::WIND_STORAGE,
         Some(Kind::Stabilizer) => st_capacity(&entity.nbt),
+        Some(Kind::ModificationStation) => station_capacity(&entity.nbt),
         Some(Kind::BioGenerator) => mekanism_core::generator::BIO_STORAGE,
         Some(Kind::GasGenerator) => chem::GAS_GENERATOR_STORAGE,
         Some(Kind::Solar(_, storage)) => storage,
@@ -6280,10 +6282,11 @@ fn tabs(block: &str) -> u8 {
             | Kind::Nucleosynthesizer
             | Kind::ChemicalInfuser
             | Kind::Washer
-            | Kind::Centrifuge,
+            | Kind::Centrifuge
+            | Kind::ModificationStation,
         ) => all,
         Some(
-            Kind::HeatGenerator | Kind::BioGenerator | Kind::GasGenerator | Kind::Wind | Kind::Solar(..) | Kind::DigitalMiner | Kind::Pump | Kind::Plenisher | Kind::Stabilizer | Kind::ModificationStation,
+            Kind::HeatGenerator | Kind::BioGenerator | Kind::GasGenerator | Kind::Wind | Kind::Solar(..) | Kind::DigitalMiner | Kind::Pump | Kind::Plenisher | Kind::Stabilizer,
         ) => {
             TAB_UPGRADE | TAB_REDSTONE | TAB_SECURITY
         }
@@ -6456,7 +6459,7 @@ fn set_window(block: &str, w: Option<Window>) {
 /// The types a block's side configuration has, in its config's order (`AttributeSideConfig`).
 fn transmissions(block: &str) -> &'static [Transmission] {
     match kind(block) {
-        Some(Kind::Machine(..) | Kind::Factory(..) | Kind::EnergyCube(_)) => &[Transmission::Item, Transmission::Energy],
+        Some(Kind::Machine(..) | Kind::Factory(..) | Kind::EnergyCube(_) | Kind::ModificationStation) => &[Transmission::Item, Transmission::Energy],
         Some(Kind::ChemicalTank(_)) => &[Transmission::Item, Transmission::Chemical],
         _ => &[Transmission::Item, Transmission::Chemical, Transmission::Energy],
     }
@@ -16720,6 +16723,11 @@ struct StnUi {
     scroll: usize,
 }
 
+/// `MachineEnergyContainer`: four ticks of the usage, grown by energy upgrades.
+fn station_capacity(nbt: &Compound) -> u64 {
+    upgrades(nbt).max_energy(machine::STORAGE_MULTIPLIER * modules::STATION_USAGE)
+}
+
 fn module_items_of(stack: &ItemStack) -> Compound {
     match custom_data(stack).and_then(|c| c.get(&JavaString::from(MODULE_ITEMS_KEY))) {
         Some(Tag::Compound(c)) => c.clone(),
@@ -16749,7 +16757,8 @@ fn write_modules(stack: &mut ItemStack, installed: &modules::Installed, kept: Co
 /// The station every tick (`onUpdateServer`): a module in its first slot goes into the item in the second,
 /// one install each half second, for 10 FE a tick; the item and its modules go to the viewers.
 fn tick_station(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = machine::STORAGE_MULTIPLIER * modules::STATION_USAGE;
+    let capacity = station_capacity(&entity.nbt);
+    let (usage, ticks_required) = (upgrades(&entity.nbt).energy_per_tick(modules::STATION_USAGE), upgrades(&entity.nbt).ticks(modules::STATION_TICKS));
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut progress = get_int(&entity.nbt, "progress");
@@ -16760,10 +16769,10 @@ fn tick_station(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity)
         (Some((slot, id)), Some(mut held)) => {
             let mut installed = modules_of(&held);
             let room = modules::max_installed(&held.item, &id).saturating_sub(installed.get(&id).copied().unwrap_or(0));
-            if room > 0 && energy.consume(modules::STATION_USAGE) {
+            if room > 0 && energy.consume(usage) {
                 active = true;
                 progress += 1;
-                if progress >= modules::STATION_TICKS {
+                if progress >= ticks_required {
                     progress = 0;
                     let put = modules::install(&held.item, &mut installed, &id, slot.count);
                     if put > 0 {
@@ -16782,7 +16791,7 @@ fn tick_station(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity)
     }
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
-    entity.data = vec![(energy.stored * 1000 / capacity) as i32, 1000, progress as i32, modules::STATION_TICKS as i32];
+    entity.data = vec![(energy.stored * 1000 / capacity) as i32, 1000, progress as i32, ticks_required as i32];
     let mut client = Compound::new();
     if let Some(Some(held)) = entity.items.get(1) {
         client.insert("stn_item".into(), Tag::String(held.item.as_ref().into()));
