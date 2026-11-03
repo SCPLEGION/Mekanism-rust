@@ -1370,9 +1370,53 @@ thread_local! {
     static TANKS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
+thread_local! {
+    /// The machines the client has seen whose working makes a sound, with their sound event.
+    static MACHINE_SOUNDS: std::cell::RefCell<std::collections::HashMap<[i32; 3], &'static str>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The sound event a machine loops while it works (`SoundEvents` in `MekanismSounds`, played by
+/// `TileComponentSound`), by block id; factories sound as the machine of their recipe.
+fn machine_sound(id: &str) -> Option<&'static str> {
+    let name = id.strip_prefix("mekanism:")?;
+    let name = ["basic_", "advanced_", "elite_", "ultimate_"].iter().find_map(|t| name.strip_prefix(t)).unwrap_or(name);
+    Some(match name {
+        "antiprotonic_nucleosynthesizer" => "mekanism:tile.machine.antiprotonic_nucleosynthesizer",
+        "chemical_crystallizer" => "mekanism:tile.machine.chemical_crystallizer",
+        "chemical_dissolution_chamber" => "mekanism:tile.machine.chemical_dissolution_chamber",
+        "chemical_infuser" => "mekanism:tile.machine.chemical_infuser",
+        "chemical_injection_chamber" | "injecting_factory" => "mekanism:tile.machine.chemical_injection_chamber",
+        "chemical_oxidizer" => "mekanism:tile.machine.chemical_oxidizer",
+        "chemical_washer" => "mekanism:tile.machine.chemical_washer",
+        "combiner" | "combining_factory" => "mekanism:tile.machine.combiner",
+        "osmium_compressor" | "compressing_factory" => "mekanism:tile.machine.compressor",
+        "crusher" | "crushing_factory" => "mekanism:tile.machine.crusher",
+        "electrolytic_separator" => "mekanism:tile.machine.electrolytic_separator",
+        "energized_smelter" | "smelting_factory" => "mekanism:tile.machine.energized_smelter",
+        "enrichment_chamber" | "enriching_factory" => "mekanism:tile.machine.enrichment_chamber",
+        "isotopic_centrifuge" => "mekanism:tile.machine.isotopic_centrifuge",
+        "metallurgic_infuser" | "infusing_factory" => "mekanism:tile.machine.metallurgic_infuser",
+        "nutritional_liquifier" => "mekanism:tile.machine.nutritional_liquifier",
+        "painting_machine" => "mekanism:tile.machine.painting_machine",
+        "pigment_extractor" => "mekanism:tile.machine.pigment_extractor",
+        "pigment_mixer" => "mekanism:tile.machine.pigment_mixer",
+        "precision_sawmill" | "sawing_factory" => "mekanism:tile.machine.precision_sawmill",
+        "pressurized_reaction_chamber" => "mekanism:tile.machine.pressurized_reaction_chamber",
+        "purification_chamber" | "purifying_factory" => "mekanism:tile.machine.purification_chamber",
+        "resistive_heater" => "mekanism:tile.machine.resistive_heater",
+        "rotary_condensentrator" => "mekanism:tile.machine.rotary_condensentrator",
+        _ => return None,
+    })
+}
+
 /// A block entity's client view arrived (`native_client_block_entity_changed`): a wind generator's rotor or a
 /// fluid tank's contents are for the world to draw.
 pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
+    if let Some(event) = machine_sound(id) {
+        MACHINE_SOUNDS.with_borrow_mut(|m| {
+            m.insert(pos, event);
+        });
+    }
     if id == "mekanismgenerators:wind_generator" {
         ROTORS.with_borrow_mut(|r| {
             r.entry(pos).or_insert((0.0, 0));
@@ -5793,6 +5837,19 @@ fn loop_sounds(game: &mut Game<'_>) {
         if game.native_block_property(pos, "active").as_deref() == Some("true") {
             let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
             game.native_loop_sound(&format!("mekanism:alarm:{pos:?}"), "mekanism:tile.machine.industrial_alarm", Some(at), 1.0, 1.0);
+        }
+    }
+    let machines: Vec<([i32; 3], &'static str)> = MACHINE_SOUNDS.with_borrow(|m| m.iter().map(|(p, e)| (*p, *e)).collect());
+    for (pos, event) in machines {
+        if game.native_client_block_entity(pos).is_none() {
+            MACHINE_SOUNDS.with_borrow_mut(|m| m.remove(&pos));
+            continue;
+        }
+        // The machine's `lit` (a barrel's `open`) stands in for Mekanism's `active`.
+        let on = |p: &str| game.native_block_property(pos, p).as_deref() == Some("true");
+        if on("lit") || on("open") {
+            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+            game.native_loop_sound(&format!("mekanism:machine:{pos:?}"), event, Some(at), 1.0, 1.0);
         }
     }
     let ticks = game.ticks as u64;
@@ -21159,12 +21216,6 @@ fn flame_hits_block(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3], mode: fl
             }
         }
         flamethrower::Mode::Inferno => {
-            // TNT is primed where it stood (`TntBlock.onCaughtFire`).
-            if name == "minecraft:tnt" {
-                game.spawn_primed_tnt(horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]), false);
-                game.native_set_block(pos, "minecraft:air", &[]);
-                return;
-            }
             // Campfires and candles light; otherwise fire goes in the air on the face that was hit.
             if let Some(lit) = game.native_block_property(pos, "lit") {
                 let lightable = name.ends_with("campfire") || name.ends_with("candle") || name.ends_with("candle_cake");
@@ -21174,8 +21225,15 @@ fn flame_hits_block(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3], mode: fl
                 }
             }
             let side = [pos[0] + face[0], pos[1] + face[1], pos[2] + face[2]];
-            if matches!(block_name(game, side), "minecraft:air" | "minecraft:cave_air") {
+            let free = matches!(block_name(game, side), "minecraft:air" | "minecraft:cave_air");
+            // `BaseFireBlock.canBePlacedAt`: fire survives on a sturdy floor or beside something that burns (TNT does).
+            let survives = name == "minecraft:tnt" || game.native_face_sturdy([side[0], side[1] - 1, side[2]], horizon_core::geometry::Direction::Up);
+            if free && survives {
                 game.native_set_block(side, "minecraft:fire", &[]);
+            } else if name == "minecraft:tnt" {
+                // Nowhere for a fire: the block catches (`TntBlock.onCaughtFire`) and primes where it stood.
+                game.spawn_primed_tnt(horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]), false);
+                game.native_set_block(pos, "minecraft:air", &[]);
             }
         }
     }

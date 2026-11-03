@@ -716,20 +716,22 @@ def sound_files(ns, out):
     import json
     root = Path(__file__).resolve().parent.parent / "src"
     events_file = root / "datagen/generated/mekanism/assets/mekanism/sounds.json"
-    files = ["tile/industrial_alarm", "item/flamethrower_active", "item/flamethrower_idle"]
+    sounds_dir = root / "main/resources/assets/mekanism/sounds"
     if not events_file.is_file():
         return 0
     events = json.loads(events_file.read_text())
-    keep = {
-        name: value
-        for name, value in events.items()
-        if name in ("tile.machine.industrial_alarm", "item.flamethrower.active", "item.flamethrower.idle")
-    }
+    # Every machine's working hum (`tile.machine.*`) and the Flamethrower's loops.
+    names = [n for n in events if n.startswith("tile.machine.") or n.startswith("item.flamethrower.")]
+    keep = {name: events[name] for name in names}
+    files = []
+    for value in keep.values():
+        for sound in value["sounds"]:
+            files.append((sound["name"] if isinstance(sound, dict) else sound).split(":", 1)[1])
     dst = out / "assets" / ns
     for f in files:
-        src = root / "main/resources/assets/mekanism/sounds" / (f + ".ogg")
+        src = sounds_dir / (f + ".ogg")
         if not src.is_file():
-            return 0
+            continue
         (dst / "sounds" / f).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, dst / "sounds" / (f + ".ogg"))
     (dst / "sounds.json").write_text(json.dumps(keep, indent=2))
