@@ -6261,6 +6261,15 @@ fn scuba_bubbles(game: &mut Game<'_>) {
     game.lan_send_particles(me.dimension, &options, None, at, motion, 1.0, 0);
 }
 
+/// The Gas Mask (`CommonPlayerTickHandler.onLivingIncomingDamage`): a scuba mask with a flowing tank that has
+/// oxygen cancels the damage tagged `mekanism:api/is_preventable_magic` (magic and indirect magic).
+pub(super) fn player_immunities(game: &mut Game<'_>, immune: &mut Vec<String>) {
+    if game.native_on(MOD_ID) && scuba_on(game) {
+        immune.push("minecraft:magic".to_owned());
+        immune.push("minecraft:indirect_magic".to_owned());
+    }
+}
+
 /// `ModeChangeKey`, on the window: the mode key (M) held while the wheel turns asks the server to toggle the
 /// flow of a scuba tank in hand or worn.
 pub(super) fn wheel(game: &mut Game<'_>, steps: f32, claimed: &mut bool) {
