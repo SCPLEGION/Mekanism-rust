@@ -9,6 +9,8 @@ transforms), `textures`, `display` and `gui_light` stay.  Child `visibility` is 
 import json
 from pathlib import Path
 
+import obj_models
+
 
 def model_path(assets, model_id):
     """`assets`: the folders that hold `<namespace>/models/`; the first with the model wins."""
@@ -27,10 +29,32 @@ def load(assets, model_id):
     return json.loads(f.read_text()) if f.is_file() else None
 
 
+def obj_model(assets, data):
+    """(elements, textures, problems) of a `neoforge:obj` model: the OBJ's boxes as elements."""
+    ns, _, path = data["model"].partition(":")
+    for root in assets:
+        f = root / ns / path
+        if f.is_file():
+            mtl = f.with_suffix(".mtl")
+            shift = (data.get("transform") or {}).get("translation", [0, 0, 0])
+            elements, problems = obj_models.elements(f.read_text(), bool(data.get("flip_v")), tuple(shift),
+                                                     mtl.read_text() if mtl.is_file() else "")
+            return elements, dict(data.get("textures", {})), problems
+    return [], dict(data.get("textures", {})), [f"{data['model']}: not found"]
+
+
 def flatten_file(assets, model_id, seen=()):
     """The model `model_id` with composite loaders resolved (written back to disk when it changed)."""
     f = model_path(assets, model_id)
     data = json.loads(f.read_text())
+    if data.get("loader") == "neoforge:obj":
+        elements, textures, problems = obj_model(assets, data)
+        if problems:
+            return data
+        out = {k: v for k, v in data.items() if k not in ("loader", "model", "flip_v", "textures", "transform")}
+        out["textures"] = textures
+        out["elements"] = elements
+        return out
     if data.get("loader") != "neoforge:composite":
         return data
     if model_id in seen:
@@ -57,6 +81,11 @@ def flatten_file(assets, model_id, seen=()):
 
 def resolve(assets, child, seen):
     """(elements, textures) of a composite child: its own, over those of its parent chain."""
+    if child.get("loader") == "neoforge:obj":
+        elements, textures, problems = obj_model(assets, child)
+        if problems:
+            raise ValueError("; ".join(problems[:3]))
+        return elements, textures
     textures = {}
     elements = None
     chain = []
@@ -85,9 +114,12 @@ def flatten_tree(out_ns_assets, assets):
             data = json.loads(path.read_text())
         except ValueError:
             continue
-        if data.get("loader") != "neoforge:composite":
+        if data.get("loader") not in ("neoforge:composite", "neoforge:obj"):
             continue
         model_id = f"{out_ns_assets.name}:{path.relative_to(models).with_suffix('').as_posix()}"
-        path.write_text(json.dumps(flatten_file(assets, model_id), indent=1) + "\n")
+        flat = flatten_file(assets, model_id)
+        if flat.get("loader"):
+            continue  # an OBJ that is not made of boxes (the transmitters): left to its own code
+        path.write_text(json.dumps(flat, indent=1) + "\n")
         count += 1
     return count
