@@ -43,6 +43,7 @@ use mekanism_core::machine::{self, ElectricMachine, Operation, Slot};
 use mekanism_core::module_config;
 use mekanism_core::modules;
 use mekanism_core::radial;
+use mekanism_core::robit;
 use mekanism_core::tier::{self, BaseTier};
 use mekanism_core::upgrades::{Upgrade, Upgrades};
 use std::sync::Arc;
@@ -4545,6 +4546,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     }
     if channel == ST_CHANNEL && game.native_on(MOD_ID) {
         st_payload(game, data);
+        return;
+    }
+    if channel == ROBIT_CHANNEL && game.native_on(MOD_ID) {
+        robit_op_payload(game, data);
         return;
     }
     if channel == TW_CHANNEL && game.native_on(MOD_ID) {
@@ -17330,6 +17335,9 @@ pub(super) fn ui_draw(game: &Game<'_>, id: &str, batch: &mut horizon_client::hud
         tweaker_draw(game, batch);
     } else if id == RADIAL_ID {
         radial_draw(game, batch);
+    } else if id == ROBIT_SCREEN {
+        ROBIT_ORIGIN.with_borrow_mut(|o| *o = robit_origin(batch));
+        robit_draw(game, batch);
     }
 }
 
@@ -17338,6 +17346,8 @@ pub(super) fn ui_click(game: &mut Game<'_>, id: &str, at: [f32; 2], button: u8, 
         tweaker_click(game, at, button, pressed);
     } else if id == RADIAL_ID && pressed {
         radial_update(game);
+    } else if id == ROBIT_SCREEN {
+        robit_click(game, at, button, pressed);
     }
 }
 
@@ -17568,4 +17578,416 @@ fn radial_scroll(game: &mut Game<'_>, steps: f32) {
     if let Some(text) = send {
         game.native_send_to_server(TW_CHANNEL, text.as_bytes());
     }
+}
+
+// --- Robit (EntityRobit) ---------------------------------------------------------------------------------
+
+/// The Robit's mob type, added through Horizon API 46: a clone of its network base, half a block big
+/// and with one point of health (`EntityRobit.createAttributes`).
+pub(super) fn mob_types(types: &mut std::collections::HashMap<String, horizon_client::mobs::MobType>) {
+    let Some(mut t) = types.get(robit::BASE).cloned() else {
+        return;
+    };
+    t.id = robit::TYPE.to_owned();
+    (t.width, t.height, t.eye_height) = (0.5, 0.5, 0.4);
+    (t.max_health, t.speed) = (1.0, 0.3);
+    let mut attributes = (*t.attributes).clone();
+    attributes.insert("minecraft:max_health".to_owned(), 1.0);
+    attributes.insert("minecraft:movement_speed".to_owned(), 0.3);
+    t.attributes = Arc::new(attributes);
+    types.insert(robit::TYPE.to_owned(), t);
+    horizon_client::mobs::register_mod_mob_base(robit::TYPE, robit::BASE);
+}
+
+/// The Robit's data on its mob (`mod_data`): owner, energy, follow and pickup switches, home, items.
+fn robit_data(m: &horizon_client::mobs::Mob) -> Compound {
+    m.extra.mod_data.clone().unwrap_or_default()
+}
+
+fn robit_items(data: &Compound) -> Vec<Option<ItemStack>> {
+    let mut out = vec![None; robit::INVENTORY_SLOTS];
+    if let Some(Tag::List(list)) = data.get(&JavaString::from("items")) {
+        for t in list {
+            if let Tag::Compound(c) = t
+                && let Some(Tag::Byte(slot)) = c.get(&JavaString::from("slot"))
+                && let Some(item) = c.get(&JavaString::from("item")).and_then(horizon_items::item_nbt::item_from_nbt)
+                && let Some(s) = out.get_mut(*slot as usize)
+            {
+                *s = Some(item);
+            }
+        }
+    }
+    out
+}
+
+fn set_robit_items(data: &mut Compound, items: &[Option<ItemStack>]) {
+    let list: Vec<Tag> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            let mut c = Compound::new();
+            c.insert("slot".into(), Tag::Byte(i as i8));
+            c.insert("item".into(), horizon_items::item_nbt::item_to_nbt(s.as_ref()?));
+            Some(Tag::Compound(c))
+        })
+        .collect();
+    data.insert("items".into(), Tag::List(list));
+}
+
+/// Puts `stack` into the Robit's slots (`directInventoryHandler.insert`): the part that did not fit.
+fn robit_insert(game: &Game<'_>, items: &mut [Option<ItemStack>], mut stack: ItemStack) -> Option<ItemStack> {
+    let max = max_stack(game, &stack.item);
+    let same = |a: &ItemStack, b: &ItemStack| a.item == b.item && format!("{:?}", a.extra) == format!("{:?}", b.extra);
+    for slot in items.iter_mut().flatten() {
+        if same(slot, &stack) && slot.count < max {
+            let moved = (max - slot.count).min(stack.count);
+            slot.count += moved;
+            stack.count -= moved;
+            if stack.count == 0 {
+                return None;
+            }
+        }
+    }
+    for slot in items.iter_mut() {
+        if slot.is_none() {
+            let moved = max.min(stack.count);
+            *slot = Some(ItemStack { count: moved, ..stack.clone() });
+            stack.count -= moved;
+            if stack.count == 0 {
+                return None;
+            }
+        }
+    }
+    Some(stack)
+}
+
+/// A Robit item used on a Chargepad spawns the Robit there (`ItemRobit.useOn`), keeping the energy it held.
+pub(super) fn use_robit(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || block_name(game, pos) != chargepad::CHARGEPAD {
+        return false;
+    }
+    let Some(held) = game.inventory.get(game.selected).cloned().flatten().filter(|s| &*s.item == robit::ITEM) else {
+        return false;
+    };
+    let Some(id) = game.spawn_mob(robit::TYPE, [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5], true) else {
+        return false;
+    };
+    let owner = game.options.player_name().to_string();
+    let mut data = Compound::new();
+    data.insert("owner_name".into(), Tag::String(owner.as_str().into()));
+    put_long(&mut data, "energy", stored_energy(&held).min(robit::MAX_ENERGY));
+    for (k, v) in ["home_x", "home_y", "home_z"].into_iter().zip(pos) {
+        data.insert(k.into(), Tag::Int(v));
+    }
+    game.native_with_mob(id, |m| {
+        m.no_ai = true;
+        m.extra.mod_data = Some(data);
+    });
+    let selected = game.selected;
+    if !game.creative {
+        game.inventory[selected] = (held.count > 1).then(|| ItemStack { count: held.count - 1, ..held });
+    }
+    true
+}
+
+/// Every tick, after the mobs ticked: each Robit follows its owner, walks on energy and collects items.
+pub(super) fn mobs_tick(game: &mut Game<'_>) {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    let ids = game.native_mob_ids(robit::TYPE);
+    if ids.is_empty() {
+        return;
+    }
+    let players = robit_players(game);
+    for id in &ids {
+        robit_tick(game, *id, &players);
+    }
+    // The clients learn which of the mobs they see are Robits (a Robit is its base type to them).
+    if game.ticks % 20 == 0 {
+        let list: Vec<u8> = ids.iter().copied().flat_map(u32::to_be_bytes).collect();
+        for p in &players {
+            game.native_send_to_player(p.uuid, ROBIT_LIST_CHANNEL, &list);
+        }
+    }
+    if game.ticks % 10 == 0 {
+        send_robit_states(game, &players);
+    }
+}
+
+const ROBIT_LIST_CHANNEL: &str = "mekanism:robits";
+
+thread_local! {
+    static ROBITS: std::cell::RefCell<std::collections::HashSet<u32>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// A player a Robit can follow: the server's players, or the one in this window.
+struct RobitPlayer {
+    name: String,
+    uuid: u128,
+    at: [f64; 3],
+}
+
+fn robit_players(game: &Game<'_>) -> Vec<RobitPlayer> {
+    let mut out: Vec<RobitPlayer> = game.native_server_players().into_iter().map(|p| RobitPlayer { name: p.name, uuid: p.uuid, at: p.position }).collect();
+    if let (Some(p), Some(u)) = (game.native_player(), game.level.player_uuid) {
+        let uuid = u.iter().fold(0u128, |acc, part| acc << 32 | u128::from(*part as u32));
+        out.push(RobitPlayer { name: game.options.player_name().to_string(), uuid, at: [p.x, p.y, p.z] });
+    }
+    out
+}
+
+fn robit_tick(game: &mut Game<'_>, id: u32, players: &[RobitPlayer]) {
+    // Items on the ground within reach, while the pickup switch is on.
+    let (at, data) = match game.native_with_mob(id, |m| (m.position, robit_data(m))) {
+        Some((p, d)) => ([p.x, p.y, p.z], d),
+        None => return,
+    };
+    let mut data = data;
+    let mut energy = get_long(&data, "energy");
+    if get_int(&data, "pickup") == 1 {
+        let r = robit::PICKUP_REACH;
+        let near = game.native_entities_in([at[0] - r, at[1] - r, at[2] - r], [at[0] + r, at[1] + 0.5 + r, at[2] + r], at);
+        let mut items = robit_items(&data);
+        let mut changed = false;
+        for e in near.into_iter().filter(|e| e.kind == "minecraft:item") {
+            if let Some(stack) = game.native_take_item_entity(e.id) {
+                let rest = robit_insert(game, &mut items, stack);
+                changed = true;
+                if let Some(rest) = rest {
+                    game.give_or_drop(rest);
+                }
+            }
+        }
+        if changed {
+            set_robit_items(&mut data, &items);
+        }
+    }
+    // Following: from 4 blocks to 2 (`RobitAIFollow`), a point of energy a block and a half.
+    let mut step = [0.0, 0.0];
+    let owner_name = get_string(&data, "owner_name").unwrap_or_default();
+    if get_int(&data, "follow") == 1
+        && let Some(o) = players.iter().find(|p| p.name == owner_name)
+    {
+        let to = [o.at[0] - at[0], o.at[2] - at[2]];
+        if to[0].hypot(to[1]) > robit::TELEPORT {
+            game.native_with_mob(id, |m| m.position = horizon_core::geometry::Vec3::new(o.at[0], o.at[1], o.at[2]));
+        }
+        let (moving, s) = robit::follow(get_int(&data, "moving") == 1, to, energy);
+        put_int(&mut data, "moving", u32::from(moving));
+        step = s;
+        if moving {
+            energy = energy.saturating_sub(robit::travel_energy(step[0].hypot(step[1])));
+        }
+    }
+    put_long(&mut data, "energy", energy);
+    game.native_with_mob(id, |m| {
+        m.no_ai = true;
+        if step != [0.0, 0.0] {
+            m.velocity.x = step[0];
+            m.velocity.z = step[1];
+            m.yaw = (step[1].atan2(step[0]).to_degrees() - 90.0) as f32;
+        }
+        m.extra.mod_data = Some(data);
+    });
+}
+
+/// A Robit died: it drops as its item with the energy and the name it had, and its slots spill
+/// (`EntityRobit.drop`).
+pub(super) fn mob_died(game: &mut Game<'_>, kind: &str, at: [f64; 3], data: Option<&Compound>) {
+    if kind != robit::TYPE || !game.native_on(MOD_ID) {
+        return;
+    }
+    let data = data.cloned().unwrap_or_default();
+    let mut drops = vec![Some(with_energy(robit::ITEM, get_long(&data, "energy")))];
+    drops.extend(robit_items(&data));
+    for stack in drops.into_iter().flatten() {
+        game.spawn_item(stack, at, [0.0, 0.2, 0.0], 10);
+    }
+}
+
+/// The window's client got the Robits' ids.
+pub(super) fn client_payload(channel: &str, data: &[u8]) {
+    if channel == ROBIT_STATE_CHANNEL {
+        robit_state_payload(data);
+    }
+    if channel == ROBIT_LIST_CHANNEL {
+        let ids = data.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
+        ROBITS.with_borrow_mut(|set| *set = ids);
+    }
+}
+
+/// A right click on a Robit (the client sees its base type): the Robit's screen opens.
+pub(super) fn use_mob(game: &mut Game<'_>, id: u32, claimed: &mut bool) {
+    if game.native_on(MOD_ID) && ROBITS.with_borrow(|set| set.contains(&id)) {
+        ROBIT_UI.with_borrow_mut(|ui| *ui = Some(id));
+        game.native_open_ui(ROBIT_SCREEN);
+        *claimed = true;
+    }
+}
+
+const ROBIT_SCREEN: &str = "mekanism:robit";
+
+thread_local! {
+    static ROBIT_UI: std::cell::RefCell<Option<u32>> = const { std::cell::RefCell::new(None) };
+}
+
+const ROBIT_STATE_CHANNEL: &str = "mekanism:robit_state";
+const ROBIT_CHANNEL: &str = "mekanism:robit_op";
+const ROBIT_WINDOW: [f32; 2] = [176.0, 166.0];
+
+/// What the window's client knows of each Robit near it: energy, switches, owner.
+#[derive(Clone, Default)]
+struct RobitView {
+    energy: u64,
+    follow: bool,
+    pickup: bool,
+    owner: String,
+}
+
+thread_local! {
+    static ROBIT_VIEWS: std::cell::RefCell<std::collections::HashMap<u32, RobitView>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The server tells the window's player about its Robits (every 10 ticks).
+fn send_robit_states(game: &mut Game<'_>, players: &[RobitPlayer]) {
+    for id in game.native_mob_ids(robit::TYPE) {
+        let Some(data) = game.native_with_mob(id, |m| robit_data(m)) else {
+            continue;
+        };
+        let mut out = id.to_be_bytes().to_vec();
+        out.extend(get_long(&data, "energy").to_be_bytes());
+        out.push(get_int(&data, "follow") as u8 | (get_int(&data, "pickup") as u8) << 1);
+        out.extend(get_string(&data, "owner_name").unwrap_or_default().bytes());
+        for p in players {
+            game.native_send_to_player(p.uuid, ROBIT_STATE_CHANNEL, &out);
+        }
+    }
+}
+
+fn robit_state_payload(data: &[u8]) {
+    if data.len() < 13 {
+        return;
+    }
+    let id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    let mut energy = [0u8; 8];
+    energy.copy_from_slice(&data[4..12]);
+    let view = RobitView {
+        energy: u64::from_be_bytes(energy),
+        follow: data[12] & 1 != 0,
+        pickup: data[12] & 2 != 0,
+        owner: String::from_utf8_lossy(&data[13..]).into_owned(),
+    };
+    ROBIT_VIEWS.with_borrow_mut(|v| {
+        v.insert(id, view);
+    });
+}
+
+/// A button on the Robit's screen, on the server: go home, toggle pickup, toggle following
+/// (`GuiInteractionEntity.GO_HOME`, `PICKUP_DROPS`, `FOLLOW`).
+fn robit_op_payload(game: &mut Game<'_>, data: &[u8]) {
+    let [op, a, b, c, d] = data[..] else {
+        return;
+    };
+    let id = u32::from_be_bytes([a, b, c, d]);
+    let Some(player) = game.native_acting_player() else {
+        return;
+    };
+    let me = [player.position[0], player.position[1], player.position[2]];
+    game.native_with_mob(id, |m| {
+        if m.kind.id != robit::TYPE || (m.position.x - me[0]).powi(2) + (m.position.y - me[1]).powi(2) + (m.position.z - me[2]).powi(2) > 256.0 {
+            return;
+        }
+        let mut data = robit_data(m);
+        match op {
+            1 => {
+                if data.contains_key(&JavaString::from("home_x")) {
+                    m.position = horizon_core::geometry::Vec3::new(
+                        f64::from(get_i32(&data, "home_x", 0)) + 0.5,
+                        f64::from(get_i32(&data, "home_y", 0)) + 1.0,
+                        f64::from(get_i32(&data, "home_z", 0)) + 0.5,
+                    );
+                }
+            }
+            2 => {
+                let v = 1 - get_int(&data, "pickup").min(1);
+                put_int(&mut data, "pickup", v);
+            }
+            3 => {
+                let v = 1 - get_int(&data, "follow").min(1);
+                put_int(&mut data, "follow", v);
+            }
+            _ => {}
+        }
+        m.extra.mod_data = Some(data);
+    });
+}
+
+fn robit_origin(batch: &horizon_client::hud::HudBatch) -> [f32; 2] {
+    [((batch.width - ROBIT_WINDOW[0]) / 2.0).floor(), ((batch.height - ROBIT_WINDOW[1]) / 2.0).floor()]
+}
+
+const ROBIT_BUTTONS: [(&str, [f32; 4], u8); 3] = [
+    ("button/home", [6.0, 16.0, 18.0, 18.0], 1),
+    ("button/drop", [152.0, 35.0, 18.0, 18.0], 2),
+    ("button/follow", [152.0, 54.0, 18.0, 18.0], 3),
+];
+
+/// `GuiRobitMain` (without its slots): the greeting screen with the robit's energy, switches and owner.
+fn robit_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    let o = robit_origin(batch);
+    let cursor = game.native_cursor();
+    let Some(id) = ROBIT_UI.with_borrow(|u| *u) else {
+        return;
+    };
+    let view = ROBIT_VIEWS.with_borrow(|v| v.get(&id).cloned()).unwrap_or_default();
+    nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [o[0] - 3.0, o[1] - 3.0, ROBIT_WINDOW[0] + 6.0, ROBIT_WINDOW[1] + 6.0], 0xBFFF_FFFF);
+    nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [o[0], o[1], ROBIT_WINDOW[0], ROBIT_WINDOW[1]], 0xFFFF_FFFF);
+    centred(game, batch, "Robit", o[0], ROBIT_WINDOW[0], o[1] + 5.0, 0x40_4040);
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [o[0] + 27.0, o[1] + 16.0, 122.0, 56.0], 0xFFFF_FFFF);
+    let yes = |b: bool| if b { "True" } else { "False" };
+    let lines = [
+        "Hi, Robit!".to_owned(),
+        String::new(),
+        format!("Energy: {} FE", view.energy),
+        format!("Following: {}", yes(view.follow)),
+        format!("Drop pickup: {}", yes(view.pickup)),
+        format!("Owner: {}", view.owner),
+    ];
+    for (i, line) in lines.iter().enumerate() {
+        game.native_text_scaled(batch, line, [o[0] + 30.0, o[1] + 19.0 + 8.5 * i as f32], 0x3CFD_3C, 0.8);
+    }
+    let fraction = (view.energy as f32 / robit::MAX_ENERGY as f32).clamp(0.0, 1.0);
+    nine_slice_tinted(game, batch, "bar/base", [5.0, 5.0], 1.0, [o[0] + 27.0, o[1] + 74.0, 120.0, 6.0], 0xFFFF_FFFF);
+    if fraction > 0.0 {
+        sprite(game, batch, "bar/horizontal_power", [0.0, 0.0, 2.0, 2.0], [o[0] + 28.0, o[1] + 75.0, 118.0 * fraction, 4.0]);
+    }
+    for (icon, r, _) in ROBIT_BUTTONS {
+        let rect = [o[0] + r[0], o[1] + r[1], r[2], r[3]];
+        draw_button(game, batch, rect, inside(cursor, rect), true, 0xFFFF_FFFF, Some((icon, 18.0)));
+    }
+}
+
+fn robit_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
+    if !pressed || button != 0 {
+        return;
+    }
+    let Some(id) = ROBIT_UI.with_borrow(|u| *u) else {
+        return;
+    };
+    let o = ROBIT_ORIGIN.with_borrow(|o| *o);
+    for (_, r, op) in ROBIT_BUTTONS {
+        if inside(at, [o[0] + r[0], o[1] + r[1], r[2], r[3]]) {
+            let mut out = vec![op];
+            out.extend(id.to_be_bytes());
+            game.native_send_to_server(ROBIT_CHANNEL, &out);
+            if op == 1 {
+                game.native_close_ui();
+            }
+        }
+    }
+}
+
+thread_local! {
+    static ROBIT_ORIGIN: std::cell::RefCell<[f32; 2]> = const { std::cell::RefCell::new([0.0, 0.0]) };
 }

@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "ea118e258c6fb8a96ee35f395e03bab5dfece388"
+horizon_revision = "3cf02648f92cd87855d22d565d24a6419c8edb17"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -460,4 +460,60 @@ bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "id", ty = "&str", value = "id" },
   { name = "steps", ty = "f32", value = "steps" },
+]
+
+[[injection]]
+id = "mob-types"
+hook = "mob_types"
+hook_version = 1
+kind = "HEAD"
+helper = "mob_types.rs"
+bindings = [
+  { name = "types", ty = "&mut std::collections::HashMap<String, horizon_client::mobs::MobType>", value = "&mut *types" },
+]
+
+[[injection]]
+id = "mobs-tick"
+hook = "mobs_tick"
+hook_version = 1
+kind = "HEAD"
+helper = "mobs_tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+]
+
+[[injection]]
+id = "mob-died"
+hook = "mob_died"
+hook_version = 1
+kind = "HEAD"
+helper = "mob_died.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "kind", ty = "&str", value = "kind" },
+  { name = "at", ty = "[f64; 3]", value = "at" },
+  { name = "data", ty = "Option<&horizon_world::nbt::Compound>", value = "data" },
+]
+
+[[injection]]
+id = "use-mob"
+hook = "use_mob"
+hook_version = 1
+kind = "HEAD"
+helper = "use_mob.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "id", ty = "u32", value = "id" },
+  { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
+]
+
+[[injection]]
+id = "client-payload"
+hook = "client_payload"
+hook_version = 1
+kind = "HEAD"
+helper = "client_payload.rs"
+bindings = [
+  { name = "channel", ty = "&str", value = "channel" },
+  { name = "data", ty = "&[u8]", value = "data" },
 ]
