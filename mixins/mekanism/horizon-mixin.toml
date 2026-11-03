@@ -612,3 +612,15 @@ bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
 ]
+
+[[injection]]
+id = "wheel"
+hook = "wheel"
+hook_version = 1
+kind = "HEAD"
+helper = "wheel.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "steps", ty = "f32", value = "steps" },
+  { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
+]
