@@ -5166,6 +5166,9 @@ fn centred(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, text: &st
 /// type tabs, the close button, the title, the eject screen and button, the face buttons with the
 /// block beside each face, the clear button and the "Slots" label.
 pub(super) fn screen_overlay(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    if qio_select_open(block) {
+        return;
+    }
     let Some(id) = open_window_id(block) else {
         return;
     };
@@ -5271,6 +5274,16 @@ pub(super) fn creative_tabs(tabs: &mut Vec<crate::game::native_hooks::NativeCrea
 /// What Mekanism's own parts cover on a screen (hook point `native_screen_covers`, API 32): its tabs
 /// beside the panel, and the open window with its type tabs.
 pub(super) fn screen_covers(block: &str, at: [f32; 2], covered: &mut bool) {
+    if qio_select_open(block) {
+        return;
+    }
+    if is_qio_tile(block) {
+        *covered |= inside(at, QIO_TAB);
+    }
+    screen_covers_base(block, at, covered);
+}
+
+fn screen_covers_base(block: &str, at: [f32; 2], covered: &mut bool) {
     let wat = window_at(block, at);
     if is_filter_screen(block) {
         *covered |= filter_covers(wat);
@@ -5909,14 +5922,10 @@ fn upgrade_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity)
     }
     let mut client = Compound::new();
     if let Some((id, n)) = upgrade_out_of(&entity.nbt) {
-        client.insert("id".into(), Tag::String(id.as_str().into()));
-        put_int(&mut client, "n", n);
+        client.insert("upg_id".into(), Tag::String(id.as_str().into()));
+        put_int(&mut client, "upg_n", n);
     }
-    let same = matches!(entity.nbt.get(&JavaString::from("client")), Some(Tag::Compound(c)) if *c == client);
-    if !same {
-        entity.nbt.insert("client".into(), Tag::Compound(client));
-        game.native_sync_block_entity(pos);
-    }
+    put_client(game, pos, entity, &["upg_id", "upg_n"], client);
 }
 
 const BUTTON_UPGRADE_INSTALL: i32 = 280;
@@ -5930,8 +5939,8 @@ const UPGRADE_OUT_SLOT: [f32; 4] = [175.0, 72.0, 18.0, 18.0];
 fn upgrade_out_view(game: &Game<'_>) -> Option<(String, u32)> {
     let (x, y, z) = game.container?;
     let (_, c) = game.native_client_block_entity([x, y, z])?;
-    let id = get_string(c, "id")?;
-    let n = get_int(c, "n");
+    let id = get_string(c, "upg_id")?;
+    let n = get_int(c, "upg_n");
     (n > 0).then_some((id, n))
 }
 
@@ -6118,6 +6127,17 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
 
 /// A press on a reactor's button (hook point `native_screen_click`, API 20).
 pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
+    if is_qio_tile(block) {
+        let select = qio_select_open(block);
+        if select || inside(at, QIO_TAB_BUTTON) {
+            qio_select_click(game, block, at, right);
+            return;
+        }
+    }
+    screen_click_base(game, block, data, at, right, button);
+}
+
+fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
     if is_freq_screen(block) {
         frequency_click(game, block, at, right);
         return;
@@ -6220,15 +6240,35 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
     if screen.is_some() {
         return;
     }
+    screen_base(block, screen);
+    // The QIO blocks swap to the selector's layout while their tab's screen is open: 176 x 155, none
+    // of the inventory (it is moved out of the way).
+    if is_qio_tile(block) && let Some(s) = screen.as_mut() {
+        s.alt = Some(Box::new(super::native_hooks::NativeScreen {
+            width: 176.0,
+            height: 155.0,
+            slots: vec![None; s.slots.len()],
+            inventory_y: 4000.0,
+            inventory_x: 0.0,
+            own_labels: true,
+            alt: None,
+        }));
+    }
+}
+
+fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScreen>) {
+    if screen.is_some() {
+        return;
+    }
     // `GuiQIORedstoneAdapter`: 26 px taller than a machine's, no slots of its own.
     if kind(block) == Some(Kind::QioRedstoneAdapter) {
-        *screen = Some(super::native_hooks::NativeScreen { width: 176.0, height: 192.0, slots: vec![None; 3], inventory_y: 110.0, inventory_x: 8.0, own_labels: true });
+        *screen = Some(super::native_hooks::NativeScreen { width: 176.0, height: 192.0, slots: vec![None; 3], inventory_y: 110.0, inventory_x: 8.0, own_labels: true, alt: None });
         return;
     }
     // `GuiPersonalStorageTile`: six rows of nine over the inventory, 56 px taller than a machine's.
     if kind(block) == Some(Kind::PersonalStorage) {
         let slots = (0..bin::PERSONAL_SLOTS).map(|i| Some([8.0 + 18.0 * (i % 9) as f32, 18.0 + 18.0 * (i / 9) as f32])).collect();
-        *screen = Some(super::native_hooks::NativeScreen { width: 176.0, height: 222.0, slots, inventory_y: 140.0, inventory_x: 8.0, own_labels: true });
+        *screen = Some(super::native_hooks::NativeScreen { width: 176.0, height: 222.0, slots, inventory_y: 140.0, inventory_x: 8.0, own_labels: true, alt: None });
         return;
     }
     // `GuiQIODriveArray` and `GuiQIODashboard`.
@@ -6238,7 +6278,7 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
     }
     // `GuiQIOFilterHandler`: 60 wider and 74 taller than a machine's, no slots of its own.
     if is_qio_filter(block) {
-        *screen = Some(super::native_hooks::NativeScreen { width: 236.0, height: 240.0, slots: vec![None; 3], inventory_y: 158.0, inventory_x: 38.0, own_labels: true });
+        *screen = Some(super::native_hooks::NativeScreen { width: 236.0, height: 240.0, slots: vec![None; 3], inventory_y: 158.0, inventory_x: 38.0, own_labels: true, alt: None });
         return;
     }
     // `GuiLogisticalSorter`: 100 wider and 88 taller than a machine's, no slots of its own.
@@ -6250,6 +6290,7 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
             inventory_y: 172.0,
             inventory_x: 58.0,
             own_labels: true,
+            alt: None,
         });
         return;
     }
@@ -6263,6 +6304,7 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
             inventory_y: 158.0,
             inventory_x: 8.0,
             own_labels: true,
+            alt: None,
         });
         return;
     }
@@ -6277,7 +6319,7 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
             slots[FACTORY_ROW + i] = Some(output);
         }
         let w = screen_width(block);
-        *screen = Some(super::native_hooks::NativeScreen { width: w, height: 166.0, slots, inventory_y: 84.0, inventory_x: 8.0 + (w - 176.0) / 2.0, own_labels: false });
+        *screen = Some(super::native_hooks::NativeScreen { width: w, height: 166.0, slots, inventory_y: 84.0, inventory_x: 8.0 + (w - 176.0) / 2.0, own_labels: false, alt: None });
         return;
     }
     *screen = Some(super::native_hooks::NativeScreen {
@@ -6287,6 +6329,7 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
         inventory_y: 84.0,
         inventory_x: 8.0,
         own_labels: false,
+        alt: None,
     });
 }
 
@@ -6404,6 +6447,17 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
 /// Mekanism's screen for a block: the base panel, its slots and the player's, its gauges, its power
 /// bar or energy gauge, its progress bar, and the energy tab on the left.
 pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    if qio_select_open(block) {
+        draw_qio_select(game, batch, block, origin);
+        return;
+    }
+    screen_draw_base(game, block, data, batch, origin);
+    if is_qio_tile(block) {
+        draw_qio_tab(game, batch, origin);
+    }
+}
+
+fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
     if is_freq_screen(block) {
         draw_frequency_screen(game, batch, block, data, origin);
         return;
@@ -6532,6 +6586,22 @@ fn inside(at: [f32; 2], rect: [f32; 4]) -> bool {
 /// The tooltips: a gauge's chemical and amount, the power bar's stored and maximum energy, the
 /// progress bar's percent, and the energy tab's usage and upgrades.
 pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
+    if qio_select_open(block) {
+        if inside(at, QIO_BACK) {
+            lines.push("Back".to_owned());
+        } else if let Some(i) = FREQ_MODES.iter().position(|r| inside([at[0], at[1] - QIO_SELECT_DY], *r)) {
+            lines.push(["Public Mode", "Private Mode", "Trusted Mode"][i].to_owned());
+        }
+        return;
+    }
+    if is_qio_tile(block) && inside(at, QIO_TAB_BUTTON) {
+        lines.push("Set Frequency".to_owned());
+        return;
+    }
+    screen_tooltip_base(game, block, data, at, lines);
+}
+
+fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
     if frequency_tooltip(block, data, at, lines) {
         return;
     }
@@ -7889,7 +7959,8 @@ pub(super) fn use_qio(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     let held = game.inventory.get(game.selected).cloned().flatten();
     let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
     if let Some(tag) = held.as_ref().filter(|s| &*s.item == "minecraft:name_tag").and_then(|s| s.custom_name()) {
-        game.native_with_mod_block_entity(pos, |m| m.nbt.insert("frequency".into(), Tag::String(tag.as_str().into())));
+        let entry = name_tag_frequency(game, &tag);
+        game.native_with_mod_block_entity(pos, |m| put_block_frequency(&mut m.nbt, Some(&entry)));
         tell(game, format!("QIO frequency: {tag}"));
         return true;
     }
@@ -8907,7 +8978,91 @@ fn freq_type(block: &str) -> Option<u8> {
     match kind(block)? {
         Kind::Teleporter => Some(0),
         Kind::Entangloporter => Some(1),
+        Kind::QioDriveArray | Kind::QioDashboard | Kind::QioImporter | Kind::QioExporter | Kind::QioRedstoneAdapter => Some(2),
         _ => None,
+    }
+}
+
+/// The QIO blocks that pick their frequency on the selector screen their tab opens
+/// (`GuiQIOTileFrequencySelect`).
+fn is_qio_tile(block: &str) -> bool {
+    freq_type(block) == Some(2)
+}
+
+thread_local! {
+    /// The open QIO block's screen shows its frequency selector (set by the tab, cleared by the back
+    /// button and when a screen opens).
+    static QIO_SELECT: std::cell::Cell<Option<([i32; 3], u64)>> = const { std::cell::Cell::new(None) };
+}
+
+fn qio_select_open(block: &str) -> bool {
+    is_qio_tile(block) && QIO_SELECT.get().is_some()
+}
+
+/// `GuiFrequencySelector`'s y offset on the QIO screen (17) over the teleporter's (14).
+const QIO_SELECT_DY: f32 = 3.0;
+/// The tab (`GuiQIOFrequencyTab`: at -26, 6, a 26 px holder with an 18 px button) and the back button.
+const QIO_TAB: [f32; 4] = [-26.0, 6.0, 26.0, 26.0];
+const QIO_TAB_BUTTON: [f32; 4] = [-22.0, 10.0, 18.0, 18.0];
+const QIO_BACK: [f32; 4] = [6.0, 6.0, 14.0, 14.0];
+
+/// Whether the open QIO block shows its selector now; a selector left open on a screen that closed
+/// (not asked for a few ticks) or on another block is dropped. Asked every frame.
+pub(super) fn screen_alt(game: &Game<'_>, block: &str, alt: &mut bool) {
+    if !is_qio_tile(block) {
+        return;
+    }
+    let now = game.ticks as u64;
+    if let Some((pos, seen)) = QIO_SELECT.get() {
+        let here = game.container.map(|(x, y, z)| [x, y, z]);
+        if here != Some(pos) || now.saturating_sub(seen) > 10 {
+            QIO_SELECT.set(None);
+        } else {
+            QIO_SELECT.set(Some((pos, now)));
+            *alt = true;
+        }
+    }
+}
+
+/// The selector's screen (`GuiQIOTileFrequencySelect`): 176 x 155, the back button, the title beside
+/// it, and the frequency selector 3 px lower than the teleporter's.
+fn draw_qio_select(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 176.0, 155.0]);
+    let title = game.native_screen_title().unwrap_or_default();
+    let tw = game.native_text_width(&title);
+    game.native_text(batch, &title, [ox + 17.0 + (176.0 - 17.0 - tw) / 2.0, oy + 3.0], 0x40_4040, false);
+    let back = [ox + QIO_BACK[0], oy + QIO_BACK[1], QIO_BACK[2], QIO_BACK[3]];
+    draw_mek_button(game, batch, back, true, inside(mouse, QIO_BACK));
+    sprite(game, batch, "button/back", [0.0, 0.0, 14.0, 14.0], back);
+    draw_freq_selector(game, batch, block, [ox, oy + QIO_SELECT_DY]);
+}
+
+/// The tab on a QIO block's screen: the holder in the tab colour (white), the button and its icon.
+fn draw_qio_tab(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let [x, y] = [ox + QIO_TAB[0], oy + QIO_TAB[1]];
+    nine_slice_tinted(game, batch, "holder_left", [26.0, 9.0], 4.0, [x, y, 26.0, 26.0], 0xFFFF_FFFF);
+    let hovered = inside([cursor[0] - ox, cursor[1] - oy], QIO_TAB_BUTTON);
+    let button = if hovered { "button_focus" } else { "button" };
+    let b = [ox + QIO_TAB_BUTTON[0] + 1.0, oy + QIO_TAB_BUTTON[1], 18.0, 18.0];
+    nine_slice_tinted(game, batch, button, [200.0, 20.0], 2.0, b, 0xFFFF_FFFF);
+    sprite(game, batch, "button/frequency", [0.0, 0.0, 18.0, 18.0], b);
+}
+
+/// A press on the QIO screen's tab or, in the selector, the back button and the selector.
+fn qio_select_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool) {
+    if qio_select_open(block) {
+        if !right && inside(at, QIO_BACK) {
+            QIO_SELECT.set(None);
+        } else {
+            frequency_click(game, block, [at[0], at[1] - QIO_SELECT_DY], right);
+        }
+    } else if !right && inside(at, QIO_TAB_BUTTON) && let Some((x, y, z)) = game.container {
+        QIO_SELECT.set(Some(([x, y, z], game.ticks as u64)));
     }
 }
 
@@ -9022,11 +9177,33 @@ fn frequency_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     }
     client.insert("list".into(), Tag::List(list.iter().map(entry_tag).collect()));
     put_int(&mut client, "status", get_int(&entity.nbt, "status"));
-    let same = matches!(entity.nbt.get(&JavaString::from("client")), Some(Tag::Compound(c)) if *c == client);
-    if !same {
+    put_client(game, pos, entity, &["freq", "list", "status"], client);
+}
+
+/// Merges what one part of the port tells the screens into the block entity's `client` compound: the
+/// `owned` keys are replaced by `new`'s, the others stay (a QIO block has the frequency's, its filters'
+/// and its own). The viewers hear of it when it changed.
+fn put_client(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, owned: &[&str], new: Compound) {
+    let before = match entity.nbt.get(&JavaString::from("client")) {
+        Some(Tag::Compound(c)) => c.clone(),
+        _ => Compound::new(),
+    };
+    let mut client = before.clone();
+    for k in owned {
+        client.remove(&JavaString::from(*k));
+    }
+    for (k, v) in new.iter() {
+        client.insert(k.clone(), v.clone());
+    }
+    if client != before || !entity.nbt.contains_key(&JavaString::from("client")) {
         entity.nbt.insert("client".into(), Tag::Compound(client));
         game.native_sync_block_entity(pos);
     }
+}
+
+/// The frequency's name as the screens show it.
+fn frequency_label(nbt: &Compound) -> Option<String> {
+    get_string(nbt, "freq_name").or_else(|| get_string(nbt, "frequency"))
 }
 
 /// A player's frequency packet, on the server: set the block's frequency (making it when it is new),
@@ -9187,7 +9364,12 @@ fn freq_buttons(block: &str) -> [[f32; 4]; 2] {
 }
 
 fn is_freq_screen(block: &str) -> bool {
-    freq_type(block).is_some()
+    matches!(freq_type(block), Some(0 | 1))
+}
+
+/// A selector is showing: the teleporters' and entangloporters' own screens, or a QIO block's.
+fn freq_open(block: &str) -> bool {
+    is_freq_screen(block) || qio_select_open(block)
 }
 
 /// The listed frequencies in the selector's mode.
@@ -9213,7 +9395,7 @@ fn submit_frequency_field(game: &Game<'_>, pos: [i32; 3], ui: &mut FreqUi) {
 /// A press on the selector, on the client: the mode buttons, the list (a row selects it, the bar
 /// scrolls it), the text box and its checkmark, Set, Delete, and the teleporter's colour.
 fn frequency_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool) -> bool {
-    let Some((pos, view)) = freq_view(game).filter(|_| is_freq_screen(block)) else {
+    let Some((pos, view)) = freq_view(game).filter(|_| freq_open(block)) else {
         return false;
     };
     let shown: Vec<freq::Entry> = with_freq_ui(pos, &view, |ui| freq_shown(game, &view, ui.mode).into_iter().cloned().collect());
@@ -9285,28 +9467,31 @@ fn frequency_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool) -> b
 
 /// Whether the selector's text box has focus (hook point `native_screen_typing`).
 pub(super) fn screen_typing(block: &str, typing: &mut bool) {
-    if is_freq_screen(block) {
+    if freq_open(block) {
         *typing |= FREQ_UI.with_borrow(|ui| ui.text.focused);
     }
-    *typing |= qio_typing(block) || filter_typing(block) || adapter_typing(block);
+    if !qio_select_open(block) {
+        *typing |= qio_typing(block) || filter_typing(block) || adapter_typing(block);
+    }
 }
 
 /// A key on the selector's focused text box (hook point `native_screen_key`): Enter sets the name as
 /// a new frequency (`setEnterHandler`).
 pub(super) fn screen_key(game: &mut Game<'_>, block: &str, key: &str, text: Option<&str>) {
-    if kind(block) == Some(Kind::QioDashboard) && game.native_on(MOD_ID) {
+    let select = qio_select_open(block);
+    if !select && kind(block) == Some(Kind::QioDashboard) && game.native_on(MOD_ID) {
         qio_key(game, key, text);
         return;
     }
-    if is_filter_screen(block) {
+    if !select && is_filter_screen(block) {
         filter_key(key, text);
         return;
     }
-    if kind(block) == Some(Kind::QioRedstoneAdapter) {
+    if !select && kind(block) == Some(Kind::QioRedstoneAdapter) {
         adapter_key(game, key, text);
         return;
     }
-    if !is_freq_screen(block) || !game.native_on(MOD_ID) {
+    if !freq_open(block) || !game.native_on(MOD_ID) {
         return;
     }
     let Some((pos, _)) = freq_view(game) else {
@@ -9381,7 +9566,18 @@ fn draw_frequency_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBa
         sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
         sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
     }
-    let Some((pos, view)) = view else {
+    draw_freq_selector(game, batch, block, origin);
+}
+
+/// The frequency selector (`GuiFrequencySelector`) drawn from `origin`: the mode buttons, the list, the
+/// frequency in use, the name box with its checkmark, Set and Delete.
+fn draw_freq_selector(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let at = |r: [f32; 4]| [ox + r[0], oy + r[1], r[2], r[3]];
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    let teleporter = kind(block) == Some(Kind::Teleporter);
+    let Some((pos, view)) = freq_view(game) else {
         return;
     };
     with_freq_ui(pos, &view, |ui| {
@@ -9624,6 +9820,7 @@ fn sorter_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
     if is_qio_filter(&entity.id) {
         put_int(&mut client, "qio", 1);
         if let Some(f) = get_string(&entity.nbt, "frequency") {
+            let label = frequency_label(&entity.nbt).unwrap_or_else(|| f.clone());
             let (net, at) = load_network(game, &f);
             if !at.is_empty() {
                 let (items, item_cap, types, type_cap) = net.totals();
@@ -9632,7 +9829,7 @@ fn sorter_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
                 put_long(&mut client, "types", types as u64);
                 put_long(&mut client, "type_cap", type_cap as u64);
             }
-            client.insert("frequency".into(), Tag::String(f.as_str().into()));
+            client.insert("frequency".into(), Tag::String(label.as_str().into()));
         }
     }
     client.insert("filters".into(), string_list(&s.filters));
@@ -9641,11 +9838,13 @@ fn sorter_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
     put_int(&mut client, "single", u32::from(s.single_item));
     put_int(&mut client, "eject", u32::from(s.auto_eject));
     put_int(&mut client, "round_robin", u32::from(s.round_robin));
-    let same = matches!(entity.nbt.get(&JavaString::from("client")), Some(Tag::Compound(c)) if *c == client);
-    if !same {
-        entity.nbt.insert("client".into(), Tag::Compound(client));
-        game.native_sync_block_entity(pos);
-    }
+    put_client(
+        game,
+        pos,
+        entity,
+        &["filters", "disabled", "filter_opts", "single", "eject", "round_robin", "qio", "frequency", "items", "item_cap", "types", "type_cap"],
+        client,
+    );
 }
 
 /// A player's sorter packet, on the server: a switch, a filter moved, enabled, deleted or added from
@@ -9949,7 +10148,7 @@ const QIO_HEIGHT: f32 = 247.0;
 /// What the screens show of the network, in the block entity's `client` compound.
 fn qio_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, net: Option<&qio::Network>) {
     let mut client = Compound::new();
-    if let Some(f) = get_string(&entity.nbt, "frequency") {
+    if let Some(f) = frequency_label(&entity.nbt) {
         client.insert("frequency".into(), Tag::String(f.as_str().into()));
     }
     if let Some(net) = net {
@@ -9959,11 +10158,7 @@ fn qio_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, net
         put_long(&mut client, "types", types as u64);
         put_long(&mut client, "type_cap", type_cap as u64);
     }
-    let same = matches!(entity.nbt.get(&JavaString::from("client")), Some(Tag::Compound(c)) if *c == client);
-    if !same {
-        entity.nbt.insert("client".into(), Tag::Compound(client));
-        game.native_sync_block_entity(pos);
-    }
+    put_client(game, pos, entity, &["frequency", "items", "item_cap", "types", "type_cap"], client);
 }
 
 /// A dashboard's search, from its player: `pos` and the text.
@@ -10024,7 +10219,7 @@ fn qio_slots(block: &str) -> Vec<Option<[f32; 2]>> {
 
 fn qio_screen(block: &str) -> super::native_hooks::NativeScreen {
     if kind(block) == Some(Kind::QioDriveArray) {
-        super::native_hooks::NativeScreen { width: 176.0, height: 206.0, slots: qio_slots(block), inventory_y: 124.0, inventory_x: 8.0, own_labels: true }
+        super::native_hooks::NativeScreen { width: 176.0, height: 206.0, slots: qio_slots(block), inventory_y: 124.0, inventory_x: 8.0, own_labels: true, alt: None }
     } else {
         super::native_hooks::NativeScreen {
             width: QIO_WIDTH,
@@ -10033,6 +10228,7 @@ fn qio_screen(block: &str) -> super::native_hooks::NativeScreen {
             inventory_y: QIO_HEIGHT - 82.0,
             inventory_x: 8.0 + (QIO_WIDTH - 176.0) / 2.0,
             own_labels: true,
+            alt: None,
         }
     }
 }
@@ -10779,7 +10975,7 @@ fn adapter_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity)
     let mut client = Compound::new();
     let frequency = get_string(&entity.nbt, "frequency");
     let item = get_string(&entity.nbt, "filter");
-    if let Some(f) = &frequency {
+    if let Some(f) = frequency_label(&entity.nbt) {
         client.insert("frequency".into(), Tag::String(f.as_str().into()));
     }
     if let Some(i) = &item {
@@ -10791,11 +10987,7 @@ fn adapter_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity)
     put_long(&mut client, "count", get_long(&entity.nbt, "count"));
     put_int(&mut client, "inverted", get_int(&entity.nbt, "inverted"));
     put_int(&mut client, "fuzzy", get_int(&entity.nbt, "fuzzy"));
-    let same = matches!(entity.nbt.get(&JavaString::from("client")), Some(Tag::Compound(c)) if *c == client);
-    if !same {
-        entity.nbt.insert("client".into(), Tag::Compound(client));
-        game.native_sync_block_entity(pos);
-    }
+    put_client(game, pos, entity, &["frequency", "filter", "count", "inverted", "fuzzy", "stored"], client);
 }
 
 /// A player's press on the adapter's screen: `pos`, an op (0 the item in hand, 1 clear the item, 2 invert,
