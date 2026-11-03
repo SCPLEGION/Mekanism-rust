@@ -5449,7 +5449,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
         if kind(&entity.id) == Some(Kind::DigitalMiner) {
             entity.data.resize(redstone_slot(&l) + 1, 0);
             let n = get_int(&entity.nbt, "to_mine");
-            entity.data.extend([(n & 0x7FFF) as i32, (n >> 15 & 0x7FFF) as i32]);
+            entity.data.extend([(n & 0x7FFF) as i32, (n >> 15 & 0x7FFF) as i32, miner_region(&entity.nbt).radius]);
         }
         // Last, the transporter window's ejector: the output colour, the six input colours (each the
         // dye + 1, or 0 for none) and strict input.
@@ -5673,6 +5673,8 @@ enum TabKind {
     Redstone,
     /// A factory's auto-sort toggle (`GuiSortingTab`).
     Sort,
+    /// The Digital Miner's visuals toggle (`GuiVisualsTab`).
+    Visuals,
 }
 
 fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
@@ -5685,6 +5687,9 @@ fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
     }
     if matches!(kind(block), Some(Kind::Factory(..))) {
         out.push(Tab { at: [-26.0, 62.0], icon: "button/sorting", argb: 0xFFFF_FFFF, what: TabKind::Sort });
+    }
+    if kind(block) == Some(Kind::DigitalMiner) {
+        out.push(Tab { at: [-26.0, 6.0], icon: "button/visuals", argb: 0xFFFF_FFFF, what: TabKind::Visuals });
     }
     if t & TAB_UPGRADE != 0 {
         out.push(Tab { at: [right, 6.0], icon: "button/upgrade", argb: 0xFFFF_FFFF, what: TabKind::Upgrade });
@@ -5771,6 +5776,13 @@ fn tab_tooltip(block: &str, l: &Layout, data: &[i32], at: [f32; 2], lines: &mut 
         }
         TabKind::Redstone => lines.push(redstone_of(l, data).0.name().into()),
         TabKind::Sort => lines.push("Auto-Sort".into()),
+        TabKind::Visuals => {
+            let (shown, too_big) = (miner_visuals_on(data), miner_view(block, data).radius > 64);
+            lines.push(format!("Visuals: {}", if shown { "On" } else { "Off" }));
+            if too_big {
+                lines.push("\u{a7}cArea too large to display visuals.".into());
+            }
+        }
     }
     true
 }
@@ -7258,6 +7270,7 @@ fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], r
         Some(TabKind::Upgrade) if !right => set_window(block, Some(Window::Upgrades(None))),
         Some(TabKind::Transporter) if !right => set_window(block, Some(Window::Transporter)),
         Some(TabKind::Sort) if !right => *button = Some(BUTTON_SORT),
+        Some(TabKind::Visuals) if !right => miner_toggle_visuals(game),
         _ => {}
     }
 }
@@ -7525,6 +7538,7 @@ struct MinerView {
     silk: bool,
     low_power: bool,
     to_mine: u32,
+    radius: i32,
 }
 
 fn miner_view(block: &str, data: &[i32]) -> MinerView {
@@ -7539,6 +7553,7 @@ fn miner_view(block: &str, data: &[i32]) -> MinerView {
         silk: v >> 9 & 1 == 1,
         low_power: v >> 10 & 1 == 1,
         to_mine: n(1) | n(2) << 15,
+        radius: n(3) as i32,
     }
 }
 
@@ -11381,6 +11396,9 @@ pub(super) fn screen_alt(game: &Game<'_>, block: &str, alt: &mut bool) {
         return;
     }
     if kind(block) == Some(Kind::DigitalMiner) {
+        if let Some((x, y, z)) = game.container {
+            MINER_OPEN.set([x, y, z]);
+        }
         miner_screen_alt(game, alt);
         return;
     }
@@ -13228,6 +13246,51 @@ fn send_miner(game: &Game<'_>, pos: [i32; 3], op: u8, value: i32, text: &str) {
     data.extend(value.to_be_bytes());
     data.extend(text.as_bytes());
     game.native_send_to_server(MINER_CHANNEL, &data);
+}
+
+thread_local! {
+    /// The miners whose region this player shows (`clientRendering`).
+    static MINER_VISUALS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(Default::default());
+    /// The miner the open screen belongs to, for the tooltip, which gets no game.
+    static MINER_OPEN: std::cell::Cell<[i32; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+fn miner_visuals_on(_data: &[i32]) -> bool {
+    MINER_VISUALS.with_borrow(|v| v.contains(&MINER_OPEN.get()))
+}
+
+fn miner_toggle_visuals(game: &Game<'_>) {
+    if let Some((x, y, z)) = game.container {
+        MINER_VISUALS.with_borrow_mut(|v| {
+            if !v.remove(&[x, y, z]) {
+                v.insert([x, y, z]);
+            }
+        });
+    }
+}
+
+/// The regions of the miners that show them (hook point `native_world_boxes`, API 41): one translucent box
+/// each, 0.01 inside the region (`RenderDigitalMiner`), white at the faces' brightness. Only within 64.
+pub(super) fn world_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    let shown: Vec<[i32; 3]> = MINER_VISUALS.with_borrow(|v| v.iter().copied().collect());
+    for pos in shown {
+        let Some((id, c)) = game.native_client_block_entity(pos) else {
+            continue;
+        };
+        if kind(&id) != Some(Kind::DigitalMiner) {
+            continue;
+        }
+        let r = miner_region(c);
+        if r.radius > 64 {
+            continue;
+        }
+        let d = f64::from(r.diameter()) - 0.02;
+        let min = [f64::from(pos[0] - r.radius) + 0.01, f64::from(r.min_y) + 0.01, f64::from(pos[2] - r.radius) + 0.01];
+        let max = [min[0] + d, min[1] + f64::from(r.max_y - r.min_y) - 0.02, min[2] + d];
+        // `ARGB.white(alpha)`: east/west 0.78, up/down 0.82, north/south 0.8.
+        let (east_west, up_down, north_south) = (0xC7FF_FFFF, 0xD1FF_FFFF, 0xCCFF_FFFF);
+        boxes.push(super::native_hooks::NativeWorldBox { min, max, colors: [east_west, east_west, up_down, up_down, north_south, north_south] });
+    }
 }
 
 /// Opens the config screen from the main one, and keeps it open while the screen is.
