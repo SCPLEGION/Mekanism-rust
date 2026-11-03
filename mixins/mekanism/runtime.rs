@@ -162,6 +162,8 @@ enum Kind {
     Laser,
     LaserAmplifier,
     TractorBeam,
+    /// The Industrial Alarm: lit and turning while redstone powers it.
+    Alarm,
     /// A Seismic Vibrator: lets a Seismic Reader see under its chunk while it has energy.
     Vibrator,
     /// The Bio-Generator: bioethanol (from bio fuel) into energy.
@@ -190,6 +192,9 @@ fn kind(id: &str) -> Option<Kind> {
     }
     if bin::is_personal(id) {
         return Some(Kind::PersonalStorage);
+    }
+    if id == "mekanism:industrial_alarm" {
+        return Some(Kind::Alarm);
     }
     match id {
         qio::DRIVE_ARRAY => return Some(Kind::QioDriveArray),
@@ -506,6 +511,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::Entangloporter
             | Kind::Teleporter
             | Kind::QioRedstoneAdapter
+            | Kind::Alarm
             | Kind::QioExporter
             // Their bucket slots are not ported; the screen shows their tanks.
             | Kind::Activator,
@@ -696,6 +702,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             }
             Kind::QioRedstoneAdapter => {
                 tick_redstone_adapter(game, pos, entity);
+                None
+            }
+            Kind::Alarm => {
+                tick_alarm(game, pos);
                 None
             }
             Kind::Laser | Kind::LaserAmplifier | Kind::TractorBeam => tick_laser(game, pos, entity),
@@ -1341,6 +1351,8 @@ thread_local! {
 thread_local! {
     /// The personal chests this client has heard of: lid openness, the previous tick's, the tick last stepped
     /// (`TileEntityPersonalStorage` / `ChestLidController`).
+    /// The industrial alarms this client has heard of.
+    static ALARMS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
     static PCHESTS: std::cell::RefCell<std::collections::HashMap<[i32; 3], (f32, f32, u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
     /// The fluid tanks this client has heard of.
     static TANKS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
@@ -1352,6 +1364,10 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
     if id == "mekanismgenerators:wind_generator" {
         ROTORS.with_borrow_mut(|r| {
             r.entry(pos).or_insert((0.0, 0));
+        });
+    } else if id == "mekanism:industrial_alarm" {
+        ALARMS.with_borrow_mut(|a| {
+            a.insert(pos);
         });
     } else if id == bin::PERSONAL_CHEST {
         PCHESTS.with_borrow_mut(|c| {
@@ -1856,6 +1872,43 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
     } else {
         None
     };
+    // The industrial alarms (`RenderIndustrialAlarm`): the bulb and its aura turn about the facing axis, their
+    // alpha pulsing with the turn, while the alarm is active.
+    ALARMS.with_borrow_mut(|alarms| {
+        alarms.retain(|pos| {
+            if !matches!(game.native_client_block_entity(*pos), Some((id, _)) if id == "mekanism:industrial_alarm") {
+                return false;
+            }
+            if game.native_block_property(*pos, "active").as_deref() != Some("true") {
+                return true;
+            }
+            let (offset, tilt) = match game.native_block_property(*pos, "facing").as_deref() {
+                Some("down") => ([0.5, 1.0, 0.5], glam::Quat::from_rotation_x(std::f32::consts::PI)),
+                Some("north") => ([0.5, 0.5, 1.0], glam::Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+                Some("south") => ([0.5, 0.5, 0.0], glam::Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                Some("east") => ([0.0, 0.5, 0.5], glam::Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2)),
+                Some("west") => ([1.0, 0.5, 0.5], glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)),
+                _ => ([0.5, 0.0, 0.5], glam::Quat::IDENTITY),
+            };
+            let turn = (now as f32 + partial) * 10.0 % 360.0;
+            let alpha = 0.7 + 0.3 * (((turn * 2.0) % 360.0 - 180.0).abs() / 180.0);
+            let q = tilt * glam::Quat::from_rotation_y(turn.to_radians());
+            models.push(super::native_hooks::NativeWorldModel {
+                model: "mekanism:alarm_bulb".into(),
+                position: [f64::from(pos[0]) + offset[0], f64::from(pos[1]) + offset[1], f64::from(pos[2]) + offset[2]],
+                yaw: 0.0,
+                pitch: 0.0,
+                roll: 0.0,
+                light_at: *pos,
+                color: (((alpha * 255.0) as u32).min(255) << 24) | 0xFF_FFFF,
+                rotation: Some(q.to_array()),
+                full_bright: true,
+                scale: 1.0,
+                parts: Vec::new(),
+            });
+            true
+        });
+    });
     PCHESTS.with_borrow_mut(|chests| {
         chests.retain(|pos, (open, prev, tick)| {
             if !matches!(game.native_client_block_entity(*pos), Some((id, _)) if id == bin::PERSONAL_CHEST) {
@@ -12430,6 +12483,16 @@ fn tick_redstone_adapter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlo
     let powered = game.native_block_property(pos, "powered").as_deref() == Some("true");
     if emit != powered {
         game.native_set_block_property(pos, "powered", if emit { "true" } else { "false" });
+    }
+}
+
+/// `TileEntityIndustrialAlarm.onPowerChange`: the alarm is active while redstone powers it.
+fn tick_alarm(game: &mut Game<'_>, pos: [i32; 3]) {
+    let at = horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]);
+    let powered = game.with_level(|b, level, ticks| b.has_neighbor_signal(level, ticks, at));
+    let active = game.native_block_property(pos, "active").as_deref() == Some("true");
+    if powered != active {
+        game.native_set_block_property(pos, "active", if powered { "true" } else { "false" });
     }
 }
 
