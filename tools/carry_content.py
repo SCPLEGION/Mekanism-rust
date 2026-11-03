@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import block_shapes
 import bounding  # noqa: E402
 import flatten_models  # noqa: E402
+import obj_models  # noqa: E402
 import worn_models  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,8 +95,9 @@ def pipe_declaration(size):
 
 
 def pipe_models(ns, out, name, blockstate):
-    """Vanilla element models for a transmitter whose blockstate uses Mekanism's OBJ model: a centre cube
-    and an arm per joined side, as a multipart blockstate. Returns its size, or None."""
+    """Vanilla element models for a transmitter whose blockstate uses Mekanism's OBJ model, taken from the OBJ
+    itself: per side the arm of `<side>NORMAL` and the centre face of `<side>NONE`, as a multipart blockstate.
+    Returns its size, or None. (The push and pull arms need the connection modes, which are not synced.)"""
     try:
         model_id = blockstate["variants"][""]["model"]
     except (KeyError, TypeError):
@@ -108,25 +110,54 @@ def pipe_models(ns, out, name, blockstate):
     side = textures.get("side_opaque") or textures.get("side")
     if not center or not side:
         return None
-    lo, hi = PIPE_SIZES[size]
-    cube = {d: {"texture": "#center"} for d in DIRECTIONS}
-    write_json(models / "block" / "transmitter" / "horizon" / f"{name}_center.json", {
-        "parent": "block/block",
-        "textures": {"particle": center, "center": center},
-        "elements": [{"from": [lo, lo, lo], "to": [hi, hi, hi], "faces": cube}],
-    })
-    arm_faces = {d: {"texture": "#side", "uv": [0, 0, 16, 16]} for d in ("east", "west", "up", "down")}
-    arm_faces["north"] = {"texture": "#center", "cullface": "north"}
-    write_json(models / "block" / "transmitter" / "horizon" / f"{name}_arm.json", {
-        "textures": {"particle": center, "center": center, "side": side},
-        "elements": [{"from": [lo, lo, 0], "to": [hi, hi, lo], "faces": arm_faces}],
-    })
+    obj_path = next(iter(SRC.glob(f"**/models/block/transmitter_{size}.obj.mek")), None)
+    if obj_path is None:
+        return None
+    mtl_path = obj_path.with_name(f"transmitter_{size}.mtl")
+    text, mtl_text = obj_path.read_text(), mtl_path.read_text()
+    mtl = obj_models.parse_mtl(mtl_text)
+    lo, hi = (v / 16 for v in PIPE_SIZES[size])
+    arms, caps = {}, {}
+    half = (hi - lo) / 2
+    for obj in obj_models.parse(text):
+        for d in DIRECTIONS:
+            if obj["name"] == d + "NORMAL":
+                el, why = obj_models.element(obj, True, (0.0, 0.0, 0.0), mtl)
+                if el is not None:
+                    arms[d] = el
+            elif obj["name"] == d + "NONE":
+                quad = obj["faces"][0]
+                local = [((p[0] - 0.5, p[1] - 0.5, p[2] - 0.5), uv) for p, uv in quad]
+                face = obj_models.face_of(d, local, (-half,) * 3, (half,) * 3, True)
+                if face is not None:
+                    if face.get("rotation") == 0:
+                        face.pop("rotation")
+                    var = mtl.get(obj["materials"][0], ("#" + str(obj["materials"][0]), False))[0]
+                    face["texture"] = var
+                    caps[d] = {"from": [lo * 16] * 3, "to": [hi * 16] * 3, "faces": {d: face}}
+    if set(arms) != set(DIRECTIONS) or set(caps) != set(DIRECTIONS):
+        return None
+
+    def remap(el):
+        for f in el["faces"].values():
+            f["texture"] = "#center" if f["texture"].startswith("#center") else "#side"
+        return el
+
+    tex = {"particle": center, "center": center, "side": side}
     base = f"{ns}:block/transmitter/horizon/{name}"
-    parts = [{"apply": {"model": f"{base}_center"}}]
     for d in DIRECTIONS:
-        parts.append({"when": {d: "false"}, "apply": {"model": f"{base}_arm", **ARM_ROTATION[d]}})
+        write_json(models / "block" / "transmitter" / "horizon" / f"{name}_arm_{d}.json",
+                   {"textures": tex, "elements": [remap(arms[d])]})
+        write_json(models / "block" / "transmitter" / "horizon" / f"{name}_cap_{d}.json",
+                   {"textures": tex, "elements": [remap(caps[d])]})
+    parts = []
+    for d in DIRECTIONS:
+        parts.append({"when": {d: "false"}, "apply": {"model": f"{base}_arm_{d}"}})
+        parts.append({"when": {d: "true"}, "apply": {"model": f"{base}_cap_{d}"}})
     write_json(out / "assets" / ns / "blockstates" / f"{name}.json", {"multipart": parts})
     # The item shows the bare centre, as Mekanism's item model does.
+    write_json(models / "block" / "transmitter" / "horizon" / f"{name}_center.json",
+               {"parent": "block/block", "textures": tex, "elements": [remap(json.loads(json.dumps(caps[d]))) for d in DIRECTIONS]})
     write_json(models / "item" / f"{name}.json", {"parent": f"{base}_center"})
     return size
 
