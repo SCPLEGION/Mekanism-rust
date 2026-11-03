@@ -67,9 +67,13 @@ enum Kind {
     /// A pressurized tube and the mB it carries in a tick.
     Tube(u64),
     Oxidizer,
+    /// A Pigment Extractor: an item into pigment, as the oxidizer makes gas.
+    PigmentExtractor,
     /// A purification chamber or osmium compressor: an item and a chemical each tick.
     Advanced(&'static chem::AdvancedMachine),
     ChemicalInfuser,
+    /// A Pigment Mixer: two pigments into a third, as the chemical infuser does.
+    PigmentMixer,
     /// A Thermal Evaporation Plant's controller; the tower's other blocks have no block entity.
     Evaporation,
     /// A Rotary Condensentrator, decondensentrating: a fluid into its chemical.
@@ -194,6 +198,8 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanismgenerators:wind_generator" => return Some(Kind::Wind),
         "mekanismgenerators:gas_burning_generator" => return Some(Kind::GasGenerator),
         "mekanism:chemical_oxidizer" => return Some(Kind::Oxidizer),
+        "mekanism:pigment_extractor" => return Some(Kind::PigmentExtractor),
+        "mekanism:pigment_mixer" => return Some(Kind::PigmentMixer),
         chem::LIQUIFIER => return Some(Kind::Liquifier),
         fa::BLOCK => return Some(Kind::Assemblicator),
         "mekanism:chemical_infuser" => return Some(Kind::ChemicalInfuser),
@@ -361,7 +367,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         return;
     }
     // The machines whose only slot is the energy slot (`EnergyInventorySlot`), which automation fills.
-    if matches!(kind(block), Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer)) {
+    if matches!(kind(block), Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::PigmentMixer | Kind::Washer)) {
         // Their energy slot and chemical slots: a hopper's five slots, which the furnace's roles would spoil.
         let used: Vec<usize> = (0..3).filter(|&i| layout(block).is_some_and(|l| l.slots[i].is_some())).chain(3..3 + extra_slots(block).len()).collect();
         *container = Some(ModContainer {
@@ -419,7 +425,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::Solar(..)) if block.ends_with("advanced_solar_generator") => (vec![0], vec![]),
         // The oxidizer's item goes in the first slot; the separator takes water buckets there and gives
         // the empty buckets back in the last.
-        Some(Kind::Oxidizer | Kind::Dissolution) => (vec![0, 1], vec![]),
+        Some(Kind::Oxidizer | Kind::PigmentExtractor | Kind::Dissolution) => (vec![0, 1], vec![]),
         // The food in the first slot, the energy slot, the item it leaves in the last (and a bucket's two slots after).
         Some(Kind::Liquifier) => (vec![0, 1], vec![2]),
         // The crystallizer's crystals come out of the last slot.
@@ -542,7 +548,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 tick_cable(game, pos, entity, rate);
                 None
             }
-            Kind::Oxidizer => tick_oxidizer(game, pos, entity),
+            Kind::Oxidizer => tick_oxidizer(game, pos, entity, false),
+            Kind::PigmentExtractor => tick_oxidizer(game, pos, entity, true),
             Kind::Liquifier => tick_liquifier(game, pos, entity),
             Kind::Assemblicator => tick_assemblicator(game, pos, entity),
             Kind::Dissolution => tick_dissolution(game, pos, entity),
@@ -586,7 +593,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 tick_teleporter(game, pos, entity);
                 None
             }
-            Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity),
+            Kind::ChemicalInfuser => tick_chemical_infuser(game, pos, entity, false),
+            Kind::PigmentMixer => tick_chemical_infuser(game, pos, entity, true),
             Kind::Evaporation => tick_evaporation(game, pos, entity),
             Kind::Rotary => tick_rotary(game, pos, entity),
             Kind::Transporter(pull) => {
@@ -662,8 +670,14 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     if let Some(active) = active {
         let lit = if active { "true" } else { "false" };
         // Blocks without the furnace's `lit` (the solar generator's iron block) show no state.
-        if game.native_block_property(pos, "lit").is_some_and(|now| now != lit) {
-            game.native_set_block_property(pos, "lit", lit);
+        // (A barrel-based machine, one that faces up or down, has `open` instead.)
+        for key in ["lit", "open"] {
+            if let Some(now) = game.native_block_property(pos, key) {
+                if now != lit {
+                    game.native_set_block_property(pos, key, lit);
+                }
+                break;
+            }
         }
     }
 }
@@ -674,11 +688,11 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
 /// item in it: the item gives its energy to the machine's buffer before the machine runs.
 fn discharge_energy_slot(entity: &mut ModBlockEntity) {
     let index = match kind(&entity.id) {
-        Some(Kind::Oxidizer | Kind::Dissolution | Kind::Crystallizer | Kind::Separator | Kind::Rotary | Kind::Liquifier) => 1,
+        Some(Kind::Oxidizer | Kind::PigmentExtractor | Kind::Dissolution | Kind::Crystallizer | Kind::Separator | Kind::Rotary | Kind::Liquifier) => 1,
         Some(Kind::Machine("combining", _) | Kind::Advanced(_) | Kind::Infuser | Kind::Nucleosynthesizer) => 3,
         Some(Kind::Pump | Kind::Plenisher) => 2,
         Some(Kind::Assemblicator) => fa::ENERGY_SLOT,
-        Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::Washer | Kind::Heater | Kind::Vibrator) => 0,
+        Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::PigmentMixer | Kind::Washer | Kind::Heater | Kind::Vibrator) => 0,
         _ => return,
     };
     let capacity = energy_capacity(entity);
@@ -1306,6 +1320,20 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
         Kind::Tube(rate) if !from_tube => Some(("chemical", rate)),
         Kind::ChemicalTank(t) if d != [0, 1, 0] => Some(("chemical", chem::chemical_tank(t).0)),
         Kind::Advanced(m) if m.chemicals.contains(&chemical) && get_tank(nbt, "chemical", chem::ADVANCED_TANK).accepts(chemical) => Some(("chemical", chem::ADVANCED_TANK)),
+        // The pigment mixer takes the pigments some recipe uses, in the same two tanks.
+        Kind::PigmentMixer if mekanism_core::recipes::pigment_mixing_input(chemical) => {
+            let cap = chem::PIGMENT_MIXER_TANK;
+            let (left, right) = (get_tank(nbt, "left", cap), get_tank(nbt, "right", cap));
+            let holds = |t: &ChemicalTank| t.chemical.as_deref() == Some(chemical);
+            let key = if holds(&left) || (!holds(&right) && left.amount == 0) {
+                "left"
+            } else if holds(&right) || right.amount == 0 {
+                "right"
+            } else {
+                return None;
+            };
+            Some((key, cap))
+        }
         // The chemical infuser fills whichever input tank holds this chemical, else an empty one.
         Kind::ChemicalInfuser if mekanism_core::recipes::infusing_input(chemical) => {
             let cap = chem::CHEMICAL_INFUSER_TANK;
@@ -1464,18 +1492,28 @@ fn push_chemical(
 
 /// The Chemical Oxidizer: an item becomes a chemical over 100 ticks at 15 FE a tick, pushed out to the
 /// tanks beside it.
-fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = chem::OXIDIZER_USAGE * u64::from(chem::OXIDIZER_TICKS);
+fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, pigment: bool) -> Option<bool> {
+    let (usage, ticks, tank_size) = if pigment {
+        (chem::PIGMENT_EXTRACTOR_USAGE, chem::PIGMENT_EXTRACTOR_TICKS, chem::PIGMENT_EXTRACTOR_TANK)
+    } else {
+        (chem::OXIDIZER_USAGE, chem::OXIDIZER_TICKS, chem::OXIDIZER_TANK)
+    };
+    let capacity = usage * u64::from(ticks);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
-    let mut tank = get_tank(&entity.nbt, "output", chem::OXIDIZER_TANK);
+    let mut tank = get_tank(&entity.nbt, "output", tank_size);
     let mut progress = get_int(&entity.nbt, "progress");
     let mut active = false;
     drain_tank_into_item(entity, 3, &mut tank);
     let recipe = entity.items.first().cloned().flatten().and_then(|stack| {
         let items = world_items!(game);
         let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
-        mekanism_core::recipes::find_oxidizing(&stack.item, stack.count, &in_tag).map(|r| (stack, *r))
+        if pigment {
+            mekanism_core::recipes::find_pigment_extracting(&stack.item, stack.count, &in_tag)
+        } else {
+            mekanism_core::recipes::find_oxidizing(&stack.item, stack.count, &in_tag)
+        }
+        .map(|r| (stack, *r))
     });
     let warn = match &recipe {
         None if entity.items.first().is_some_and(|s| s.is_some()) => 8,
@@ -1485,10 +1523,10 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     put_int(&mut entity.nbt, "warn", warn);
     match recipe {
         Some((stack, r)) if tank.accepts(r.output) && tank.amount + r.amount <= tank.capacity => {
-            if energy.consume(chem::OXIDIZER_USAGE) {
+            if energy.consume(usage) {
                 active = true;
                 progress += 1;
-                if progress >= chem::OXIDIZER_TICKS {
+                if progress >= ticks {
                     progress = 0;
                     tank.insert(r.output, r.amount);
                     let left = stack.count - r.input_count;
@@ -1507,7 +1545,7 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
         (energy.stored * 1000 / capacity) as i32,
         1000,
         progress as i32,
-        chem::OXIDIZER_TICKS as i32,
+        ticks as i32,
     ];
     Some(active)
 }
@@ -1930,27 +1968,33 @@ fn tick_nucleosynthesizer(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> O
 /// The Chemical Infuser: one operation a tick of two chemicals into a third (oxygen + sulfur dioxide →
 /// sulfur trioxide), 15 FE a tick, pushed out to the blocks beside it. Each input tank takes one of the
 /// two chemicals (`chemical_receiver`).
-fn tick_chemical_infuser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    let cap = chem::CHEMICAL_INFUSER_TANK;
-    let capacity = machine::STORAGE_MULTIPLIER * chem::CHEMICAL_INFUSER_USAGE;
+fn tick_chemical_infuser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, pigment: bool) -> Option<bool> {
+    let (cap, usage, out_cap) = if pigment {
+        (chem::PIGMENT_MIXER_TANK, chem::PIGMENT_MIXER_USAGE, chem::PIGMENT_MIXER_TANK * 2)
+    } else {
+        (chem::CHEMICAL_INFUSER_TANK, chem::CHEMICAL_INFUSER_USAGE, chem::CHEMICAL_INFUSER_TANK)
+    };
+    let valid = if pigment { mekanism_core::recipes::pigment_mixing_input } else { mekanism_core::recipes::infusing_input };
+    let find = if pigment { mekanism_core::recipes::find_pigment_mixing } else { mekanism_core::recipes::find_chemical_infusing };
+    let capacity = machine::STORAGE_MULTIPLIER * usage;
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut left = get_tank(&entity.nbt, "left", cap);
     let mut right = get_tank(&entity.nbt, "right", cap);
-    let mut out = get_tank(&entity.nbt, "output", cap);
+    let mut out = get_tank(&entity.nbt, "output", out_cap);
     let mut active = false;
-    fill_tank_from_item(entity, 1, &mut left, mekanism_core::recipes::infusing_input);
-    fill_tank_from_item(entity, 2, &mut right, mekanism_core::recipes::infusing_input);
+    fill_tank_from_item(entity, 1, &mut left, valid);
+    fill_tank_from_item(entity, 2, &mut right, valid);
     drain_tank_into_item(entity, 3, &mut out);
     if let (Some(a), Some(b)) = (left.chemical.clone(), right.chemical.clone())
-        && let Some((r, swapped)) = mekanism_core::recipes::find_chemical_infusing(&a, &b)
+        && let Some((r, swapped)) = find(&a, &b)
     {
         let (need_a, need_b) = if swapped { (r.right_amount, r.left_amount) } else { (r.left_amount, r.right_amount) };
         if left.amount >= need_a
             && right.amount >= need_b
             && out.accepts(r.output)
             && out.amount + r.amount <= out.capacity
-            && energy.consume(chem::CHEMICAL_INFUSER_USAGE)
+            && energy.consume(usage)
         {
             left.extract(need_a);
             right.extract(need_b);
@@ -2740,6 +2784,8 @@ fn serves(family: &str, kind: Kind) -> bool {
             Kind::Reaction
                 | Kind::Entangloporter
                 | Kind::Oxidizer
+                | Kind::PigmentExtractor
+                | Kind::PigmentMixer
                 | Kind::Advanced(_)
                 | Kind::Nucleosynthesizer
                 | Kind::ChemicalInfuser
@@ -2766,6 +2812,8 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::Factory(..)
                 | Kind::HeatGenerator
                 | Kind::Oxidizer
+                | Kind::PigmentExtractor
+                | Kind::PigmentMixer
                 | Kind::Liquifier
                 | Kind::Assemblicator
                 | Kind::Dissolution
@@ -3612,6 +3660,8 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::EnergyCube(t) if facing_away => Some(tier::energy_cube(t)),
         Kind::Cable(rate) if !from_cable => Some((rate, rate)),
         Kind::Oxidizer => Some((chem::OXIDIZER_USAGE * u64::from(chem::OXIDIZER_TICKS), u64::MAX)),
+        Kind::PigmentExtractor => Some((chem::PIGMENT_EXTRACTOR_USAGE * u64::from(chem::PIGMENT_EXTRACTOR_TICKS), u64::MAX)),
+        Kind::PigmentMixer => Some((machine::STORAGE_MULTIPLIER * chem::PIGMENT_MIXER_USAGE, u64::MAX)),
         Kind::Liquifier => Some((chem::LIQUIFIER_USAGE * u64::from(chem::LIQUIFIER_TICKS), u64::MAX)),
         Kind::Assemblicator => Some((asm_capacity(nbt), u64::MAX)),
         Kind::Dissolution => Some((machine::STORAGE_MULTIPLIER * nuclear::DISSOLUTION_USAGE, u64::MAX)),
@@ -4065,16 +4115,19 @@ pub(super) fn place_bounding_blocks(game: &mut Game<'_>, stack: &ItemStack, pos:
     }
 }
 
-/// A machine broken at `pos` takes its bounding blocks with it (`removeBoundingBlocks`).
-pub(super) fn clear_bounding_blocks(game: &mut Game<'_>, pos: [i32; 3]) {
-    if !game.native_on(MOD_ID) {
+/// A machine that stopped being at `pos` (`old`, with its properties) takes its bounding blocks with it
+/// (`removeBoundingBlocks`), whatever removed it: a player, an explosion, a piston, a command.
+pub(super) fn clear_bounding_blocks(
+    game: &mut Game<'_>,
+    pos: [i32; 3],
+    old: &str,
+    old_properties: &std::collections::BTreeMap<String, String>,
+) {
+    if !game.native_on(MOD_ID) || bounding::cells(old).is_none() {
         return;
     }
-    let id = game.native_block(pos);
-    if bounding::cells(&id).is_none() {
-        return;
-    }
-    for (at, bounding_id) in bounding::fill(&id, &machine_facing(game, pos), pos) {
+    let facing = old_properties.get("facing").map_or("north", String::as_str);
+    for (at, bounding_id) in bounding::fill(old, facing, pos) {
         if game.native_block(at) == bounding_id {
             game.native_set_block(at, "minecraft:air", &[]);
         }
@@ -5213,6 +5266,24 @@ const CHEMICALS: &[(&str, &str, u32)] = &[
     ("mekanismgenerators:deuterium", "Deuterium", 0xFF3232),
     ("mekanismgenerators:tritium", "Tritium", 0x64FF70),
     ("mekanismgenerators:fusion_fuel", "D-T Fuel", 0x7E007D),
+        ("mekanism:aqua", "Aqua", 0x30FFF9),
+        ("mekanism:black", "Black", 0x404040),
+        ("mekanism:blue", "Blue", 0x366BD0),
+        ("mekanism:brown", "Brown", 0xA17649),
+        ("mekanism:cyan", "Cyan", 0x00F3D0),
+        ("mekanism:dark_red", "Dark Red", 0xC9071F),
+        ("mekanism:gray", "Gray", 0x7A7A7A),
+        ("mekanism:green", "Green", 0x59C15F),
+        ("mekanism:light_blue", "Light Blue", 0x559EFF),
+        ("mekanism:light_gray", "Light Gray", 0xCFCFCF),
+        ("mekanism:lime", "Lime", 0x75FF89),
+        ("mekanism:magenta", "Magenta", 0xD55ECB),
+        ("mekanism:orange", "Orange", 0xFFA160),
+        ("mekanism:pink", "Pink", 0xFFBCC4),
+        ("mekanism:purple", "Purple", 0xA460D9),
+        ("mekanism:red", "Red", 0xFF383C),
+        ("mekanism:white", "White", 0xFFFFFF),
+        ("mekanism:yellow", "Yellow", 0xFFDD4F),
 ];
 
 fn chemical_index(id: Option<&str>) -> i32 {
@@ -5293,6 +5364,13 @@ fn layout(block: &str) -> Option<Layout> {
         Kind::Oxidizer => Layout {
             slots: [Some(([26.0, 36.0], "slot/normal")), Some(([152.0, 14.0], "slot/power")), None],
             gauges: vec![gauge("output", chem::OXIDIZER_TANK, 131.0, 13.0, STANDARD)],
+            power: Some(PowerBar::Horizontal([115.0, 75.0])),
+            progress: large_right(64.0, 40.0),
+        },
+        // TileEntityPigmentExtractor and GuiPigmentExtractor: the oxidizer's screen.
+        Kind::PigmentExtractor => Layout {
+            slots: [Some(([26.0, 36.0], "slot/normal")), Some(([152.0, 14.0], "slot/power")), None],
+            gauges: vec![gauge("output", chem::PIGMENT_EXTRACTOR_TANK, 131.0, 13.0, STANDARD)],
             power: Some(PowerBar::Horizontal([115.0, 75.0])),
             progress: large_right(64.0, 40.0),
         },
@@ -5576,6 +5654,17 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Horizontal([115.0, 75.0])),
             progress: None,
         },
+        // GuiPigmentMixer: the chemical infuser's screen with 1,000 mB inputs and a 2,000 mB output.
+        Kind::PigmentMixer => Layout {
+            slots: [Some(([154.0, 14.0], "slot/power")), Some(([6.0, 56.0], "slot/normal")), Some(([154.0, 56.0], "slot/normal"))],
+            gauges: vec![
+                gauge("left", chem::PIGMENT_MIXER_TANK, 25.0, 13.0, STANDARD),
+                gauge("output", chem::PIGMENT_MIXER_TANK * 2, 79.0, 4.0, STANDARD),
+                gauge("right", chem::PIGMENT_MIXER_TANK, 133.0, 13.0, STANDARD),
+            ],
+            power: Some(PowerBar::Horizontal([115.0, 75.0])),
+            progress: None,
+        },
         // GuiChemicalWasher: water, dirty slurry, clean slurry.
         Kind::Washer => Layout {
             slots: [Some(([152.0, 14.0], "slot/power")), Some(([152.0, 56.0], "slot/normal")), None],
@@ -5772,6 +5861,8 @@ fn miner_flags(nbt: &Compound) -> u32 {
 fn base_usage(k: Kind) -> Option<u64> {
     Some(match k {
         Kind::Oxidizer => chem::OXIDIZER_USAGE,
+        Kind::PigmentExtractor => chem::PIGMENT_EXTRACTOR_USAGE,
+        Kind::PigmentMixer => chem::PIGMENT_MIXER_USAGE,
         Kind::Liquifier => chem::LIQUIFIER_USAGE,
         Kind::Dissolution => nuclear::DISSOLUTION_USAGE,
         Kind::Centrifuge => nuclear::CENTRIFUGE_USAGE,
@@ -5828,7 +5919,7 @@ fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
         // The bucket slot under the water slot (`outputInputSlot`).
         Some(Kind::Evaporation) => vec![([28.0, 51.0], "slot/output")],
         // `ChemicalInventorySlot`s: the output's drain slot, the input's fill slot (`TileEntityChemical*`).
-        Some(Kind::Oxidizer) => vec![([152.0, 55.0], "slot/normal")],
+        Some(Kind::Oxidizer | Kind::PigmentExtractor) => vec![([152.0, 55.0], "slot/normal")],
         // `FluidInventorySlot.drain` (the bucket to fill) and the filled container's output slot.
         Some(Kind::Liquifier) => vec![([155.0, 25.0], "slot/normal"), ([155.0, 56.0], "slot/output")],
         Some(Kind::Assemblicator) => (2..fa::INPUTS)
@@ -5839,7 +5930,7 @@ fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
             .collect(),
         Some(Kind::Dissolution) => vec![([8.0, 65.0], "slot/normal"), ([152.0, 55.0], "slot/normal")],
         Some(Kind::Crystallizer) => vec![([8.0, 65.0], "slot/normal")],
-        Some(Kind::ChemicalInfuser) => vec![([80.0, 65.0], "slot/normal")],
+        Some(Kind::ChemicalInfuser | Kind::PigmentMixer) => vec![([80.0, 65.0], "slot/normal")],
         Some(Kind::Separator) => vec![([59.0, 52.0], "slot/normal"), ([101.0, 52.0], "slot/normal")],
         // The chemical side's drain slot and the output it moves a full item to.
         Some(Kind::Rotary) => vec![([5.0, 25.0], "slot/normal"), ([5.0, 56.0], "slot/output")],
@@ -5944,6 +6035,8 @@ fn tabs(block: &str) -> u8 {
             Kind::Machine(..)
             | Kind::Factory(..)
             | Kind::Oxidizer
+            | Kind::PigmentExtractor
+            | Kind::PigmentMixer
             | Kind::Liquifier
             | Kind::Assemblicator
             | Kind::Dissolution
@@ -6479,7 +6572,7 @@ thread_local! {
 fn chemical_layout_slots(block: &str) -> &'static [usize] {
     match kind(block) {
         Some(Kind::Centrifuge) => &[1, 2],
-        Some(Kind::ChemicalInfuser) => &[1, 2],
+        Some(Kind::ChemicalInfuser | Kind::PigmentMixer) => &[1, 2],
         Some(Kind::Washer) => &[1],
         _ => &[],
     }
@@ -7988,7 +8081,7 @@ fn extras(block: &str) -> Extras {
     let large = |x, y| ([x, y], "progress/large_right", [48.0, 8.0]);
     match kind(block) {
         Some(Kind::Activator | Kind::Centrifuge) => Extras { active_progress: vec![large(64.0, 39.0)], ..none },
-        Some(Kind::ChemicalInfuser) => Extras {
+        Some(Kind::ChemicalInfuser | Kind::PigmentMixer) => Extras {
             active_progress: vec![([47.0, 39.0], "progress/small_right", [28.0, 8.0]), ([101.0, 39.0], "progress/small_left", [28.0, 8.0])],
             ..none
         },
@@ -8107,7 +8200,7 @@ thread_local! {
 
 fn draw_nucleosynthesizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
     let [ox, oy] = origin;
-    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit")).as_deref() == Some("true");
+    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit").or_else(|| game.native_block_property(p, "open"))).as_deref() == Some("true");
     let screen = [ox + 45.0, oy + 18.0, 104.0, 68.0];
     nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, screen, 0xFFFF_FFFF);
     let rate = if lit { "100%" } else { "0%" };
@@ -8781,7 +8874,7 @@ fn draw_dynamic_rate_bar(game: &Game<'_>, batch: &mut horizon_client::hud::HudBa
 fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, data: &[i32], origin: [f32; 2]) {
     let e = extras(block);
     let [ox, oy] = origin;
-    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit")).as_deref() == Some("true");
+    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit").or_else(|| game.native_block_property(p, "open"))).as_deref() == Some("true");
     for (at, name, [w, h]) in &e.active_progress {
         let state = if lit { "full" } else { "empty" };
         sprite(game, batch, &format!("{name}/{state}"), [0.0, 0.0, *w, *h], [ox + at[0], oy + at[1], *w, *h]);
