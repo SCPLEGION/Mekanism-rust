@@ -5535,7 +5535,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
     if tabs(&entity.id) & TAB_REDSTONE != 0 {
         entity.data.resize(DATA_GAUGES + l.gauges.len() * GAUGE_SLOTS, 0);
         let signal = get_int(&entity.nbt, "powered") & 3;
-        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2 | (if matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) { get_int(&entity.nbt, "dump") % 3 } else if kind(&entity.id) == Some(Kind::DigitalMiner) { miner_flags(&entity.nbt) } else { get_int(&entity.nbt, "warn") & 15 | energy_warn(&entity.id, &entity.nbt) }) << 4) as i32);
+        entity.data.push((get_int(&entity.nbt, "control") & 3 | signal << 2 | (if matches!(kind(&entity.id), Some(Kind::ChemicalTank(_))) { get_int(&entity.nbt, "dump") % 3 } else if kind(&entity.id) == Some(Kind::DigitalMiner) { miner_flags(&entity.nbt) } else if kind(&entity.id) == Some(Kind::Oredictionificator) { u32::from(od_filters(&entity.nbt).iter().any(|f| f.enabled && !f.has_filter())) } else { get_int(&entity.nbt, "warn") & 15 | energy_warn(&entity.id, &entity.nbt) }) << 4) as i32);
         // Then, for the side configuration window, each type's faces in relative-side order and
         // which types' auto-eject is off.
         if tabs(&entity.id) & TAB_SIDES != 0 {
@@ -8956,6 +8956,10 @@ fn warning_bits(block: &str, l: &Layout, data: &[i32]) -> u32 {
     if kind(block) == Some(Kind::DigitalMiner) {
         return (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 15;
     }
+    // `WarningType.INVALID_OREDICTIONIFICATOR_FILTER`: bit 4 here.
+    if is_od(block) {
+        return ((data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 1) << 4;
+    }
     if kind(block).is_some_and(|k| base_usage(k).is_some()) {
         return (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 15;
     }
@@ -8978,6 +8982,7 @@ fn warnings(block: &str, l: &Layout, data: &[i32]) -> Vec<&'static str> {
         (1, " - No matching recipe or not enough input"),
         (2, " - Not enough room in output"),
         (0, " - Not enough energy to operate"),
+        (4, " - Filter is no longer valid or supported"),
     ] {
         if bits & (1 << bit) != 0 {
             out.push(text);
@@ -14614,6 +14619,10 @@ fn od_filters(nbt: &Compound) -> Vec<od::Filter> {
 
 /// The items of a tag, in a fixed order.
 fn od_tag_items(items: &horizon_client::items::Items, tag: &str) -> Vec<String> {
+    // Vanilla's order for the tag (`TagLoader`: file order, nested tags in place); sorted when it is not known.
+    if let Some(order) = items.item_tag_order.get(tag) {
+        return order.clone();
+    }
     let mut all: Vec<String> = items.item_tags.get(tag).map(|t| t.iter().map(|i| i.to_string()).collect()).unwrap_or_default();
     all.sort();
     all
@@ -14780,7 +14789,7 @@ fn draw_od_list(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, orig
         sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [rx + 2.0, ry + 2.0, 18.0, 18.0]);
         // `WarningType.INVALID_OREDICTIONIFICATOR_FILTER` on the slot of an enabled filter that names no usable tag.
         if f.enabled && !f.has_filter() {
-            sprite(game, batch, "warning/slot", [0.0, 0.0, 18.0, 18.0], [rx + 2.0, ry + 2.0, 18.0, 18.0]);
+            sprite(game, batch, "slot/warning", [0.0, 0.0, 18.0, 18.0], [rx + 2.0, ry + 2.0, 18.0, 18.0]);
         }
         if let Some((item, _)) = &result {
             game.native_item(batch, item, [rx + 3.0, ry + 3.0], 16.0);
