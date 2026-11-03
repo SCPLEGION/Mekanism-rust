@@ -1886,6 +1886,17 @@ fn tick_infuser(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool
         _ => None,
     };
     let out = entity.items.get(2).cloned().flatten();
+    let warn = match (&recipe, entity.items.first().is_some_and(|s| s.is_some())) {
+        (None, true) if tank.chemical.is_none() => 2,
+        (None, true) => 8,
+        (Some((_, r)), _) => {
+            let max = items.get(r.output).map_or(64, |i| i.max_stack);
+            let fits = out.as_ref().is_none_or(|o| &*o.item == r.output && o.count + r.output_count <= max);
+            u32::from(tank.amount < r.chemical_amount) << 1 | u32::from(!fits) << 2
+        }
+        _ => 0,
+    };
+    put_int(&mut entity.nbt, "warn", warn);
     match recipe {
         Some((stack, r)) if tank.amount >= r.chemical_amount => {
             let max = items.get(r.output).map_or(64, |i| i.max_stack);
@@ -1939,6 +1950,8 @@ fn tick_separator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     let mut right = get_tank(&entity.nbt, "right", chem::SEPARATOR_GAS);
     drain_tank_into_item(entity, 3, &mut left);
     drain_tank_into_item(entity, 4, &mut right);
+    let warn = if fluid.amount > 0 && (left.amount >= left.capacity || right.amount >= right.capacity) { 4 } else { 0 };
+    put_int(&mut entity.nbt, "warn", warn);
     let active = chem::separate(&mut fluid, &mut left, &mut right, &mut energy);
     push_chemical(game, pos, &mut left, None, u64::MAX, false);
     push_chemical(game, pos, &mut right, None, u64::MAX, false);
@@ -1990,6 +2003,12 @@ fn tick_rotary(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
     // `ChemicalInventorySlot.rotary`: the gas drains into a tank item, which moves to the output slot once full.
     drain_tank_into_item(entity, 3, &mut gas);
     move_full_chemical_item(entity, 3, 4);
+    let warn = match fluid.chemical.as_deref().filter(|_| fluid.amount > 0).map(chem::rotary_chemical) {
+        Some(None) => 8,
+        Some(Some(output)) if !(gas.accepts(output) && gas.amount < gas.capacity) => 4,
+        _ => 0,
+    };
+    put_int(&mut entity.nbt, "warn", warn);
     let mut active = false;
     if let Some(output) = fluid.chemical.as_deref().and_then(chem::rotary_chemical)
         && fluid.amount > 0
