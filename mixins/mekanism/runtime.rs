@@ -743,6 +743,27 @@ fn tick_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize, reci
             op.map(|o| (o, max))
         })
         .collect();
+    // The issues of each process (`RecipeError`): 1 energy, 2 input, 4 output room, 8 input without a recipe.
+    let warn: Vec<i32> = (0..n)
+        .map(|i| match &operations[i] {
+            None if inputs[i].item.is_some() => 8,
+            None => 0,
+            Some((op, max)) => {
+                let fits = match &outputs[i].item {
+                    None => op.output_count <= *max,
+                    Some(item) => *item == op.output && outputs[i].count + op.output_count <= *max,
+                };
+                if !fits {
+                    4
+                } else if inputs[i].count < op.input_count {
+                    2
+                } else {
+                    i32::from(f.machine.energy.stored < f.machine.usage)
+                }
+            }
+        })
+        .collect();
+    entity.nbt.insert("warn".into(), Tag::IntArray(warn));
     f.tick(&mut inputs, &mut outputs, &operations);
     for i in 0..n {
         set_slot(entity, i, &inputs[i]);
@@ -5131,7 +5152,11 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
             };
             for i in 0..n {
                 let done = i64::from(saved.get(i).copied().unwrap_or(0).max(0));
-                entity.data.push((done * 20 / ticks).clamp(0, 20) as i32);
+                let warn = match entity.nbt.get(&JavaString::from("warn")) {
+                    Some(Tag::IntArray(v)) => v.get(i).copied().unwrap_or(0) & 15,
+                    _ => 0,
+                };
+                entity.data.push((done * 20 / ticks).clamp(0, 20) as i32 | warn << 5);
             }
             // Then whether auto-sort is on (the sorting tab).
             entity.data.resize(redstone_slot(&l) + 5 + 9, 0);
@@ -5218,7 +5243,15 @@ fn draw_factory_slots(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
         sprite(game, batch, "slot/output", [0.0, 0.0, 18.0, 18.0], [ox + output[0] - 1.0, oy + output[1] - 1.0, 18.0, 18.0]);
         let (x, y) = (ox + input[0] + 4.0, oy + 33.0);
         sprite(game, batch, "progress/down/empty", [0.0, 0.0, 8.0, 20.0], [x, y, 8.0, 20.0]);
-        let h = data.get(first + i).copied().unwrap_or(0).clamp(0, 20) as f32;
+        let h = (data.get(first + i).copied().unwrap_or(0) & 31).clamp(0, 20) as f32;
+        // `GuiSlot.warning` on the process's input and output.
+        let warn = data.get(first + i).copied().unwrap_or(0) >> 5;
+        if warn & 2 != 0 {
+            sprite(game, batch, "slot/warning", [0.0, 0.0, 18.0, 18.0], [ox + input[0] - 1.0, oy + input[1] - 1.0, 18.0, 18.0]);
+        }
+        if warn & 4 != 0 {
+            sprite(game, batch, "slot/warning", [0.0, 0.0, 18.0, 18.0], [ox + output[0] - 1.0, oy + output[1] - 1.0, 18.0, 18.0]);
+        }
         if h > 0.0 {
             sprite(game, batch, "progress/down/full", [0.0, 0.0, 8.0, h], [x, y, 8.0, h]);
         }
@@ -8189,7 +8222,13 @@ fn draw_tank_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
 
 /// The machine's issue bits (`RecipeError`s) from its data: 0 energy, 1 input, 2 output room, 3 no recipe.
 fn warning_bits(block: &str, l: &Layout, data: &[i32]) -> u32 {
-    if tabs(block) & TAB_REDSTONE == 0 || !matches!(kind(block), Some(Kind::Machine(..))) {
+    if tabs(block) & TAB_REDSTONE == 0 {
+        return 0;
+    }
+    if let Some(Kind::Factory(n, ..)) = kind(block) {
+        return (0..n).fold(0, |all, i| all | (data.get(redstone_slot(l) + 5 + i).copied().unwrap_or(0).max(0) as u32) >> 5 & 15);
+    }
+    if !matches!(kind(block), Some(Kind::Machine(..))) {
         return 0;
     }
     (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4
@@ -8200,7 +8239,7 @@ fn warnings(block: &str, l: &Layout, data: &[i32]) -> Vec<&'static str> {
     if tabs(block) & TAB_REDSTONE == 0 {
         return vec![];
     }
-    let word = data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32;
+    let bits = warning_bits(block, l, data);
     let (control, now, last) = redstone_of(l, data);
     let mut out = vec![];
     for (bit, text) in [
@@ -8209,7 +8248,7 @@ fn warnings(block: &str, l: &Layout, data: &[i32]) -> Vec<&'static str> {
         (2, " - Not enough room in output"),
         (0, " - Not enough energy to operate"),
     ] {
-        if matches!(kind(block), Some(Kind::Machine(..))) && word >> 4 & (1 << bit) != 0 {
+        if bits & (1 << bit) != 0 {
             out.push(text);
         }
     }
