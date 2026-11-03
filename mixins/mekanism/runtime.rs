@@ -7915,7 +7915,12 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     if let Some(Kind::Factory(n, ..)) = kind(block) {
         draw_factory_slots(game, batch, block, n, &l, data, origin);
     }
-    for (at, name) in l.slots.iter().flatten().chain(extra_slots(block).iter()) {
+    let warn = warning_bits(block, &l, data);
+    let extra = extra_slots(block);
+    let slots = l.slots.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|s| (i, s))).chain(extra.iter().map(|s| (9, s)));
+    for (i, (at, name)) in slots {
+        // `GuiSlot.warning`: the input slot without a recipe or enough input, the output slot without room.
+        let name = if (i == 0 && warn & 2 != 0) || (i == 2 && warn & 4 != 0) { &"slot/warning" } else { name };
         sprite(game, batch, name, [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
     }
     if kind(block) == Some(Kind::Nucleosynthesizer) {
@@ -7994,6 +7999,10 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         Some(p @ PowerBar::Vertical(_)) => {
             let [x, y, w, h] = power_rect(p);
             nine_slice(game, batch, "bar/base", 5.0, 1.0, [ox + x, oy + y, w, h]);
+            // `GuiBar.warning`: the warning background behind the contents (not enough energy).
+            if warn & 1 != 0 {
+                fill_tiled(game, batch, &format!("{SPRITES}warning_background"), [ox + x + 1.0, oy + y + 1.0, w - 2.0, h - 2.0], 0xFFFF_FFFF);
+            }
             let filled = energy * (h - 2.0);
             if filled > 0.0 {
                 sprite(game, batch, "bar/vertical_power", [0.0, 0.0, 2.0, 2.0], [ox + x + 1.0, oy + y + h - 1.0 - filled, w - 2.0, filled]);
@@ -8111,6 +8120,14 @@ fn inside(at: [f32; 2], rect: [f32; 4]) -> bool {
 
 /// The tooltips: a gauge's chemical and amount, the power bar's stored and maximum energy, the
 /// progress bar's percent, and the energy tab's usage and upgrades.
+/// The machine's issue bits (`RecipeError`s) from its data: 0 energy, 1 input, 2 output room, 3 no recipe.
+fn warning_bits(block: &str, l: &Layout, data: &[i32]) -> u32 {
+    if tabs(block) & TAB_REDSTONE == 0 || !matches!(kind(block), Some(Kind::Machine(..))) {
+        return 0;
+    }
+    (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4
+}
+
 /// `GuiWarningTab`: the issues listed by the warning tab, in `WarningType` order.
 fn warnings(block: &str, l: &Layout, data: &[i32]) -> Vec<&'static str> {
     if tabs(block) & TAB_REDSTONE == 0 {
