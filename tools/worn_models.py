@@ -210,6 +210,11 @@ def mekasuit_points(point, pivot):
     return [-x - pivot[0] / 16, 1.5 - y - pivot[1] / 16, z - pivot[2] / 16]
 
 
+# The piece whose presence hides a piece's exclusive parts (`MekaSuitArmor(type, adjacentType)`).
+ADJACENT = {"mekasuit_helmet": "mekasuit_bodyarmor", "mekasuit_bodyarmor": "mekasuit_helmet",
+            "mekasuit_pants": "mekasuit_boots", "mekasuit_boots": "mekasuit_pants"}
+
+
 def build_mekasuit(ns, item, assets, out, textures_dirs, report):
     """Write the worn model and equipment asset of one MekaSuit piece; exclusive (`excl_`) parts, which show only
     while the neighbouring piece is not worn, are left out; shared parts are drawn by every piece that owns them."""
@@ -223,7 +228,8 @@ def build_mekasuit(ns, item, assets, out, textures_dirs, report):
     per_texture = {}
     for obj in objs:
         name = obj["name"]
-        if name.startswith("excl_") or keyword not in name:
+        exclusive = name.startswith("excl_")
+        if keyword not in name:
             continue
         bone = next((b for key, b, _ in BONES if key in name), None)
         pivot = next((p for key, _, p in BONES if key in name), None)
@@ -238,13 +244,15 @@ def build_mekasuit(ns, item, assets, out, textures_dirs, report):
             pts = [mekasuit_points(p, pivot) for p, _ in quad]
             uvs = [[uv[0], 1 - uv[1]] for _, uv in quad]
             poly, normal = polygon(pts, uvs)
-            per_texture.setdefault(texture, {}).setdefault(bone, []).append((poly, normal))
-    return write_layers(ns, item, per_texture, out, textures_dirs, report)
+            per_texture.setdefault((texture, exclusive), {}).setdefault(bone, []).append((poly, normal))
+    hide = {True: [f"{ns}:{ADJACENT[item]}"], False: []}
+    return write_layers(ns, item, per_texture, out, textures_dirs, report, hide)
 
 
-def write_layers(ns, item, per_texture, out, textures_dirs, report):
+def write_layers(ns, item, per_texture, out, textures_dirs, report, hide=None):
     layers = []
-    for n, (texture, bones) in enumerate(sorted(per_texture.items())):
+    for n, (key, bones) in enumerate(sorted(per_texture.items())):
+        texture, exclusive = key
         tns, _, tpath = texture.partition(":")
         name = f"{item}_{n}"
         children = {bone: {"pose": [0, 0, 0, 0, 0, 0, 1, 1, 1], "polygons": [p for p, _ in quads],
@@ -260,7 +268,10 @@ def write_layers(ns, item, per_texture, out, textures_dirs, report):
         sprite = out / "assets" / ns / "textures/entity/equipment/horizon_models" / f"{name}.png"
         sprite.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, sprite)
-        layers.append({"model": f"{ns}:{name}", "texture": f"{ns}:{name}"})
+        layer = {"model": f"{ns}:{name}", "texture": f"{ns}:{name}"}
+        if exclusive and hide:
+            layer["hide_with"] = hide[True]
+        layers.append(layer)
     if not layers:
         return False
     target = out / "assets" / ns / "equipment" / f"{item}.json"
@@ -297,3 +308,97 @@ def build_world_model(ns, name, obj_file, texture, out, textures_dirs, report):
     shutil.copyfile(source, sprite)
     report["world_models"] = report.get("world_models", 0) + 1
     return True
+
+
+def build_cube_world_model(ns, name, half, texture_png, out, report):
+    """A part tree for `native_world_models`: a cube of side `2 * half` blocks about its centre, the whole
+    texture on every face (Mekanism's `energy_core` element at 0.4 scale)."""
+    h = half
+    faces = [  # counter-clockwise seen from outside
+        [(-h, -h, h), (h, -h, h), (h, h, h), (-h, h, h)],       # south
+        [(h, -h, -h), (-h, -h, -h), (-h, h, -h), (h, h, -h)],   # north
+        [(h, -h, h), (h, -h, -h), (h, h, -h), (h, h, h)],       # east
+        [(-h, -h, -h), (-h, -h, h), (-h, h, h), (-h, h, -h)],   # west
+        [(-h, h, h), (h, h, h), (h, h, -h), (-h, h, -h)],       # up
+        [(-h, -h, -h), (h, -h, -h), (h, -h, h), (-h, -h, h)],   # down
+    ]
+    uvs = [[0, 1], [1, 1], [1, 0], [0, 0]]
+    polygons, normals = [], []
+    for quad in faces:
+        poly, normal = polygon([list(p) for p in quad], uvs)
+        polygons.append(poly)
+        normals.append(normal)
+    target = out / "assets" / ns / "horizon" / "world_models" / f"{name}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"pose": [0, 0, 0, 0, 0, 0, 1, 1, 1], "polygons": polygons, "normals": normals}))
+    sprite = out / "assets" / ns / "textures/entity/equipment/horizon_models" / f"{name}.png"
+    sprite.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(texture_png, sprite)
+    report["world_models"] = report.get("world_models", 0) + 1
+
+
+# Vanilla's FaceInfo: the four corners of each face, as (x, y, z) picks of min (0) or max (1).
+FACE_CORNERS = {
+    "down": [(0, 0, 1), (0, 0, 0), (1, 0, 0), (1, 0, 1)],
+    "up": [(0, 1, 0), (0, 1, 1), (1, 1, 1), (1, 1, 0)],
+    "north": [(1, 1, 0), (1, 0, 0), (0, 0, 0), (0, 1, 0)],
+    "south": [(0, 1, 1), (0, 0, 1), (1, 0, 1), (1, 1, 1)],
+    "west": [(0, 1, 0), (0, 0, 0), (0, 0, 1), (0, 1, 1)],
+    "east": [(1, 1, 1), (1, 0, 1), (1, 0, 0), (1, 1, 0)],
+}
+
+
+def default_uv(direction, lo, hi):
+    if direction in ("north", "south"):
+        return [lo[0], 16 - hi[1], hi[0], 16 - lo[1]]
+    if direction in ("east", "west"):
+        return [lo[2], 16 - hi[1], hi[2], 16 - lo[1]]
+    if direction == "up":
+        return [lo[0], lo[2], hi[0], hi[2]]
+    return [lo[0], 16 - hi[2], hi[0], 16 - lo[2]]
+
+
+def rotate_point(p, rotation):
+    """`p` (pixels) turned about the element's rotation axis (degrees) around its origin."""
+    axis = next((a for a in "xyz" if a in rotation), None)
+    if axis is None:
+        return p
+    angle = math.radians(rotation[axis])
+    o = rotation.get("origin", [8, 8, 8])
+    q = [p[i] - o[i] for i in range(3)]
+    c, s = math.cos(angle), math.sin(angle)
+    if axis == "x":
+        q = [q[0], q[1] * c - q[2] * s, q[1] * s + q[2] * c]
+    elif axis == "y":
+        q = [q[0] * c + q[2] * s, q[1], -q[0] * s + q[2] * c]
+    else:
+        q = [q[0] * c - q[1] * s, q[0] * s + q[1] * c, q[2]]
+    return [q[i] + o[i] for i in range(3)]
+
+
+def build_element_world_model(ns, name, model, texture_png, out, report, center=(8, 8, 8)):
+    """A part tree for `native_world_models` from an element model with one texture, centred on the block's
+    middle (pixels, y up), so the game can turn it about the block's centre."""
+    polygons, normals = [], []
+    for el in model["elements"]:
+        lo, hi = el["from"], el["to"]
+        for direction, face in el["faces"].items():
+            u0, v0, u1, v1 = face.get("uv") or default_uv(direction, lo, hi)
+            turn = int(face.get("rotation", 0)) // 90 % 4
+            pts, uvs = [], []
+            for i, pick in enumerate(FACE_CORNERS[direction]):
+                p = [hi[k] if pick[k] else lo[k] for k in range(3)]
+                p = rotate_point(p, el.get("rotation", {}))
+                pts.append([(p[k] - center[k]) / 16 for k in range(3)])
+                corner = (i + turn) % 4
+                uvs.append([(u0 if corner < 2 else u1) / 16, (v0 if corner in (0, 3) else v1) / 16])
+            poly, normal = polygon(pts, uvs)
+            polygons.append(poly)
+            normals.append(normal)
+    target = out / "assets" / ns / "horizon" / "world_models" / f"{name}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"pose": [0, 0, 0, 0, 0, 0, 1, 1, 1], "polygons": polygons, "normals": normals}))
+    sprite = out / "assets" / ns / "textures/entity/equipment/horizon_models" / f"{name}.png"
+    sprite.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(texture_png, sprite)
+    report["world_models"] = report.get("world_models", 0) + 1
