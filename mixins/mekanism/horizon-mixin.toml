@@ -109,6 +109,28 @@ bindings = [
 ]
 
 [[injection]]
+id = "client-block-entity-changed"
+hook = "client_block_entity_changed"
+hook_version = 1
+kind = "HEAD"
+helper = "client_block_entity_changed.rs"
+bindings = [
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "id", ty = "&str", value = "id" },
+]
+
+[[injection]]
+id = "world-models"
+hook = "world_models"
+hook_version = 1
+kind = "HEAD"
+helper = "world_models.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "models", ty = "&mut Vec<crate::game::native_hooks::NativeWorldModel>", value = "&mut *models" },
+]
+
+[[injection]]
 id = "place-block"
 hook = "place_block"
 hook_version = 1

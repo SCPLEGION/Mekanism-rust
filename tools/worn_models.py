@@ -268,3 +268,32 @@ def write_layers(ns, item, per_texture, out, textures_dirs, report):
     target.write_text(json.dumps({"layers": {"horizon_models": layers}}, indent=1) + "\n")
     report["worn_items"] = report.get("worn_items", 0) + 1
     return True
+
+
+def build_world_model(ns, name, obj_file, texture, out, textures_dirs, report):
+    """A part tree for `native_world_models`: the OBJ as it stands (pixels, y up), its texture beside it."""
+    objs = obj_models.parse(obj_file.read_text())
+    mtl_file = obj_file.with_suffix(".mtl")
+    mtl = obj_models.parse_mtl(mtl_file.read_text() if mtl_file.is_file() else "")
+    polygons, normals = [], []
+    for obj in objs:
+        for quad in obj["faces"]:
+            if len(quad) != 4:
+                continue
+            poly, normal = polygon([list(p) for p, _ in quad], [[uv[0], 1 - uv[1]] for _, uv in quad])
+            polygons.append(poly)
+            normals.append(normal)
+    tns, _, tpath = texture.partition(":")
+    source = next((d / tns / "textures" / f"{tpath}.png" for d in textures_dirs
+                   if (d / tns / "textures" / f"{tpath}.png").is_file()), None)
+    if source is None or not polygons:
+        report.setdefault("worn_missing_textures", []).append(texture)
+        return False
+    target = out / "assets" / ns / "horizon" / "world_models" / f"{name}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"pose": [0, 0, 0, 0, 0, 0, 1, 1, 1], "polygons": polygons, "normals": normals}))
+    sprite = out / "assets" / ns / "textures/entity/equipment/horizon_models" / f"{name}.png"
+    sprite.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, sprite)
+    report["world_models"] = report.get("world_models", 0) + 1
+    return True
