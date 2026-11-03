@@ -6161,6 +6161,30 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
     }
 }
 
+/// The wheel on a screen (hook point `native_screen_wheel`): it scrolls the filter list of the sorter, the
+/// QIO importer and exporter and the miner's config screen (`GuiFilterHolder.mouseScrolled`), a row a notch.
+pub(super) fn screen_wheel(game: &Game<'_>, block: &str, steps: f32, taken: &mut bool) {
+    let notch = |first: usize, count: usize| {
+        let hidden = count.saturating_sub(SORTER_ROWS);
+        if steps > 0.0 { first.min(hidden).saturating_sub(1) } else { (first + 1).min(hidden) }
+    };
+    if miner_cfg_open(block) {
+        if let Some(c) = miner_cfg(game)
+            && MINER_UI.with_borrow(|ui| !ui.select && ui.edit.is_none())
+        {
+            MINER_UI.with_borrow_mut(|ui| ui.scroll = notch(ui.scroll, c.filters.len()));
+            *taken = true;
+        }
+    } else if is_filter_screen(block)
+        && FILTER_EDIT.with_borrow(|e| e.is_none())
+        && FILTER_SELECT.get().is_none()
+        && let Some((pos, view)) = sorter_view(game)
+    {
+        SORTER_SCROLL.set((pos, notch(sorter_scroll(pos), view.filters.len())));
+        *taken = true;
+    }
+}
+
 /// Escape on a screen (hook point `native_screen_escape`): it closes the open window and not the screen.
 pub(super) fn screen_escape(block: &str, consumed: &mut bool) {
     if miner_cfg_open(block) {
