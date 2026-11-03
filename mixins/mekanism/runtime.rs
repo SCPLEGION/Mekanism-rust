@@ -16567,6 +16567,7 @@ fn stabilizer_boxes(game: &Game<'_>, pos: [i32; 3], c: &Compound, boxes: &mut Ve
                 min,
                 max,
                 colors: [side(east, east_west), side(west, east_west), 0, 0, side(south, north_south), side(north, north_south)],
+                sprite: None,
             });
         }
     }
