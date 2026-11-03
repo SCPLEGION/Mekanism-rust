@@ -3666,6 +3666,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
         adapter_payload(game, data);
         return;
     }
+    if channel == FISSION_CHANNEL && game.native_on(MOD_ID) {
+        fission_payload(game, data);
+        return;
+    }
     if channel == QIO_CHANNEL && game.native_on(MOD_ID) {
         qio_payload(game, data);
         return;
@@ -3909,6 +3913,14 @@ fn get_pos(nbt: &Compound, key: &str) -> Option<[i32; 3]> {
 /// its tanks: it takes fissile fuel from the tubes and chemical tanks beside the ports and water from the
 /// pipes and fluid tanks beside them, burns the fuel at the set rate while switched on (water boils to
 /// steam), and gives steam and nuclear waste out of every port.
+/// The reactor's rate limit in tenths of a mB/t: the default 0.1 until set, never over the maximum.
+fn fission_burn(nbt: &Compound, max: u64) -> u64 {
+    match nbt.get(&JavaString::from("burn")) {
+        Some(_) => get_long(nbt, "burn").min(max),
+        None => fission::DEFAULT_BURN_TENTHS.min(max),
+    }
+}
+
 fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     let ticker = get_int(&entity.nbt, "ticker");
     put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
@@ -3944,7 +3956,7 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
         pull_from_carriers(game, p, &mut water, "minecraft:water");
     }
     if get_long(&entity.nbt, "active") == 1 {
-        let rate = get_long(&entity.nbt, "burn").clamp(1, r.max_burn_tenths());
+        let rate = fission_burn(&entity.nbt, r.max_burn_tenths());
         let mut partial = get_long(&entity.nbt, "partial");
         let burned = fission::burn(
             rate,
@@ -6573,7 +6585,7 @@ fn multiblock_data(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
                 (_, 1) => 2,
                 _ => 0,
             };
-            let burn = get_long(nbt, "burn").clamp(1, r.max_burn_tenths().max(1));
+            let burn = fission_burn(nbt, r.max_burn_tenths());
             ([1, on, small(burn), small(r.max_burn_tenths())], 0)
         }
         Some(Kind::FusionPort) => {
@@ -6659,6 +6671,16 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
 
 /// A press on a reactor's button (hook point `native_screen_click`, API 20).
 pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
+    if kind(block) == Some(Kind::FissionPort) {
+        if fission_stats_open(block) {
+            fission_stats_click(game, data, at, right);
+            return;
+        }
+        if !right && inside(at, STATS_TAB_BUTTON) && let Some((x, y, z)) = game.container {
+            STATS_VIEW.set(Some(([x, y, z], game.ticks as u64)));
+            return;
+        }
+    }
     if is_qio_tile(block) {
         let select = qio_select_open(block);
         if select || inside(at, QIO_TAB_BUTTON) {
@@ -6776,6 +6798,18 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
     screen_base(block, screen);
     // The QIO blocks swap to the selector's layout while their tab's screen is open: 176 x 155, none
     // of the inventory (it is moved out of the way).
+    if kind(block) == Some(Kind::FissionPort) && let Some(s) = screen.as_mut() {
+        // `GuiFissionReactorStats`: the default 176 x 166 with no inventory.
+        s.alt = Some(Box::new(super::native_hooks::NativeScreen {
+            width: 176.0,
+            height: 166.0,
+            slots: vec![None; s.slots.len()],
+            inventory_y: 4000.0,
+            inventory_x: 0.0,
+            own_labels: true,
+            alt: None,
+        }));
+    }
     if is_qio_tile(block) && let Some(s) = screen.as_mut() {
         s.alt = Some(Box::new(super::native_hooks::NativeScreen {
             width: 176.0,
@@ -7068,7 +7102,149 @@ fn draw_nucleosynthesizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudB
 
 /// `GuiDynamicHorizontalRateBar`: the dynamic-rate sprite multiplied by a colour that runs from
 /// (60, 45, 74) to (100, 30, 170) along the bar.
+/// The fission rate limit packet: the port's position and the limit as a big-endian f64.
+const FISSION_CHANNEL: &str = "mekanism:fission_limit";
+/// The tab (`GuiTabElementType`: at -26, 6) and its button.
+const STATS_TAB_BUTTON: [f32; 4] = [-22.0, 10.0, 18.0, 18.0];
+const STATS_FIELD: [f32; 4] = [77.0, 128.0, 54.0, 12.0];
+const STATS_CHECK: [f32; 4] = [119.0, 128.0, 12.0, 12.0];
+
+fn fission_stats_open(block: &str) -> bool {
+    kind(block) == Some(Kind::FissionPort) && STATS_VIEW.get().is_some()
+}
+
+fn draw_stats_tab(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2], icon: &str) {
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    nine_slice_tinted(game, batch, "holder_left", [26.0, 9.0], 4.0, [ox - 26.0, oy + 6.0, 26.0, 26.0], 0xFFFF_FFFF);
+    let hovered = inside([cursor[0] - ox, cursor[1] - oy], STATS_TAB_BUTTON);
+    let b = [ox + STATS_TAB_BUTTON[0] + 1.0, oy + STATS_TAB_BUTTON[1], 18.0, 18.0];
+    nine_slice_tinted(game, batch, if hovered { "button_focus" } else { "button" }, [200.0, 20.0], 2.0, b, 0xFFFF_FFFF);
+    sprite(game, batch, icon, [0.0, 0.0, 18.0, 18.0], b);
+}
+
+/// `GuiFissionReactorStats`: the title, the fuel statistics, the current burn rate bar and the rate limit
+/// field. (The heat statistics need the heat model the port does not have yet.)
+fn draw_fission_stats(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 176.0, 166.0]);
+    let title = game.native_screen_title().unwrap_or_default();
+    centred(game, batch, &format!("{title} Statistics"), ox, 176.0, oy + 4.0, 0x40_4040);
+    let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0);
+    let (limit, max) = (f64::from(get(2)) / 10.0, f64::from(get(3)) / 10.0);
+    let active = get(1) == 1;
+    let at = |y: f32| [ox + 6.0, oy + y];
+    game.native_text(batch, "Fuel Statistics", at(68.0), 0x20_2020, false);
+    game.native_text(batch, &format!("Max Burn Rate: {} mB/t", java_double(max)), at(80.0), 0x40_4040, false);
+    game.native_text(batch, &format!("Rate Limit: {} mB/t", java_double(limit)), at(90.0), 0x40_4040, false);
+    game.native_text(batch, "Current Burn Rate:", at(104.0), 0x40_4040, false);
+    let current = if active { limit } else { 0.0 };
+    draw_dynamic_rate_bar(game, batch, [ox + 5.0, oy + 114.0], 183.0, if max > 0.0 { (current / max).min(1.0) as f32 } else { 0.0 });
+    let label = "Set Rate Limit:";
+    game.native_text(batch, label, [ox + 75.0 - game.native_text_width(label), oy + 130.0], 0x40_4040, false);
+    let [fx, fy, fw, fh] = STATS_FIELD;
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + fx - 1.0, oy + fy - 1.0, fw + 2.0, fh + 2.0], 0xFFFF_FFFF);
+    STATS_TEXT.with_borrow(|t| {
+        let text_at = [ox + fx + 2.0, oy + fy + 2.0];
+        game.native_text(batch, &t.value, text_at, 0xE0_E0E0, true);
+        if t.focused && (game.ticks / 6) % 2 == 0 {
+            let before: String = t.value.chars().take(t.cursor).collect();
+            game.native_text(batch, "_", [text_at[0] + game.native_text_width(&before), text_at[1]], 0xE0_E0E0, true);
+        }
+        let typed = !t.value.is_empty();
+        draw_mek_button(game, batch, [ox + STATS_CHECK[0], oy + STATS_CHECK[1], STATS_CHECK[2], STATS_CHECK[3]], typed, typed && inside(mouse, STATS_CHECK));
+        sprite(game, batch, "button/checkmark", [0.0, 0.0, 12.0, 12.0], [ox + STATS_CHECK[0], oy + STATS_CHECK[1], 12.0, 12.0]);
+    });
+    draw_stats_tab(game, batch, origin, "button/radioactive");
+}
+
+fn fission_stats_click(game: &Game<'_>, data: &[i32], at: [f32; 2], right: bool) {
+    if right {
+        return;
+    }
+    if inside(at, STATS_TAB_BUTTON) {
+        STATS_VIEW.set(None);
+        return;
+    }
+    STATS_TEXT.with_borrow_mut(|t| {
+        t.focused = inside(at, STATS_FIELD) && !inside(at, STATS_CHECK);
+        if inside(at, STATS_CHECK) && !t.value.is_empty() {
+            send_fission_limit(game, data, &t.value.clone());
+            *t = freq::TextBox::default();
+        }
+    });
+}
+
+fn fission_stats_key(game: &Game<'_>, key: &str, text: Option<&str>) {
+    let Some((pos, _)) = STATS_VIEW.get() else {
+        return;
+    };
+    let max = game.native_client_block_entity(pos).map_or(0, |(_, c)| get_int(c, "max_burn"));
+    // Room for the largest whole rate, a point and two decimals.
+    let room = (max.saturating_sub(1) / 10).to_string().len() + 3;
+    STATS_TEXT.with_borrow_mut(|t| {
+        if t.key(key, text, |c| c.is_ascii_digit() || c == '.', room) == freq::Typed::Enter && !t.value.is_empty() {
+            let value = t.value.clone();
+            send_fission_limit_at(game, pos, &value);
+            *t = freq::TextBox::default();
+        }
+    });
+}
+
+fn send_fission_limit(game: &Game<'_>, _data: &[i32], value: &str) {
+    if let Some((pos, _)) = STATS_VIEW.get() {
+        send_fission_limit_at(game, pos, value);
+    }
+}
+
+/// `setRateLimit`: a number from 0 up to the maximum burn rate, rounded to two decimals.
+fn send_fission_limit_at(game: &Game<'_>, pos: [i32; 3], value: &str) {
+    let Ok(limit) = value.parse::<f64>() else {
+        return;
+    };
+    let mut data = Vec::new();
+    for c in pos {
+        data.extend(c.to_be_bytes());
+    }
+    data.extend(((limit * 100.0).floor() / 100.0).to_be_bytes());
+    game.native_send_to_server(FISSION_CHANNEL, &data);
+}
+
+/// A player's rate limit for a reactor, within reach: tenths of a mB/t, from 0 to the maximum.
+fn fission_payload(game: &mut Game<'_>, data: &[u8]) {
+    let (Some(pos), Some(limit), Some(player)) = (data.get(..12), data.get(12..20), game.native_acting_player()) else {
+        return;
+    };
+    let int = |i: usize| i32::from_be_bytes([pos[i], pos[i + 1], pos[i + 2], pos[i + 3]]);
+    let pos = [int(0), int(4), int(8)];
+    let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    let limit = f64::from_be_bytes([limit[0], limit[1], limit[2], limit[3], limit[4], limit[5], limit[6], limit[7]]);
+    if !near || !limit.is_finite() || limit < 0.0 || kind(block_name(game, pos)) != Some(Kind::FissionPort) {
+        return;
+    }
+    let Some(Some(master)) = game.native_with_mod_block_entity(pos, |m| multiblock_master(m, pos)) else {
+        return;
+    };
+    let set = |m: &mut ModBlockEntity| {
+        let max = fission::Reactor { assemblies: get_long(&m.nbt, "assemblies"), volume: get_long(&m.nbt, "volume") }.max_burn_tenths();
+        let tenths = (limit * 10.0).round() as u64;
+        if tenths <= max {
+            put_long(&mut m.nbt, "burn", tenths);
+        }
+    };
+    if master == pos {
+        game.native_with_mod_block_entity(pos, set);
+    } else {
+        game.native_with_mod_block_entity(master, set);
+    }
+}
+
 thread_local! {
+    /// The fission reactor whose statistics screen is open (its position and the tick it was last drawn).
+    static STATS_VIEW: std::cell::Cell<Option<([i32; 3], u64)>> = const { std::cell::Cell::new(None) };
+    static STATS_TEXT: std::cell::RefCell<freq::TextBox> = std::cell::RefCell::new(freq::TextBox::default());
     /// The fission reactor's temperature, one sample per client tick (`GuiDoubleGraph`).
     static FISSION_TEMPS: std::cell::RefCell<(u64, Vec<f64>)> = const { std::cell::RefCell::new((0, Vec::new())) };
 }
@@ -7110,6 +7286,8 @@ fn draw_fission(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data
         let rgb = if enabled { 0xFF_FFFF } else { 0xA0_A0A0 };
         game.native_text(batch, label, [ox + rect[0] + (rect[2] - tw) / 2.0, oy + rect[1] + (rect[3] - 8.0) / 2.0], rgb, true);
     }
+    // The statistics tab (`GuiFissionReactorTab.STAT`).
+    draw_stats_tab(game, batch, origin, "button/stats");
     // `GuiBigLight` (173, 76).
     nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + 173.0, oy + 76.0, 14.0, 14.0], 0xFFFF_FFFF);
     let light = if active { "light/big/enabled" } else { "light/big/disabled" };
@@ -7191,6 +7369,10 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
 /// Mekanism's screen for a block: the base panel, its slots and the player's, its gauges, its power
 /// bar or energy gauge, its progress bar, and the energy tab on the left.
 pub(super) fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
+    if fission_stats_open(block) {
+        draw_fission_stats(game, batch, data, origin);
+        return;
+    }
     if qio_select_open(block) {
         draw_qio_select(game, batch, block, origin);
         return;
@@ -7440,6 +7622,20 @@ pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f3
     if is_qio_tile(block) && inside(at, QIO_TAB_BUTTON) {
         lines.push("Set Frequency".to_owned());
         return;
+    }
+    if kind(block) == Some(Kind::FissionPort) {
+        if inside(at, STATS_TAB_BUTTON) {
+            lines.push(if fission_stats_open(block) { "Main" } else { "Stats" }.to_owned());
+            return;
+        }
+        if fission_stats_open(block) {
+            if inside(at, [5.0, 114.0, 183.0, 8.0]) {
+                let burn = f64::from(data.get(2).copied().unwrap_or(0).max(0)) / 10.0;
+                let active = data.get(1).copied().unwrap_or(0) == 1;
+                lines.push(format!("Burn Rate: {} mB/t", java_double(if active { burn } else { 0.0 })));
+            }
+            return;
+        }
     }
     screen_tooltip_base(game, block, data, at, lines);
 }
@@ -9936,10 +10132,22 @@ fn screen_opened(game: &Game<'_>, block: &str) {
 /// (not asked for a few ticks) or on another block is dropped. Asked every frame.
 pub(super) fn screen_alt(game: &Game<'_>, block: &str, alt: &mut bool) {
     screen_opened(game, block);
+    let now = game.ticks as u64;
+    if kind(block) == Some(Kind::FissionPort) {
+        if let Some((pos, seen)) = STATS_VIEW.get() {
+            let here = game.container.map(|(x, y, z)| [x, y, z]);
+            if here != Some(pos) || now.saturating_sub(seen) > 10 {
+                STATS_VIEW.set(None);
+            } else {
+                STATS_VIEW.set(Some((pos, now)));
+                *alt = true;
+            }
+        }
+        return;
+    }
     if !is_qio_tile(block) {
         return;
     }
-    let now = game.ticks as u64;
     if let Some((pos, seen)) = QIO_SELECT.get() {
         let here = game.container.map(|(x, y, z)| [x, y, z]);
         if here != Some(pos) || now.saturating_sub(seen) > 10 {
@@ -10400,11 +10608,18 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
     if !qio_select_open(block) {
         *typing |= qio_typing(block) || filter_typing(block) || adapter_typing(block);
     }
+    if fission_stats_open(block) {
+        *typing |= STATS_TEXT.with_borrow(|t| t.focused);
+    }
 }
 
 /// A key on the selector's focused text box (hook point `native_screen_key`): Enter sets the name as
 /// a new frequency (`setEnterHandler`).
 pub(super) fn screen_key(game: &mut Game<'_>, block: &str, key: &str, text: Option<&str>) {
+    if fission_stats_open(block) {
+        fission_stats_key(game, key, text);
+        return;
+    }
     let select = qio_select_open(block);
     if !select && kind(block) == Some(Kind::QioDashboard) && game.native_on(MOD_ID) {
         qio_key(game, key, text);
