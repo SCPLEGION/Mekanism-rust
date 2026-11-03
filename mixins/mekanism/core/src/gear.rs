@@ -57,6 +57,32 @@ pub fn item_energy(id: &str) -> Option<ItemEnergy> {
     })
 }
 
+/// The ids of every item that holds energy (`item_energy` knows them): what an energy slot takes.
+pub fn energy_item_ids() -> Vec<String> {
+    let mut ids: Vec<String> = [
+        "mekanism:energy_tablet",
+        "mekanism:atomic_disassembler",
+        "mekanism:electric_bow",
+        crate::seismic::READER,
+        crate::teleporter::PORTABLE,
+        crate::modules::MEKA_TOOL,
+        crate::modules::HELMET,
+        crate::modules::BODYARMOR,
+        crate::modules::PANTS,
+        crate::modules::BOOTS,
+        "mekanism:free_runners",
+        "mekanism:free_runners_armored",
+    ]
+    .map(str::to_owned)
+    .into();
+    ids.extend(
+        BaseTier::ALL
+            .into_iter()
+            .map(|t| format!("mekanism:{}_energy_cube", t.name())),
+    );
+    ids
+}
+
 /// A charge slot (an energy cube's left slot) fills the item from `source`, at most the item's rate
 /// a tick. Returns the item's new energy.
 pub fn charge(item: ItemEnergy, stored: u64, source: &mut EnergyContainer) -> u64 {
@@ -352,5 +378,17 @@ mod free_runner_tests {
             item_energy("mekanism:free_runners").map(|e| e.capacity),
             Some(FREE_RUNNER_CAPACITY)
         );
+    }
+}
+
+#[cfg(test)]
+mod energy_item_tests {
+    use super::*;
+
+    #[test]
+    fn every_listed_item_holds_energy() {
+        for id in energy_item_ids() {
+            assert!(item_energy(&id).is_some(), "{id}");
+        }
     }
 }

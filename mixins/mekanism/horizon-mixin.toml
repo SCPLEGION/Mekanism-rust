@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "28cd4f8cb161236f05316556dda87f7666903ed3"
+horizon_revision = "a223debe97fb02967e88549a128ccd3bcfd2b83b"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -339,4 +339,15 @@ helper = "screen_escape.rs"
 bindings = [
   { name = "block", ty = "&str", value = "block" },
   { name = "consumed", ty = "&mut bool", value = "&mut *consumed" },
+]
+
+[[injection]]
+id = "slot-rules"
+hook = "slot_rules"
+hook_version = 1
+kind = "HEAD"
+helper = "slot_rules.rs"
+bindings = [
+  { name = "block", ty = "&str", value = "block" },
+  { name = "rules", ty = "&mut Vec<horizon_client::lan::menu::SlotRule>", value = "&mut *rules" },
 ]
