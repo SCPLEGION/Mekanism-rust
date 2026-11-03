@@ -643,8 +643,14 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     if let Some(active) = active {
         let lit = if active { "true" } else { "false" };
         // Blocks without the furnace's `lit` (the solar generator's iron block) show no state.
-        if game.native_block_property(pos, "lit").is_some_and(|now| now != lit) {
-            game.native_set_block_property(pos, "lit", lit);
+        // (A barrel-based machine, one that faces up or down, has `open` instead.)
+        for key in ["lit", "open"] {
+            if let Some(now) = game.native_block_property(pos, key) {
+                if now != lit {
+                    game.native_set_block_property(pos, key, lit);
+                }
+                break;
+            }
         }
     }
 }
@@ -8060,7 +8066,7 @@ thread_local! {
 
 fn draw_nucleosynthesizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
     let [ox, oy] = origin;
-    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit")).as_deref() == Some("true");
+    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit").or_else(|| game.native_block_property(p, "open"))).as_deref() == Some("true");
     let screen = [ox + 45.0, oy + 18.0, 104.0, 68.0];
     nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, screen, 0xFFFF_FFFF);
     let rate = if lit { "100%" } else { "0%" };
@@ -8734,7 +8740,7 @@ fn draw_dynamic_rate_bar(game: &Game<'_>, batch: &mut horizon_client::hud::HudBa
 fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, data: &[i32], origin: [f32; 2]) {
     let e = extras(block);
     let [ox, oy] = origin;
-    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit")).as_deref() == Some("true");
+    let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit").or_else(|| game.native_block_property(p, "open"))).as_deref() == Some("true");
     for (at, name, [w, h]) in &e.active_progress {
         let state = if lit { "full" } else { "empty" };
         sprite(game, batch, &format!("{name}/{state}"), [0.0, 0.0, *w, *h], [ox + at[0], oy + at[1], *w, *h]);
