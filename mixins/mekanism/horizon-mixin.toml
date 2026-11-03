@@ -588,3 +588,16 @@ bindings = [
   { name = "kind", ty = "&str", value = "kind" },
   { name = "hidden", ty = "&mut bool", value = "&mut *hidden" },
 ]
+
+[[injection]]
+id = "using-tick"
+hook = "using_tick"
+hook_version = 1
+kind = "HEAD"
+helper = "using_tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+  { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
+  { name = "keep", ty = "&mut bool", value = "&mut *keep" },
+]

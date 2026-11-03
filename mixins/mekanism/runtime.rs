@@ -1709,6 +1709,32 @@ pub(super) fn world_quads(game: &Game<'_>, quads: &mut Vec<super::native_hooks::
     let (right, up) = game.native_camera_axes();
     let (right, up) = (right.map(|v| v as f32), up.map(|v| v as f32));
     let corner = |c: [f32; 3], x: f32, y: f32| -> [f64; 3] { std::array::from_fn(|k| f64::from(c[k] + right[k] * x + up[k] * y)) };
+    // `RenderFlame`: two crossed planes along the flight, fading over the flame's life.
+    FLAME_VIEW.with_borrow_mut(|view| {
+        for f in view.iter_mut() {
+            // A word that has just come is stamped with this tick; a flame not heard of for a while is gone.
+            if f.arrived == u64::MAX {
+                f.arrived = ticks;
+            }
+            if ticks > f.arrived + 2 {
+                continue;
+            }
+            let since = (ticks - f.arrived) as f64 + f64::from(partial);
+            let at = [0, 1, 2].map(|i| f.pos[i] + f.vel[i] * since);
+            let alpha = flamethrower::alpha(f.age as f32 + since as f32).clamp(0.0, 1.0);
+            if alpha <= 0.0 {
+                continue;
+            }
+            for corners in flamethrower::quads(at, f.vel) {
+                quads.push(super::native_hooks::NativeWorldQuad {
+                    corners,
+                    color: ((alpha * 255.0) as u32) << 24 | 0xFF_FFFF,
+                    sprite: Some("mekanism:gui/flame".into()),
+                    uv: [0.0, 0.0, 0.5, 0.1],
+                });
+            }
+        }
+    });
     SPS_FX.with_borrow_mut(|set| {
         set.retain(|pos, fx| {
             let Some((id, c)) = game.native_client_block_entity(*pos) else {
@@ -5370,6 +5396,10 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
         portable_teleporter_use(game, claimed);
         return;
     }
+    if !*claimed && &*stack.item == flamethrower::ITEM && game.native_on(MOD_ID) {
+        flamethrower_use(game, claimed);
+        return;
+    }
     if !*claimed && &*stack.item == seismic::READER && game.native_on(MOD_ID) {
         seismic_reader_use(game, claimed);
         return;
@@ -5730,7 +5760,9 @@ fn is_jetpack(stack: &ItemStack) -> bool {
 }
 
 fn jetpack_capacity(stack: &ItemStack) -> u64 {
-    if &*stack.item == modules::BODYARMOR { modules::SUIT_JETPACK_CAPACITY } else { gear::JETPACK_CAPACITY }
+    if &*stack.item == flamethrower::ITEM {
+        flamethrower::CAPACITY
+    } else if &*stack.item == modules::BODYARMOR { modules::SUIT_JETPACK_CAPACITY } else { gear::JETPACK_CAPACITY }
 }
 
 fn jetpack_fuel(stack: &ItemStack) -> u64 {
@@ -5880,7 +5912,7 @@ pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         return false;
     }
     let selected = game.selected;
-    let Some(held) = game.inventory.get(selected).cloned().flatten().filter(is_jetpack) else {
+    let Some(held) = game.inventory.get(selected).cloned().flatten().filter(|s| is_jetpack(s) || &*s.item == flamethrower::ITEM) else {
         return false;
     };
     let fuel = jetpack_fuel(&held);
@@ -5902,10 +5934,11 @@ pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         return false;
     };
     let mut held = held;
+    let name = if &*held.item == flamethrower::ITEM { "Flamethrower" } else { "Jetpack" };
     set_jetpack_fuel(&mut held, fuel + n);
     game.inventory[selected] = Some(held);
     if let Some(player) = game.native_acting_player() {
-        let line = format!("Jetpack: {} / {} mB hydrogen", fuel + n, capacity);
+        let line = format!("{name}: {} / {} mB hydrogen", fuel + n, capacity);
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
     true
@@ -19317,6 +19350,7 @@ pub(super) fn mobs_tick(game: &mut Game<'_>) {
     if !game.native_on(MOD_ID) {
         return;
     }
+    flames_tick(game);
     let ids = game.native_mob_ids(robit::TYPE);
     if ids.is_empty() {
         return;
@@ -19512,6 +19546,9 @@ pub(super) fn mob_died(game: &mut Game<'_>, kind: &str, at: [f64; 3], data: Opti
 
 /// The window's client got the Robits' ids.
 pub(super) fn client_payload(channel: &str, data: &[u8]) {
+    if channel == FLAME_CHANNEL {
+        flames_payload(data);
+    }
     if channel == ROBIT_STATE_CHANNEL {
         robit_state_payload(data);
     }
@@ -20818,6 +20855,250 @@ pub(super) fn ui_closed(game: &mut Game<'_>, id: &str) {
             let mut out = vec![5];
             out.extend(rid.to_be_bytes());
             game.native_send_to_server(ROBIT_CHANNEL, &out);
+        }
+    }
+}
+
+
+// --- Flamethrower -----------------------------------------------------------------------------------
+
+use mekanism_core::flamethrower;
+
+/// A flame the server flies (`EntityFlame`).
+struct Flame {
+    pos: [f64; 3],
+    vel: [f64; 3],
+    age: u32,
+    mode: flamethrower::Mode,
+}
+
+/// A flame as a client has it, from the server's last word.
+struct FlameView {
+    pos: [f64; 3],
+    vel: [f64; 3],
+    age: u32,
+    arrived: u64,
+}
+
+const FLAME_CHANNEL: &str = "mekanism:flames";
+const FLAMETHROWER_MODE_KEY: &str = "mekanism:flamethrower_mode";
+
+thread_local! {
+    static FLAMES: std::cell::RefCell<Vec<Flame>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FLAME_VIEW: std::cell::RefCell<Vec<FlameView>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FLAME_RNG: std::cell::RefCell<Option<bolt::Rng>> = const { std::cell::RefCell::new(None) };
+}
+
+fn flamethrower_mode(stack: &ItemStack) -> flamethrower::Mode {
+    let name = custom_data(stack).and_then(|c| match c.get(&JavaString::from(FLAMETHROWER_MODE_KEY)) {
+        Some(Tag::String(s)) => s.to_string().ok(),
+        _ => None,
+    });
+    name.as_deref().and_then(flamethrower::Mode::from_name).unwrap_or_default()
+}
+
+/// A right click with the flamethrower (`ItemFlamethrower.use`): sneaking changes its mode; with hydrogen
+/// in it, the use begins and goes on while the key is held.
+fn flamethrower_use(game: &mut Game<'_>, claimed: &mut bool) {
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == flamethrower::ITEM) else {
+        return;
+    };
+    if sneaking {
+        let mode = flamethrower_mode(held).next();
+        set_custom_string(held, FLAMETHROWER_MODE_KEY, mode.name());
+        *claimed = true;
+        if let Some(player) = game.native_acting_player() {
+            game.native_action_bar(player.uuid, horizon_client::text::Text::literal(format!("Mode changed to: {}", mode.label())));
+        }
+        return;
+    }
+    if jetpack_fuel(held) > 0 {
+        game.native_start_using();
+        *claimed = true;
+    }
+}
+
+/// Each tick the use key is held (`ItemFlamethrower.onUseTick`): a mB of hydrogen makes a flame; with none the
+/// use ends.
+pub(super) fn using_tick(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut bool, keep: &mut bool) {
+    if &*stack.item != flamethrower::ITEM || !game.native_on(MOD_ID) {
+        return;
+    }
+    *claimed = true;
+    let creative = game.creative;
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == flamethrower::ITEM) else {
+        return;
+    };
+    let fuel = jetpack_fuel(held);
+    if fuel == 0 {
+        return;
+    }
+    let mode = flamethrower_mode(held);
+    if !creative {
+        set_jetpack_fuel(held, fuel - 1);
+    }
+    *keep = true;
+    let (Some(player), Some(eye)) = (game.native_player(), game.native_eye()) else {
+        return;
+    };
+    let shooter = game.player.as_ref().map_or([0.0; 3], |p| {
+        [p.velocity.x, if p.ground.on_ground { 0.0 } else { p.velocity.y }, p.velocity.z]
+    });
+    let noise = FLAME_RNG.with_borrow_mut(|r| {
+        let rng = r.get_or_insert_with(|| bolt::Rng::new(game.ticks as u64 ^ 0xF1A3));
+        [rng.gaussian(), rng.gaussian(), rng.gaussian()]
+    });
+    let start = flamethrower::start(eye, player.yaw, player.pitch, true);
+    let flame = Flame { pos: start, vel: flamethrower::velocity(player.yaw, player.pitch, shooter, noise), age: 0, mode };
+    // Between the eyes and where the flame starts a block hit it at once, so it cannot shoot through a wall.
+    let from = [eye[0], eye[1] - 0.1, eye[2]];
+    if let Some((_, block, face)) = game.native_clip(from, start) {
+        flame_hits_block(game, block, face, mode);
+        return;
+    }
+    FLAMES.with_borrow_mut(|f| f.push(flame));
+}
+
+/// Every tick, on the server: the flames fly, hit and fade, and the clients are told where they are.
+fn flames_tick(game: &mut Game<'_>) {
+    let mut flames = FLAMES.with_borrow_mut(std::mem::take);
+    flames.retain_mut(|f| {
+        f.age += 1;
+        if f.age > flamethrower::LIFESPAN {
+            return false;
+        }
+        let target = [0, 1, 2].map(|i| f.pos[i] + f.vel[i]);
+        let mut end = target;
+        let block = game.native_clip(f.pos, target);
+        if let Some((point, _, _)) = block {
+            end = point;
+        }
+        // The nearest mob or dropped item the flame's path meets, within a third of a block.
+        let lo = [0, 1, 2].map(|i| f.pos[i].min(end[i]) - 0.3);
+        let hi = [0, 1, 2].map(|i| f.pos[i].max(end[i]) + 0.3);
+        let hit = game.native_entities_in(lo, hi, f.pos).into_iter().next();
+        if let Some(entity) = hit {
+            flame_hits_entity(game, entity.id, &entity.kind, f.mode);
+            return false;
+        }
+        if let Some((_, pos, face)) = block {
+            flame_hits_block(game, pos, face, f.mode);
+            return false;
+        }
+        // Water and lava put the flame out.
+        let at = [target[0].floor() as i32, target[1].floor() as i32, target[2].floor() as i32];
+        if matches!(block_name(game, at), "minecraft:water" | "minecraft:lava") {
+            return false;
+        }
+        f.pos = target;
+        true
+    });
+    FLAMES.with_borrow_mut(|f| {
+        flames.append(f);
+        *f = flames;
+    });
+    // The clients get every flame each tick (id-less: they only draw what the last word holds).
+    let mut data = Vec::new();
+    FLAMES.with_borrow(|f| {
+        for flame in f {
+            for v in flame.pos.iter().chain(flame.vel.iter()) {
+                data.extend((*v as f32).to_be_bytes());
+            }
+            data.extend((flame.age as u16).to_be_bytes());
+        }
+    });
+    let sent = FLAME_SENT.replace(!data.is_empty());
+    if data.is_empty() && !sent {
+        return;
+    }
+    for p in robit_players(game) {
+        game.native_send_to_player(p.uuid, FLAME_CHANNEL, &data);
+    }
+}
+
+thread_local! {
+    static FLAME_SENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The server's flames reached the window (28 bytes each: position, velocity, age).
+fn flames_payload(data: &[u8]) {
+    let view: Vec<FlameView> = data
+        .chunks_exact(26)
+        .map(|c| {
+            let f = |i: usize| f64::from(f32::from_be_bytes([c[i * 4], c[i * 4 + 1], c[i * 4 + 2], c[i * 4 + 3]]));
+            FlameView { pos: [f(0), f(1), f(2)], vel: [f(3), f(4), f(5)], age: u32::from(u16::from_be_bytes([c[24], c[25]])), arrived: u64::MAX }
+        })
+        .collect();
+    FLAME_VIEW.with_borrow_mut(|v| *v = view);
+}
+
+/// `EntityFlame.onHitEntity`: a mob burns (ten damage and five seconds of fire) unless it is fire immune; a dropped
+/// item is smelted by the heat mode once it is five seconds old, and burns up otherwise.
+fn flame_hits_entity(game: &mut Game<'_>, id: u32, kind: &str, mode: flamethrower::Mode) {
+    if kind == "minecraft:item" {
+        let Some(at) = game.dropped.iter().position(|i| i.id == id) else {
+            return;
+        };
+        if mode == flamethrower::Mode::Heat {
+            if game.dropped[at].ticks > flamethrower::SMELT_AGE {
+                let stack = game.dropped[at].stack.clone();
+                if let Some(cooking) = world_recipes!(game).cook("minecraft:smelting", &stack) {
+                    let item = &mut game.dropped[at];
+                    item.stack = stack_of(&cooking.result.item.to_string(), cooking.result.count * stack.count);
+                    item.ticks = 0;
+                } else if flamethrower::DESTROY_ITEMS {
+                    game.dropped.remove(at);
+                }
+            }
+        } else if flamethrower::DESTROY_ITEMS {
+            game.dropped.remove(at);
+        }
+        return;
+    }
+    let immune = game.native_with_mob(id, |m| m.kind.flags.fire_immune).unwrap_or(true);
+    if !immune {
+        game.native_hurt_mob(id, flamethrower::DAMAGE, flamethrower::BURN_TICKS);
+    }
+}
+
+/// `EntityFlame.onHitBlock` (with the aesthetic world damage on): the heat mode smelts the block, the inferno mode
+/// lights it or the air beside it.
+fn flame_hits_block(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3], mode: flamethrower::Mode) {
+    let name = block_name(game, pos).to_owned();
+    match mode {
+        flamethrower::Mode::Combat => {}
+        flamethrower::Mode::Heat => {
+            if name.is_empty() || name == "minecraft:air" {
+                return;
+            }
+            let stack = stack_of(&name, 1);
+            let Some(cooking) = world_recipes!(game).cook("minecraft:smelting", &stack) else {
+                return;
+            };
+            let (result, count) = (cooking.result.item.to_string(), cooking.result.count);
+            let is_block = world_items!(game).get(&result).is_some_and(|i| i.block.is_some());
+            if is_block {
+                game.native_set_block(pos, &result, &[]);
+            } else {
+                game.native_set_block(pos, "minecraft:air", &[]);
+                let item = stack_of(&result, count);
+                game.spawn_item(item, [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5], [0.0; 3], 10);
+            }
+        }
+        flamethrower::Mode::Inferno => {
+            // Campfires and candles light; otherwise fire goes in the air on the face that was hit.
+            if let Some(lit) = game.native_block_property(pos, "lit") {
+                let lightable = name.ends_with("campfire") || name.ends_with("candle") || name.ends_with("candle_cake");
+                if lightable && lit == "false" {
+                    game.native_set_block_property(pos, "lit", "true");
+                    return;
+                }
+            }
+            let side = [pos[0] + face[0], pos[1] + face[1], pos[2] + face[2]];
+            if matches!(block_name(game, side), "minecraft:air" | "minecraft:cave_air") {
+                game.native_set_block(side, "minecraft:fire", &[]);
+            }
         }
     }
 }
