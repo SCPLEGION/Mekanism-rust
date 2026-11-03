@@ -18600,6 +18600,21 @@ pub(super) fn ui_click(game: &mut Game<'_>, id: &str, at: [f32; 2], button: u8, 
 
 /// A key on a mod screen: typing into the Robit's repair name box (`GuiTextField`, 50 characters).
 pub(super) fn ui_key(game: &mut Game<'_>, id: &str, key: &str, text: Option<&str>, pressed: bool) {
+    if id == ROBIT_SCREEN && pressed && ROBIT_WIN.with(std::cell::Cell::get) == 1 {
+        // `GuiRobitRename`: Enter confirms like the button.
+        if key == "key.keyboard.enter" || key == "key.keyboard.keypad_enter" {
+            if let Some(rid) = ROBIT_UI.with_borrow(|u| *u) {
+                robit_confirm_rename(game, rid);
+            }
+            return;
+        }
+        let mut edit = ROBIT_RENAME.with_borrow_mut(|b| b.take());
+        if let Some(e) = edit.as_mut() {
+            field_key(game, e, key, text);
+        }
+        ROBIT_RENAME.with_borrow_mut(|b| *b = edit);
+        return;
+    }
     if id != ROBIT_SCREEN || !pressed || ROBIT_TAB.with(std::cell::Cell::get) != RobitTab::Repair {
         return;
     }
@@ -18629,6 +18644,9 @@ pub(super) fn ui_wheel(game: &mut Game<'_>, id: &str, steps: f32) {
         tweaker_wheel(game.native_cursor(), steps);
     } else if id == RADIAL_ID {
         radial_scroll(game, steps);
+    } else if id == ROBIT_SCREEN && ROBIT_WIN.with(std::cell::Cell::get) == 2 {
+        let rows = ROBIT_UNLOCKED.with_borrow(|u| u.len().div_ceil(3)).saturating_sub(3);
+        ROBIT_SKIN_ROW.with(|r| r.set((r.get() as i32 - steps.signum() as i32).clamp(0, rows as i32) as usize));
     }
 }
 
@@ -19201,6 +19219,9 @@ struct RobitView {
     pickup: bool,
     /// The smelting progress, 0 to 100.
     progress: u8,
+    /// `EntityRobit.getName`'s custom name, and the skin worn.
+    name: String,
+    skin: String,
     owner: String,
 }
 
@@ -19218,6 +19239,10 @@ fn send_robit_states(game: &mut Game<'_>, players: &[RobitPlayer]) {
         out.extend(get_long(&data, "energy").to_be_bytes());
         out.push(get_int(&data, "follow") as u8 | (get_int(&data, "pickup") as u8) << 1);
         out.push((get_int(&data, "progress") * 100 / robit::SMELT_TICKS) as u8);
+        for s in [get_string(&data, "name").unwrap_or_default(), get_string(&data, "skin").unwrap_or_else(|| ROBIT_BASE_SKIN.to_owned())] {
+            out.push(s.len().min(255) as u8);
+            out.extend(s.bytes().take(255));
+        }
         out.extend(get_string(&data, "owner_name").unwrap_or_default().bytes());
         for p in players {
             game.native_send_to_player(p.uuid, ROBIT_STATE_CHANNEL, &out);
@@ -19237,7 +19262,23 @@ fn robit_state_payload(data: &[u8]) {
         follow: data[12] & 1 != 0,
         pickup: data[12] & 2 != 0,
         progress: data[13],
-        owner: String::from_utf8_lossy(&data[14..]).into_owned(),
+        name: String::new(),
+        skin: String::new(),
+        owner: String::new(),
+    };
+    let mut at = 14;
+    let mut read = || -> Option<String> {
+        let len = usize::from(*data.get(at)?);
+        let s = String::from_utf8_lossy(data.get(at + 1..at + 1 + len)?).into_owned();
+        at += 1 + len;
+        Some(s)
+    };
+    let (name, skin) = (read().unwrap_or_default(), read().unwrap_or_default());
+    let view = RobitView {
+        name,
+        skin,
+        owner: String::from_utf8_lossy(data.get(at..).unwrap_or_default()).into_owned(),
+        ..view
     };
     ROBIT_VIEWS.with_borrow_mut(|v| {
         v.insert(id, view);
@@ -19263,6 +19304,10 @@ fn robit_op_payload(game: &mut Game<'_>, data: &[u8]) {
             let name: String = String::from_utf8_lossy(&data[5..]).chars().take(50).collect();
             ROBIT_NAME.with_borrow_mut(|n| n.insert(player.name, name));
         }
+        return;
+    }
+    if data.len() >= 5 && (data[0] == 9 || data[0] == 10) {
+        robit_set_text(game, data[0], u32::from_be_bytes([data[1], data[2], data[3], data[4]]), &String::from_utf8_lossy(&data[5..]));
         return;
     }
     let [op, a, b, c, d] = data[..] else {
@@ -19321,8 +19366,10 @@ fn robit_origin(batch: &horizon_client::hud::HudBatch) -> [f32; 2] {
     [((batch.width - ROBIT_WINDOW[0]) / 2.0).floor(), ((batch.height - ROBIT_WINDOW[1]) / 2.0).floor()]
 }
 
-const ROBIT_BUTTONS: [(&str, [f32; 4], u8); 3] = [
+const ROBIT_BUTTONS: [(&str, [f32; 4], u8); 5] = [
     ("button/home", [6.0, 16.0, 18.0, 18.0], 1),
+    ("button/rename", [6.0, 35.0, 18.0, 18.0], 101),
+    ("button/skin", [6.0, 54.0, 18.0, 18.0], 102),
     ("button/drop", [152.0, 35.0, 18.0, 18.0], 2),
     ("button/follow", [152.0, 54.0, 18.0, 18.0], 3),
 ];
@@ -19341,7 +19388,7 @@ fn robit_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
     nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [o[0] + 27.0, o[1] + 16.0, 122.0, 56.0], 0xFFFF_FFFF);
     let yes = |b: bool| if b { "True" } else { "False" };
     let lines = [
-        "Hi, Robit!".to_owned(),
+        format!("Hi, I'm {}!", if view.name.is_empty() { "Robit" } else { &view.name }),
         String::new(),
         format!("Energy: {} FE", view.energy),
         format!("Following: {}", yes(view.follow)),
@@ -19364,14 +19411,182 @@ fn robit_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
             game.native_item(batch, &item, [r[0] + 1.0, r[1] + 1.0], 16.0);
         }
     }
-    for (icon, r, _) in ROBIT_BUTTONS {
+    let window = ROBIT_WIN.with(std::cell::Cell::get);
+    for (icon, r, op) in ROBIT_BUTTONS {
         let rect = [o[0] + r[0], o[1] + r[1], r[2], r[3]];
-        draw_button(game, batch, rect, inside(cursor, rect), true, 0xFFFF_FFFF, Some((icon, 18.0)));
+        // The window's button stays dark while its window is open (`setListenerTab`).
+        let active = !((op == 101 && window == 1) || (op == 102 && window == 2));
+        draw_button(game, batch, rect, active && inside(cursor, rect) && window == 0, active, 0xFFFF_FFFF, Some((icon, 18.0)));
+    }
+    match window {
+        1 => robit_draw_rename(game, batch, o),
+        2 => robit_draw_skins(game, batch, o, &view),
+        _ => {}
+    }
+}
+
+/// A `GuiWindow` that is a focus overlay: the screen dimmed, the window on its own plate.
+fn robit_window_plate(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, r: [f32; 4], title: &str) {
+    game.native_fill(batch, [-2000.0, -2000.0, 6000.0, 6000.0], 0x803C_3C3C);
+    nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [r[0] - 3.0, r[1] - 3.0, r[2] + 6.0, r[3] + 6.0], 0xBFFF_FFFF);
+    nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, r, 0xFFFF_FFFF);
+    centred(game, batch, title, r[0], r[2], r[1] + 7.0, 0x40_4040);
+}
+
+fn robit_text_button(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, r: [f32; 4], label: &str) {
+    draw_button(game, batch, r, inside(game.native_cursor(), r), true, 0xFFFF_FFFF, None);
+    let w = game.native_text_width(label);
+    game.native_text(batch, label, [r[0] + (r[2] - w) / 2.0, r[1] + 6.0], 0xFF_FFFF, true);
+}
+
+const RENAME_WINDOW: [f32; 4] = [27.0, 16.0, 172.0, 58.0];
+const SKIN_WINDOW: [f32; 4] = [4.0, -12.0, 168.0, 190.0];
+
+fn robit_rename_rects(o: [f32; 2]) -> ([f32; 4], [f32; 4], [f32; 4]) {
+    let w = [o[0] + RENAME_WINDOW[0], o[1] + RENAME_WINDOW[1], RENAME_WINDOW[2], RENAME_WINDOW[3]];
+    (w, [w[0] + 21.0, w[1] + 17.0, w[2] - 42.0, 12.0], [w[0] + 56.0, w[1] + 32.0, 60.0, 20.0])
+}
+
+/// `GuiRobitRename`: a text field and Confirm.
+fn robit_draw_rename(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2]) {
+    let (w, field, confirm) = robit_rename_rects(o);
+    robit_window_plate(game, batch, w, "Rename this Robit");
+    nine_slice_tinted(game, batch, "digital_text_input", [16.0, 16.0], 3.0, [field[0] - 1.0, field[1] - 2.0, field[2] + 2.0, field[3] + 4.0], 0xFFFF_FFFF);
+    ROBIT_RENAME.with_borrow_mut(|b| {
+        let edit = b.get_or_insert_with(|| robit_name_field());
+        [edit.x, edit.y, edit.width, edit.height] = field;
+        edit.focused = true;
+        edit.draw(batch, &game.gui.atlas, None);
+    });
+    robit_text_button(game, batch, confirm, "Confirm");
+}
+
+fn robit_skin_slot(i: usize, o: [f32; 2]) -> [f32; 4] {
+    [o[0] + SKIN_WINDOW[0] + 6.0 + 48.0 * (i % 3) as f32, o[1] + SKIN_WINDOW[1] + 18.0 + 48.0 * (i / 3) as f32, 48.0, 48.0]
+}
+
+fn robit_skin_buttons(o: [f32; 2]) -> ([f32; 4], [f32; 4]) {
+    let (x, y) = (o[0] + SKIN_WINDOW[0], o[1] + SKIN_WINDOW[1]);
+    ([x + SKIN_WINDOW[2] / 2.0 - 61.0, y + 165.0, 60.0, 20.0], [x + SKIN_WINDOW[2] / 2.0 + 1.0, y + 165.0, 60.0, 20.0])
+}
+
+/// The skin's name (`robit_skin.mekanism.*`).
+fn robit_skin_name(skin: &str) -> String {
+    match skin.trim_start_matches("mekanism:") {
+        "robit" => "Default".to_owned(),
+        "pride" => "Pride".to_owned(),
+        "allay" => "Allay Costume".to_owned(),
+        other => {
+            let mut c = other.chars();
+            let head = c.next().map(|f| f.to_uppercase().collect::<String>()).unwrap_or_default();
+            format!("{head}{} Pride", c.as_str())
+        }
+    }
+}
+
+/// `GuiRobitSkinSelect`: three by three skins, a scroll bar, Cancel and Confirm. The skins are named, not
+/// shown turning (the original renders each baked model into its slot).
+fn robit_draw_skins(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2], view: &RobitView) {
+    let w = [o[0] + SKIN_WINDOW[0], o[1] + SKIN_WINDOW[1], SKIN_WINDOW[2], SKIN_WINDOW[3]];
+    robit_window_plate(game, batch, w, "Change this Robit's appearance");
+    let skins = ROBIT_UNLOCKED.with_borrow(Clone::clone);
+    let picked = ROBIT_PICKED.with_borrow(|p| if p.is_empty() { view.skin.clone() } else { p.clone() });
+    let rows = skins.len().div_ceil(3);
+    let first = ROBIT_SKIN_ROW.with(std::cell::Cell::get).min(rows.saturating_sub(3));
+    let cursor = game.native_cursor();
+    for i in 0..9 {
+        let r = robit_skin_slot(i, o);
+        let skin = skins.get(first * 3 + i);
+        let selected = skin.is_some_and(|s| *s == picked);
+        nine_slice_tinted(game, batch, if selected { "inner_screen" } else { "element_holder" }, if selected { [256.0, 256.0] } else { [32.0, 32.0] }, 6.0, r, 0xFFFF_FFFF);
+        if let Some(s) = skin {
+            let name = robit_skin_name(s);
+            centred(game, batch, &name, r[0], r[2], r[1] + 20.0, if selected { 0x3CFD_3C } else { 0x40_4040 });
+            if inside(cursor, r) {
+                game.native_fill(batch, r, 0x70FF_EA00);
+            }
+        }
+    }
+    // The scroll bar (`GuiScrollBar`, 12 wide, three rows shown).
+    let bar = [w[0] + 6.0 + 144.0, w[1] + 18.0, 12.0, 144.0];
+    let hidden = rows.saturating_sub(3);
+    let thumb = if hidden > 0 { (first as f32 / hidden as f32 * (bar[3] - 2.0 - 15.0)).round() } else { 0.0 };
+    nine_slice_tinted(game, batch, "scroll/list_border", [6.0, 6.0], 2.0, [bar[0], bar[1], bar[2], bar[3]], 0xFFFF_FFFF);
+    sprite(game, batch, if hidden > 0 { "scroll/bar" } else { "scroll/bar_inactive" }, [0.0, 0.0, 12.0, 15.0], [bar[0], bar[1] + 1.0 + thumb, 12.0, 15.0]);
+    let (cancel, confirm) = robit_skin_buttons(o);
+    robit_text_button(game, batch, cancel, "Cancel");
+    robit_text_button(game, batch, confirm, "Confirm");
+}
+
+/// A click while a Robit window is open: the window takes every click (`isFocusOverlay`).
+fn robit_window_click(game: &mut Game<'_>, at: [f32; 2], button: u8, window: u8) {
+    let o = ROBIT_ORIGIN.with_borrow(|o| *o);
+    let Some(id) = ROBIT_UI.with_borrow(|u| *u) else {
+        return;
+    };
+    if button != 0 {
+        return;
+    }
+    if window == 1 {
+        let (_, field, confirm) = robit_rename_rects(o);
+        if inside(at, field) {
+            let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);
+            let now = std::time::Instant::now();
+            let double = ROBIT_LAST_CLICK.with(|c| c.replace(Some(now))).is_some_and(|t| now.duration_since(t).as_millis() < 250);
+            ROBIT_RENAME.with_borrow_mut(|b| {
+                if let Some(e) = b {
+                    e.click(&game.gui.atlas, at[0], shift, double);
+                }
+            });
+        } else if inside(at, confirm) {
+            robit_confirm_rename(game, id);
+        }
+    } else {
+        let skins = ROBIT_UNLOCKED.with_borrow(Clone::clone);
+        let first = ROBIT_SKIN_ROW.with(std::cell::Cell::get).min(skins.len().div_ceil(3).saturating_sub(3));
+        for i in 0..9 {
+            if inside(at, robit_skin_slot(i, o))
+                && let Some(s) = skins.get(first * 3 + i)
+            {
+                ROBIT_PICKED.with_borrow_mut(|p| *p = s.clone());
+            }
+        }
+        let (cancel, confirm) = robit_skin_buttons(o);
+        if inside(at, cancel) {
+            ROBIT_WIN.with(|w| w.set(0));
+        } else if inside(at, confirm) {
+            let picked = ROBIT_PICKED.with_borrow(Clone::clone);
+            let current = ROBIT_VIEWS.with_borrow(|v| v.get(&id).map(|v| v.skin.clone())).unwrap_or_default();
+            if !picked.is_empty() && picked != current {
+                let mut out = vec![10];
+                out.extend(id.to_be_bytes());
+                out.extend(picked.bytes());
+                game.native_send_to_server(ROBIT_CHANNEL, &out);
+            }
+            ROBIT_WIN.with(|w| w.set(0));
+        }
+    }
+}
+
+/// `changeName`: a trimmed, non-blank name goes to the server and the window closes.
+fn robit_confirm_rename(game: &mut Game<'_>, id: u32) {
+    let name = ROBIT_RENAME.with_borrow(|b| b.as_ref().map(|e| e.value.trim().to_owned())).unwrap_or_default();
+    if !name.is_empty() {
+        let mut out = vec![9];
+        out.extend(id.to_be_bytes());
+        out.extend(name.bytes());
+        game.native_send_to_server(ROBIT_CHANNEL, &out);
+        ROBIT_WIN.with(|w| w.set(0));
     }
 }
 
 fn robit_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
     if !pressed {
+        return;
+    }
+    let window = ROBIT_WIN.with(std::cell::Cell::get);
+    if window != 0 {
+        robit_window_click(game, at, button, window);
         return;
     }
     let o = ROBIT_ORIGIN.with_borrow(|o| *o);
@@ -19410,6 +19625,18 @@ fn robit_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
     let o = ROBIT_ORIGIN.with_borrow(|o| *o);
     for (_, r, op) in ROBIT_BUTTONS {
         if inside(at, [o[0] + r[0], o[1] + r[1], r[2], r[3]]) {
+            if op == 101 {
+                ROBIT_RENAME.with_borrow_mut(|b| *b = Some(robit_name_field()));
+                ROBIT_WIN.with(|w| w.set(1));
+                continue;
+            }
+            if op == 102 {
+                let skin = ROBIT_VIEWS.with_borrow(|v| v.get(&id).map(|v| v.skin.clone())).unwrap_or_default();
+                ROBIT_PICKED.with_borrow_mut(|p| *p = skin);
+                ROBIT_SKIN_ROW.with(|r| r.set(0));
+                ROBIT_WIN.with(|w| w.set(2));
+                continue;
+            }
             let mut out = vec![op];
             out.extend(id.to_be_bytes());
             game.native_send_to_server(ROBIT_CHANNEL, &out);
@@ -19452,6 +19679,13 @@ thread_local! {
     /// Client: the repair input's `getHoverName` the server reported (a custom name included).
     static ROBIT_HOVER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     static ROBIT_LAST_CLICK: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    /// Client: the open window (0 none, 1 rename, 2 skin select), its rename box, the picked skin, the skins the
+    /// server unlocked for this player, and the first row shown.
+    static ROBIT_WIN: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static ROBIT_RENAME: std::cell::RefCell<Option<horizon_client::ui::EditBox>> = const { std::cell::RefCell::new(None) };
+    static ROBIT_PICKED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static ROBIT_UNLOCKED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    static ROBIT_SKIN_ROW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ROBIT_COST: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
     /// Server: who has the inventory open, and the stack on their cursor.
     static ROBIT_WATCH: std::cell::RefCell<std::collections::HashMap<String, (u32, Option<ItemStack>)>> = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -19641,6 +19875,51 @@ fn robit_inventory_click(game: &mut Game<'_>, id: u32, slot: usize, how: slot_cl
     });
 }
 
+const ROBIT_BASE_SKIN: &str = "mekanism:robit";
+/// The skins of `data/mekanism/mekanism/robit_skin`: the default first, then by name.
+const ROBIT_SKINS_ALL: [&str; 13] = [
+    "mekanism:robit", "mekanism:ace", "mekanism:agender", "mekanism:allay", "mekanism:aro", "mekanism:bi", "mekanism:enby",
+    "mekanism:gay", "mekanism:genderfluid", "mekanism:lesbian", "mekanism:pan", "mekanism:pride", "mekanism:trans",
+];
+
+/// `RobitSkin.isUnlocked`: the Allay costume comes with `husbandry/allay_deliver_item_to_player`, the rest are free.
+fn robit_unlocked_skins(game: &Game<'_>) -> Vec<&'static str> {
+    let allay = game.adv.tree.list.iter().find(|a| a.id == "minecraft:husbandry/allay_deliver_item_to_player").is_some_and(|a| game.adv.progress.done(a));
+    ROBIT_SKINS_ALL.into_iter().filter(|s| allay || *s != "mekanism:allay").collect()
+}
+
+/// `PacketRobitName` and `PacketRobitSkin`: rename the Robit (and `sara` in the base skin picks a pride skin), or change its skin.
+fn robit_set_text(game: &mut Game<'_>, op: u8, id: u32, text: &str) {
+    let Some(player) = game.native_acting_player() else {
+        return;
+    };
+    let unlocked = robit_unlocked_skins(game);
+    let pick = horizon_core::random::RandomSource::next_float(&mut game.world.random) < 0.5;
+    game.native_with_mob(id, |m| {
+        let near = (m.position.x - player.position[0]).powi(2) + (m.position.z - player.position[2]).powi(2) <= 256.0;
+        if m.kind.id != robit::TYPE || !near {
+            return;
+        }
+        let mut data = robit_data(m);
+        if op == 9 {
+            let name = text.trim();
+            if name.is_empty() || name.chars().count() > 50 {
+                return;
+            }
+            data.insert("name".into(), Tag::String(name.into()));
+            if get_string(&data, "skin").is_none_or(|s| s == ROBIT_BASE_SKIN) && name.to_lowercase() == "sara" {
+                let skin = if pick { "mekanism:trans" } else { "mekanism:lesbian" };
+                data.insert("skin".into(), Tag::String(skin.into()));
+            }
+        } else if unlocked.contains(&text) {
+            data.insert("skin".into(), Tag::String(text.into()));
+        } else {
+            return;
+        }
+        m.extra.mod_data = Some(data);
+    });
+}
+
 /// `AnvilMenu.createResult` for the Robit's repair slots; `name` is what its name box holds.
 fn robit_anvil(game: &Game<'_>, items: &[Option<ItemStack>], name: &str) -> horizon_client::stations::AnvilResult {
     let input = items.get(robit::REPAIR_INPUT).and_then(Option::as_ref);
@@ -19722,6 +20001,12 @@ fn send_robit_inventories(game: &mut Game<'_>) {
         let hover = shown[robit::REPAIR_INPUT].as_ref().map(|i| horizon_client::stations::hover_name(&|id| game.pack.names.display_item(id), i)).unwrap_or_default();
         out.extend((hover.len() as u16).to_be_bytes());
         out.extend(hover.bytes());
+        let skins = robit_unlocked_skins(game);
+        out.push(skins.len() as u8);
+        for s in skins {
+            out.push(s.len() as u8);
+            out.extend(s.bytes());
+        }
         game.native_send_to_player(uuid, ROBIT_ITEMS_CHANNEL, &out);
     }
 }
@@ -19749,6 +20034,21 @@ fn robit_items_payload(data: &[u8]) {
             let len = usize::from(u16::from_be_bytes([l[0], l[1]]));
             if let Some(s) = data.get(at + 6..at + 6 + len) {
                 ROBIT_HOVER.with_borrow_mut(|h| *h = String::from_utf8_lossy(s).into_owned());
+                let mut p = at + 6 + len;
+                let count = data.get(p).copied().unwrap_or(0);
+                p += 1;
+                let mut skins = vec![];
+                for _ in 0..count {
+                    let Some(&l) = data.get(p) else {
+                        break;
+                    };
+                    let Some(s) = data.get(p + 1..p + 1 + usize::from(l)) else {
+                        break;
+                    };
+                    skins.push(String::from_utf8_lossy(s).into_owned());
+                    p += 1 + usize::from(l);
+                }
+                ROBIT_UNLOCKED.with_borrow_mut(|u| *u = skins);
             }
         }
     }
@@ -19983,6 +20283,7 @@ fn robit_set_tab(game: &mut Game<'_>, tab: RobitTab) {
 /// The mod screen closed (Escape, or another screen replaced it): the Robit's inventory lets go of the cursor.
 pub(super) fn ui_closed(game: &mut Game<'_>, id: &str) {
     if id == ROBIT_SCREEN {
+        ROBIT_WIN.with(|w| w.set(0));
         ROBIT_TAB.with(|t| t.set(RobitTab::Main));
         if let Some(rid) = ROBIT_UI.with_borrow(|u| *u) {
             let mut out = vec![5];
