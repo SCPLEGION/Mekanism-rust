@@ -33,6 +33,8 @@ pub struct HeatGenerator {
     pub active: bool,
     /// Energy made in the last tick.
     pub producing: u64,
+    /// Heat lost to the air in the last tick (`getLastEnvironmentLoss`).
+    pub last_env: f64,
 }
 
 impl Default for HeatGenerator {
@@ -53,6 +55,7 @@ impl HeatGenerator {
             lava: 0,
             active: false,
             producing: 0,
+            last_env: 0.0,
         }
     }
 
@@ -89,10 +92,11 @@ impl HeatGenerator {
         self.heat.handle_heat(-heat_lost);
         let energy = ((heat_lost.abs() * carnot) as u64).min(MAX_PRODUCTION);
         self.energy.insert(energy, crate::energy::Action::Execute);
-        self.heat.lose_to_air(0.0);
+        let mut env = self.heat.lose_to_air(0.0);
         for _ in 0..5 {
-            self.heat.lose_to_air(INVERSE_INSULATION_COEFFICIENT);
+            env += self.heat.lose_to_air(INVERSE_INSULATION_COEFFICIENT);
         }
+        self.last_env = env;
         self.producing = self.energy.stored - before;
     }
 }

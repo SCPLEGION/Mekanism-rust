@@ -1205,6 +1205,9 @@ fn tick_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     put_int(&mut entity.nbt, "lava", g.lava);
     entity.nbt.insert("heat".into(), Tag::Double(g.heat.heat.to_bits()));
     // The flame shows the lava left, the arrow the temperature above ambient (up to 200 K).
+    put_long(&mut entity.nbt, "prod", g.producing);
+    entity.nbt.insert("temp".into(), Tag::Double(g.heat.temperature().to_bits()));
+    entity.nbt.insert("env".into(), Tag::Double(g.last_env.to_bits()));
     let warm = (g.heat.temperature() - mekanism_core::heat::AMBIENT_TEMP).clamp(0.0, 200.0) as i32;
     entity.data = vec![g.lava as i32, mekanism_core::generator::TANK_CAPACITY as i32, warm, 200];
     Some(g.active)
@@ -1235,6 +1238,8 @@ fn tick_solar(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, p
     charge_slot(entity, 0, &mut energy);
     push_energy(game, pos, &mut energy, None, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
+    put_long(&mut entity.nbt, "prod", produced);
+    put_int(&mut entity.nbt, "sees", u32::from(overworld(game) && game.sky_darken() < 4 && can_see_sky(game, pos)));
     entity.data = vec![(energy.stored * 1000 / storage.max(1)) as i32, 1000, produced as i32, peak as i32];
     Some(produced > 0)
 }
@@ -1281,6 +1286,9 @@ fn tick_wind(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) ->
     charge_slot(entity, 0, &mut energy);
     push_energy(game, pos, &mut energy, None, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
+    put_long(&mut entity.nbt, "prod", produced);
+    // `GuiWindGenerator`: why it makes nothing (0 it does, 1 no wind in this dimension, 2 sky blocked).
+    put_int(&mut entity.nbt, "wstate", if produced > 0 { 0 } else if overworld(game) { 2 } else { 1 });
     entity.data = vec![(energy.stored * 1000 / g::WIND_STORAGE) as i32, 1000, produced as i32, g::WIND_GENERATION_MAX as i32];
     // What the rotor needs in the world: whether it turns and how fast (`getHeightSpeedRatio`, in thousandths).
     let mut client = Compound::new();
@@ -4812,6 +4820,9 @@ fn tick_gas_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_tank(&mut entity.nbt, "fuel", &fuel);
     put_int(&mut entity.nbt, "used", used as u32);
+    // `fuelDensity * getUsed` for the energy tab.
+    let density = fuel.chemical.as_deref().and_then(chem::fuel).map_or(0, |(d, _)| d);
+    put_long(&mut entity.nbt, "prod", density * used);
     Some(made > 0)
 }
 
@@ -7014,7 +7025,7 @@ fn layout(block: &str) -> Option<Layout> {
         // The bio-generator's fuel slot and bioethanol gauge (GuiBioGenerator).
         Kind::BioGenerator => Layout {
             slots: [Some(([143.0, 35.0], "slot/power")), Some(([17.0, 35.0], "slot/normal")), None],
-            gauges: vec![gauge("fuel", mekanism_core::generator::BIO_TANK, 55.0, 18.0, WIDE)],
+            gauges: vec![gauge("fuel", mekanism_core::generator::BIO_TANK, 7.0, 15.0, [4.0, 52.0])],
             power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
         },
@@ -7347,6 +7358,23 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
         // `TileEntityGasGenerator.getUsed`: the gas burnt last tick, for the screen's burn rate.
         if kind(&entity.id) == Some(Kind::GasGenerator) {
             entity.data[3] = get_int(&entity.nbt, "used").min(32_767) as i32;
+        }
+        // The generators' screens: what they make a tick (the energy tab and the screens' "Producing"),
+        // the heat generator's temperature and dissipation in tenths of a kelvin, the wind generator's
+        // reason for making nothing, the solar generator's sky.
+        if let Some(k @ (Kind::GasGenerator | Kind::HeatGenerator | Kind::BioGenerator | Kind::Wind | Kind::Solar(..))) = kind(&entity.id) {
+            match k {
+                Kind::HeatGenerator => {
+                    let temp = get_double(&entity.nbt, "temp").unwrap_or(300.0);
+                    entity.data[2] = (temp * 10.0).clamp(0.0, 32_767.0) as i32;
+                    entity.data[3] = (get_double(&entity.nbt, "env").unwrap_or(0.0) * 10.0).clamp(0.0, 32_767.0) as i32;
+                }
+                Kind::Wind => entity.data[1] = get_int(&entity.nbt, "wstate") as i32,
+                Kind::Solar(..) => entity.data[1] = get_int(&entity.nbt, "sees") as i32,
+                _ => {}
+            }
+            entity.data.truncate(DATA_USAGE);
+            entity.data.extend(wide(get_long(&entity.nbt, "prod")));
         }
         if let Some(k @ (Kind::Heater | Kind::FuelwoodHeater)) = kind(&entity.id) {
             let temp = 300.0 + get_double(&entity.nbt, "heat_out").unwrap_or(0.0) / 100.0;
@@ -9726,6 +9754,9 @@ fn extras(block: &str) -> Extras {
         // `GuiTexturedElement.downArrow(imageWidth + 8, 91)` between the washer's two fluid slots.
         Some(Kind::Washer) => Extras { active_progress: vec![large(64.0, 39.0)], arrows: vec![[184.0, 91.0]], ..none },
         Some(Kind::Heater) => Extras { screen: Some([48.0, 23.0, 80.0, 42.0]), ..none },
+        Some(Kind::BioGenerator) => Extras { screen: Some([48.0, 23.0, 80.0, 40.0]), ..none },
+        Some(Kind::Wind) => Extras { screen: Some([48.0, 21.0, 80.0, 44.0]), ..none },
+        Some(Kind::Solar(..)) => Extras { screen: Some([40.0, 23.0, 96.0, 40.0]), ..none },
         Some(Kind::DigitalMiner) => Extras { screen: Some([7.0, 19.0, 77.0, 69.0]), ..none },
         // `GuiThermalEvaporationController`: the screen between the gauges and the arrows under the buckets.
         Some(Kind::BoilerValve) => Extras { screen: Some([54.0, 23.0, 110.0, 40.0]), ..none },
@@ -9809,6 +9840,22 @@ fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
             let finished = if data.get(2).copied().unwrap_or(0) == 1 { "Yes" } else { "No" };
             vec![energy, format!("Finished: {finished}"), fluid()]
         }
+        // `GuiBioGenerator`, `GuiWindGenerator`, `GuiSolarGenerator`: the energy, then what they hold and make.
+        Some(Kind::BioGenerator) => vec![
+            energy,
+            format!("BioFuel: {}", thousands(read_wide(data, DATA_GAUGES))),
+            format!("Producing: {}/t", fe(read_wide(data, DATA_USAGE))),
+        ],
+        Some(Kind::Wind) => {
+            let mut lines = vec![energy, format!("Power: {}", fe(read_wide(data, DATA_USAGE)))];
+            match data.get(1).copied().unwrap_or(0) {
+                0 => {}
+                1 => lines.push("No wind".to_owned()),
+                _ => lines.push("Sky blocked".to_owned()),
+            }
+            lines
+        }
+        Some(Kind::Solar(..)) => vec![energy, format!("Producing: {}/t", fe(read_wide(data, DATA_USAGE)))],
         // The heaters' temperature (kelvin, sent in tenths) and the usage or the fuel left.
         Some(Kind::Heater | Kind::FuelwoodHeater) => {
             let temp = f64::from(data.get(2).copied().unwrap_or(3000).max(0)) / 10.0;
@@ -10522,6 +10569,13 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
             let pad = if matches!(kind(block), Some(Kind::TurbineValve | Kind::SpsPort | Kind::DigitalMiner)) { 5.0 } else { 3.0 };
             let at = |dy: f32, step: f32| [ox + x + pad, oy + y + dy + step * i as f32];
             match kind(block) {
+                // `GuiInnerScreen.defaultFormat`: 5 px in, 0.8 scale, 2 px between the lines, centred in the screen.
+                Some(Kind::BioGenerator | Kind::Wind | Kind::Solar(..)) => {
+                    let n = screen_lines(block, data).len() as f32;
+                    let top = ((h - (11.0 * n - 2.0)) / 2.0).floor();
+                    let red = kind(block) == Some(Kind::Wind) && i == 2;
+                    game.native_text_scaled(batch, line, [ox + x + 5.0, oy + y + top + 11.0 * i as f32], if red { 0xAA_0000 } else { 0x3C_FE9A }, 0.8)
+                }
                 Some(Kind::Evaporation) => game.native_text_scaled(batch, line, at(2.0, 9.0), 0x3C_FE9A, 0.8),
                 // `clearSpacing().clearFormat()`: top-aligned, 5 px in, 9 px a line.
                 Some(Kind::DigitalMiner) => game.native_text_scaled(batch, line, at(0.0, 9.0), 0x3C_FE9A, 0.8),
@@ -10536,6 +10590,26 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
                 _ => game.native_text(batch, line, at(3.0, 10.0), 0x3C_FE9A, false),
             }
         }
+    }
+    // `GuiFluidBar` (7, 15, 4 by 52): the bio-generator's bioethanol, from the bottom up.
+    if kind(block) == Some(Kind::BioGenerator) {
+        let (amount, capacity) = (read_wide(data, DATA_GAUGES), read_wide(data, DATA_GAUGES + 4).max(1));
+        let chemical = usize::try_from(data.get(DATA_GAUGES + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c));
+        let (texture, argb) = gauge_texture(chemical);
+        nine_slice(game, batch, "bar/base", 5.0, 1.0, [ox + 7.0, oy + 15.0, 4.0, 52.0]);
+        let h = 50.0 * (amount as f32 / capacity as f32).clamp(0.0, 1.0);
+        if h > 0.0 {
+            fill_tiled(game, batch, &texture, [ox + 8.0, oy + 66.0 - h, 2.0, h], argb);
+        }
+    }
+    // `GuiStateTexture` (18, 35): the holder with the state's 12 px sprite inside.
+    if let Some((on, off, lit)) = match kind(block) {
+        Some(Kind::Wind) => Some(("wind_on", "wind_off", data.get(1).copied().unwrap_or(0) == 0)),
+        Some(Kind::Solar(..)) => Some(("sees_sun", "no_sun", data.get(1).copied().unwrap_or(0) != 0)),
+        _ => None,
+    } {
+        game.native_sprite(batch, "mekanismgenerators:gui/sprites/state/holder", [0.0, 0.0, 16.0, 16.0], [ox + 18.0, oy + 35.0, 16.0, 16.0]);
+        game.native_sprite(batch, &format!("mekanismgenerators:gui/sprites/state/{}", if lit { on } else { off }), [0.0, 0.0, 12.0, 12.0], [ox + 20.0, oy + 37.0, 12.0, 12.0]);
     }
     for [x, y] in &e.arrows {
         sprite(game, batch, "arrow/down", [0.0, 0.0, 8.0, 9.0], [ox + x, oy + y, 8.0, 9.0]);
@@ -10705,7 +10779,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         };
         sprite(game, batch, &format!("gauge/overlay/{overlay}"), [0.0, 0.0, size[0] - 2.0, size[1] - 2.0], [x + 1.0, y + 1.0, size[0] - 2.0, size[1] - 2.0]);
     };
-    for (i, g) in l.gauges.iter().enumerate().filter(|(_, g)| !matches!(kind(block), Some(Kind::FusionPort | Kind::ChemicalTank(_))) && !g.key.starts_with("stats_")) {
+    for (i, g) in l.gauges.iter().enumerate().filter(|(_, g)| !matches!(kind(block), Some(Kind::FusionPort | Kind::ChemicalTank(_) | Kind::BioGenerator)) && !g.key.starts_with("stats_")) {
         let at = DATA_GAUGES + i * GAUGE_SLOTS;
         let (amount, capacity) = (read_wide(data, at), read_wide(data, at + 4).max(1));
         let chemical = usize::try_from(data.get(at + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c));
@@ -10786,7 +10860,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         sprite(game, batch, "tab/energy_info", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 137.0, 26.0, 26.0]);
     }
     // The heaters' heat tab (`GuiHeatTab`, in kelvin) above the energy tab.
-    if matches!(kind(block), Some(Kind::Heater | Kind::FuelwoodHeater | Kind::Evaporation | Kind::BoilerValve)) {
+    if matches!(kind(block), Some(Kind::Heater | Kind::FuelwoodHeater | Kind::Evaporation | Kind::BoilerValve | Kind::HeatGenerator)) {
         sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
     }
     draw_extras(game, batch, block, data, origin);
@@ -11186,6 +11260,15 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         && inside(at, [p[0], p[1], w, h])
     {
         lines.push(format!("{}%", get(2) * 100 / get(3).max(1)));
+    } else if matches!(kind(block), Some(Kind::GasGenerator | Kind::HeatGenerator | Kind::BioGenerator | Kind::Wind | Kind::Solar(..))) && inside(at, [-26.0, 137.0, 26.0, 26.0]) {
+        // `GuiEnergyTab` of the generators: what they make a tick.
+        lines.push(format!("Producing: {}/t", mekanism_core::energy::format_fe(read_wide(data, DATA_USAGE))));
+    } else if kind(block) == Some(Kind::HeatGenerator) && inside(at, [-26.0, 109.0, 26.0, 26.0]) {
+        // `GuiHeatTab`: the temperature, what it passes on and what the air takes.
+        let k = |tenths: i32| mekanism_core::energy::format_unit(f64::from(tenths.max(0)) / 10.0, "K");
+        lines.push(format!("Temperature: {}", k(get(2))));
+        lines.push(format!("Transferred: {}/t", k(0)));
+        lines.push(format!("Dissipated: {}/t", k(get(3))));
     } else if l.power.is_some() && inside(at, [-26.0, 137.0, 26.0, 26.0]) {
         let usage = read_wide(data, DATA_USAGE);
         if usage > 0 {
@@ -13557,6 +13640,7 @@ fn tick_bio_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     push_energy(game, pos, &mut energy, None, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_tank(&mut entity.nbt, "fuel", &fuel);
+    put_long(&mut entity.nbt, "prod", made);
     Some(made > 0)
 }
 
