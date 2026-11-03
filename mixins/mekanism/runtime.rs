@@ -831,7 +831,7 @@ fn tick_machine(game: &mut Game<'_>, entity: &mut ModBlockEntity, recipe: &str, 
     let u = upgrades(&entity.nbt);
     entity.data.extend(wide(m.energy.stored));
     entity.data.extend(wide(m.energy.capacity));
-    entity.data.extend([u.speed as i32, u.energy as i32]);
+    entity.data.extend([(u.speed | u.anchor << 14) as i32, u.energy as i32]);
     entity.data.extend(wide(m.usage));
     Some(m.active)
 }
@@ -1043,6 +1043,7 @@ pub(super) fn install_upgrade(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         let target = self::kind(&m.id);
         if !matches!(target, Some(Kind::Machine(..) | Kind::Factory(..) | Kind::DigitalMiner | Kind::Pump | Kind::Plenisher))
             || (kind == Upgrade::Filter && target != Some(Kind::Pump))
+            || (kind == Upgrade::Anchor && target != Some(Kind::DigitalMiner))
         {
             return None;
         }
@@ -2716,6 +2717,17 @@ fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
                 delay = delay_length;
             }
         }
+    }
+    // The Anchor upgrade (`TileComponentChunkLoader`, Horizon API 45): its own chunk and the one it is mining.
+    if u.anchor > 0 {
+        let mut chunks = vec![(pos[0] >> 4, pos[2] >> 4)];
+        if let Some(&index) = found.last() {
+            let at = region.position(pos, index as u32);
+            if (at[0] >> 4, at[2] >> 4) != chunks[0] {
+                chunks.push((at[0] >> 4, at[2] >> 4));
+            }
+        }
+        game.native_keep_chunks(&chunks);
     }
     // Auto-eject (`doEject`): a stack to the inventory behind it (one block up and two back), every 10 ticks.
     if get_int(&entity.nbt, "eject") == 1 && game.ticks % 10 == 0 {
@@ -7181,7 +7193,7 @@ fn window_button(game: &Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id
 /// Mekanism's upgrades in their registry's order (`MekanismDatapackRegistries`): id, name, colour
 /// (`EnumColor`), description, and the port's upgrade when it installs that one.
 const UPGRADE_TYPES: [(&str, &str, u32, &str, Option<Upgrade>); 7] = [
-    ("mekanism:anchor", "Anchor", 0x59C15F, "Keeps a machine's chunk loaded.", None),
+    ("mekanism:anchor", "Anchor", 0x59C15F, "Keeps a machine's chunk loaded.", Some(Upgrade::Anchor)),
     ("mekanism:chemical", "Chemical", 0xFFDD4F, "Increases the efficiency of chemical-using machinery.", None),
     ("mekanism:energy", "Energy", 0x75FF89, "Increases energy efficiency and capacity of machinery.", Some(Upgrade::Energy)),
     ("mekanism:filter", "Filter", 0x00F3D0, "A filter that separates heavy water from regular water.", Some(Upgrade::Filter)),
@@ -7193,7 +7205,8 @@ const UPGRADE_TYPES: [(&str, &str, u32, &str, Option<Upgrade>); 7] = [
 /// The upgrades the port installs in a block (`install_upgrade`).
 fn supported_upgrades(block: &str) -> &'static [Upgrade] {
     match kind(block) {
-        Some(Kind::Machine(..) | Kind::Factory(..) | Kind::DigitalMiner | Kind::Plenisher) => &[Upgrade::Speed, Upgrade::Energy],
+        Some(Kind::DigitalMiner) => &[Upgrade::Speed, Upgrade::Energy, Upgrade::Anchor],
+        Some(Kind::Machine(..) | Kind::Factory(..) | Kind::Plenisher) => &[Upgrade::Speed, Upgrade::Energy],
         Some(Kind::Pump) => &[Upgrade::Speed, Upgrade::Energy, Upgrade::Filter],
         _ => &[],
     }
@@ -7202,9 +7215,11 @@ fn supported_upgrades(block: &str) -> &'static [Upgrade] {
 /// The installed upgrades' registry indices, from the screen's data (speed and energy counts).
 fn installed_upgrades(data: &[i32]) -> Vec<(usize, u32)> {
     let count = |u: Upgrade| match u {
-        Upgrade::Speed => data.get(DATA_SPEED).copied().unwrap_or(0).max(0) as u32,
+        Upgrade::Speed => (data.get(DATA_SPEED).copied().unwrap_or(0).max(0) & 0x3FFF) as u32,
         Upgrade::Energy => data.get(DATA_ENERGY_UPGRADES).copied().unwrap_or(0).max(0) as u32,
         Upgrade::Filter => 0,
+        // Bit 14 of the speed slot (a machine's speed count is at most 8).
+        Upgrade::Anchor => (data.get(DATA_SPEED).copied().unwrap_or(0).max(0) >> 14 & 1) as u32,
     };
     UPGRADE_TYPES
         .iter()
@@ -7455,6 +7470,7 @@ fn upgrade_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
         Upgrade::Speed => &mut u.speed,
         Upgrade::Energy => &mut u.energy,
         Upgrade::Filter => &mut u.filter,
+        Upgrade::Anchor => &mut u.anchor,
     };
     if *field == 0 {
         return true;
@@ -9796,7 +9812,7 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         }
         lines.push(format!("Stored: {} FE", read_wide(data, DATA_STORED)));
         if matches!(kind(block), Some(Kind::Machine(..))) {
-            lines.push(format!("§7Speed upgrades: {}/8", get(DATA_SPEED)));
+            lines.push(format!("§7Speed upgrades: {}/8", get(DATA_SPEED) & 0x3FFF));
             lines.push(format!("§7Energy upgrades: {}/8", get(DATA_ENERGY_UPGRADES)));
         }
     }
@@ -16073,6 +16089,10 @@ fn tick_stabilizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
     let per_tick = st::energy_per_tick(&grid);
     // The chunks stay loaded only while the whole usage can be paid.
     let active = energy.consume(per_tick);
+    if active {
+        // Horizon API 45: the chunks stay loaded while the whole usage is paid.
+        game.native_keep_chunks(&st::chunk_set(&grid, pos[0] >> 4, pos[2] >> 4));
+    }
     put_int(&mut entity.nbt, "warn", u32::from(per_tick > energy.stored + if active { per_tick } else { 0 }));
     put_long(&mut entity.nbt, "energy", energy.stored);
     entity.data = vec![(energy.stored * 1000 / capacity) as i32, 1000, 0, 0];

@@ -35,6 +35,19 @@ pub fn decode(text: &str) -> Grid {
     grid
 }
 
+/// The chunks the grid loads around the stabilizer's chunk `(cx, cz)` (`getChunkSet`).
+pub fn chunk_set(grid: &Grid, cx: i32, cz: i32) -> Vec<(i32, i32)> {
+    let mut out = vec![];
+    for x in 0..DIAMETER {
+        for z in 0..DIAMETER {
+            if grid[x * DIAMETER + z] {
+                out.push((cx + x as i32 - MAX_LOAD_RADIUS, cz + z as i32 - MAX_LOAD_RADIUS));
+            }
+        }
+    }
+    out
+}
+
 pub fn chunks_loaded(grid: &Grid) -> u64 {
     grid.iter().filter(|&&b| b).count() as u64
 }
@@ -150,6 +163,14 @@ pub fn decode_request(data: &[u8]) -> Option<(Op, [i32; 3])> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_chunk_set_surrounds_the_stabilizer() {
+        let mut g = super::new_grid();
+        assert_eq!(super::chunk_set(&g, 10, -3), vec![(10, -3)]);
+        g[0] = true;
+        assert!(super::chunk_set(&g, 10, -3).contains(&(8, -5)));
+    }
+
     use super::*;
 
     #[test]

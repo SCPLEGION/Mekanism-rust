@@ -11,10 +11,12 @@ pub enum Upgrade {
     Energy,
     /// The Electric Pump's: water pumps as heavy water.
     Filter,
+    /// The Digital Miner's: keeps the chunks it works in loaded.
+    Anchor,
 }
 
 impl Upgrade {
-    pub const ALL: [Upgrade; 3] = [Upgrade::Speed, Upgrade::Energy, Upgrade::Filter];
+    pub const ALL: [Upgrade; 4] = [Upgrade::Speed, Upgrade::Energy, Upgrade::Filter, Upgrade::Anchor];
 
     /// The `mekanism:upgrade_type` value of the upgrade item.
     pub fn id(self) -> &'static str {
@@ -22,6 +24,7 @@ impl Upgrade {
             Upgrade::Speed => "mekanism:speed",
             Upgrade::Energy => "mekanism:energy",
             Upgrade::Filter => "mekanism:filter",
+            Upgrade::Anchor => "mekanism:anchor",
         }
     }
 
@@ -31,7 +34,7 @@ impl Upgrade {
 
     pub fn max(self) -> u32 {
         match self {
-            Upgrade::Filter => 1,
+            Upgrade::Filter | Upgrade::Anchor => 1,
             _ => 8,
         }
     }
@@ -47,6 +50,7 @@ pub struct Upgrades {
     pub speed: u32,
     pub energy: u32,
     pub filter: u32,
+    pub anchor: u32,
 }
 
 impl Upgrades {
@@ -55,6 +59,7 @@ impl Upgrades {
             Upgrade::Speed => self.speed,
             Upgrade::Energy => self.energy,
             Upgrade::Filter => self.filter,
+            Upgrade::Anchor => self.anchor,
         }
     }
 
@@ -66,6 +71,7 @@ impl Upgrades {
             Upgrade::Speed => self.speed += n,
             Upgrade::Energy => self.energy += n,
             Upgrade::Filter => self.filter += n,
+            Upgrade::Anchor => self.anchor += n,
         }
         n
     }
@@ -125,6 +131,7 @@ mod tests {
             speed: 8,
             energy: 0,
             filter: 0,
+            anchor: 0,
         };
         assert_eq!(u.ticks(200), 20);
         assert_eq!(u.energy_per_tick(50), 5000);
@@ -133,6 +140,7 @@ mod tests {
             speed: 4,
             energy: 0,
             filter: 0,
+            anchor: 0,
         };
         assert_eq!((half.ticks(200), half.energy_per_tick(50)), (63, 500));
     }
@@ -143,12 +151,14 @@ mod tests {
             speed: 0,
             energy: 8,
             filter: 0,
+            anchor: 0,
         };
         assert_eq!((u.energy_per_tick(50), u.max_energy(200)), (5, 2000));
         let both = Upgrades {
             speed: 8,
             energy: 8,
             filter: 0,
+            anchor: 0,
         };
         assert_eq!(both.energy_per_tick(50), 500);
     }
@@ -160,6 +170,7 @@ mod tests {
         assert_eq!(u.install(Upgrade::Speed, 5), 3);
         assert_eq!(u.install(Upgrade::Speed, 1), 0);
         assert_eq!(Upgrade::from_id("mekanism:energy"), Some(Upgrade::Energy));
-        assert_eq!(Upgrade::from_id("mekanism:anchor"), None);
+        assert_eq!(Upgrade::from_id("mekanism:anchor"), Some(Upgrade::Anchor));
+        assert_eq!(Upgrade::from_id("mekanism:muffling"), None);
     }
 }
