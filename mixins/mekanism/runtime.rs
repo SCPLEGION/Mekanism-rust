@@ -1212,6 +1212,11 @@ thread_local! {
 }
 
 thread_local! {
+    /// The energy cubes this client has heard of.
+    static CORES: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
     /// The fluid tanks this client has heard of.
     static TANKS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
@@ -1225,6 +1230,10 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
         });
     } else if matches!(kind(id), Some(Kind::FluidTank(_))) {
         TANKS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    } else if matches!(kind(id), Some(Kind::EnergyCube(_))) {
+        CORES.with_borrow_mut(|t| {
             t.insert(pos);
         });
     } else if id == "mekanism:teleporter" {
@@ -1304,7 +1313,46 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                 pitch: 0.0,
                 roll,
                 light_at: [pos[0], pos[1] + 4, pos[2]],
+                color: 0xFFFF_FFFF,
+                rotation: None,
+                full_bright: false,
             });
+            true
+        });
+    });
+    // `RenderEnergyCube`: the core floats, bobs and turns while the cube holds energy, tinted with the tier's
+    // colour and the fill as alpha.
+    const TIER_RGB: [u32; 5] = [0x5FFFB8, 0xFF806A, 0x4BF8FF, 0xF787FF, 0x585858];
+    let time = game.ticks as f32 + game.clock.fraction() as f32;
+    CORES.with_borrow_mut(|cores| {
+        cores.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::EnergyCube(_))) {
+                return false;
+            }
+            let alpha = get_int(c, "core_alpha").min(255);
+            if alpha > 0 {
+                let rgb = TIER_RGB.get(get_int(c, "core_tier") as usize).copied().unwrap_or(0xFFFFFF);
+                let scaled = 4.0 * time;
+                let bob = f64::from((3.0 * time).to_radians().sin() / 7.0 * 0.4);
+                // poseStack: rotate Y by `scaled`, then about (0, 1/√2, 1/√2) by 36 + `scaled`.
+                let axis = glam::Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2);
+                let q = glam::Quat::from_axis_angle(glam::Vec3::Y, scaled.to_radians())
+                    * glam::Quat::from_axis_angle(axis, (36.0 + scaled).to_radians());
+                models.push(super::native_hooks::NativeWorldModel {
+                    model: "mekanism:energy_core".into(),
+                    position: [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5 + bob, f64::from(pos[2]) + 0.5],
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    roll: 0.0,
+                    light_at: *pos,
+                    color: (alpha << 24) | rgb,
+                    rotation: Some(q.to_array()),
+                    full_bright: true,
+                });
+            }
             true
         });
     });
@@ -1328,6 +1376,11 @@ fn tick_cube(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, ti
     }
     put_long(&mut entity.nbt, "energy", energy.stored);
     entity.data = vec![(energy.stored * 1000 / capacity.max(1)) as i32, 1000, 0, 0];
+    // The core, for `RenderEnergyCube`: the tier and how full the cube is (its alpha), as 0..=255.
+    let mut core = Compound::new();
+    put_int(&mut core, "core_alpha", (energy.stored as f64 / capacity.max(1) as f64 * 255.0) as u32);
+    put_int(&mut core, "core_tier", tier as u32);
+    put_client(game, pos, entity, &["core_alpha", "core_tier"], core);
 }
 
 // --- Universal cables -------------------------------------------------------------------------------
@@ -9603,8 +9656,8 @@ fn tick_teleporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
     put_client(game, pos, entity, &["portal", "portal_rotated", "portal_color"], portal);
 }
 
-/// The portals this client has heard of, drawn as `RenderTeleporter` does: a translucent sheet of the
-/// portal texture tinted with the frequency's colour, between the teleporter's frame.
+// The portals this client has heard of, drawn as `RenderTeleporter` does: a translucent sheet of the
+// portal texture tinted with the frequency's colour, between the teleporter's frame.
 thread_local! {
     static PORTALS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
