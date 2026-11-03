@@ -423,3 +423,41 @@ bindings = [
   { name = "block", ty = "&str", value = "block" },
   { name = "rules", ty = "&mut Vec<horizon_client::lan::menu::SlotRule>", value = "&mut *rules" },
 ]
+
+[[injection]]
+id = "ui-draw"
+hook = "ui_draw"
+hook_version = 1
+kind = "HEAD"
+helper = "ui_draw.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "id", ty = "&str", value = "id" },
+  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+]
+
+[[injection]]
+id = "ui-click"
+hook = "ui_click"
+hook_version = 1
+kind = "HEAD"
+helper = "ui_click.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "id", ty = "&str", value = "id" },
+  { name = "at", ty = "[f32; 2]", value = "at" },
+  { name = "button", ty = "u8", value = "button" },
+  { name = "pressed", ty = "bool", value = "pressed" },
+]
+
+[[injection]]
+id = "ui-wheel"
+hook = "ui_wheel"
+hook_version = 1
+kind = "HEAD"
+helper = "ui_wheel.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "id", ty = "&str", value = "id" },
+  { name = "steps", ty = "f32", value = "steps" },
+]

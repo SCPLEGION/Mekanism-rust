@@ -40,6 +40,7 @@ use mekanism_core::teleporter;
 use mekanism_core::factory::{self, Factory};
 use mekanism_core::generator::HeatGenerator;
 use mekanism_core::machine::{self, ElectricMachine, Operation, Slot};
+use mekanism_core::module_config;
 use mekanism_core::modules;
 use mekanism_core::tier::{self, BaseTier};
 use mekanism_core::upgrades::{Upgrade, Upgrades};
@@ -4475,6 +4476,9 @@ fn set_jetpack_fuel(stack: &mut ItemStack, amount: u64) {
 /// fuelled jetpack on, outside creative flight, thrusts in its normal mode and stops the fall, and tells
 /// the server, which spends the hydrogen.
 pub(super) fn client_tick(game: &mut Game<'_>) {
+    if game.native_window() && game.native_on(MOD_ID) {
+        tweaker_key(game);
+    }
     if !game.native_window() || !game.native_on(MOD_ID) || !game.native_playing() {
         return;
     }
@@ -4527,6 +4531,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     }
     if channel == ST_CHANNEL && game.native_on(MOD_ID) {
         st_payload(game, data);
+        return;
+    }
+    if channel == TW_CHANNEL && game.native_on(MOD_ID) {
+        tweaker_payload(game, data);
         return;
     }
     if channel == STN_CHANNEL && game.native_on(MOD_ID) {
@@ -16966,4 +16974,298 @@ fn station_wheel(game: &Game<'_>, steps: f32) {
         let first = ui.scroll.min(hidden);
         ui.scroll = if steps > 0.0 { first.saturating_sub(1) } else { (first + 1).min(hidden) };
     });
+}
+
+// --- Module Tweaker (GuiModuleTweaker) ---------------------------------------------------------------------
+
+const TW_ID: &str = "mekanism:module_tweaker";
+const TW_CHANNEL: &str = "mekanism:module_tweaker";
+/// Where an item's module settings are kept (`ModuleConfig`s of the `module_container`): module -> key -> value.
+const MODULE_CONFIG_KEY: &str = "mekanism:module_config";
+const TW_WINDOW: [f32; 2] = [220.0, 150.0];
+const TW_ROWS: usize = 6;
+const TW_SETTING_ROWS: usize = 4;
+
+#[derive(Default)]
+struct TwUi {
+    slot: Option<usize>,
+    module: Option<String>,
+    scroll: usize,
+    setting_scroll: usize,
+    /// Where the window was drawn last, for the clicks.
+    origin: [f32; 2],
+}
+
+thread_local! {
+    static TW_UI: std::cell::RefCell<TwUi> = std::cell::RefCell::new(TwUi::default());
+}
+
+static TW_KEY_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Slots the tweaker can pick: 0..4 the worn armor, 4..13 the hotbar, 13 the off hand.
+fn tw_stack<'a>(game: &'a Game<'_>, slot: usize) -> Option<&'a ItemStack> {
+    match slot {
+        0..=3 => game.armor.get(slot)?.as_ref(),
+        4..=12 => game.inventory.get(slot - 4)?.as_ref(),
+        13 => game.offhand.as_ref(),
+        _ => None,
+    }
+    .filter(|s| modules::is_container(&s.item))
+}
+
+fn tw_stack_mut<'a>(game: &'a mut Game<'_>, slot: usize) -> Option<&'a mut ItemStack> {
+    match slot {
+        0..=3 => game.armor.get_mut(slot)?.as_mut(),
+        4..=12 => game.inventory.get_mut(slot - 4)?.as_mut(),
+        13 => game.offhand.as_mut(),
+        _ => None,
+    }
+    .filter(|s| modules::is_container(&s.item))
+}
+
+fn tw_slots(game: &Game<'_>) -> Vec<usize> {
+    (0..14).filter(|i| tw_stack(game, *i).is_some_and(|s| !modules_of(s).is_empty())).collect()
+}
+
+/// A stored setting of `module` on `stack`, or the default.
+fn module_setting(stack: &ItemStack, module: &str, s: &module_config::Setting, installed: u32) -> u32 {
+    let stored = match custom_data(stack).and_then(|c| c.get(&JavaString::from(MODULE_CONFIG_KEY))) {
+        Some(Tag::Compound(all)) => match all.get(&JavaString::from(module)) {
+            Some(Tag::Compound(m)) => match m.get(&JavaString::from(s.key)) {
+                Some(Tag::Int(v)) => Some(v.to_string()),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    module_config::parse(s.kind, stored.as_deref(), installed)
+}
+
+fn tw_set(stack: &mut ItemStack, module: &str, s: &module_config::Setting, installed: u32, value: u32) {
+    let mut all = match custom_data(stack).and_then(|c| c.get(&JavaString::from(MODULE_CONFIG_KEY))) {
+        Some(Tag::Compound(c)) => c.clone(),
+        _ => Compound::new(),
+    };
+    let mut m = match all.get(&JavaString::from(module)) {
+        Some(Tag::Compound(c)) => c.clone(),
+        _ => Compound::new(),
+    };
+    let value = value.min(module_config::choices(s.kind, installed).saturating_sub(1) as u32);
+    match module_config::encode(s.kind, value) {
+        Some(text) => {
+            m.insert(s.key.into(), Tag::Int(text.parse().unwrap_or(0)));
+        }
+        None => {
+            m.remove(&JavaString::from(s.key));
+        }
+    }
+    if m.is_empty() {
+        all.remove(&JavaString::from(module));
+    } else {
+        all.insert(module.into(), Tag::Compound(m));
+    }
+    set_custom_compound(stack, MODULE_CONFIG_KEY, all);
+}
+
+/// Whether `module` is switched on on `stack` (the `enabled` option; modules that can't be disabled always are).
+fn module_enabled(stack: &ItemStack, module: &str) -> bool {
+    let n = modules_of(stack).get(module).copied().unwrap_or(0);
+    match module_config::settings(module, n).first() {
+        Some(s) if s.key == "enabled" => module_setting(stack, module, s, n) == 1,
+        _ => n > 0,
+    }
+}
+
+/// The key press that opens the tweaker (hook point `native_tick`, client side).
+fn tweaker_key(game: &mut Game<'_>) {
+    let down = game.keys.contains(&winit::keyboard::KeyCode::Backslash);
+    let was = TW_KEY_DOWN.swap(down, std::sync::atomic::Ordering::Relaxed);
+    if down && !was && game.native_playing() && game.native_ui_open().is_none() {
+        TW_UI.with_borrow_mut(|ui| *ui = TwUi::default());
+        game.native_open_ui(TW_ID);
+    }
+}
+
+fn tw_geometry(batch_w: f32, batch_h: f32) -> [f32; 2] {
+    [((batch_w - TW_WINDOW[0]) / 2.0).floor(), ((batch_h - TW_WINDOW[1]) / 2.0).floor()]
+}
+
+fn tw_item_cell(i: usize, o: [f32; 2]) -> [f32; 4] {
+    [o[0] + 8.0 + 18.0 * i as f32, o[1] + 17.0, 18.0, 18.0]
+}
+
+fn tw_module_row(i: usize, o: [f32; 2]) -> [f32; 4] {
+    [o[0] + 9.0, o[1] + 40.0 + 12.0 * i as f32, 86.0, 12.0]
+}
+
+fn tw_setting_row(i: usize, o: [f32; 2]) -> [f32; 4] {
+    [o[0] + 104.0, o[1] + 39.0 + 27.0 * i as f32, 108.0, 26.0]
+}
+
+fn tw_button(row: [f32; 4]) -> [f32; 4] {
+    [row[0], row[1] + 10.0, row[2], 14.0]
+}
+
+fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    let o = tw_geometry(batch.width, batch.height);
+    TW_UI.with_borrow_mut(|ui| ui.origin = o);
+    let (w, h) = (TW_WINDOW[0], TW_WINDOW[1]);
+    let cursor = game.native_cursor();
+    nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [o[0] - 3.0, o[1] - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
+    nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [o[0], o[1], w, h], 0xFFFF_FFFF);
+    centred(game, batch, "Module Tweaker", o[0], w, o[1] + 5.0, 0x40_4040);
+    let slots = tw_slots(game);
+    TW_UI.with_borrow_mut(|ui| {
+        if ui.slot.is_some_and(|s| !slots.contains(&s)) {
+            ui.slot = None;
+            ui.module = None;
+        }
+        for (i, slot) in slots.iter().take(11).enumerate() {
+            let r = tw_item_cell(i, o);
+            let base = if ui.slot == Some(*slot) {
+                "list/selected"
+            } else if inside(cursor, r) {
+                "list/hovered"
+            } else {
+                "list/base"
+            };
+            nine_slice_tinted(game, batch, base, [12.0, 12.0], 1.0, r, 0xFFFF_FFFF);
+            if let Some(stack) = tw_stack(game, *slot) {
+                game.native_item(batch, &stack.item, [r[0] + 1.0, r[1] + 1.0], 16.0);
+            }
+        }
+        let frame = [o[0] + 8.0, o[1] + 39.0, 88.0, 14.0 + 12.0 * (TW_ROWS as f32 - 1.0) + 2.0];
+        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, frame, 0xFFFF_FFFF);
+        let Some(stack) = ui.slot.and_then(|s| tw_stack(game, s)) else {
+            game.native_text(batch, "Pick an item", [o[0] + 12.0, o[1] + 44.0], 0x60_6060, false);
+            return;
+        };
+        let installed = modules_of(stack);
+        let ids: Vec<&String> = installed.keys().collect();
+        ui.scroll = ui.scroll.min(ids.len().saturating_sub(TW_ROWS));
+        if ui.module.as_ref().is_some_and(|m| !installed.contains_key(m)) {
+            ui.module = None;
+        }
+        for (i, id) in ids.iter().skip(ui.scroll).take(TW_ROWS).enumerate() {
+            let r = tw_module_row(i, o);
+            let base = if ui.module.as_deref() == Some(id.as_str()) {
+                "list/selected"
+            } else if inside(cursor, r) {
+                "list/hovered"
+            } else {
+                "list/base"
+            };
+            nine_slice_tinted(game, batch, base, [12.0, 12.0], 1.0, r, 0xFFFF_FFFF);
+            let on = module_enabled(stack, id);
+            game.native_text_scaled(batch, &module_name(id), [r[0] + 3.0, r[1] + 3.0], if on { 0x40_4040 } else { 0xA0_4040 }, 0.7);
+        }
+        let Some(module) = ui.module.clone() else {
+            return;
+        };
+        let n = installed.get(&module).copied().unwrap_or(0);
+        let settings = module_config::settings(&module, n);
+        ui.setting_scroll = ui.setting_scroll.min(settings.len().saturating_sub(TW_SETTING_ROWS));
+        for (i, s) in settings.iter().skip(ui.setting_scroll).take(TW_SETTING_ROWS).enumerate() {
+            let row = tw_setting_row(i, o);
+            game.native_text_scaled(batch, s.label, [row[0], row[1] + 1.0], 0x40_4040, 0.75);
+            let b = tw_button(row);
+            let value = module_config::value_text(s.kind, module_setting(stack, &module, s, n));
+            draw_button(game, batch, b, inside(cursor, b), true, 0xFFFF_FFFF, None);
+            centred(game, batch, &value, b[0], b[2], b[1] + 3.0, 0xFF_FFFF);
+        }
+    });
+}
+
+fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
+    if !pressed || button > 1 {
+        return;
+    }
+    let o = TW_UI.with_borrow(|ui| ui.origin);
+    let slots = tw_slots(game);
+    let mut send = None;
+    TW_UI.with_borrow_mut(|ui| {
+        if let Some(i) = (0..slots.len().min(11)).find(|i| inside(at, tw_item_cell(*i, o))) {
+            ui.slot = Some(slots[i]);
+            ui.module = None;
+            ui.scroll = 0;
+            return;
+        }
+        let Some(stack) = ui.slot.and_then(|s| tw_stack(game, s)) else {
+            return;
+        };
+        let installed = modules_of(stack);
+        let ids: Vec<&String> = installed.keys().collect();
+        if let Some(i) = (0..TW_ROWS).find(|i| inside(at, tw_module_row(*i, o))) {
+            if let Some(id) = ids.get(ui.scroll + i) {
+                ui.module = Some((*id).clone());
+                ui.setting_scroll = 0;
+            }
+            return;
+        }
+        let Some(module) = ui.module.clone() else {
+            return;
+        };
+        let n = installed.get(&module).copied().unwrap_or(0);
+        let settings = module_config::settings(&module, n);
+        if let Some(i) = (0..TW_SETTING_ROWS).find(|i| inside(at, tw_button(tw_setting_row(*i, o))))
+            && let Some(s) = settings.get(ui.setting_scroll + i)
+        {
+            let now = module_setting(stack, &module, s, n);
+            let count = module_config::choices(s.kind, n) as u32;
+            let next = if button == 1 { (now + count - 1) % count } else { (now + 1) % count };
+            send = ui.slot.map(|slot| format!("{slot}|{module}|{}|{next}", s.key));
+        }
+    });
+    if let Some(text) = send {
+        game.native_send_to_server(TW_CHANNEL, text.as_bytes());
+    }
+}
+
+fn tweaker_wheel(at: [f32; 2], steps: f32) {
+    let delta = if steps > 0.0 { -1 } else { 1 };
+    TW_UI.with_borrow_mut(|ui| {
+        let field = if at[0] < ui.origin[0] + 100.0 { &mut ui.scroll } else { &mut ui.setting_scroll };
+        *field = (*field as i32 + delta).max(0) as usize;
+    });
+}
+
+/// A tweaker setting changed on the server (the player's own item).
+fn tweaker_payload(game: &mut Game<'_>, data: &[u8]) {
+    let Ok(text) = std::str::from_utf8(data) else {
+        return;
+    };
+    let parts: Vec<&str> = text.split('|').collect();
+    let [slot, module, key, value] = parts[..] else {
+        return;
+    };
+    let (Ok(slot), Ok(value)) = (slot.parse::<usize>(), value.parse::<u32>()) else {
+        return;
+    };
+    let Some(stack) = tw_stack_mut(game, slot) else {
+        return;
+    };
+    let n = modules_of(stack).get(module).copied().unwrap_or(0);
+    if let Some(s) = module_config::settings(module, n).into_iter().find(|s| s.key == key) {
+        tw_set(stack, module, &s, n, value);
+    }
+}
+
+/// The mod's own screens (hook points `native_ui_*`, API 44).
+pub(super) fn ui_draw(game: &Game<'_>, id: &str, batch: &mut horizon_client::hud::HudBatch) {
+    if id == TW_ID {
+        tweaker_draw(game, batch);
+    }
+}
+
+pub(super) fn ui_click(game: &mut Game<'_>, id: &str, at: [f32; 2], button: u8, pressed: bool) {
+    if id == TW_ID {
+        tweaker_click(game, at, button, pressed);
+    }
+}
+
+pub(super) fn ui_wheel(game: &Game<'_>, id: &str, steps: f32) {
+    if id == TW_ID {
+        tweaker_wheel(game.native_cursor(), steps);
+    }
 }
