@@ -4629,12 +4629,12 @@ fn layout(block: &str) -> Option<Layout> {
                 Some(([116.0, 40.0], "slot/output")),
             ],
             gauges: vec![
-                gauge("fluid", REACTION_TANK, 5.0, 10.0, STANDARD),
-                gauge("input", REACTION_TANK, 28.0, 10.0, STANDARD),
-                gauge("output", REACTION_TANK, 140.0, 40.0, STANDARD),
+                gauge("fluid", REACTION_TANK, 5.0, 15.0, STANDARD),
+                gauge("input", REACTION_TANK, 28.0, 15.0, STANDARD),
+                gauge("output", REACTION_TANK, 140.0, 45.0, SMALL),
             ],
-            power: Some(PowerBar::Vertical([163.0, 15.0])),
-            progress: Some(([77.0, 38.0], "progress/bar", [25.0, 9.0])),
+            power: Some(PowerBar::Vertical([163.0, 21.0])),
+            progress: Some(([77.0, 43.0], "progress/bar", [25.0, 9.0])),
         },
         Kind::Nucleosynthesizer => Layout {
             slots: [
@@ -4845,7 +4845,12 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
 
 /// A machine screen's height: the nucleosynthesizer's is 27 taller (`DEFAULT_IMAGE_HEIGHT + 27`).
 fn screen_height(block: &str) -> f32 {
-    if kind(block) == Some(Kind::Nucleosynthesizer) { 193.0 } else { 166.0 }
+    match kind(block) {
+        Some(Kind::Nucleosynthesizer) => 193.0,
+        // `DEFAULT_IMAGE_HEIGHT + 5`.
+        Some(Kind::Reaction) => 171.0,
+        _ => 166.0,
+    }
 }
 
 /// The item slots past the three of `Layout` (a hopper menu's fourth): the energy slot of the machines
