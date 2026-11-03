@@ -5327,6 +5327,24 @@ thread_local! {
 }
 
 /// The window open on `block`'s screen, as an index into `WindowMoves`.
+/// Escape on a screen (hook point `native_screen_escape`): it closes the open window and not the screen.
+pub(super) fn screen_escape(block: &str, consumed: &mut bool) {
+    if is_filter_screen(block) {
+        if FILTER_EDIT.with_borrow(|e| e.is_some()) {
+            close_filter_window();
+            *consumed = true;
+        } else if FILTER_SELECT.get().is_some() {
+            FILTER_SELECT.set(None);
+            *consumed = true;
+        }
+        return;
+    }
+    if window(block).is_some() {
+        set_window(block, None);
+        *consumed = true;
+    }
+}
+
 fn open_window_id(block: &str) -> Option<usize> {
     if is_filter_screen(block) {
         return if FILTER_SELECT.get().is_some() {
@@ -6346,6 +6364,18 @@ pub(super) fn screen(block: &str, screen: &mut Option<super::native_hooks::Nativ
         return;
     }
     screen_base(block, screen);
+    // A pinned window opens again with the screen (`GuiMekanism` restores the pinned windows).
+    if screen.is_some() && window(block).is_none() && !is_filter_screen(block) {
+        let t = tabs(block);
+        let (sides, upgrades) = MOVES.with_borrow(|m| (m.pinned[WINDOW_SIDES], m.pinned[WINDOW_UPGRADES]));
+        if sides && t & TAB_SIDES != 0 {
+            set_window(block, Some(Window::Sides(0)));
+        } else if upgrades && t & TAB_UPGRADE != 0 {
+            set_window(block, Some(Window::Upgrades(None)));
+        } else if MOVES.with_borrow(|m| m.pinned[WINDOW_TRANSPORTER]) && t & TAB_SIDES != 0 {
+            set_window(block, Some(Window::Transporter));
+        }
+    }
     // The QIO blocks swap to the selector's layout while their tab's screen is open: 176 x 155, none
     // of the inventory (it is moved out of the way).
     if is_qio_tile(block) && let Some(s) = screen.as_mut() {
