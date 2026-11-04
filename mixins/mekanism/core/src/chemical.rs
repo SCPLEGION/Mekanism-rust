@@ -219,6 +219,24 @@ pub struct AdvancedMachine {
 pub const ADVANCED_TICKS: u32 = 200;
 pub const ADVANCED_TANK: u64 = 210;
 
+/// The Metallurgic Infuser's recipes and infuse types as a factory runs them (its tank takes the infuse type as a
+/// whole: `chemical_amount` is used once, at the end of each operation).
+pub static INFUSING_FACTORY: AdvancedMachine = AdvancedMachine {
+    block: "mekanism:metallurgic_infuser",
+    usage: INFUSER_USAGE,
+    chemicals: &[
+        "mekanism:bio",
+        "mekanism:carbon",
+        "mekanism:diamond",
+        "mekanism:fungi",
+        "mekanism:gold",
+        "mekanism:redstone",
+        "mekanism:refined_obsidian",
+        "mekanism:tin",
+    ],
+    table: crate::recipe_table::METALLURGIC_INFUSING,
+};
+
 pub static ADVANCED_MACHINES: &[AdvancedMachine] = &[
     AdvancedMachine {
         block: "mekanism:purification_chamber",
