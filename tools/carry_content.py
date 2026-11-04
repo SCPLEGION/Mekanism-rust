@@ -508,6 +508,19 @@ def build_module(ns, out):
                     part = {"elements": [e for e in elements if bool(e.get("light_emission")) == glow]}
                     worn_models.build_element_world_model(ns, f"robit_{part_name}_{skin_json.stem}{suffix}", part, png, out, report, (8, 0, 8))
     if ns == "mekanism":
+        # The skin previews (`GuiRobitSkinSelectScroll`) turn each skin's body, one model per texture of the skin.
+        robit = next((d / ns / "models/robit/robit.json" for d in search if (d / ns / "models/robit/robit.json").is_file()), None)
+        if robit is not None:
+            body = {"elements": [e for e in json.loads(robit.read_text())["elements"] if not e.get("light_emission")]}
+            for skin_json in sorted({f for d in search for f in (d.parent / "data" / ns / "mekanism" / "robit_skin").glob("*.json")}, key=lambda f: f.name):
+                for index, texture_id in enumerate(json.loads(skin_json.read_text()).get("textures", [])):
+                    tex_ns, tex_name = texture_id.split(":")
+                    png = next((d / tex_ns / "textures/entity/robit" / f"{tex_name}.png" for d in search
+                                if (d / tex_ns / "textures/entity/robit" / f"{tex_name}.png").is_file()), None)
+                    if png is not None:
+                        suffix = "" if index == 0 else f"_{index}"
+                        worn_models.build_element_world_model(ns, f"robit_preview_{skin_json.stem}{suffix}", body, png, out, report, (8, 0, 8))
+    if ns == "mekanism":
         # The Personal Chest (`RenderPersonalChest`): vanilla's chest parts in Mekanism's skin, the lid turned.
         chest = next((d / ns / "textures/block/models/personal_chest.png" for d in search
                       if (d / ns / "textures/block/models/personal_chest.png").is_file()), None)
