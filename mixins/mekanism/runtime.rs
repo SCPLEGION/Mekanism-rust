@@ -6641,6 +6641,11 @@ struct Meltdown {
     hi: [i32; 3],
     magnitude: f64,
     age: u32,
+    /// The reactor's master port, and the walls it had when the meltdown began: `BlockMekanism.onBlockExploded`
+    /// calls `meltdownHappened` when the first of them goes.
+    master: [i32; 3],
+    shell: Vec<([i32; 3], u32)>,
+    happened: bool,
 }
 
 thread_local! {
@@ -6660,6 +6665,19 @@ fn tick_meltdowns(game: &mut Game<'_>) {
                 at[k] = f64::from(game.world.random.next_int_between_inclusive(m.lo[k], m.hi[k]).unwrap_or(m.lo[k]));
             }
             let _ = game.server_explode(at, fission::MELTDOWN_RADIUS, super::explosion::BlockInteraction::DestroyWithDecay, true);
+            if !m.happened && m.shell.iter().any(|&(at, state)| game.world.block(at[0], at[1], at[2]).0 != state) {
+                m.happened = true;
+                // `meltdownHappened`: the heated coolant is lost and the reactor starts over, damaged.
+                game.native_with_mod_block_entity(m.master, |e| {
+                    let r = reactor_of(&e.nbt);
+                    let mut st = fission_state(&e.nbt, &r);
+                    st.meltdown_reset();
+                    save_fission_state(&mut e.nbt, &st);
+                    let mut steam = get_tank(&e.nbt, "steam", r.steam_capacity());
+                    steam.extract(steam.amount);
+                    put_tank(&mut e.nbt, "steam", &steam);
+                });
+            }
         }
         m.age < 5 * 20
     });
@@ -6707,9 +6725,15 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     let mut water = get_tank(&entity.nbt, "water", r.water_capacity());
     let mut steam = get_tank(&entity.nbt, "steam", r.steam_capacity());
     let mut waste = get_tank(&entity.nbt, "waste", r.fuel_capacity());
-    for &p in &ports {
-        pull_from_carriers(game, p, &mut fuel, FISSILE_FUEL);
-        pull_from_carriers(game, p, &mut water, "minecraft:water");
+    // A port takes things in only in input mode, gives waste in waste mode and the heated coolant in coolant mode
+    // (a block without the mode property does all three).
+    let modes: Vec<Option<usize>> = ports.iter().map(|&p| port_mode(game, p)).collect();
+    for (&p, mode) in ports.iter().zip(&modes) {
+        if mode.is_none_or(|m| m == 0) {
+            pull_from_carriers(game, p, &mut fuel, FISSILE_FUEL);
+            pull_from_carriers(game, p, &mut water, "minecraft:water");
+            pull_from_carriers(game, p, &mut water, fission::SODIUM_COOLANT);
+        }
     }
     let mut st = fission_state(&entity.nbt, &r);
     // `burnFuel`: fissile fuel into heat and nuclear waste.
@@ -6722,19 +6746,28 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
         fuel.extract(before.saturating_sub(amount));
         waste.insert("mekanism:nuclear_waste", waste_amount.saturating_sub(waste_before));
     }
-    // `handleCoolant`: heat above boiling turns water into steam.
+    // `handleCoolant`: heat above boiling turns the coolant (water, or cooled sodium in the same merged tank) into its
+    // heated variant (steam, superheated sodium).
     {
-        let mut w = if water.accepts("minecraft:water") { water.amount } else { 0 };
+        let (conductivity, enthalpy, heated) = match water.chemical.as_deref() {
+            Some(fission::SODIUM_COOLANT) => (fission::SODIUM_CONDUCTIVITY, fission::SODIUM_ENTHALPY, fission::SODIUM_HEATED),
+            _ => (fission::WATER_CONDUCTIVITY, fission::COOLANT_ENTHALPY, "mekanism:steam"),
+        };
+        let mut w = water.amount;
         let w_before = w;
-        let mut s = if steam.accepts("mekanism:steam") { steam.amount } else { steam.capacity };
+        let mut s = if steam.accepts(heated) { steam.amount } else { steam.capacity };
         let s_before = s;
-        st.coolant(&mut w, &mut s, steam.capacity, fission::boil_efficiency(r.surface, r.assemblies));
+        st.coolant_with(&mut w, &mut s, steam.capacity, fission::boil_efficiency(r.surface, r.assemblies), conductivity, enthalpy);
         water.extract(w_before - w);
-        steam.insert("mekanism:steam", s.saturating_sub(s_before));
+        steam.insert(heated, s.saturating_sub(s_before));
     }
-    for &p in &ports {
-        push_chemical(game, p, &mut steam, None, u64::MAX, false);
-        push_chemical(game, p, &mut waste, None, u64::MAX, false);
+    for (&p, mode) in ports.iter().zip(&modes) {
+        if mode.is_none_or(|m| m == 2) {
+            push_chemical(game, p, &mut steam, None, u64::MAX, false);
+        }
+        if mode.is_none_or(|m| m == 1) {
+            push_chemical(game, p, &mut waste, None, u64::MAX, false);
+        }
     }
     // `simulateEnvironment`, then `handleDamage`.
     st.environment();
@@ -6745,11 +6778,21 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
         {
             let lo = [b[0], b[1], b[2]];
             let hi = [b[0] + b[3] - 1, b[1] + b[4] - 1, b[2] + b[5] - 1];
-            MELTDOWNS.with_borrow_mut(|v| v.push(Meltdown { lo, hi, magnitude: st.heat, age: 0 }));
+            // One meltdown at a time for a reactor (`MeltdownData` keys them by the multiblock's id).
+            if !MELTDOWNS.with_borrow(|v| v.iter().any(|m| m.master == pos)) {
+                let mut shell = Vec::new();
+                for x in lo[0]..=hi[0] {
+                    for y in lo[1]..=hi[1] {
+                        for z in lo[2]..=hi[2] {
+                            if x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2] {
+                                shell.push(([x, y, z], game.world.block(x, y, z).0));
+                            }
+                        }
+                    }
+                }
+                MELTDOWNS.with_borrow_mut(|v| v.push(Meltdown { lo, hi, magnitude: st.heat, age: 0, master: pos, shell, happened: false }));
+            }
         }
-        // `meltdownHappened`: the heated coolant is lost and the reactor starts over, damaged.
-        steam.extract(steam.amount);
-        st.meltdown_reset();
     }
     save_fission_state(&mut entity.nbt, &st);
     put_tank(&mut entity.nbt, "fuel", &fuel);
@@ -6786,50 +6829,28 @@ pub(super) fn use_fission_port(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     if !game.native_on(MOD_ID) || game.inventory.get(game.selected).cloned().flatten().is_some() {
         return false;
     }
-    // A plain click opens the reactor's screen.
+    // A plain click opens the reactor's screen; sneaking steps the port's mode (`onSneakRightClick`).
     let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
-    if !sneaking {
+    if !sneaking || block_name(game, pos) != "mekanismgenerators:fission_reactor_port" {
         return false;
     }
-    let master = game.native_with_mod_block_entity(pos, |m| {
-        (kind(&m.id) == Some(Kind::FissionPort)).then(|| get_pos(&m.nbt, "master"))
-    });
-    let Some(Some(master)) = master else {
-        return false;
-    };
-    let line = match master {
-        None => "Fission Reactor: not formed".to_owned(),
-        Some(master) => game
-            .native_with_mod_block_entity(master, |m| {
-                let r = reactor_of(&m.nbt);
-                let mut st = fission_state(&m.nbt, &r);
-                st.set_active(!st.active);
-                save_fission_state(&mut m.nbt, &st);
-                let amount = |key: &str| {
-                    let mut c = Compound::new();
-                    if let Some(t) = m.nbt.get(&JavaString::from(key)) {
-                        c.insert("t".into(), t.clone());
-                    }
-                    get_tank(&c, "t", u64::MAX).amount
-                };
-                let state = if st.active { "on" } else if st.force_disable { "disabled by damage" } else { "off" };
-                format!(
-                    "Fission Reactor: {state}, burn {} mB/t, {:.0} K, damage {:.0}%, fuel {}, water {}, steam {}, waste {}",
-                    java_double(st.rate_limit),
-                    st.temperature(),
-                    st.damage,
-                    amount("fuel"),
-                    amount("water"),
-                    amount("steam"),
-                    amount("waste"),
-                )
-            })
-            .unwrap_or_else(|| "Fission Reactor: not formed".to_owned()),
-    };
+    let now = port_mode(game, pos).unwrap_or(0);
+    let next = (now + 1) % PORT_MODES.len();
+    game.native_set_block_property(pos, "mode", PORT_MODES[next].0);
     if let Some(player) = game.native_acting_player() {
+        let line = format!("Port mode changed to: {}", PORT_MODES[next].1);
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
     true
+}
+
+/// `FissionPortMode`: the blockstate value and its name, in the order a sneaking click steps through.
+const PORT_MODES: [(&str, &str); 3] = [("input", "input only"), ("output_waste", "output waste"), ("output_coolant", "output coolant")];
+
+/// The mode of the fission port at `pos` (index into `PORT_MODES`), or none where the block has no such property.
+fn port_mode(game: &Game<'_>, pos: [i32; 3]) -> Option<usize> {
+    let mode = game.native_block_property(pos, "mode")?;
+    PORT_MODES.iter().position(|(v, _)| *v == mode)
 }
 
 /// The Electric Pump: every 19 ticks (fewer with speed upgrades) it takes the water source below it,

@@ -171,19 +171,25 @@ impl State {
     /// `handleCoolant` for water: the heat above boiling, by the boil efficiency and the water's
     /// conductivity, turns water to steam; the steam the tank has no room for is vented.
     pub fn coolant(&mut self, water: &mut u64, steam: &mut u64, steam_capacity: u64, efficiency: f64) {
-        if *water == 0 {
+        self.coolant_with(water, steam, steam_capacity, efficiency, WATER_CONDUCTIVITY, COOLANT_ENTHALPY);
+    }
+
+    /// `handleCoolant` for any coolant with the given conductivity and thermal enthalpy (`CooledCoolant`): the heat
+    /// above boiling turns the cooled coolant into its heated variant; what the heated tank has no room for is vented.
+    pub fn coolant_with(&mut self, coolant: &mut u64, heated: &mut u64, heated_capacity: u64, efficiency: f64, conductivity: f64, enthalpy: f64) {
+        if *coolant == 0 {
             self.last_boil = 0;
             return;
         }
         let heat = efficiency * (self.heat - BASE_BOIL_TEMP * self.capacity);
-        let heated = heat * WATER_CONDUCTIVITY / COOLANT_ENTHALPY;
-        let stored = (*water).min(i32::MAX as u64) as i64;
-        let boil = i64::from(heated as i32).clamp(0, stored) as u64;
+        let amount = heat * conductivity / enthalpy;
+        let stored = (*coolant).min(i32::MAX as u64) as i64;
+        let boil = i64::from(amount as i32).clamp(0, stored) as u64;
         self.last_boil = boil;
         if boil > 0 {
-            *water -= boil;
-            *steam += boil.min(steam_capacity.saturating_sub(*steam));
-            self.heat -= boil as f64 * COOLANT_ENTHALPY;
+            *coolant -= boil;
+            *heated += boil.min(heated_capacity.saturating_sub(*heated));
+            self.heat -= boil as f64 * enthalpy;
         }
     }
 
@@ -232,6 +238,12 @@ impl State {
     }
 }
 
+/// The sodium coolant (`CooledCoolant(superheated sodium, thermalEnthalpy 5, conductivity 1)`).
+pub const SODIUM_COOLANT: &str = "mekanism:sodium";
+pub const SODIUM_HEATED: &str = "mekanism:superheated_sodium";
+pub const SODIUM_ENTHALPY: f64 = 5.0;
+pub const SODIUM_CONDUCTIVITY: f64 = 1.0;
+
 /// `getBoilEfficiency`: the fuel assemblies' average surface area over the target, at most 1.
 pub fn boil_efficiency(surface: u64, assemblies: u64) -> f64 {
     if assemblies == 0 {
@@ -243,6 +255,18 @@ pub fn boil_efficiency(surface: u64, assemblies: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sodium_takes_heat_at_its_own_enthalpy() {
+        let mut st = State::new(1_000.0, 300.0);
+        st.heat = 1_000.0 * 1_000.0;
+        let (mut sodium, mut hot) = (1_000_000_u64, 0_u64);
+        st.coolant_with(&mut sodium, &mut hot, 10_000_000, 1.0, SODIUM_CONDUCTIVITY, SODIUM_ENTHALPY);
+        // (1,000,000 - 373.15 × 1,000) × 1 / 5 mB.
+        assert_eq!(hot, 125_370);
+        assert_eq!(sodium, 1_000_000 - 125_370);
+        assert!((st.heat - (1_000_000.0 - 125_370.0 * 5.0)).abs() < 1e-6);
+    }
 
     #[test]
     fn reactors_count_assemblies_and_step_rates() {
