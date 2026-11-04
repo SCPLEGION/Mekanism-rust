@@ -11195,9 +11195,44 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
     let e = extras(block);
     let [ox, oy] = origin;
     let lit = game.container.map(|(x, y, z)| [x, y, z]).and_then(|p| game.native_block_property(p, "lit").or_else(|| game.native_block_property(p, "open"))).as_deref() == Some("true");
-    for (at, name, [w, h]) in &e.active_progress {
+    // `GuiPigmentMixer`: each arrow runs from its input's colour to the output's, or to the colour of the
+    // recipe's result while the output tank is empty (white with no recipe).
+    let mixer = |i: usize| -> Option<(u32, u32)> {
+        let tank = |g: usize| {
+            let at = DATA_GAUGES + g * GAUGE_SLOTS;
+            let chem = usize::try_from(data.get(at + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c));
+            (read_wide(data, at) > 0).then_some(chem).flatten()
+        };
+        let from = tank(if i == 0 { 0 } else { 2 })?;
+        let to = match tank(1) {
+            Some(out) => out.2,
+            None => match (tank(0), tank(2)) {
+                (Some(l), Some(r)) => mekanism_core::recipes::find_pigment_mixing(l.0, r.0)
+                    .and_then(|(rec, _)| CHEMICALS.iter().find(|c| c.0 == rec.output))
+                    .map_or(0xFFFFFF, |c| c.2),
+                _ => 0xFFFFFF,
+            },
+        };
+        Some((from.2, to))
+    };
+    for (i, (at, name, [w, h])) in e.active_progress.iter().enumerate() {
         let state = if lit { "full" } else { "empty" };
-        sprite(game, batch, &format!("{name}/{state}"), [0.0, 0.0, *w, *h], [ox + at[0], oy + at[1], *w, *h]);
+        sprite(game, batch, &format!("{name}/empty"), [0.0, 0.0, *w, *h], [ox + at[0], oy + at[1], *w, *h]);
+        match mixer(i).filter(|_| lit && kind(block) == Some(Kind::PigmentMixer)) {
+            Some((from, to)) => {
+                let texture = format!("{SPRITES}{name}/full");
+                let reverse = name.ends_with("left");
+                let (a, b) = if reverse { (to, from) } else { (from, to) };
+                let lerp = |t: f32| {
+                    let ch = |sh: u32| ((a >> sh & 0xFF) as f32 + ((b >> sh & 0xFF) as f32 - (a >> sh & 0xFF) as f32) * t).round() as u32;
+                    0xFF00_0000 | ch(16) << 16 | ch(8) << 8 | ch(0)
+                };
+                for x in 0..*w as i32 {
+                    game.native_sprite_tinted(batch, &texture, [x as f32, 0.0, 1.0, *h], [ox + at[0] + x as f32, oy + at[1], 1.0, *h], lerp((x as f32 + 0.5) / *w));
+                }
+            }
+            None => sprite(game, batch, &format!("{name}/{state}"), [0.0, 0.0, *w, *h], [ox + at[0], oy + at[1], *w, *h]),
+        }
     }
     if let Some([x, y, w, h]) = e.screen {
         nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + x, oy + y, w, h], 0xFFFF_FFFF);
@@ -11508,22 +11543,28 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         }
         let done = if warning_bits(block, &l, data) & 8 != 0 { 0.0 } else { (get(2) / get(3).max(1.0)).clamp(0.0, 1.0) * w };
         if done > 0.0 {
-            // `GuiProgress.colored`: the Pigment Extractor's arrow runs from white to the pigment in its tank.
-            let tint = (kind(block) == Some(Kind::PigmentExtractor) && read_wide(data, DATA_GAUGES) > 0)
+            // `GuiProgress.colored`: the Pigment Extractor's arrow runs from white to the pigment in its tank,
+            // the Painting Machine's from that pigment to white.
+            let pigment = (read_wide(data, DATA_GAUGES) > 0)
                 .then(|| usize::try_from(data.get(DATA_GAUGES + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c)).map(|c| c.2))
                 .flatten();
+            let tint = match (kind(block), pigment) {
+                (Some(Kind::PigmentExtractor), Some(rgb)) => Some((0xFFFFFF, rgb)),
+                (Some(Kind::Painting), Some(rgb)) => Some((rgb, 0xFFFFFF)),
+                _ => None,
+            };
             match tint {
-                Some(rgb) => {
+                Some((from, to)) => {
                     let progress = done / w;
                     let lerp = |a: u32, b: u32, t: f32| {
                         let ch = |s: u32| ((a >> s & 0xFF) as f32 + ((b >> s & 0xFF) as f32 - (a >> s & 0xFF) as f32) * t).round() as u32;
                         0xFF00_0000 | ch(16) << 16 | ch(8) << 8 | ch(0)
                     };
-                    let end = lerp(0xFFFFFF, rgb, progress);
+                    let end = lerp(from, to, progress);
                     let texture = format!("{SPRITES}{name}/full");
                     for x in 0..done.ceil() as i32 {
                         let width = (done - x as f32).min(1.0);
-                        let argb = lerp(0xFFFFFF, end, (x as f32 + 0.5) / done);
+                        let argb = lerp(from, end, (x as f32 + 0.5) / done);
                         game.native_sprite_tinted(batch, &texture, [x as f32, 0.0, width, h], [ox + at[0] + x as f32, oy + at[1], width, h], argb);
                     }
                 }
