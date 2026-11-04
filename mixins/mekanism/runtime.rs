@@ -14071,7 +14071,7 @@ fn laser_hit_entities(game: &mut Game<'_>, entity: &mut ModBlockEntity, pos: [i3
         }
     }
     if left > 0 {
-        left = laser_hit_players(game, min, max, left);
+        left = laser_hit_players(game, min, max, left, pos.map(|c| f64::from(c) + 0.5));
     }
     left
 }
@@ -14096,7 +14096,18 @@ fn laser_armor(g: &Game<'_>) -> (f32, f32) {
 
 /// The beam hits the players in its box (`TileEntityBasicLaser.fireLaser`): armor dissipates some of its energy and
 /// refracts more past the wearer, the rest burns and hurts with the laser damage type. What is left goes on.
-fn laser_hit_players(game: &mut Game<'_>, min: [f64; 3], max: [f64; 3], energy: u64) -> u64 {
+/// A damage type set already matched against the laser, for `BlockingRules::resolve`.
+struct LaserMatch;
+
+impl horizon_world::blocking_rules::TypeMatchWorld for LaserMatch {
+    type Error = std::convert::Infallible;
+    type Set = bool;
+    fn source_in_set(&mut self, set: bool) -> Result<bool, Self::Error> {
+        Ok(set)
+    }
+}
+
+fn laser_hit_players(game: &mut Game<'_>, min: [f64; 3], max: [f64; 3], energy: u64, from: [f64; 3]) -> u64 {
     use horizon_core::geometry::Vec3;
     let reach = horizon_core::geometry::Aabb::new(Vec3::new(min[0], min[1], min[2]), Vec3::new(max[0], max[1], max[2]));
     let mut left = energy;
@@ -14112,8 +14123,24 @@ fn laser_hit_players(game: &mut Game<'_>, min: [f64; 3], max: [f64; 3], energy: 
             if g.creative || g.spectator() {
                 return;
             }
-            let (dissipation, refraction) = laser_armor(g);
             let mut remaining = left;
+            // `TileEntityBasicLaser.damageShield`: a raised shield takes some of the damage first, for durability.
+            let full = laser::damage(remaining).0;
+            if let Some(blocking) = g.player_blocking(Some(from), laser::LASER, false)
+                && !blocking.bypassed
+                && full > 0.0
+            {
+                let Ok(blocked) = blocking.rules.resolve(&mut LaserMatch, full, blocking.angle);
+                if blocked > 0.0 {
+                    g.after_block(horizon_client::health::BlockOutcome { hurt: true, blocked, sound: false, knockback: false }, full, None, true);
+                    remaining -= ((laser::ENERGY_PER_DAMAGE as f64 * f64::from(blocked)) as u64).min(remaining);
+                    if remaining == 0 {
+                        result = 0;
+                        return;
+                    }
+                }
+            }
+            let (dissipation, refraction) = laser_armor(g);
             if dissipation > 0.0 {
                 remaining = (remaining as f64 * f64::from(1.0 - dissipation.min(1.0))) as u64;
                 if remaining == 0 {
