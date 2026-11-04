@@ -5848,6 +5848,37 @@ const JETPACKS: [&str; 2] = ["mekanism:jetpack", "mekanism:jetpack_armored"];
 /// The client's word, each tick it thrusts, that its wearer spends a mB of hydrogen.
 const JETPACK_CHANNEL: &str = "mekanism:jetpack";
 
+/// The jetpack item's mode (`JetpackMode`: 0 normal, 1 hover, 2 vector, 3 disabled), kept in its custom data.
+const JETPACK_MODE_KEY: &str = "mekanism:jetpack_mode";
+/// A client's word that the mode key and the wheel changed the mode of the jetpack worn: one byte, the shift (-1 or 1).
+const JETPACK_MODE_CHANNEL: &str = "mekanism:jetpack_mode_change";
+const JETPACK_MODE_NAMES: [&str; 4] = ["Normal", "Hover", "Vector", "Disabled"];
+/// `ThrustMultiplier`: half, normal, fast, faster, fastest.
+const THRUST_MULTIPLIERS: [f32; 5] = [0.5, 1.0, 2.0, 3.0, 4.0];
+
+/// `IJetpackItem.getJetpackMode` and the thrust multiplier of the jetpack `stack` is: the item's mode, or the suit's
+/// enabled Jetpack Unit's mode and the multiplier of that mode (`ModuleJetpackUnit.getThrustMultiplier`).
+fn jetpack_settings(stack: &ItemStack) -> (u32, f32) {
+    if JETPACKS.contains(&&*stack.item) {
+        return (custom_data(stack).map_or(0, |c| get_long(c, JETPACK_MODE_KEY)).min(3) as u32, 1.0);
+    }
+    const UNIT: &str = "mekanism:jetpack_unit";
+    if !module_on(stack, UNIT) {
+        return (3, 1.0);
+    }
+    let installed = installed_modules(stack).get(UNIT).copied().unwrap_or(1);
+    let setting = |key: &str| module_config::settings(UNIT, installed).into_iter().find(|s| s.key == key).map(|s| module_setting(stack, UNIT, &s, installed));
+    let mode = setting("jetpack_mode").unwrap_or(0).min(3);
+    let mult = setting(if mode == 1 { "jetpack_mult.hover" } else { "jetpack_mult" }).unwrap_or(1) as usize;
+    (mode, THRUST_MULTIPLIERS[mult.min(4)])
+}
+
+/// `Entity.calculateViewVector`.
+fn view_vector(pitch: f64, yaw: f64) -> [f64; 3] {
+    let (p, y) = (pitch.to_radians(), yaw.to_radians());
+    [-y.sin() * p.cos(), -p.sin(), y.cos() * p.cos()]
+}
+
 /// A jetpack, or MekaSuit body armor with a Jetpack Unit (`ModuleJetpackUnit`).
 fn is_jetpack(stack: &ItemStack) -> bool {
     JETPACKS.contains(&&*stack.item) || (&*stack.item == modules::BODYARMOR && modules_of(stack).contains_key("mekanism:jetpack_unit"))
@@ -6200,18 +6231,74 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     let Some(chest) = game.armor[1].as_ref().filter(|s| is_jetpack(s)) else {
         return;
     };
-    if jetpack_fuel(chest) == 0 || !game.keys.contains(&winit::keyboard::KeyCode::Space) {
-        return;
-    }
-    let Some(p) = game.player.as_mut().filter(|p| !p.flying && !p.spectator) else {
+    let fuel = jetpack_fuel(chest);
+    let (mut mode, mult) = jetpack_settings(chest);
+    // `IJetpackItem.getPlayerJetpackMode`.
+    let ascending = game.keys.contains(&winit::keyboard::KeyCode::Space);
+    let descending = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let (yaw, pitch) = (f64::from(game.yaw), f64::from(game.pitch));
+    let sleeping = game.sleeping.is_some();
+    let Some(p) = game.player.as_mut().filter(|p| !p.spectator) else {
         return;
     };
-    let d = gear::jetpack_normal([p.velocity.x, p.velocity.y, p.velocity.z], gear::JETPACK_THRUST);
-    p.velocity.x += d[0];
-    p.velocity.y += d[1];
-    p.velocity.z += d[2];
-    p.fall_distance = 0.0;
-    game.native_send_to_server(JETPACK_CHANNEL, &[1]);
+    let grounded = p.ground.on_ground || sleeping || p.flying;
+    let active = match mode {
+        3 => false,
+        1 => (ascending && !descending) || !grounded,
+        _ => ascending,
+    };
+    if !active || fuel == 0 {
+        return;
+    }
+    // `ItemMekaSuitArmor.useJetpackFuel`: `ceil(multiplier)` mB for that much thrust (the item spends one).
+    let amount = if JETPACKS.contains(&&*game.armor[1].as_ref().map_or("", |s| &*s.item)) { 1 } else { (mult.ceil() as u64).max(1) }.min(fuel);
+    let thrust = 0.15 * amount as f64;
+    let motion = [p.velocity.x, p.velocity.y, p.velocity.z];
+    // `IJetpackItem.handleJetpackMotion`.
+    if mode == 2 && descending {
+        mode = 0;
+    }
+    let coefficient = |y: f64| (-y).exp().min(1.0);
+    let mut reset = true;
+    if (mode == 0 || mode == 2) && p.fall_flying {
+        let forward = view_vector(pitch, yaw);
+        for k in 0..3 {
+            let drag = (forward[k] * 1.5 - motion[k]) * 0.5;
+            let delta = forward[k] * thrust + drag;
+            match k {
+                0 => p.velocity.x += delta,
+                1 => p.velocity.y += delta,
+                _ => p.velocity.z += delta,
+            }
+        }
+        reset = false;
+    } else if mode == 0 {
+        p.velocity.x += 0.08 * motion[0];
+        p.velocity.y += thrust * coefficient(motion[1]);
+        p.velocity.z += 0.08 * motion[2];
+    } else if mode == 2 {
+        let up = view_vector(pitch + 90.0, yaw);
+        p.velocity.x += up[0] * thrust;
+        p.velocity.y += up[1] * thrust * coefficient(motion[1]);
+        p.velocity.z += up[2] * thrust;
+    } else {
+        let y = motion[1];
+        if ascending == descending {
+            if y > 0.0 {
+                p.velocity.y = (y - thrust).max(0.0);
+            } else if y < 0.0 && !grounded {
+                p.velocity.y = (y + thrust).min(0.0);
+            }
+        } else if ascending {
+            p.velocity.y = (y + thrust).min(2.0 * thrust);
+        } else if !grounded {
+            p.velocity.y = (y - thrust).max(-2.0 * thrust);
+        }
+    }
+    if reset {
+        p.fall_distance = 0.0;
+    }
+    game.native_send_to_server(JETPACK_CHANNEL, &[amount as u8, u8::from(reset)]);
 }
 
 /// A client's packet, with its player swapped in (API 26): a jetpack thrust spends one mB of the
@@ -6297,6 +6384,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
         scuba_toggle(game);
         return;
     }
+    if channel == JETPACK_MODE_CHANNEL && game.native_on(MOD_ID) {
+        jetpack_change_mode(game, data.first().map_or(1, |b| *b as i8));
+        return;
+    }
     if channel != JETPACK_CHANNEL || !game.native_on(MOD_ID) {
         return;
     }
@@ -6307,11 +6398,41 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     if fuel == 0 {
         return;
     }
-    set_jetpack_fuel(chest, fuel - 1);
-    if let Some(p) = game.player.as_mut() {
+    let amount = u64::from(data.first().copied().unwrap_or(1).max(1)).min(fuel);
+    let reset = data.get(1).copied().unwrap_or(1) != 0;
+    set_jetpack_fuel(chest, fuel - amount);
+    if reset && let Some(p) = game.player.as_mut() {
         p.fall_distance = 0.0;
     }
     jetpack_flames(game);
+}
+
+/// `IModeItem.changeMode` / `ModuleJetpackUnit.changeMode` for the jetpack worn: the mode moves by `shift` round the four
+/// (`IIncrementalEnum.adjust`), and the action bar tells the new one.
+fn jetpack_change_mode(game: &mut Game<'_>, shift: i8) {
+    let Some(chest) = game.armor[1].as_mut().filter(|s| is_jetpack(s)) else {
+        return;
+    };
+    let new = if JETPACKS.contains(&&*chest.item) {
+        let new = (jetpack_settings(chest).0 as i32 + i32::from(shift)).rem_euclid(4) as u64;
+        set_custom_long(chest, JETPACK_MODE_KEY, new);
+        new as u32
+    } else {
+        const UNIT: &str = "mekanism:jetpack_unit";
+        let installed = installed_modules(chest).get(UNIT).copied().unwrap_or(1);
+        let settings = module_config::settings(UNIT, installed);
+        // A unit that does not handle the mode key leaves it to the tweaker.
+        let handles = settings.iter().find(|s| s.key == "handle_mode_change").is_none_or(|s| module_setting(chest, UNIT, s, installed) != 0);
+        let Some(mode) = settings.iter().find(|s| s.key == "jetpack_mode").filter(|_| handles && module_on(chest, UNIT)) else {
+            return;
+        };
+        let new = (module_setting(chest, UNIT, mode, installed) as i32 + i32::from(shift)).rem_euclid(4) as u32;
+        tw_set(chest, UNIT, mode, installed, new);
+        new
+    };
+    if let Some(player) = game.native_acting_player() {
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(format!("Jetpack Mode: {}", JETPACK_MODE_NAMES[new as usize])));
+    }
 }
 
 /// `RenderTickHandler.doJetpackRender`: flame and smoke from the two side nozzles and the middle of the pack, for a
@@ -6604,6 +6725,11 @@ pub(super) fn glide_wear(game: &mut Game<'_>, wear: u32, claimed: &mut bool) {
 /// flow of a scuba tank in hand or worn.
 pub(super) fn wheel(game: &mut Game<'_>, steps: f32, claimed: &mut bool) {
     if *claimed || !game.native_on(MOD_ID) || !game.native_playing() || !game.keys.contains(&winit::keyboard::KeyCode::KeyM) {
+        return;
+    }
+    if game.armor[1].as_ref().is_some_and(is_jetpack) && steps.round() != 0.0 && !game.armor[1].as_ref().is_some_and(|s| &*s.item == SCUBA_TANK) {
+        *claimed = true;
+        game.native_send_to_server(JETPACK_MODE_CHANNEL, &[(steps.round().signum() as i8) as u8]);
         return;
     }
     if (steps.round() as i32).abs() % 2 != 1 {
