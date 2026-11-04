@@ -4976,6 +4976,40 @@ fn tick_carrier(
     same: fn(Kind) -> Option<u64>,
 ) {
     let mut tank = get_tank(&entity.nbt, key, rate);
+    // A pull face takes from the tank beside it (`ConnectionType.PULL`, as a cable does from an energy cube).
+    for (face, (_, d)) in DIRECTIONS.into_iter().enumerate() {
+        if conn_of(&entity.nbt, face) != 2 {
+            continue;
+        }
+        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        let back = face_index([-d[0], -d[1], -d[2]]);
+        let room = rate.saturating_sub(tank.amount);
+        if room == 0 {
+            break;
+        }
+        let wanted = tank.chemical.clone();
+        let taken = game.native_with_mod_block_entity(at, |m| {
+            let capacity = match kind(&m.id)? {
+                Kind::ChemicalTank(t) if key == "chemical" => chem::chemical_tank(t).0,
+                Kind::FluidTank(t) if key == "fluid" => tier::fluid_tank(t).0,
+                _ => return None,
+            };
+            if !sides_of(&m.nbt, Transmission::Chemical).get(back).gives_out() {
+                return None;
+            }
+            let mut theirs = get_tank(&m.nbt, key, capacity);
+            let chemical = theirs.chemical.clone()?;
+            if wanted.as_ref().is_some_and(|w| *w != chemical) {
+                return None;
+            }
+            let n = theirs.extract(room);
+            put_tank(&mut m.nbt, key, &theirs);
+            Some((chemical, n))
+        });
+        if let Some(Some((chemical, n))) = taken {
+            tank.insert(&chemical, n);
+        }
+    }
     if tank.amount == 0 {
         return;
     }
