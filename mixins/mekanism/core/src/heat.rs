@@ -1,7 +1,12 @@
 // Heat (mekanism.common.capabilities.heat.BasicHeatCapacitor, ITileHeatHandler.simulateEnvironment).
 
-/// `HeatAPI.AMBIENT_TEMP`, kelvin. Mekanism adjusts it by biome; this port uses the default for now.
+/// `HeatAPI.AMBIENT_TEMP`, kelvin: the ambient temperature of a biome at temperature 0.8.
 pub const AMBIENT_TEMP: f64 = 300.0;
+
+/// `HeatAPI.getAmbientTemp(biomeTemp)`: 300 K shifted 25 K per biome-temperature step from 0.8.
+pub fn ambient_temp(biome_temp: f64) -> f64 {
+    AMBIENT_TEMP + 25.0 * (biome_temp.clamp(-5.0, 5.0) - 0.8)
+}
 /// `HeatAPI.AIR_INVERSE_COEFFICIENT`.
 pub const AIR_INVERSE_COEFFICIENT: f64 = 10_000.0;
 /// `HeatAPI.EPSILON`.
@@ -14,15 +19,27 @@ pub struct HeatCapacitor {
     pub capacity: f64,
     pub inverse_conduction: f64,
     pub inverse_insulation: f64,
+    /// The temperature it relaxes toward (`ambientTempSupplier`).
+    pub ambient: f64,
 }
 
 impl HeatCapacitor {
     pub fn new(capacity: f64, inverse_conduction: f64, inverse_insulation: f64) -> Self {
+        Self::with_ambient(capacity, inverse_conduction, inverse_insulation, AMBIENT_TEMP)
+    }
+
+    pub fn with_ambient(
+        capacity: f64,
+        inverse_conduction: f64,
+        inverse_insulation: f64,
+        ambient: f64,
+    ) -> Self {
         Self {
-            heat: capacity * AMBIENT_TEMP,
+            heat: capacity * ambient,
             capacity,
             inverse_conduction,
             inverse_insulation,
+            ambient,
         }
     }
 
@@ -41,7 +58,7 @@ impl HeatCapacitor {
     /// insulation; returns the temperature moved when it is hotter than ambient, else 0.
     pub fn lose_to_air(&mut self, inverse_insulation: f64) -> f64 {
         let inv = AIR_INVERSE_COEFFICIENT + inverse_insulation + self.inverse_conduction;
-        let temp = (self.temperature() - AMBIENT_TEMP) / inv;
+        let temp = (self.temperature() - self.ambient) / inv;
         self.handle_heat(-temp * self.capacity);
         temp.max(0.0)
     }
@@ -57,6 +74,18 @@ mod tests {
         assert_eq!(c.temperature(), AMBIENT_TEMP);
         c.handle_heat(-1e9);
         assert_eq!(c.heat, 0.0);
+    }
+
+    #[test]
+    fn ambient_follows_the_biome_temperature() {
+        assert_eq!(ambient_temp(0.8), 300.0);
+        assert_eq!(ambient_temp(2.0), 330.0);
+        assert_eq!(ambient_temp(-0.5), 267.5);
+        assert_eq!(ambient_temp(99.0), 300.0 + 25.0 * 4.2);
+        let mut c = HeatCapacitor::with_ambient(10.0, 5.0, 100.0, 330.0);
+        assert_eq!(c.temperature(), 330.0);
+        c.handle_heat(1_000.0);
+        assert!(c.lose_to_air(100.0) > 0.0 && c.temperature() > 330.0);
     }
 
     #[test]

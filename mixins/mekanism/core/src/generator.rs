@@ -2,7 +2,7 @@
 // lava in its tank, burning lava heats it, and heat above ambient becomes energy at the Carnot efficiency.
 
 use crate::energy::EnergyContainer;
-use crate::heat::{AMBIENT_TEMP, HeatCapacitor};
+use crate::heat::HeatCapacitor;
 
 /// `TileEntityHeatGenerator` constants.
 pub const HEAT_CAPACITY: f64 = 10.0;
@@ -62,6 +62,12 @@ impl HeatGenerator {
         }
     }
 
+    /// Sets the ambient temperature of the generator's biome (the heat starts there, as `BasicHeatCapacitor` does).
+    pub fn set_ambient(&mut self, ambient: f64) {
+        self.heat.ambient = ambient;
+        self.heat.heat = self.heat.capacity * ambient;
+    }
+
     /// The lava a fuel item of `burn_time` ticks gives (bucket volume × burn time / lava bucket's).
     pub fn lava_for(burn_time: u32) -> u32 {
         (1_000u64 * burn_time as u64 / LAVA_BUCKET_BURN_TIME as u64) as u32
@@ -95,8 +101,9 @@ impl HeatGenerator {
         // simulate(): the thermoelectric part, then the environment, six sides (the bottom keeps the
         // default insulation of 0).
         let temp = self.heat.temperature();
-        let carnot = 1.0 - temp.min(AMBIENT_TEMP) / temp.max(AMBIENT_TEMP);
-        let heat_lost = THERMAL_EFFICIENCY * (temp - AMBIENT_TEMP);
+        let ambient = self.heat.ambient;
+        let carnot = 1.0 - temp.min(ambient) / temp.max(ambient);
+        let heat_lost = THERMAL_EFFICIENCY * (temp - ambient);
         self.heat.handle_heat(-heat_lost);
         let energy = ((heat_lost.abs() * carnot) as u64).min(MAX_PRODUCTION);
         self.energy.insert(energy, crate::energy::Action::Execute);
@@ -113,6 +120,7 @@ impl HeatGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heat::AMBIENT_TEMP;
 
     #[test]
     fn max_production_is_159_with_the_defaults() {

@@ -1287,6 +1287,7 @@ fn find_operation(
 
 fn tick_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
     let mut g = HeatGenerator::new();
+    g.set_ambient(ambient_at(game, pos));
     g.energy.stored = get_long(&entity.nbt, "energy").min(g.energy.capacity);
     g.lava = get_int(&entity.nbt, "lava");
     if let Some(heat) = get_double(&entity.nbt, "heat") {
@@ -1325,7 +1326,7 @@ fn tick_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
                     if kind(&m.id) != Some(Kind::HeatGenerator) {
                         return None;
                     }
-                    let mut sink = mekanism_core::heat::HeatCapacitor::new(heat.capacity, heat.inverse_conduction, heat.inverse_insulation);
+                    let mut sink = mekanism_core::heat::HeatCapacitor::with_ambient(heat.capacity, heat.inverse_conduction, heat.inverse_insulation, heat.ambient);
                     sink.heat = get_double(&m.nbt, "heat").unwrap_or(sink.heat);
                     let sink_temp = sink.temperature();
                     if temp <= sink_temp {
@@ -1359,7 +1360,7 @@ fn tick_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     entity.nbt.insert("temp".into(), Tag::Double(g.heat.temperature().to_bits()));
     entity.nbt.insert("env".into(), Tag::Double(g.last_env.to_bits()));
     entity.nbt.insert("transfer".into(), Tag::Double(g.last_transfer.to_bits()));
-    let warm = (g.heat.temperature() - mekanism_core::heat::AMBIENT_TEMP).clamp(0.0, 200.0) as i32;
+    let warm = (g.heat.temperature() - g.heat.ambient).clamp(0.0, 200.0) as i32;
     entity.data = vec![g.lava as i32, mekanism_core::generator::TANK_CAPACITY as i32, warm, 200];
     Some(g.active)
 }
@@ -1393,6 +1394,37 @@ fn tick_solar(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, p
     put_int(&mut entity.nbt, "sees", u32::from(overworld(game) && game.sky_darken() < 4 && can_see_sky(game, pos)));
     entity.data = vec![(energy.stored * 1000 / storage.max(1)) as i32, 1000, produced as i32, peak as i32];
     Some(produced > 0)
+}
+
+/// `Biome.getTemperature(pos, seaLevel)` of the biome at `pos`; 0.8 (plains) where the chunk is not loaded.
+fn biome_temperature(game: &Game<'_>, pos: [i32; 3]) -> f64 {
+    game.world
+        .chunks
+        .get(&(pos[0] >> 4, pos[2] >> 4))
+        .map_or(0.8, |c| {
+            let b = &game.res.biomes().list[c.biome(pos[0], pos[1], pos[2]) as usize];
+            let at = horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]);
+            f64::from(b.temperature_at(at, 63))
+        })
+}
+
+/// `HeatAPI.getAmbientTemp(level, pos)`.
+fn ambient_at(game: &Game<'_>, pos: [i32; 3]) -> f64 {
+    mekanism_core::heat::ambient_temp(biome_temperature(game, pos))
+}
+
+/// `MultiblockData.calculateAverageAmbientTemperature`: the biome temperature averaged over the eight corners.
+fn ambient_over(game: &Game<'_>, min: [i32; 3], max: [i32; 3]) -> f64 {
+    let mut sum = 0.0;
+    for i in 0..8 {
+        let at = [
+            if i & 1 == 0 { min[0] } else { max[0] },
+            if i & 2 == 0 { min[1] } else { max[1] },
+            if i & 4 == 0 { min[2] } else { max[2] },
+        ];
+        sum += biome_temperature(game, at);
+    }
+    mekanism_core::heat::ambient_temp(sum / 8.0)
 }
 
 /// What a solar panel at `pos` with `peak` makes this tick.
@@ -4944,9 +4976,11 @@ fn tick_evaporation(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         .map(|[dx, dz]| [x0 + dx, top, z0 + dz])
         .filter(|&at| sun && block_name(game, at) == "mekanismgenerators:advanced_solar_generator" && can_see_sky(game, at))
         .count() as u32;
-    let mut temperature = get_double(&entity.nbt, "temperature").unwrap_or(evap::AMBIENT_TEMP);
+    // The biome's ambient temperature, averaged over the tower's corners (`calculateAverageAmbientTemperature`).
+    let ambient = ambient_over(game, tower.origin, [x0 + 3, top - 1, z0 + 3]);
+    let mut temperature = get_double(&entity.nbt, "temperature").unwrap_or(ambient);
     let before = temperature;
-    temperature = evap::step_temperature(temperature, solars, evap::AMBIENT_TEMP);
+    temperature = evap::step_temperature(temperature, solars, ambient);
     let mut progress = get_int(&entity.nbt, "progress");
     let ops = evap::operations(evap::temp_multiplier(temperature, tower.height), &mut progress);
     // Water evaporates into brine, and brine into lithium.
@@ -6435,8 +6469,8 @@ fn get_pos(nbt: &Compound, key: &str) -> Option<[i32; 3]> {
 /// its tanks: it takes fissile fuel from the tubes and chemical tanks beside the ports and water from the
 /// pipes and fluid tanks beside them, burns the fuel at the set rate while switched on (water boils to
 /// steam), and gives steam and nuclear waste out of every port.
-/// The ambient temperature of a reactor: `calculateAverageAmbientTemperature` needs the biome's
-/// temperature, which the heat system will bring; until then the default 300 K.
+/// The ambient temperature of a reactor not yet formed (the plains default); a formed one stores the
+/// average of its biome (`calculateAverageAmbientTemperature`).
 const FISSION_AMBIENT: f64 = 300.0;
 
 /// What a master port saved of its reactor's shape.
@@ -6527,6 +6561,8 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
             Some((r, ports, lo, size, columns)) => {
                 entity.nbt.insert("box".into(), Tag::IntArray(vec![lo[0], lo[1], lo[2], size[0], size[1], size[2]]));
                 entity.nbt.insert("columns".into(), Tag::IntArray(columns.concat()));
+                let hi = [lo[0] + size[0] - 1, lo[1] + size[1] - 1, lo[2] + size[2] - 1];
+                put_double(&mut entity.nbt, "ambient", ambient_over(game, lo, hi));
                 put_long(&mut entity.nbt, "assemblies", r.assemblies);
                 put_long(&mut entity.nbt, "volume", r.volume);
                 put_long(&mut entity.nbt, "surface", r.surface);
@@ -6972,10 +7008,12 @@ fn fusion_tanks(nbt: &Compound, injection: u64) -> [ChemicalTank; 5] {
 }
 
 fn fusion_plasma(nbt: &Compound) -> fusion::Plasma {
+    let ambient = get_double(nbt, "ambient").unwrap_or(fusion::AMBIENT);
     fusion::Plasma {
-        plasma: get_double(nbt, "plasma").unwrap_or(fusion::AMBIENT),
-        case: get_double(nbt, "case").unwrap_or(fusion::AMBIENT),
+        plasma: get_double(nbt, "plasma").unwrap_or(ambient),
+        case: get_double(nbt, "case").unwrap_or(ambient),
         burning: get_long(nbt, "burning") == 1,
+        ambient,
     }
 }
 
@@ -7007,6 +7045,8 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
                 entity.nbt.insert("master".into(), Tag::IntArray(ports[0].to_vec()));
                 entity.nbt.insert("ports".into(), Tag::IntArray(ports.concat()));
                 entity.nbt.insert("controller".into(), Tag::IntArray(vec![lo[0] + 2, lo[1] + fusion::SIZE - 1, lo[2] + 2]));
+                let n = fusion::SIZE - 1;
+                put_double(&mut entity.nbt, "ambient", ambient_over(game, lo, [lo[0] + n, lo[1] + n, lo[2] + n]));
             }
             None => {
                 entity.nbt.remove(&JavaString::from("master"));
@@ -7226,6 +7266,7 @@ const CHEMICALS: &[(&str, &str, u32)] = &[
     ("mekanism:nutritional_paste", "Nutritional Paste", 0xEB6CA3),
     ("mekanism:chlorine", "Chlorine", 0xCFE800),
     ("mekanism:sodium", "Sodium", 0xE9FEF4),
+    ("mekanism:superheated_sodium", "Superheated Sodium", 0xD19469),
     ("mekanism:hydrogen_chloride", "Hydrogen Chloride", 0xA8F1E9),
     ("mekanism:sulfur_dioxide", "Sulfur Dioxide", 0xA99D90),
     ("mekanism:sulfur_trioxide", "Sulfur Trioxide", 0xCE6C6C),
@@ -7580,7 +7621,7 @@ fn layout(block: &str) -> Option<Layout> {
         Kind::BoilerValve => Layout {
             slots: [None; 3],
             // `GuiThermoelectricBoiler`: the heated coolant and water tanks on the left, the steam and cooled
-            // coolant tanks on the right (the port has no coolant, so those two stay empty).
+            // coolant tanks on the right.
             gauges: vec![
                 gauge("heated_coolant", 0, 6.0, 13.0, STANDARD),
                 gauge("water", 0, 26.0, 13.0, STANDARD),
@@ -9649,6 +9690,8 @@ fn multiblock_capacity(entity: &ModBlockEntity, key: &str) -> u64 {
             match key {
                 "water" => b.water_capacity(),
                 "steam" => b.steam_capacity(),
+                "heated_coolant" => b.heated_coolant_capacity(),
+                "cooled_coolant" => b.cooled_coolant_capacity(),
                 _ => 0,
             }
         }
@@ -12949,6 +12992,7 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
         match find_boiler(game, pos) {
             Some((b, valves, heaters, bounds)) => {
                 entity.nbt.insert("box".into(), Tag::IntArray(bounds.to_vec()));
+                put_double(&mut entity.nbt, "ambient", ambient_over(game, [bounds[0], bounds[1], bounds[2]], [bounds[3], bounds[4], bounds[5]]));
                 for (key, v) in [
                     ("elements", b.elements),
                     ("volume", b.volume),
@@ -12981,10 +13025,16 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
             touched.push(v);
         }
     }
-    let mut casing = mekanism_core::heat::HeatCapacitor::new(
+    let mut heated = get_tank(&entity.nbt, "heated_coolant", b.heated_coolant_capacity());
+    let mut cooled = get_tank(&entity.nbt, "cooled_coolant", b.cooled_coolant_capacity());
+    for &v in &positions(&entity.nbt, "valves") {
+        pull_from_carriers(game, v, &mut heated, boiler::HEATED_COOLANT);
+    }
+    let mut casing = mekanism_core::heat::HeatCapacitor::with_ambient(
         b.heat_capacity(),
         boiler::CASING_INVERSE_CONDUCTION,
         boiler::CASING_INVERSE_INSULATION,
+        get_double(&entity.nbt, "ambient").unwrap_or(mekanism_core::heat::AMBIENT_TEMP),
     );
     if let Some(heat) = get_double(&entity.nbt, "heat") {
         casing.heat = heat;
@@ -13000,6 +13050,15 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     // `lastEnvironmentLoss`: the temperature the casing gave to the air.
     let lost = casing.lose_to_air(boiler::CASING_INVERSE_INSULATION);
     entity.nbt.insert("env_loss".into(), Tag::Double(lost.to_bits()));
+    // The superheated coolant gives its heat to the casing and comes out cooled.
+    if heated.chemical.as_deref() == Some(boiler::HEATED_COOLANT) && heated.amount > 0 && cooled.accepts(boiler::COOLED_COOLANT) {
+        let done = boiler::Boiler::cool(casing.temperature(), heated.amount, cooled.capacity - cooled.amount);
+        if done > 0 {
+            heated.extract(done);
+            cooled.insert(boiler::COOLED_COOLANT, done);
+            casing.handle_heat(done as f64 * boiler::COOLANT_ENTHALPY);
+        }
+    }
     let water_in = if water.accepts("minecraft:water") { water.amount } else { 0 };
     let room = if steam.accepts("mekanism:steam") { steam.capacity - steam.amount } else { 0 };
     let boiled = b.boil(&mut casing.heat, water_in, room);
@@ -13009,8 +13068,13 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
         if steam.amount > 0 {
             push_chemical(game, v, &mut steam, None, u64::MAX, false);
         }
+        if cooled.amount > 0 {
+            push_chemical(game, v, &mut cooled, None, u64::MAX, false);
+        }
     }
     entity.nbt.insert("heat".into(), Tag::Double(casing.heat.to_bits()));
+    put_tank(&mut entity.nbt, "heated_coolant", &heated);
+    put_tank(&mut entity.nbt, "cooled_coolant", &cooled);
     put_tank(&mut entity.nbt, "water", &water);
     put_tank(&mut entity.nbt, "steam", &steam);
     put_long(&mut entity.nbt, "boil_rate", boiled);

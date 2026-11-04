@@ -26,7 +26,7 @@ pub const MAX_INJECTION: u64 = 98;
 pub const BURN_TEMPERATURE: f64 = 100_000_000.0;
 const PLASMA_HEAT_CAPACITY: f64 = 100.0;
 const PLASMA_CASE_CONDUCTIVITY: f64 = 0.2;
-/// `HeatAPI.AMBIENT_TEMP`, as biomes do not change it here.
+/// `HeatAPI.AMBIENT_TEMP`, the default of a reactor in a plains biome.
 pub const AMBIENT: f64 = 300.0;
 /// `GeneratorsConfig`: `fuelEnergy`, `thermocoupleEfficiency`, `casingThermalConductivity`,
 /// `waterHeatingRatio`, `fuelCapacity`, `energyCapacity`, `waterPerInjection`, `steamPerInjection`.
@@ -91,14 +91,24 @@ pub struct Plasma {
     pub plasma: f64,
     pub case: f64,
     pub burning: bool,
+    /// `biomeAmbientTemp`: what the casing relaxes toward.
+    pub ambient: f64,
 }
 
 impl Default for Plasma {
     fn default() -> Self {
+        Self::at_ambient(AMBIENT)
+    }
+}
+
+impl Plasma {
+    /// A cold reactor in a biome of ambient temperature `ambient`.
+    pub fn at_ambient(ambient: f64) -> Self {
         Self {
-            plasma: AMBIENT,
-            case: AMBIENT,
+            plasma: ambient,
+            case: ambient,
             burning: false,
+            ambient,
         }
     }
 }
@@ -170,7 +180,7 @@ pub fn tick(p: &mut Plasma, t: &mut Tanks, injection: u64, steam_capacity: u64) 
     p.plasma -= plasma_case / PLASMA_HEAT_CAPACITY;
     case_heat += plasma_case;
     // Casing to water.
-    let case_water = WATER_HEATING_RATIO * (p.case - AMBIENT);
+    let case_water = WATER_HEATING_RATIO * (p.case - p.ambient);
     if t.water > 0 && case_water > 0.0 {
         let boil = ((STEAM_EFFICIENCY * case_water / WATER_ENTHALPY) as u64)
             .min(steam_capacity.saturating_sub(t.steam))
@@ -181,7 +191,7 @@ pub fn tick(p: &mut Plasma, t: &mut Tanks, injection: u64, steam_capacity: u64) 
         case_heat -= lost_to_water;
     }
     // Casing to air, through the thermocouples.
-    let case_air = CASING_CONDUCTIVITY * (p.case - AMBIENT);
+    let case_air = CASING_CONDUCTIVITY * (p.case - p.ambient);
     case_heat -= case_air;
     let energy = (case_air * THERMOCOUPLE_EFFICIENCY).max(0.0) as u64;
     p.case += case_heat;
@@ -294,6 +304,7 @@ mod tests {
             plasma: 3e8,
             case: 2e8,
             burning: true,
+            ambient: AMBIENT,
         };
         let mut t = Tanks {
             deuterium: 1_000,

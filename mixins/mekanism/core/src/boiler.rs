@@ -23,6 +23,16 @@ const SUPERHEATING_HEAT_TRANSFER: f64 = 16_000_000.0;
 pub const CASING_HEAT_CAPACITY: f64 = 50.0;
 pub const CASING_INVERSE_INSULATION: f64 = 100_000.0;
 pub const CASING_INVERSE_CONDUCTION: f64 = 1.0;
+/// `general.boiler.heatedCoolantPerTank` and `cooledCoolantPerTank`: 256 buckets a tank.
+pub const COOLANT_PER_BLOCK: u64 = 256_000;
+/// The heated coolant chemical and its cooled variant (`HeatedCoolant` / `CooledCoolant` data maps).
+pub const HEATED_COOLANT: &str = "mekanism:superheated_sodium";
+pub const COOLED_COOLANT: &str = "mekanism:sodium";
+/// `HeatedCoolant(sodium, thermalEnthalpy 5)` with the base conductivity 0.4 and temperature 100,000 K.
+pub const COOLANT_ENTHALPY: f64 = 5.0;
+pub const COOLANT_CONDUCTIVITY: f64 = 0.4;
+pub const COOLANT_TEMPERATURE: f64 = 100_000.0;
+
 /// `HeatUtils.BASE_BOIL_TEMP`: 100 °C.
 pub const BOIL_TEMP: f64 = 373.15;
 const STEAM_EFFICIENCY: f64 = 0.2;
@@ -67,6 +77,25 @@ impl Boiler {
 
     pub fn steam_capacity(&self) -> u64 {
         self.steam_volume * STEAM_PER_BLOCK
+    }
+
+    /// The superheated coolant tank holds a tank's worth for each block of water space.
+    pub fn heated_coolant_capacity(&self) -> u64 {
+        self.water_volume * COOLANT_PER_BLOCK
+    }
+
+    /// The cooled coolant tank, for each block of steam space.
+    pub fn cooled_coolant_capacity(&self) -> u64 {
+        self.steam_volume * COOLANT_PER_BLOCK
+    }
+
+    /// The coolant step of `BoilerMultiblockData.tick`: the share of `heated` mB that gives its heat to the casing at
+    /// `temperature`, limited by the room in the cooled tank. Returns the mB cooled; the casing gains
+    /// `cooled * COOLANT_ENTHALPY` heat.
+    pub fn cool(temperature: f64, heated: u64, cooled_room: u64) -> u64 {
+        let portion = COOLANT_CONDUCTIVITY * heated as f64;
+        let to_cool = (portion * (1.0 - temperature / COOLANT_TEMPERATURE)).round();
+        (to_cool.max(0.0) as u64).min(cooled_room).min(heated)
     }
 
     pub fn heat_capacity(&self) -> f64 {
@@ -135,6 +164,19 @@ mod tests {
         assert!((start - heat - 700.0).abs() < 1e-3);
         // 300 left over → 210 available → 4 mB.
         assert_eq!(b.boil(&mut heat, 1_000, 1_000), 4);
+    }
+
+    #[test]
+    fn hot_coolant_heats_the_casing_and_cools() {
+        // 1,000 mB at 300 K: 0.4 × 1,000 × (1 - 300 / 100,000) = 398.8 → 399.
+        assert_eq!(Boiler::cool(300.0, 1_000, u64::MAX), 399);
+        // Limited by the room for the cooled coolant.
+        assert_eq!(Boiler::cool(300.0, 1_000, 100), 100);
+        // A casing hotter than the coolant gets nothing.
+        assert_eq!(Boiler::cool(200_000.0, 1_000, u64::MAX), 0);
+        let b = boiler();
+        assert_eq!(b.heated_coolant_capacity(), 256_000);
+        assert_eq!(b.cooled_coolant_capacity(), 0);
     }
 
     #[test]
