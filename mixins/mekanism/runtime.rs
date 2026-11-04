@@ -6148,6 +6148,11 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
             lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
         }
     }
+    // `REACTION_STARTER`'s tooltip, after the stored chemical.
+    if &*stack.item == fusion::HOHLRAUM {
+        let (text, rgb) = if hohlraum_ready(stack) { ("Ready for Reaction!", (0x00, 0xAA, 0x00)) } else { ("Insufficient Fuel", (0xAA, 0x00, 0x00)) };
+        lines.push((horizon_client::text::Text::literal(text.to_owned()), horizon_client::hud::rgba(rgb.0, rgb.1, rgb.2, 0xFF)));
+    }
     if let Some(Tag::Compound(c)) = custom_data(stack).and_then(|c| c.get(&JavaString::from(BIN_KEY)))
         && let Some(t) = bin::tier_of(&stack.item)
     {
@@ -7159,6 +7164,29 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         }
     }
     if get_pos(&entity.nbt, "master") != Some(pos) {
+        // `reactorSlot` belongs to the multiblock: every port shows the master's. A change at this port goes to the
+        // master; a change the master made comes here.
+        if let Some(master) = get_pos(&entity.nbt, "master") {
+            let key = |s: &Option<ItemStack>| format!("{s:?}");
+            let own = entity.items.get(3).cloned().flatten();
+            let last = match entity.nbt.get(&JavaString::from("mirror")) {
+                Some(Tag::String(v)) => v.to_string().ok(),
+                _ => None,
+            };
+            let theirs = game.native_with_mod_block_entity(master, |m| {
+                if m.items.len() > 3 && key(&m.items[3]) != key(&own) {
+                    if Some(key(&own)) == last {
+                        return m.items[3].clone();
+                    }
+                    m.items[3] = own.clone();
+                }
+                own.clone()
+            });
+            if let (Some(theirs), true) = (theirs, entity.items.len() > 3) {
+                entity.items[3] = theirs;
+                entity.nbt.insert("mirror".into(), Tag::String(key(&entity.items[3]).as_str().into()));
+            }
+        }
         put_flag(game, pos, entity, "fus_on", false);
         return;
     }
@@ -7166,6 +7194,14 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         Some(Tag::IntArray(v)) => v.chunks(3).filter(|c| c.len() == 3).map(|c| [c[0], c[1], c[2]]).collect(),
         _ => vec![pos],
     };
+    // Only a hohlraum full of D-T fuel stays in the slot (`reactorSlot`'s insert check): another pops out of the port.
+    if let Some(Some(stack)) = entity.items.get(3).cloned()
+        && !hohlraum_ready(&stack)
+    {
+        entity.items[3] = None;
+        let at = horizon_core::position::BlockPos::new(pos[0], pos[1] + 1, pos[2]);
+        game.with_level(|_, level, _| level.drop_lost_contents(at, vec![Some(stack)]));
+    }
     let injection = fusion_injection(&entity.nbt);
     let [mut deuterium, mut tritium, mut fuel, mut water, mut steam] = fusion_tanks(&entity.nbt, injection);
     for &p in &ports {
@@ -7174,38 +7210,17 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         pull_from_carriers(game, p, &mut water, "minecraft:water");
     }
     let mut plasma = fusion_plasma(&entity.nbt);
-    // `vaporiseHohlraum`: over the burn temperature and not yet burning, a full hohlraum in the reactor slot (the
-    // port's own, or any other port's) gives its fuel to the tank and starts the reaction.
+    // `vaporiseHohlraum`: over the burn temperature and not yet burning, a full hohlraum in the reactor slot
+    // (shared by all ports through the master's) gives its fuel to the tank and starts the reaction.
     if plasma.plasma >= fusion::BURN_TEMPERATURE && !plasma.burning {
         let needed = fuel.capacity - fuel.amount;
-        let mut slots: Vec<[i32; 3]> = vec![pos];
-        slots.extend(ports.iter().copied().filter(|&p| p != pos));
-        for at in slots {
-            let mut take = |items: &mut Vec<Option<ItemStack>>| -> bool {
-                let Some(Some(stack)) = items.get(3).cloned() else {
-                    return false;
-                };
-                let full = stack.item.as_ref() == fusion::HOHLRAUM
-                    && item_tank(&stack, CHEMICAL_KEY, fusion::HOHLRAUM_CAPACITY)
-                        .is_some_and(|t| t.amount >= fusion::HOHLRAUM_CAPACITY && t.chemical.as_deref() == Some(fusion::FUSION_FUEL));
-                let Some(fuel_in) = full.then(|| fusion::vaporise(needed)).flatten() else {
-                    return false;
-                };
-                if fuel_in > 0 {
-                    fuel.insert(fusion::FUSION_FUEL, fuel_in);
-                }
-                items[3] = None;
-                true
-            };
-            let started = if at == pos {
-                take(&mut entity.items)
-            } else {
-                game.native_with_mod_block_entity(at, |m| take(&mut m.items)).unwrap_or(false)
-            };
-            if started {
-                plasma.burning = true;
-                break;
+        let full = matches!(entity.items.get(3), Some(Some(stack)) if hohlraum_ready(stack));
+        if full && let Some(fuel_in) = fusion::vaporise(needed) {
+            if fuel_in > 0 {
+                fuel.insert(fusion::FUSION_FUEL, fuel_in);
             }
+            entity.items[3] = None;
+            plasma.burning = true;
         }
     }
     let mut t = fusion::Tanks {
@@ -7267,6 +7282,13 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         put_int(&mut core, "fus_on", 0);
     }
     put_client(game, pos, entity, &["fus_on", "fus_scaled", "fus_x", "fus_y", "fus_z"], core);
+}
+
+/// A hohlraum full of D-T fuel (`ResourceHandlerUtil.isFull` on its chemical handler): the reaction starter.
+fn hohlraum_ready(stack: &ItemStack) -> bool {
+    &*stack.item == fusion::HOHLRAUM
+        && item_tank(stack, CHEMICAL_KEY, fusion::HOHLRAUM_CAPACITY)
+            .is_some_and(|t| t.amount >= fusion::HOHLRAUM_CAPACITY && t.chemical.as_deref() == Some(fusion::FUSION_FUEL))
 }
 
 /// A right click with an empty hand on a Fusion Reactor's controller or port steps the injection rate (sneaking
