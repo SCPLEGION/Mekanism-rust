@@ -7535,6 +7535,8 @@ fn layout(block: &str) -> Option<Layout> {
             gauges: vec![
                 gauge("input", sps::INPUT_CAPACITY, 7.0, 17.0, STANDARD),
                 gauge("output", sps::OUTPUT_CAPACITY, 151.0, 17.0, STANDARD),
+                // `lastProcessed` in thousandths of a mB (never drawn).
+                gauge("stats_a", 1 << 58, 0.0, 0.0, SMALL),
             ],
             power: None,
             progress: None,
@@ -7766,6 +7768,10 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
                     tank.capacity = st.capacity as u64;
                 }
             }
+        }
+        if g.key == "stats_a" && kind(&entity.id) == Some(Kind::SpsPort) {
+            tank = ChemicalTank::new(g.capacity);
+            tank.insert("minecraft:lava", (get_double(&entity.nbt, "processed").unwrap_or(0.0).max(0.0) * 1_000.0).round() as u64);
         }
         if g.key.starts_with("stats_") && kind(&entity.id) == Some(Kind::FusionPort) {
             tank = ChemicalTank::new(g.capacity);
@@ -9598,9 +9604,9 @@ fn multiblock_data(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
         }
         Some(Kind::DynamicValve) => ([1, small(get_long(nbt, "volume")), 0, 0], 0),
         Some(Kind::SpsPort) => {
-            let progress = (sps_of(nbt).scaled_progress() * 1_000.0) as u64;
-            let processed = get_double(nbt, "processed").unwrap_or(0.0).max(0.0) as u64;
-            ([1, small(get_long(nbt, "coils")), small(progress), small(processed)], get_long(nbt, "received"))
+            // The progress in hundredths of a percent.
+            let progress = (sps_of(nbt).scaled_progress().min(1.0) * 10_000.0) as u64;
+            ([1, small(get_long(nbt, "coils")), small(progress), 0], get_long(nbt, "received"))
         }
         _ => ([1, 0, 0, 0], get_long(nbt, "rate")),
     };
@@ -10257,12 +10263,12 @@ fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
         }
         Some(Kind::Pump) => vec![energy, fluid()],
         Some(Kind::SpsPort) if data.first().copied().unwrap_or(0) > 0 => {
-            let processed = data.get(3).copied().unwrap_or(0).max(0);
+            let processed = read_wide(data, DATA_GAUGES + 2 * GAUGE_SLOTS);
             let active = processed > 0;
             let mut lines = vec![format!("Status: {}", if active { "Active" } else { "Idle" })];
             if active {
                 lines.push(format!("Energy Input: {}/t", fe(read_wide(data, DATA_USAGE))));
-                lines.push(format!("Process Rate: {} mB/t", java_double(f64::from(processed) / 1000.0)));
+                lines.push(format!("Process Rate: {} mB/t", java_double((processed as f64 / 1_000.0).round() / 1_000.0)));
             }
             lines
         }
@@ -11559,7 +11565,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         draw_fusion_main(game, batch, origin, width, height);
     }
     if kind(block) == Some(Kind::SpsPort) && get(0) > 0.0 {
-        draw_dynamic_rate_bar(game, batch, [ox + 7.0, oy + 79.0], 160.0, (get(2) / 1000.0).clamp(0.0, 1.0));
+        draw_dynamic_rate_bar(game, batch, [ox + 7.0, oy + 79.0], 160.0, (get(2) / 10_000.0).clamp(0.0, 1.0));
     }
     if kind(block) == Some(Kind::TurbineValve) && get(0) > 0.0 {
         draw_stats_tab(game, batch, origin, "button/stats");
@@ -11943,7 +11949,7 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         }
     }
     if kind(block) == Some(Kind::SpsPort) && inside(at, [7.0, 79.0, 160.0, 8.0]) {
-        lines.push(format!("Progress: {:.0}%", f64::from(data.get(2).copied().unwrap_or(0).max(0)) / 10.0));
+        lines.push(format!("Progress: {}%", (f64::from(data.get(2).copied().unwrap_or(0).max(0)) / 100.0).round()));
         return;
     }
     if kind(block) == Some(Kind::TurbineValve) && inside(at, [173.0, 72.0, 10.0, 10.0]) {
