@@ -57,11 +57,24 @@ const HEAT_GENERATOR: &str = "mekanismgenerators:heat_generator";
 const FACTORY_ROW: usize = 9;
 /// A factory's energy slot (`TileEntityFactory.energySlot`), after its two rows.
 const FACTORY_ENERGY: usize = 2 * FACTORY_ROW;
-/// The chemical slot of the item and chemical factories (`ChemicalInventorySlot.fillOrConvert`, at (7, 57)).
+/// The chemical slot of the item and chemical factories (`ChemicalInventorySlot.fillOrConvert`, at (7, 57)), or the
+/// combiner factory's extra input; the sawing factory's secondary outputs start here instead.
 const FACTORY_CHEM: usize = FACTORY_ENERGY + 1;
+
+/// How many slots a factory has: its two rows, the energy slot, and its extra slot or secondary outputs.
+fn factory_slot_count(block: &str) -> usize {
+    match kind(block) {
+        Some(Kind::Factory(n, "sawing", _)) => FACTORY_CHEM + n,
+        Some(Kind::Factory(_, recipe, _)) if factory::has_extra_slot(recipe) => FACTORY_CHEM + 1,
+        _ => FACTORY_CHEM,
+    }
+}
 
 /// The advanced machine whose recipes and chemicals a chemical factory runs.
 fn chem_factory(recipe: &str) -> Option<&'static chem::AdvancedMachine> {
+    if recipe == "infusing" {
+        return Some(&chem::INFUSING_FACTORY);
+    }
     let block = match recipe {
         "compressing" => "mekanism:osmium_compressor",
         "purifying" => "mekanism:purification_chamber",
@@ -335,7 +348,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         let inputs: Vec<usize> = (0..n).collect();
         let outputs: Vec<usize> = (FACTORY_ROW..FACTORY_ROW + n).collect();
         *container = Some(ModContainer {
-            slots: FACTORY_ENERGY + 1 + usize::from(is_chem_factory(block)),
+            slots: factory_slot_count(block),
             faces: [outputs.clone(), inputs.clone(), inputs.clone(), inputs.clone(), inputs.clone(), inputs.clone()],
             inputs,
             outputs,
@@ -905,24 +918,48 @@ fn tick_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize, reci
             *p = (*v).max(0) as u32;
         }
     }
+    let (combining, sawing) = (recipe == "combining", recipe == "sawing");
     let mut outputs: Vec<Slot> = (0..n)
         .map(|i| slot(entity.items.get(FACTORY_ROW + i).cloned().flatten()))
         .collect();
+    // The sawing factory's secondary output slot of each process.
+    let mut seconds: Vec<Slot> = (0..n)
+        .map(|i| if sawing { slot(entity.items.get(FACTORY_CHEM + i).cloned().flatten()) } else { Slot::default() })
+        .collect();
+    // The combiner factory's one extra input slot, shared by every process.
+    let mut extra = if combining { slot(entity.items.get(FACTORY_CHEM).cloned().flatten()) } else { Slot::default() };
     if get_int(&entity.nbt, "sorting") & 1 != 0 && get_int(&entity.nbt, "sort_tick") % 20 == 0 {
         sort_factory_inputs(game, entity, n, recipe);
     }
     let sort_tick = get_int(&entity.nbt, "sort_tick");
     put_int(&mut entity.nbt, "sort_tick", (sort_tick + 1) % 20);
     let mut inputs: Vec<Slot> = (0..n).map(|i| slot(entity.items.get(i).cloned().flatten())).collect();
-    let operations: Vec<Option<(Operation, u32)>> = (0..n)
+    let mut chances: Vec<Option<(String, u32, f64)>> = vec![None; n];
+    let mut second_full = vec![false; n];
+    let mut operations: Vec<Option<(Operation, u32)>> = (0..n)
         .map(|i| {
-            let (op, max, _) = find_operation(game, recipe, entity.items.get(i).cloned().flatten(), &Slot::default());
+            let (op, max, chance) = find_operation(game, recipe, entity.items.get(i).cloned().flatten(), &extra);
+            chances[i] = chance;
             op.map(|o| (o, max))
         })
         .collect();
-    // The issues of each process (`RecipeError`): 1 energy, 2 input, 4 output room, 8 input without a recipe.
+    // `NOT_ENOUGH_SPACE_SECONDARY_OUTPUT_ERROR`: a process stops while its secondary slot cannot take the output.
+    for i in 0..n {
+        if let Some((item, count, _)) = &chances[i]
+            && operations[i].is_some()
+        {
+            let max = max_stack(game, item);
+            if !(seconds[i].item.as_ref().is_none_or(|s| s == item) && seconds[i].count + count <= max) {
+                operations[i] = None;
+                second_full[i] = true;
+            }
+        }
+    }
+    // The issues of each process (`RecipeError`): 1 energy, 2 input, 4 output room, 8 input without a recipe, 16 the
+    // secondary output's room.
     let warn: Vec<i32> = (0..n)
         .map(|i| match &operations[i] {
+            None if second_full[i] => 4 | 16,
             None if inputs[i].item.is_some() => 8,
             None => 0,
             Some((op, max)) => {
@@ -932,7 +969,7 @@ fn tick_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize, reci
                 };
                 if !fits {
                     4
-                } else if inputs[i].count < op.input_count {
+                } else if inputs[i].count < op.input_count || (combining && extra.count < op.extra_count) {
                     2
                 } else {
                     i32::from(f.machine.energy.stored < f.machine.usage)
@@ -941,10 +978,27 @@ fn tick_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize, reci
         })
         .collect();
     entity.nbt.insert("warn".into(), Tag::IntArray(warn));
-    f.tick(&mut inputs, &mut outputs, &operations);
+    let before: Vec<u32> = outputs.iter().map(|o| o.count).collect();
+    f.tick(&mut inputs, &mut outputs, combining.then_some(&mut extra), &operations);
+    // The sawing factory's chance output, rolled for each process that finished an operation.
+    for i in 0..n {
+        if outputs[i].count != before[i]
+            && let Some((item, count, p)) = chances[i].clone()
+            && roll(entity) < p
+        {
+            seconds[i].item = Some(item);
+            seconds[i].count += count;
+        }
+    }
     for i in 0..n {
         set_slot(entity, i, &inputs[i]);
         set_slot(entity, FACTORY_ROW + i, &outputs[i]);
+        if sawing {
+            set_slot(entity, FACTORY_CHEM + i, &seconds[i]);
+        }
+    }
+    if combining {
+        set_slot(entity, FACTORY_CHEM, &extra);
     }
     put_long(&mut entity.nbt, "energy", f.machine.energy.stored);
     entity.nbt.insert(
@@ -963,7 +1017,7 @@ fn tick_chem_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize,
     f.machine.energy.stored = get_long(&entity.nbt, "energy").min(f.machine.energy.capacity);
     discharge_slot(entity, FACTORY_ENERGY, &mut f.machine.energy);
     let ticks = f.machine.ticks_required.max(1);
-    let mut tank = get_tank(&entity.nbt, "chemical", factory::CHEMICAL_PER_PROCESS * n as u64);
+    let mut tank = get_tank(&entity.nbt, "chemical", factory::chemical_per_process(recipe_kind) * n as u64);
     let saved = |key: &str| match entity.nbt.get(&JavaString::from(key)) {
         Some(Tag::IntArray(v)) => v.clone(),
         _ => vec![],
@@ -1010,9 +1064,12 @@ fn tick_chem_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize,
         let max = items.get(r.output).map_or(64, |it| it.max_stack);
         let fits = out.as_ref().is_none_or(|o| &*o.item == r.output && o.count + r.output_count <= max);
         // The chemical for this tick: the recipe's amount over all its ticks, `used` of it spent already.
+        // The infusing factory takes the infuse type as a whole when an operation ends (`TwoInputCachedRecipe`), the
+        // others a little every tick.
+        let per_tick = recipe_kind != "infusing";
         let total = r.chemical_amount * u64::from(chem::ADVANCED_TICKS);
-        let want = (total * u64::from(progress[i] + 1) / u64::from(ticks)).saturating_sub(used[i]);
-        let has_chemical = tank.chemical.as_deref() == Some(r.chemical) && tank.amount >= want;
+        let want = if per_tick { (total * u64::from(progress[i] + 1) / u64::from(ticks)).saturating_sub(used[i]) } else { 0 };
+        let has_chemical = tank.chemical.as_deref() == Some(r.chemical) && tank.amount >= if per_tick { want } else { r.chemical_amount };
         let has_energy = f.machine.energy.stored >= f.machine.usage;
         warn[i] = i32::from(!has_energy) | i32::from(!has_chemical) << 1 | i32::from(!fits) << 2;
         if fits && has_chemical && has_energy {
@@ -1024,6 +1081,9 @@ fn tick_chem_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize,
             if progress[i] >= ticks {
                 progress[i] = 0;
                 used[i] = 0;
+                if !per_tick {
+                    tank.extract(r.chemical_amount);
+                }
                 let left = stack.count - r.input_count;
                 entity.items[i] = (left > 0).then(|| ItemStack { count: left, ..stack });
                 entity.items[FACTORY_ROW + i] = Some(match out {
@@ -7449,7 +7509,7 @@ fn layout(block: &str) -> Option<Layout> {
             slots: [None, None, None],
             // The item and chemical factories' `GuiChemicalBar` (7, 76), 138 wide (172 in the ultimate), 4 high.
             gauges: if factory::takes_chemical(recipe) {
-                vec![gauge("chemical", factory::CHEMICAL_PER_PROCESS * n as u64, 7.0, 76.0, [if n == 9 { 172.0 } else { 138.0 }, 4.0])]
+                vec![gauge("chemical", factory::chemical_per_process(recipe) * n as u64, 7.0, 76.0, [if n == 9 { 172.0 } else { 138.0 }, 4.0])]
             } else {
                 vec![]
             },
@@ -8081,7 +8141,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
             for i in 0..n {
                 let done = i64::from(saved.get(i).copied().unwrap_or(0).max(0));
                 let warn = match entity.nbt.get(&JavaString::from("warn")) {
-                    Some(Tag::IntArray(v)) => v.get(i).copied().unwrap_or(0) & 15,
+                    Some(Tag::IntArray(v)) => v.get(i).copied().unwrap_or(0) & 31,
                     _ => 0,
                 };
                 entity.data.push((done * 20 / ticks).clamp(0, 20) as i32 | warn << 5);
@@ -8154,6 +8214,8 @@ fn screen_height(block: &str) -> f32 {
     match kind(block) {
         // `DEFAULT_IMAGE_HEIGHT + 11` for the secondary resource bar.
         Some(Kind::Factory(_, recipe, _)) if factory::takes_chemical(recipe) => 177.0,
+        // `DEFAULT_IMAGE_HEIGHT + 21` for the secondary output row.
+        Some(Kind::Factory(_, "sawing", _)) => 187.0,
         Some(Kind::Nucleosynthesizer) => 193.0,
         // `DEFAULT_IMAGE_HEIGHT + 5`.
         Some(Kind::Reaction) => 171.0,
@@ -8239,12 +8301,17 @@ fn draw_factory_slots(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
     let [ox, oy] = origin;
     let first = redstone_slot(l) + 5;
     sprite(game, batch, "slot/power", [0.0, 0.0, 18.0, 18.0], [ox + 6.0, oy + 12.0, 18.0, 18.0]);
-    if is_chem_factory(_block) {
+    let kind_of = kind(_block);
+    if matches!(kind_of, Some(Kind::Factory(_, recipe, _)) if factory::has_extra_slot(recipe)) {
         sprite(game, batch, "slot/extra", [0.0, 0.0, 18.0, 18.0], [ox + 6.0, oy + 56.0, 18.0, 18.0]);
     }
+    let sawing = matches!(kind_of, Some(Kind::Factory(_, "sawing", _)));
     for (i, (input, output)) in factory_slots(n).into_iter().enumerate() {
         sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + input[0] - 1.0, oy + input[1] - 1.0, 18.0, 18.0]);
         sprite(game, batch, "slot/output", [0.0, 0.0, 18.0, 18.0], [ox + output[0] - 1.0, oy + output[1] - 1.0, 18.0, 18.0]);
+        if sawing {
+            sprite(game, batch, "slot/output", [0.0, 0.0, 18.0, 18.0], [ox + output[0] - 1.0, oy + output[1] + 20.0 - 1.0, 18.0, 18.0]);
+        }
         let (x, y) = (ox + input[0] + 4.0, oy + 33.0);
         sprite(game, batch, "progress/down/empty", [0.0, 0.0, 8.0, 20.0], [x, y, 8.0, 20.0]);
         let h = (data.get(first + i).copied().unwrap_or(0) & 31).clamp(0, 20) as f32;
@@ -8253,8 +8320,12 @@ fn draw_factory_slots(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
         if warn & 2 != 0 {
             sprite(game, batch, "slot/warning", [0.0, 0.0, 18.0, 18.0], [ox + input[0] - 1.0, oy + input[1] - 1.0, 18.0, 18.0]);
         }
-        if warn & 4 != 0 {
+        // Bit 16 is the sawing factory's secondary output without room: that slot warns, not the main one.
+        if warn & 4 != 0 && warn & 16 == 0 {
             sprite(game, batch, "slot/warning", [0.0, 0.0, 18.0, 18.0], [ox + output[0] - 1.0, oy + output[1] - 1.0, 18.0, 18.0]);
+        }
+        if warn & 16 != 0 {
+            sprite(game, batch, "slot/warning", [0.0, 0.0, 18.0, 18.0], [ox + output[0] - 1.0, oy + output[1] + 20.0 - 1.0, 18.0, 18.0]);
         }
         if h > 0.0 {
             sprite(game, batch, "progress/down/full", [0.0, 0.0, 8.0, h], [x, y, 8.0, h]);
@@ -8877,9 +8948,13 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
         SlotRule::Items(ids)
     };
     if let Some(Kind::Factory(n, ..)) = kind(block) {
-        *rules = vec![SlotRule::Any; FACTORY_ENERGY + 1 + usize::from(is_chem_factory(block))];
+        *rules = vec![SlotRule::Any; factory_slot_count(block)];
         for i in 0..factory_slots(n).len() {
             rules[FACTORY_ROW + i] = SlotRule::Refuse;
+            // The sawing factory's secondary output slots only give.
+            if matches!(kind(block), Some(Kind::Factory(_, "sawing", _))) {
+                rules[FACTORY_CHEM + i] = SlotRule::Refuse;
+            }
         }
         rules[FACTORY_ENERGY] = convert();
     } else if kind(block) == Some(Kind::Teleporter) {
@@ -10327,15 +10402,18 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         return;
     };
     if let Some(Kind::Factory(n, ..)) = kind(block) {
-        let chem = is_chem_factory(block);
-        let mut slots = vec![None; FACTORY_ENERGY + 1 + usize::from(chem)];
+        let mut slots = vec![None; factory_slot_count(block)];
         slots[FACTORY_ENERGY] = Some([7.0, 13.0]);
-        if chem {
+        let sawing = matches!(kind(block), Some(Kind::Factory(_, "sawing", _)));
+        if matches!(kind(block), Some(Kind::Factory(_, recipe, _)) if factory::has_extra_slot(recipe)) {
             slots[FACTORY_CHEM] = Some([7.0, 57.0]);
         }
         for (i, (input, output)) in factory_slots(n).into_iter().enumerate() {
             slots[i] = Some(input);
             slots[FACTORY_ROW + i] = Some(output);
+            if sawing {
+                slots[FACTORY_CHEM + i] = Some([output[0], 77.0]);
+            }
         }
         let w = screen_width(block);
         let h = screen_height(block);
@@ -12002,7 +12080,11 @@ fn warning_bits(block: &str, l: &Layout, data: &[i32]) -> u32 {
         return 0;
     }
     if let Some(Kind::Factory(n, ..)) = kind(block) {
-        return (0..n).fold(0, |all, i| all | (data.get(redstone_slot(l) + 5 + i).copied().unwrap_or(0).max(0) as u32) >> 5 & 15);
+        // The sawing factory's secondary-output bit (16) also lights the output room warning (4).
+        return (0..n).fold(0, |all, i| {
+            let bits = (data.get(redstone_slot(l) + 5 + i).copied().unwrap_or(0).max(0) as u32) >> 5;
+            all | bits & 15 | (bits & 16) >> 2
+        });
     }
     if kind(block) == Some(Kind::DigitalMiner) {
         return (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 15;
