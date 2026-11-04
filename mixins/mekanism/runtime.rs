@@ -7524,6 +7524,39 @@ fn save_fission_state(nbt: &mut Compound, st: &fission::State) {
     put_long(nbt, "last_boil", st.last_boil);
 }
 
+/// What a fission reactor keeps in its master port's data (`FissionReactorMultiblockData`): the state and the tanks.
+const FISSION_KEPT: [&str; 14] = ["heat", "damage", "burn_rem", "pwaste", "limit", "last_burn", "env_loss", "active", "force", "last_boil", "fuel", "water", "steam", "waste"];
+
+thread_local! {
+    /// `MultiblockCache`: a reactor's state kept by dimension and box, so that a rebuilt reactor, or one whose master
+    /// port was blown up, picks up where it was. In memory only.
+    static FISSION_CACHE: std::cell::RefCell<std::collections::HashMap<(String, [i32; 6]), Compound>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn fission_cache_key(dimension: &str, nbt: &Compound) -> Option<(String, [i32; 6])> {
+    match nbt.get(&JavaString::from("box")) {
+        Some(Tag::IntArray(b)) if b.len() == 6 => Some((dimension.to_owned(), [b[0], b[1], b[2], b[3], b[4], b[5]])),
+        _ => None,
+    }
+}
+
+fn fission_cache_store(dimension: &str, nbt: &Compound) {
+    if let Some(key) = fission_cache_key(dimension, nbt) {
+        let mut kept = Compound::new();
+        for k in FISSION_KEPT {
+            if let Some(v) = nbt.get(&JavaString::from(k)) {
+                kept.insert(k.into(), v.clone());
+            }
+        }
+        FISSION_CACHE.with_borrow_mut(|c| c.insert(key, kept));
+    }
+}
+
+thread_local! {
+    /// Doses a reactor gives to what stands in its hot zone this tick: (dimension, lowest block, highest block, magnitude).
+    static RAD_HITS: std::cell::RefCell<Vec<(String, [i32; 3], [i32; 3], f64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// A meltdown in progress (`Meltdown`): for five seconds, random explosions inside the old reactor's box.
 struct Meltdown {
     lo: [i32; 3],
@@ -7554,6 +7587,7 @@ fn tick_meltdowns(game: &mut Game<'_>) {
                 at[k] = f64::from(game.world.random.next_int_between_inclusive(m.lo[k], m.hi[k]).unwrap_or(m.lo[k]));
             }
             let _ = game.server_explode(at, fission::MELTDOWN_RADIUS, super::explosion::BlockInteraction::DestroyWithDecay, true);
+            let dimension = game.dim.id().to_owned();
             if !m.happened && m.shell.iter().any(|&(at, state)| game.world.block(at[0], at[1], at[2]).0 != state) {
                 m.happened = true;
                 // `meltdownHappened`: the heated coolant is lost and the reactor starts over, damaged.
@@ -7562,9 +7596,26 @@ fn tick_meltdowns(game: &mut Game<'_>) {
                     let mut st = fission_state(&e.nbt, &r);
                     st.meltdown_reset();
                     save_fission_state(&mut e.nbt, &st);
+                    // The radioactive chemicals of the fuel, waste, coolant and heated coolant tanks are lost to the air:
+                    // `fissionMeltdownRadiationMultiplier` (50) times their radioactivity, at the box's centre.
+                    let mut radiation = 0.0;
+                    for (key, capacity) in [("fuel", r.fuel_capacity()), ("waste", r.fuel_capacity()), ("water", r.water_capacity()), ("steam", r.steam_capacity())] {
+                        let mut tank = get_tank(&e.nbt, key, capacity);
+                        let r = tank.chemical.as_deref().map_or(0.0, radioactivity) * tank.amount as f64;
+                        if r > 0.0 {
+                            radiation += r;
+                            tank.extract(tank.amount);
+                            put_tank(&mut e.nbt, key, &tank);
+                        }
+                    }
+                    radiation *= 50.0;
+                    let centre = [(m.lo[0] + m.hi[0]) / 2, (m.lo[1] + m.hi[1]) / 2, (m.lo[2] + m.hi[2]) / 2];
+                    radiate_at(&dimension, centre, radiation);
                     let mut steam = get_tank(&e.nbt, "steam", r.steam_capacity());
                     steam.extract(steam.amount);
                     put_tank(&mut e.nbt, "steam", &steam);
+                    // `cache.sync`: the reset reactor outlives its master port.
+                    fission_cache_store(&dimension, &e.nbt);
                 });
             }
         }
@@ -7593,6 +7644,19 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
                 let master = ports.first().copied().unwrap_or(pos);
                 entity.nbt.insert("master".into(), Tag::IntArray(master.to_vec()));
                 entity.nbt.insert("ports".into(), Tag::IntArray(ports.concat()));
+                if master == pos {
+                    // A reactor formed over the box of one that was lost takes its cached state; else the state is kept.
+                    let dimension = game.dim.id().to_owned();
+                    if !entity.nbt.contains_key(&JavaString::from("heat"))
+                        && let Some(key) = fission_cache_key(&dimension, &entity.nbt)
+                        && let Some(kept) = FISSION_CACHE.with_borrow_mut(|c| c.remove(&key))
+                    {
+                        for (k, v) in kept {
+                            entity.nbt.insert(k, v);
+                        }
+                    }
+                    fission_cache_store(&dimension, &entity.nbt);
+                }
             }
             None => {
                 put_long(&mut entity.nbt, "assemblies", 0);
@@ -7656,6 +7720,19 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
         }
         if mode.is_none_or(|m| m == 1) {
             push_chemical(game, p, &mut waste, None, u64::MAX, false);
+        }
+    }
+    // `radiateEntities`: a burning reactor doses what stands inside, by what it burns and the waste it holds.
+    if st.last_burn > 0.0 && rad_int(20) == 0
+        && let Some(Tag::IntArray(b)) = entity.nbt.get(&JavaString::from("box")).cloned()
+        && b.len() == 6
+    {
+        let waste_radiation = waste.chemical.as_deref().map_or(0.0, radioactivity) * waste.amount as f64 / 3_600.0;
+        let magnitude = st.last_burn + waste_radiation;
+        if magnitude > radiation::BASELINE {
+            let lo = [b[0] + 1, b[1] + 1, b[2] + 1];
+            let hi = [b[0] + b[3] - 2, b[1] + b[4] - 2, b[2] + b[5] - 2];
+            RAD_HITS.with_borrow_mut(|h| h.push((game.dim.id().to_owned(), lo, hi, magnitude)));
         }
     }
     // `simulateEnvironment`, then `handleDamage`.
@@ -23849,6 +23926,12 @@ fn radiation_server_tick(game: &mut Game<'_>) {
             let (level, max) = RAD_SOURCES.with_borrow(|all| all.get(&dimension).map_or((radiation::BASELINE, radiation::BASELINE), |s| s.level_at(pos)));
             let playing = !g.creative && !g.spectator();
             let mut dose = RAD_DOSE.with_borrow(|d| d.get(&uuid).copied()).unwrap_or(radiation::BASELINE);
+            // `IRadiationManager.radiate(entity, magnitude)`: a reactor's hot zone doses the player through the armor at once.
+            let hit: f64 = RAD_HITS.with_borrow(|h| h.iter().filter(|(d, lo, hi, _)| *d == dimension && (0..3).all(|k| pos[k] >= lo[k] && pos[k] <= hi[k])).map(|h| h.3).sum());
+            if hit > 0.0 && playing {
+                dose = (dose + hit * radiation::through_shielding(rad_resistance(g))).max(radiation::BASELINE);
+                RAD_DOSE.with_borrow_mut(|d| d.insert(uuid, dose));
+            }
             // A 1 in 20 chance a tick: the level doses the player (through the armor), and the dose decays.
             if rad_int(20) == 0 {
                 if level > radiation::BASELINE && playing {
@@ -23890,6 +23973,7 @@ fn radiation_server_tick(game: &mut Game<'_>) {
             game.native_send_to_player(uuid, RADIATION_CHANNEL, &rad_payload(level, max, dose));
         }
     }
+    RAD_HITS.with_borrow_mut(Vec::clear);
 }
 
 const NUTRITION_UNIT: &str = "mekanism:nutritional_injection_unit";
