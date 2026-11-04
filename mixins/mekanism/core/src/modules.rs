@@ -204,8 +204,8 @@ pub fn blast_offsets(radius: i32, axis: usize) -> Vec<[i32; 3]> {
 }
 
 /// The enchantments a container's enchantment modules stand for (`registerEnchantBased`): silk touch
-/// (which wins over fortune, as they exclude each other), fortune and frost walker, at the installed
-/// count.
+/// (which wins over fortune, as they exclude each other), fortune, frost walker and soul speed (the Soul Surfer
+/// Unit), at the installed count.
 pub fn enchantments(installed: &Installed) -> Vec<(&'static str, u32)> {
     let n = |m: &str| installed.get(m).copied().unwrap_or(0);
     let mut out = Vec::new();
@@ -217,13 +217,17 @@ pub fn enchantments(installed: &Installed) -> Vec<(&'static str, u32)> {
     if n("mekanism:frost_walker_unit") > 0 {
         out.push(("minecraft:frost_walker", n("mekanism:frost_walker_unit")));
     }
+    if n("mekanism:soul_surfer_unit") > 0 {
+        out.push(("minecraft:soul_speed", n("mekanism:soul_surfer_unit")));
+    }
     out
 }
 
-pub const MODULE_ENCHANTMENTS: [&str; 3] = [
+pub const MODULE_ENCHANTMENTS: [&str; 4] = [
     "minecraft:silk_touch",
     "minecraft:fortune",
     "minecraft:frost_walker",
+    "minecraft:soul_speed",
 ];
 
 /// `ItemMekaTool.getDestroySpeed`: the efficiency while the energy is there, the base efficiency scaled

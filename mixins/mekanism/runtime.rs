@@ -13980,6 +13980,73 @@ fn laser_hit_entities(game: &mut Game<'_>, entity: &mut ModBlockEntity, pos: [i3
             break;
         }
     }
+    if left > 0 {
+        left = laser_hit_players(game, min, max, left);
+    }
+    left
+}
+
+/// `LaserDissipationHandler`: the share of a laser's energy each worn MekaSuit piece with the Laser Dissipation Unit
+/// on dissipates and refracts (helmet, chestplate, leggings, boots).
+fn laser_armor(g: &Game<'_>) -> (f32, f32) {
+    const UNIT: &str = "mekanism:laser_dissipation_unit";
+    const SHARES: [(f32, f32); 4] = [(0.15, 0.2), (0.3, 0.4), (0.1875, 0.25), (0.1125, 0.15)];
+    let (mut dissipation, mut refraction) = (0.0, 0.0);
+    for (i, (d, r)) in SHARES.into_iter().enumerate() {
+        if g.armor[i].as_ref().is_some_and(|s| &*s.item == SUIT[i] && module_on(s, UNIT)) {
+            dissipation += d;
+            refraction += r;
+            if dissipation >= 1.0 {
+                break;
+            }
+        }
+    }
+    (dissipation, refraction)
+}
+
+/// The beam hits the players in its box (`TileEntityBasicLaser.fireLaser`): armor dissipates some of its energy and
+/// refracts more past the wearer, the rest burns and hurts with the laser damage type. What is left goes on.
+fn laser_hit_players(game: &mut Game<'_>, min: [f64; 3], max: [f64; 3], energy: u64) -> u64 {
+    use horizon_core::geometry::Vec3;
+    let reach = horizon_core::geometry::Aabb::new(Vec3::new(min[0], min[1], min[2]), Vec3::new(max[0], max[1], max[2]));
+    let mut left = energy;
+    for target in game.fight_players() {
+        if left == 0 {
+            break;
+        }
+        if !target.alive || !target.bounds.intersects(reach) {
+            continue;
+        }
+        let mut result = left;
+        game.as_fight_player(target.who, |g| {
+            if g.creative || g.spectator() {
+                return;
+            }
+            let (dissipation, refraction) = laser_armor(g);
+            let mut remaining = left;
+            if dissipation > 0.0 {
+                remaining = (remaining as f64 * f64::from(1.0 - dissipation.min(1.0))) as u64;
+                if remaining == 0 {
+                    result = 0;
+                    return;
+                }
+            }
+            let refracted = (remaining as f64 * f64::from(refraction.min(1.0))) as u64;
+            let (damage, fire) = laser::damage(remaining - refracted);
+            if damage <= 0.0 {
+                result = remaining;
+                return;
+            }
+            let before = g.player.as_ref().map_or(0.0, |p| p.health.health());
+            if let Some(p) = g.player.as_mut() {
+                let _ = p.ignite_for_ticks(fire);
+            }
+            g.hurt_player_by("mekanism:laser", damage);
+            let lost = (before - g.player.as_ref().map_or(before, |p| p.health.health())).max(0.0);
+            result = remaining - laser::spent(lost, remaining - refracted).min(remaining);
+        });
+        left = result;
+    }
     left
 }
 
@@ -22082,6 +22149,7 @@ fn radiation_server_tick(game: &mut Game<'_>) {
                     }
                 }
             }
+            magnetic_attraction(g);
             // Told again when the digits of the level or of the dose would change (the dose is an attachment in Java).
             let (previous_level, previous_dose) = RAD_SENT.with_borrow(|s| s.get(&uuid).copied()).unwrap_or((None, None));
             let (new_level, new_dose) = (radiation::Previous::compare(previous_level, level), radiation::Previous::compare(previous_dose, dose));
@@ -22093,6 +22161,59 @@ fn radiation_server_tick(game: &mut Game<'_>) {
         if let Some((level, max, dose)) = send {
             game.native_send_to_player(uuid, RADIATION_CHANNEL, &rad_payload(level, max, dose));
         }
+    }
+}
+
+/// `ModuleMagneticAttractionUnit.tickServer`, for the player swapped in: the boots pull the dropped items within
+/// `4 + range` blocks that can be picked up, each for `250 * range` FE.
+fn magnetic_attraction(g: &mut Game<'_>) {
+    const UNIT: &str = "mekanism:magnetic_attraction_unit";
+    const RANGES: [f32; 5] = [0.0, 1.0, 3.0, 5.0, 10.0];
+    let Some(boots) = g.armor[3].as_ref().filter(|s| &*s.item == modules::BOOTS && module_on(s, UNIT)) else {
+        return;
+    };
+    let installed = installed_modules(boots).get(UNIT).copied().unwrap_or(1);
+    let range = module_config::settings(UNIT, installed)
+        .into_iter()
+        .find(|s| s.key == "range")
+        .map_or(1.0, |s| RANGES[(module_setting(boots, UNIT, &s, installed) as usize).min(4)]);
+    if range <= 0.0 || g.dropped.is_empty() {
+        return;
+    }
+    let size = f64::from(4.0 + range);
+    let usage = (250.0 * range).ceil() as u64;
+    let Some((at, velocity)) = g.player.as_ref().map(|p| (p.position, p.velocity)) else {
+        return;
+    };
+    let creative = g.creative;
+    let near: Vec<usize> = g
+        .dropped
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.pickup_delay == 0 && (d.position.x - at.x).abs() <= size + 0.3 && (d.position.z - at.z).abs() <= size + 0.3 && d.position.y >= at.y - size && d.position.y <= at.y + 1.8 + size)
+        .map(|(i, _)| i)
+        .collect();
+    for i in near {
+        let item = &g.dropped[i].position;
+        let diff = [at.x - item.x, at.y - item.y, at.z - item.z];
+        if (diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2]).sqrt() <= 0.001 {
+            continue;
+        }
+        if !creative {
+            let Some(boots) = g.armor[3].as_mut() else {
+                return;
+            };
+            let stored = stored_energy(boots);
+            if stored < usage {
+                break;
+            }
+            set_energy(boots, stored - usage);
+        }
+        let needed = [diff[0].min(1.0), diff[1].min(1.0), diff[2].min(1.0)];
+        let v = &mut g.dropped[i].velocity;
+        v.x = (needed[0] - velocity.x) * 0.2;
+        v.y = (needed[1] - velocity.y) * 0.2;
+        v.z = (needed[2] - velocity.z) * 0.2;
     }
 }
 
