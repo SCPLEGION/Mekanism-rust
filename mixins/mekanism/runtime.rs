@@ -5,6 +5,7 @@
 use super::native_lifecycle::WorldPhase;
 use super::Game;
 use horizon_client::containers::{ModBlockEntity, ModContainer};
+use horizon_client::effects::EffectInstance;
 use horizon_client::items::ItemStack;
 use horizon_world::nbt::{Compound, JavaString, Tag};
 use mekanism_core::bolt;
@@ -23922,6 +23923,12 @@ fn vision_enhancement_upkeep(g: &mut Game<'_>) {
         let stored = stored_energy(helmet);
         if stored >= VISION_ENERGY {
             set_energy(helmet, stored - VISION_ENERGY);
+            // The original lights the world on the client alone (`ClientTickHandler.isVisionEnhancementOn`); Horizon reads
+            // night vision from the player's effects, so a hidden, ambient one stands for it while the unit is paid for.
+            let mut effect = EffectInstance::new("night_vision", 220, 0);
+            effect.ambient = true;
+            effect.visible = false;
+            g.potions.effects.add(effect);
         }
     }
 }
