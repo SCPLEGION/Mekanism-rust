@@ -9,11 +9,39 @@ pub const TIERS: [(&str, usize); 4] =
     [("basic", 3), ("advanced", 5), ("elite", 7), ("ultimate", 9)];
 
 /// The factory kinds this port runs: (`FactoryType` name, the machine's recipe kind, energy per tick).
-pub const KINDS: [(&str, &str, u64); 3] = [
+pub const KINDS: [(&str, &str, u64); 9] = [
     ("enriching", "enriching", 5),
     ("crushing", "crushing", 8),
     ("smelting", "smelting", 5),
+    // The item and chemical factories (`TileEntityItemStackChemicalToItemStackFactory`).
+    ("compressing", "compressing", 15),
+    ("purifying", "purifying", 10),
+    ("injecting", "injecting", 15),
+    // The metallurgic infuser's factory takes its infuse type from the tank as a whole, at the end of each operation.
+    ("infusing", "infusing", 5),
+    // The combiner's factory shares one extra input slot; the sawmill's gives each process a secondary output.
+    ("combining", "combining", 5),
+    ("sawing", "sawing", 5),
 ];
+
+/// The recipe kinds that also take a chemical from the factory's tank.
+pub fn takes_chemical(recipe: &str) -> bool {
+    matches!(recipe, "compressing" | "purifying" | "injecting" | "infusing")
+}
+
+/// The factories with one shared slot at (7, 57): the chemical item slot, or the combiner's extra input.
+pub fn has_extra_slot(recipe: &str) -> bool {
+    takes_chemical(recipe) || recipe == "combining"
+}
+
+/// `TileEntityMetallurgicInfuser.MAX_INFUSE` and `TileEntityAdvancedElectricMachine.MAX_GAS`: what the chemical tank
+/// holds for each process.
+pub fn chemical_per_process(recipe: &str) -> u64 {
+    if recipe == "infusing" { 1_000 } else { CHEMICAL_PER_PROCESS }
+}
+
+/// `TileEntityAdvancedElectricMachine.MAX_GAS`: what each process adds to the chemical tank.
+pub const CHEMICAL_PER_PROCESS: u64 = 210;
 
 /// A factory block id (`mekanism:elite_crushing_factory`): its processes, recipe kind and usage.
 pub fn factory(block: &str) -> Option<(usize, &'static str, u64)> {
@@ -63,6 +91,7 @@ impl Factory {
         &mut self,
         inputs: &mut [Slot],
         outputs: &mut [Slot],
+        mut extra: Option<&mut Slot>,
         operations: &[Option<(Operation, u32)>],
     ) {
         self.active = false;
@@ -72,7 +101,7 @@ impl Factory {
             self.machine.tick(
                 &mut inputs[i],
                 &mut outputs[i],
-                None,
+                extra.as_deref_mut(),
                 op.map(|(o, _)| o),
                 op.map_or(64, |(_, max)| *max),
             );
@@ -120,7 +149,22 @@ mod tests {
             factory("mekanism:ultimate_crushing_factory"),
             Some((9, "crushing", 8))
         );
-        assert_eq!(factory("mekanism:basic_infusing_factory"), None);
+        assert_eq!(
+            factory("mekanism:elite_injecting_factory"),
+            Some((7, "injecting", 15))
+        );
+        assert!(takes_chemical("purifying") && !takes_chemical("crushing"));
+        assert_eq!(
+            factory("mekanism:basic_infusing_factory"),
+            Some((3, "infusing", 5))
+        );
+        assert_eq!(
+            factory("mekanism:elite_sawing_factory"),
+            Some((7, "sawing", 5))
+        );
+        assert!(has_extra_slot("combining") && has_extra_slot("infusing") && !has_extra_slot("sawing"));
+        assert_eq!(chemical_per_process("infusing"), 1_000);
+        assert_eq!(chemical_per_process("purifying"), 210);
         assert_eq!(factory("mekanism:crusher"), None);
     }
 
@@ -143,7 +187,7 @@ mod tests {
         let ops = vec![Some((op.clone(), 64)), Some((op, 64)), None];
         for _ in 0..200 {
             f.machine.energy.stored = f.machine.energy.capacity;
-            f.tick(&mut inputs, &mut outputs, &ops);
+            f.tick(&mut inputs, &mut outputs, None, &ops);
         }
         assert_eq!(
             (outputs[0].count, outputs[1].count, outputs[2].count),
@@ -152,7 +196,7 @@ mod tests {
         // Two processes ran: 10 FE a tick.
         f.machine.energy.stored = 10;
         let mut more = vec![ore(), ore(), Slot::default()];
-        f.tick(&mut more, &mut outputs, &ops);
+        f.tick(&mut more, &mut outputs, None, &ops);
         assert_eq!(f.machine.energy.stored, 0);
         assert!(f.active);
     }

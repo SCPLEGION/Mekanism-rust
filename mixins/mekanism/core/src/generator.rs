@@ -2,7 +2,7 @@
 // lava in its tank, burning lava heats it, and heat above ambient becomes energy at the Carnot efficiency.
 
 use crate::energy::EnergyContainer;
-use crate::heat::{AMBIENT_TEMP, HeatCapacitor};
+use crate::heat::HeatCapacitor;
 
 /// `TileEntityHeatGenerator` constants.
 pub const HEAT_CAPACITY: f64 = 10.0;
@@ -33,6 +33,10 @@ pub struct HeatGenerator {
     pub active: bool,
     /// Energy made in the last tick.
     pub producing: u64,
+    /// Heat lost to the air in the last tick (`getLastEnvironmentLoss`).
+    pub last_env: f64,
+    /// Heat given to the neighbours in the last tick (`getLastTransferLoss`).
+    pub last_transfer: f64,
 }
 
 impl Default for HeatGenerator {
@@ -53,7 +57,15 @@ impl HeatGenerator {
             lava: 0,
             active: false,
             producing: 0,
+            last_env: 0.0,
+            last_transfer: 0.0,
         }
+    }
+
+    /// Sets the ambient temperature of the generator's biome (the heat starts there, as `BasicHeatCapacitor` does).
+    pub fn set_ambient(&mut self, ambient: f64) {
+        self.heat.ambient = ambient;
+        self.heat.heat = self.heat.capacity * ambient;
     }
 
     /// The lava a fuel item of `burn_time` ticks gives (bucket volume × burn time / lava bucket's).
@@ -73,6 +85,11 @@ impl HeatGenerator {
 
     /// One server tick (`onUpdateServer` then `simulate`); the passive lava boost is not modelled yet.
     pub fn tick(&mut self) {
+        self.tick_with(&mut |_| 0.0);
+    }
+
+    /// A tick where `adjacent` moves heat to the neighbours (`simulateAdjacent`) and returns the temperature it moved.
+    pub fn tick_with(&mut self, adjacent: &mut dyn FnMut(&mut HeatCapacitor) -> f64) {
         self.energy.start_tick();
         let before = self.energy.stored;
         self.active = false;
@@ -84,15 +101,18 @@ impl HeatGenerator {
         // simulate(): the thermoelectric part, then the environment, six sides (the bottom keeps the
         // default insulation of 0).
         let temp = self.heat.temperature();
-        let carnot = 1.0 - temp.min(AMBIENT_TEMP) / temp.max(AMBIENT_TEMP);
-        let heat_lost = THERMAL_EFFICIENCY * (temp - AMBIENT_TEMP);
+        let ambient = self.heat.ambient;
+        let carnot = 1.0 - temp.min(ambient) / temp.max(ambient);
+        let heat_lost = THERMAL_EFFICIENCY * (temp - ambient);
         self.heat.handle_heat(-heat_lost);
         let energy = ((heat_lost.abs() * carnot) as u64).min(MAX_PRODUCTION);
         self.energy.insert(energy, crate::energy::Action::Execute);
-        self.heat.lose_to_air(0.0);
+        self.last_transfer = adjacent(&mut self.heat);
+        let mut env = self.heat.lose_to_air(0.0);
         for _ in 0..5 {
-            self.heat.lose_to_air(INVERSE_INSULATION_COEFFICIENT);
+            env += self.heat.lose_to_air(INVERSE_INSULATION_COEFFICIENT);
         }
+        self.last_env = env;
         self.producing = self.energy.stored - before;
     }
 }
@@ -100,6 +120,7 @@ impl HeatGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heat::AMBIENT_TEMP;
 
     #[test]
     fn max_production_is_159_with_the_defaults() {
