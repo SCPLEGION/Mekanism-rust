@@ -3733,6 +3733,22 @@ fn drain_tank_into_bucket(game: &Game<'_>, entity: &mut ModBlockEntity, from: us
     let Some(Some(bucket)) = entity.items.get(from).cloned() else {
         return false;
     };
+    // A MekaSuit with a Nutritional Injection Unit takes the paste as it comes (`FluidInventorySlot.drainTank`).
+    if &*bucket.item == modules::BODYARMOR && installed_modules(&bucket).contains_key(NUTRITION_UNIT) {
+        if tank.chemical.as_deref() != Some(chem::NUTRITIONAL_PASTE) {
+            return false;
+        }
+        let moved = tank.amount.min(SUIT_PASTE_CAPACITY.saturating_sub(suit_paste(&bucket)));
+        if moved == 0 {
+            return false;
+        }
+        let mut suit = bucket;
+        let held = suit_paste(&suit);
+        set_suit_paste(&mut suit, held + moved);
+        entity.items[from] = Some(suit);
+        tank.extract(moved);
+        return true;
+    }
     if &*bucket.item != "minecraft:bucket" || tank.amount < 1_000 {
         return false;
     }
@@ -6113,6 +6129,12 @@ fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
                 let color = if ratio > 0.2 { REGULAR } else if ratio > 0.1 { 0xFFDD4F } else { 0xFF383C };
                 elements.push((icon, format!("{}%", (ratio * 100.0).round() as i64), color));
             }
+        }
+        // `ModuleNutritionalInjectionUnit.addHUDElements`: the paste in the suit, as a percentage.
+        if flag(stack, NUTRITION_UNIT, "enabled") == Some(1) {
+            let ratio = (suit_paste(stack) as f64 / SUIT_PASTE_CAPACITY as f64).min(1.0);
+            let color = if ratio > 0.2 { REGULAR } else if ratio > 0.1 { 0xFFDD4F } else { 0xFF383C };
+            elements.push(("nutritional_injection_unit", format!("{}%", (ratio * 100.0).round() as i64), color));
         }
         for (module, icon) in [("mekanism:gravitational_modulating_unit", "gravitational_modulation_unit"), ("mekanism:vision_enhancement_unit", "vision_enhancement_unit")] {
             if installed_modules(stack).get(module).copied().unwrap_or(0) > 0 && flag(stack, module, "render_hud") != Some(0) {
@@ -22216,6 +22238,7 @@ fn radiation_server_tick(game: &mut Game<'_>) {
                 }
             }
             magnetic_attraction(g);
+            nutritional_injection(g);
             // Told again when the digits of the level or of the dose would change (the dose is an attachment in Java).
             let (previous_level, previous_dose) = RAD_SENT.with_borrow(|s| s.get(&uuid).copied()).unwrap_or((None, None));
             let (new_level, new_dose) = (radiation::Previous::compare(previous_level, level), radiation::Previous::compare(previous_dose, dose));
@@ -22227,6 +22250,52 @@ fn radiation_server_tick(game: &mut Game<'_>) {
         if let Some((level, max, dose)) = send {
             game.native_send_to_player(uuid, RADIATION_CHANNEL, &rad_payload(level, max, dose));
         }
+    }
+}
+
+const NUTRITION_UNIT: &str = "mekanism:nutritional_injection_unit";
+const SUIT_PASTE_KEY: &str = "mekanism:suit_nutritional_paste";
+/// `GearConfig.mekaSuitNutritionalMaxStorage`: 128 buckets.
+const SUIT_PASTE_CAPACITY: u64 = 128_000;
+/// `GeneralConfig.nutritionalPasteMBPerFood` and `saturation`.
+const PASTE_PER_FOOD: u64 = 50;
+const PASTE_SATURATION: f32 = 0.8;
+/// `GearConfig.mekaSuitEnergyUsageNutritionalInjection`.
+const NUTRITION_ENERGY: u64 = 20_000;
+
+/// The nutritional paste a suit holds, in mB.
+fn suit_paste(stack: &ItemStack) -> u64 {
+    custom_data(stack).map_or(0, |c| get_long(c, SUIT_PASTE_KEY))
+}
+
+fn set_suit_paste(stack: &mut ItemStack, amount: u64) {
+    set_custom_long(stack, SUIT_PASTE_KEY, amount);
+}
+
+/// `ModuleNutritionalInjectionUnit.tickServer`, for the player swapped in: while hungry and in a playing mode, the
+/// chest piece turns paste (50 mB) and energy (20,000 FE) into a point of food each, as many as it holds the energy for.
+fn nutritional_injection(g: &mut Game<'_>) {
+    if g.creative || g.spectator() {
+        return;
+    }
+    let Some(missing) = g.player.as_ref().map(|p| 20 - p.health.food.food).filter(|m| *m > 0) else {
+        return;
+    };
+    let Some(piece) = g.armor[1].as_mut().filter(|s| &*s.item == modules::BODYARMOR && module_on(s, NUTRITION_UNIT)) else {
+        return;
+    };
+    let by_paste = suit_paste(piece) / PASTE_PER_FOOD;
+    let by_energy = stored_energy(piece) / NUTRITION_ENERGY;
+    let food = by_paste.min(by_energy).min(missing as u64);
+    if food == 0 {
+        return;
+    }
+    let held = suit_paste(piece);
+    set_suit_paste(piece, held - food * PASTE_PER_FOOD);
+    let stored = stored_energy(piece);
+    set_energy(piece, stored - food * NUTRITION_ENERGY);
+    if let Some(p) = g.player.as_mut() {
+        p.health.food.eat(food as i32, PASTE_SATURATION);
     }
 }
 
