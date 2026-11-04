@@ -647,3 +647,37 @@ bindings = [
   { name = "absorbed", ty = "f32", value = "absorbed" },
   { name = "rules", ty = "&mut Vec<(String, f32)>", value = "&mut *rules" },
 ]
+
+[[injection]]
+id = "gear-attributes"
+hook = "gear_attributes"
+hook_version = 1
+kind = "HEAD"
+helper = "gear_attributes.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "attributes", ty = "&mut Vec<(String, String, f64, String)>", value = "&mut *attributes" },
+]
+
+[[injection]]
+id = "glider"
+hook = "glider"
+hook_version = 1
+kind = "HEAD"
+helper = "glider.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "glider", ty = "&mut bool", value = "&mut *glider" },
+]
+
+[[injection]]
+id = "glide-wear"
+hook = "glide_wear"
+hook_version = 1
+kind = "HEAD"
+helper = "glide_wear.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "wear", ty = "u32", value = "wear" },
+  { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
+]
