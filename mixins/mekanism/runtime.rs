@@ -6232,6 +6232,7 @@ fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, V
                     if !seen.contains(&at) {
                         return None;
                     }
+                    reactor.locations += 1;
                     if name == FISSION_PORT {
                         ports.push(at);
                     }
@@ -6255,6 +6256,25 @@ fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, V
                     columns.push([x, start, z, y - start]);
                 } else {
                     y += 1;
+                }
+            }
+        }
+    }
+    // `FissionReactorValidator.postcheck`: 6 faces per fuel assembly, 2 fewer for each neighbour it touches.
+    let fuel = |at: [i32; 3]| block_name(game, at) == "mekanismgenerators:fission_fuel_assembly";
+    for x in lo[0] + 1..hi[0] {
+        for y in lo[1] + 1..hi[1] {
+            for z in lo[2] + 1..hi[2] {
+                if fuel([x, y, z]) {
+                    reactor.surface += 6;
+                    for (_, d) in DIRECTIONS {
+                        if d[0] + d[1] + d[2] < 0 || (d[0] + d[1] + d[2] == 0) {
+                            continue;
+                        }
+                        if fuel([x + d[0], y + d[1], z + d[2]]) {
+                            reactor.surface -= 2;
+                        }
+                    }
                 }
             }
         }
@@ -6310,12 +6330,88 @@ fn get_pos(nbt: &Compound, key: &str) -> Option<[i32; 3]> {
 /// its tanks: it takes fissile fuel from the tubes and chemical tanks beside the ports and water from the
 /// pipes and fluid tanks beside them, burns the fuel at the set rate while switched on (water boils to
 /// steam), and gives steam and nuclear waste out of every port.
-/// The reactor's rate limit in tenths of a mB/t: the default 0.1 until set, never over the maximum.
-fn fission_burn(nbt: &Compound, max: u64) -> u64 {
-    match nbt.get(&JavaString::from("burn")) {
-        Some(_) => get_long(nbt, "burn").min(max),
-        None => fission::DEFAULT_BURN_TENTHS.min(max),
+/// The ambient temperature of a reactor: `calculateAverageAmbientTemperature` needs the biome's
+/// temperature, which the heat system will bring; until then the default 300 K.
+const FISSION_AMBIENT: f64 = 300.0;
+
+/// What a master port saved of its reactor's shape.
+fn reactor_of(nbt: &Compound) -> fission::Reactor {
+    fission::Reactor {
+        assemblies: get_long(nbt, "assemblies"),
+        volume: get_long(nbt, "volume"),
+        surface: get_long(nbt, "surface"),
+        locations: get_long(nbt, "locations"),
     }
+}
+
+/// `FissionReactorMultiblockData`'s heat, damage and burn fields as the master saved them.
+fn fission_state(nbt: &Compound, r: &fission::Reactor) -> fission::State {
+    let capacity = r.locations as f64 * fission::CASING_HEAT_CAPACITY;
+    let ambient = get_double(nbt, "ambient").unwrap_or(FISSION_AMBIENT);
+    let mut st = fission::State::new(capacity, ambient);
+    st.heat = get_double(nbt, "heat").unwrap_or(capacity * ambient);
+    st.damage = get_double(nbt, "damage").unwrap_or(0.0);
+    st.burn_remaining = get_double(nbt, "burn_rem").unwrap_or(0.0);
+    st.partial_waste = get_double(nbt, "pwaste").unwrap_or(0.0);
+    st.rate_limit = get_double(nbt, "limit").unwrap_or(fission::DEFAULT_RATE_LIMIT);
+    st.active = get_long(nbt, "active") == 1;
+    st.force_disable = get_long(nbt, "force") == 1;
+    st.last_burn = get_double(nbt, "last_burn").unwrap_or(0.0);
+    st.last_boil = get_long(nbt, "last_boil");
+    st.env_loss = get_double(nbt, "env_loss").unwrap_or(0.0);
+    st
+}
+
+fn put_double(nbt: &mut Compound, key: &str, v: f64) {
+    nbt.insert(key.into(), Tag::Double(v.to_bits()));
+}
+
+fn save_fission_state(nbt: &mut Compound, st: &fission::State) {
+    put_double(nbt, "heat", st.heat);
+    put_double(nbt, "damage", st.damage);
+    put_double(nbt, "burn_rem", st.burn_remaining);
+    put_double(nbt, "pwaste", st.partial_waste);
+    put_double(nbt, "limit", st.rate_limit);
+    put_double(nbt, "last_burn", st.last_burn);
+    put_double(nbt, "env_loss", st.env_loss);
+    put_double(nbt, "ambient", st.ambient);
+    put_long(nbt, "active", u64::from(st.active));
+    put_long(nbt, "force", u64::from(st.force_disable));
+    put_long(nbt, "last_boil", st.last_boil);
+}
+
+/// A meltdown in progress (`Meltdown`): for five seconds, random explosions inside the old reactor's box.
+struct Meltdown {
+    lo: [i32; 3],
+    hi: [i32; 3],
+    magnitude: f64,
+    age: u32,
+}
+
+thread_local! {
+    static MELTDOWNS: std::cell::RefCell<Vec<Meltdown>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `Meltdown.update` for every meltdown: a tenth of the ticks, if the heat times the chance allows, an
+/// explosion of the configured radius with fire at a random spot of the box.
+fn tick_meltdowns(game: &mut Game<'_>) {
+    use horizon_core::random::RandomSource;
+    let mut list = MELTDOWNS.with_borrow_mut(std::mem::take);
+    list.retain_mut(|m| {
+        m.age += 1;
+        if game.world.random.next_int() % 10 == 0 && game.world.random.next_double() < m.magnitude * fission::EXPLOSION_CHANCE {
+            let mut at = [0.0; 3];
+            for k in 0..3 {
+                at[k] = f64::from(game.world.random.next_int_between_inclusive(m.lo[k], m.hi[k]).unwrap_or(m.lo[k]));
+            }
+            let _ = game.server_explode(at, fission::MELTDOWN_RADIUS, super::explosion::BlockInteraction::DestroyWithDecay, true);
+        }
+        m.age < 5 * 20
+    });
+    MELTDOWNS.with_borrow_mut(|v| {
+        list.append(v);
+        *v = list;
+    });
 }
 
 fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
@@ -6328,6 +6424,8 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
                 entity.nbt.insert("columns".into(), Tag::IntArray(columns.concat()));
                 put_long(&mut entity.nbt, "assemblies", r.assemblies);
                 put_long(&mut entity.nbt, "volume", r.volume);
+                put_long(&mut entity.nbt, "surface", r.surface);
+                put_long(&mut entity.nbt, "locations", r.locations);
                 let master = ports.first().copied().unwrap_or(pos);
                 entity.nbt.insert("master".into(), Tag::IntArray(master.to_vec()));
                 entity.nbt.insert("ports".into(), Tag::IntArray(ports.concat()));
@@ -6339,7 +6437,7 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
             }
         }
     }
-    let r = fission::Reactor { assemblies: get_long(&entity.nbt, "assemblies"), volume: get_long(&entity.nbt, "volume") };
+    let r = reactor_of(&entity.nbt);
     if r.assemblies == 0 || get_pos(&entity.nbt, "master") != Some(pos) {
         put_fills(game, pos, entity, &[]);
         return;
@@ -6356,36 +6454,47 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
         pull_from_carriers(game, p, &mut fuel, FISSILE_FUEL);
         pull_from_carriers(game, p, &mut water, "minecraft:water");
     }
-    if get_long(&entity.nbt, "active") == 1 {
-        let rate = fission_burn(&entity.nbt, r.max_burn_tenths());
-        let mut partial = get_long(&entity.nbt, "partial");
-        let burned = fission::burn(
-            rate,
-            &mut partial,
-            fuel.amount,
-            if water.accepts("minecraft:water") { water.amount } else { 0 },
-            (steam.capacity - steam.amount) * u64::from(steam.accepts("mekanism:steam")),
-            (waste.capacity - waste.amount) * u64::from(waste.accepts("mekanism:nuclear_waste")),
-        );
-        match burned {
-            Some(b) => {
-                fuel.extract(b.fuel);
-                water.extract(b.steam);
-                steam.insert("mekanism:steam", b.steam);
-                waste.insert("mekanism:nuclear_waste", b.waste);
-                put_long(&mut entity.nbt, "partial", partial);
-            }
-            // SCRAM: too little water to take the heat, or nowhere for the steam or waste.
-            None => {
-                put_long(&mut entity.nbt, "active", 0);
-                put_long(&mut entity.nbt, "scram", 1);
-            }
-        }
+    let mut st = fission_state(&entity.nbt, &r);
+    // `burnFuel`: fissile fuel into heat and nuclear waste.
+    {
+        let mut amount = if fuel.accepts(FISSILE_FUEL) { fuel.amount } else { 0 };
+        let before = amount;
+        let mut waste_amount = if waste.accepts("mekanism:nuclear_waste") { waste.amount } else { waste.capacity };
+        let waste_before = waste_amount;
+        st.burn(&mut amount, fuel.capacity, r.assemblies, &mut waste_amount, waste.capacity);
+        fuel.extract(before.saturating_sub(amount));
+        waste.insert("mekanism:nuclear_waste", waste_amount.saturating_sub(waste_before));
+    }
+    // `handleCoolant`: heat above boiling turns water into steam.
+    {
+        let mut w = if water.accepts("minecraft:water") { water.amount } else { 0 };
+        let w_before = w;
+        let mut s = if steam.accepts("mekanism:steam") { steam.amount } else { steam.capacity };
+        let s_before = s;
+        st.coolant(&mut w, &mut s, steam.capacity, fission::boil_efficiency(r.surface, r.assemblies));
+        water.extract(w_before - w);
+        steam.insert("mekanism:steam", s.saturating_sub(s_before));
     }
     for &p in &ports {
         push_chemical(game, p, &mut steam, None, u64::MAX, false);
         push_chemical(game, p, &mut waste, None, u64::MAX, false);
     }
+    // `simulateEnvironment`, then `handleDamage`.
+    st.environment();
+    let roll = horizon_core::random::RandomSource::next_double(&mut game.world.random);
+    if st.damage_step(roll) == fission::Damage::Meltdown {
+        if let Some(Tag::IntArray(b)) = entity.nbt.get(&JavaString::from("box")).cloned()
+            && b.len() == 6
+        {
+            let lo = [b[0], b[1], b[2]];
+            let hi = [b[0] + b[3] - 1, b[1] + b[4] - 1, b[2] + b[5] - 1];
+            MELTDOWNS.with_borrow_mut(|v| v.push(Meltdown { lo, hi, magnitude: st.heat, age: 0 }));
+        }
+        // `meltdownHappened`: the heated coolant is lost and the reactor starts over, damaged.
+        steam.extract(steam.amount);
+        st.meltdown_reset();
+    }
+    save_fission_state(&mut entity.nbt, &st);
     put_tank(&mut entity.nbt, "fuel", &fuel);
     put_tank(&mut entity.nbt, "water", &water);
     put_tank(&mut entity.nbt, "steam", &steam);
@@ -6406,7 +6515,7 @@ fn tick_fission_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     }
     put_fills(game, pos, entity, &fills);
     let columns = match entity.nbt.get(&JavaString::from("columns")) {
-        Some(Tag::IntArray(v)) if get_long(&entity.nbt, "active") == 1 => v.clone(),
+        Some(Tag::IntArray(v)) if st.active => v.clone(),
         _ => Vec::new(),
     };
     let mut glow = Compound::new();
@@ -6435,16 +6544,10 @@ pub(super) fn use_fission_port(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         None => "Fission Reactor: not formed".to_owned(),
         Some(master) => game
             .native_with_mod_block_entity(master, |m| {
-                let r = fission::Reactor { assemblies: get_long(&m.nbt, "assemblies"), volume: get_long(&m.nbt, "volume") };
-                let mut burn = get_long(&m.nbt, "burn").clamp(1, r.max_burn_tenths().max(1));
-                if sneaking {
-                    let on = get_long(&m.nbt, "active") == 0;
-                    put_long(&mut m.nbt, "active", u64::from(on));
-                    put_long(&mut m.nbt, "scram", 0);
-                } else {
-                    burn = fission::next_burn(burn, r.max_burn_tenths());
-                }
-                put_long(&mut m.nbt, "burn", burn);
+                let r = reactor_of(&m.nbt);
+                let mut st = fission_state(&m.nbt, &r);
+                st.set_active(!st.active);
+                save_fission_state(&mut m.nbt, &st);
                 let amount = |key: &str| {
                     let mut c = Compound::new();
                     if let Some(t) = m.nbt.get(&JavaString::from(key)) {
@@ -6452,15 +6555,12 @@ pub(super) fn use_fission_port(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
                     }
                     get_tank(&c, "t", u64::MAX).amount
                 };
-                let state = match (get_long(&m.nbt, "active"), get_long(&m.nbt, "scram")) {
-                    (1, _) => "on",
-                    (_, 1) => "SCRAM (no coolant or full)",
-                    _ => "off",
-                };
+                let state = if st.active { "on" } else if st.force_disable { "disabled by damage" } else { "off" };
                 format!(
-                    "Fission Reactor: {state}, burn {}.{} mB/t, fuel {}, water {}, steam {}, waste {}",
-                    burn / 10,
-                    burn % 10,
+                    "Fission Reactor: {state}, burn {} mB/t, {:.0} K, damage {:.0}%, fuel {}, water {}, steam {}, waste {}",
+                    java_double(st.rate_limit),
+                    st.temperature(),
+                    st.damage,
                     amount("fuel"),
                     amount("water"),
                     amount("steam"),
@@ -7336,6 +7436,10 @@ fn layout(block: &str) -> Option<Layout> {
                 gauge("water", 0, 6.0, 13.0, STANDARD),
                 gauge("steam", 0, 152.0, 13.0, STANDARD),
                 gauge("waste", 0, 171.0, 13.0, STANDARD),
+                // The numbers the screens show, packed (never drawn as gauges): see `multiblock_data`.
+                gauge("stats_a", 1 << 58, 0.0, 0.0, SMALL),
+                gauge("stats_b", 1 << 58, 0.0, 0.0, SMALL),
+                gauge("stats_c", 1 << 58, 0.0, 0.0, SMALL),
             ],
             power: None,
             progress: None,
@@ -7629,6 +7733,31 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
             };
             tank = ChemicalTank::new(g.capacity);
             tank.insert("minecraft:lava", packed);
+        }
+        if g.key.starts_with("stats_") && kind(&entity.id) == Some(Kind::FissionPort) {
+            let r = reactor_of(&entity.nbt);
+            let st = fission_state(&entity.nbt, &r);
+            tank = ChemicalTank::new(g.capacity);
+            match g.key {
+                // The burn rate in millionths in the amount, the rate limit in hundredths in the capacity.
+                "stats_a" => {
+                    tank.insert("minecraft:lava", (st.last_burn * 1e6).round() as u64);
+                    tank.capacity = (st.rate_limit * 100.0).round() as u64;
+                }
+                // The temperature in hundredths of a kelvin and the damage in thousandths of a percent;
+                // the heat lost to the air in thousandths.
+                "stats_b" => {
+                    let temp = (st.temperature() * 100.0).clamp(0.0, f64::from(1u32 << 30) - 1.0) as u64;
+                    let damage = (st.damage * 1_000.0).clamp(0.0, f64::from(1u32 << 20) - 1.0) as u64;
+                    tank.insert("minecraft:lava", temp | damage << 30);
+                    tank.capacity = (st.env_loss * 1_000.0) as u64;
+                }
+                // The water boiled last tick, the fuel surface area and the assemblies; the heat capacity.
+                _ => {
+                    tank.insert("minecraft:lava", st.last_boil & 0x7FFF_FFFF | (r.surface & 0xFFFF) << 31 | (r.assemblies & 0x1FFF) << 47);
+                    tank.capacity = st.capacity as u64;
+                }
+            }
         }
         if matches!(g.key, "plasma" | "case") && kind(&entity.id) == Some(Kind::FusionPort) {
             let p = fusion_plasma(&entity.nbt);
@@ -9361,7 +9490,7 @@ fn multiblock_capacity(entity: &ModBlockEntity, key: &str) -> u64 {
     let nbt = &entity.nbt;
     match kind(&entity.id) {
         Some(Kind::FissionPort) => {
-            let r = fission::Reactor { assemblies: get_long(nbt, "assemblies"), volume: get_long(nbt, "volume") };
+            let r = reactor_of(nbt);
             match key {
                 "water" => r.water_capacity(),
                 "steam" => r.steam_capacity(),
@@ -9430,14 +9559,11 @@ fn multiblock_data(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
     let small = |v: u64| v.min(i16::MAX as u64) as i32;
     let (state, usage) = match kind(&entity.id) {
         Some(Kind::FissionPort) => {
-            let r = fission::Reactor { assemblies: get_long(nbt, "assemblies"), volume: get_long(nbt, "volume") };
-            let on = match (get_long(nbt, "active"), get_long(nbt, "scram")) {
-                (1, _) => 1,
-                (_, 1) => 2,
-                _ => 0,
-            };
-            let burn = fission_burn(nbt, r.max_burn_tenths());
-            ([1, on, small(burn), small(r.max_burn_tenths())], 0)
+            let r = reactor_of(nbt);
+            let st = fission_state(nbt, &r);
+            // 1 on, 2 forcibly disabled by damage (`isForceDisabled`), 0 off.
+            let on = if st.active { 1 } else if st.force_disable { 2 } else { 0 };
+            ([1, on, 0, small(r.assemblies)], 0)
         }
         Some(Kind::FusionPort) => {
             let plasma = fusion_plasma(nbt);
@@ -9758,13 +9884,11 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
     };
     let press = |m: &mut ModBlockEntity| match (kind(&m.id), id) {
         // Activate (0) and SCRAM (1): `FISSION_ACTIVE` with 1 and 0.
-        (Some(Kind::FissionPort), 0) => {
-            put_long(&mut m.nbt, "active", 1);
-            put_long(&mut m.nbt, "scram", 0);
-        }
-        (Some(Kind::FissionPort), 1) => {
-            put_long(&mut m.nbt, "active", 0);
-            put_long(&mut m.nbt, "scram", 0);
+        (Some(Kind::FissionPort), 0 | 1) => {
+            let r = reactor_of(&m.nbt);
+            let mut st = fission_state(&m.nbt, &r);
+            st.set_active(id == 0);
+            save_fission_state(&mut m.nbt, &st);
         }
         // `GasMode.getNext`: idle, dumping excess, dumping.
         (Some(Kind::TurbineValve), 0) => {
@@ -10747,8 +10871,8 @@ fn draw_tab(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: 
     game.native_sprite(batch, icon, [0.0, 0.0, 18.0, 18.0], b);
 }
 
-/// `GuiFissionReactorStats`: the title, the fuel statistics, the current burn rate bar and the rate limit
-/// field. (The heat statistics need the heat model the port does not have yet.)
+/// `GuiFissionReactorStats`: the title, the heat and fuel statistics, the current burn rate bar and the
+/// rate limit field.
 fn draw_fission_stats(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
     let [ox, oy] = origin;
     let cursor = game.native_cursor();
@@ -10756,16 +10880,20 @@ fn draw_fission_stats(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
     nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 176.0, 166.0]);
     let title = game.native_screen_title().unwrap_or_default();
     centred(game, batch, &format!("{title} Statistics"), ox, 176.0, oy + 4.0, 0x40_4040);
-    let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0);
-    let (limit, max) = (f64::from(get(2)) / 10.0, f64::from(get(3)) / 10.0);
-    let active = get(1) == 1;
+    let v = fission_view(data);
+    let max = v.assemblies as f64;
     let at = |y: f32| [ox + 6.0, oy + y];
+    game.native_text(batch, "Heat Statistics", at(20.0), 0x20_2020, false);
+    game.native_text(batch, &format!("Heat Capacity: {} J/K", thousands(v.capacity as u64)), at(32.0), 0x40_4040, false);
+    game.native_text(batch, &format!("Fuel Surface Area: {} m2", thousands(v.surface)), at(42.0), 0x40_4040, false);
+    let efficiency = (fission::boil_efficiency(v.surface, v.assemblies) * 1_000.0).round() / 1_000.0;
+    game.native_text(batch, &format!("Boil Efficiency: {}", java_double(efficiency)), at(52.0), 0x40_4040, false);
     game.native_text(batch, "Fuel Statistics", at(68.0), 0x20_2020, false);
-    game.native_text(batch, &format!("Max Burn Rate: {} mB/t", java_double(max)), at(80.0), 0x40_4040, false);
-    game.native_text(batch, &format!("Rate Limit: {} mB/t", java_double(limit)), at(90.0), 0x40_4040, false);
+    game.native_text(batch, &format!("Max Burn Rate: {} mB/t", thousands(v.assemblies)), at(80.0), 0x40_4040, false);
+    game.native_text(batch, &format!("Rate Limit: {} mB/t", java_double(v.rate_limit)), at(90.0), 0x40_4040, false);
     game.native_text(batch, "Current Burn Rate:", at(104.0), 0x40_4040, false);
-    let current = if active { limit } else { 0.0 };
-    draw_dynamic_rate_bar(game, batch, [ox + 5.0, oy + 114.0], 183.0, if max > 0.0 { (current / max).min(1.0) as f32 } else { 0.0 });
+    draw_dynamic_rate_bar(game, batch, [ox + 5.0, oy + 114.0], 183.0, if max > 0.0 { (v.last_burn / max).min(1.0) as f32 } else { 0.0 });
+    sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
     let label = "Set Rate Limit:";
     game.native_text(batch, label, [ox + 75.0 - game.native_text_width(label), oy + 130.0], 0x40_4040, false);
     let [fx, fy, fw, fh] = STATS_FIELD;
@@ -10805,9 +10933,9 @@ fn fission_stats_key(game: &Game<'_>, key: &str, text: Option<&str>) {
     let Some((pos, _)) = STATS_VIEW.get() else {
         return;
     };
-    let max = game.native_client_block_entity(pos).map_or(0, |(_, c)| get_int(c, "max_burn"));
-    // Room for the largest whole rate, a point and two decimals.
-    let room = (max.saturating_sub(1) / 10).to_string().len() + 3;
+    let _ = pos;
+    // Room for the largest whole rate (the most assemblies a reactor holds is 4,096), a point and two decimals.
+    let room = 4 + 3;
     STATS_TEXT.with_borrow_mut(|t| {
         if t.key(key, text, |c| c.is_ascii_digit() || c == '.', room) == freq::Typed::Enter && !t.value.is_empty() {
             let value = t.value.clone();
@@ -10852,11 +10980,11 @@ fn fission_payload(game: &mut Game<'_>, data: &[u8]) {
         return;
     };
     let set = |m: &mut ModBlockEntity| {
-        let max = fission::Reactor { assemblies: get_long(&m.nbt, "assemblies"), volume: get_long(&m.nbt, "volume") }.max_burn_tenths();
-        let tenths = (limit * 10.0).round() as u64;
-        if tenths <= max {
-            put_long(&mut m.nbt, "burn", tenths);
-        }
+        // `setRateLimit`: from 0 to the maximum burn rate (one mB a tick per assembly).
+        let r = reactor_of(&m.nbt);
+        let mut st = fission_state(&m.nbt, &r);
+        st.set_rate_limit(limit, r.assemblies);
+        save_fission_state(&mut m.nbt, &st);
     };
     if master == pos {
         game.native_with_mod_block_entity(pos, set);
@@ -10879,45 +11007,96 @@ fn labelled(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, label: &
     game.native_text_scaled(batch, value, [at[0] + game.native_text_width(label) * 0.8, at[1]], argb, 0.8);
 }
 
+/// What the reactor's screens show, unpacked from its three "stats" gauges (see `multiblock_data`).
+struct FissionView {
+    active: bool,
+    forced_off: bool,
+    last_burn: f64,
+    rate_limit: f64,
+    temperature: f64,
+    damage: f64,
+    env_loss: f64,
+    boil: u64,
+    surface: u64,
+    assemblies: u64,
+    capacity: f64,
+}
+
+fn fission_view(data: &[i32]) -> FissionView {
+    let at = |i: usize| DATA_GAUGES + i * GAUGE_SLOTS;
+    let (a, b, c) = (at(4), at(5), at(6));
+    let status = data.get(1).copied().unwrap_or(0);
+    FissionView {
+        active: status == 1,
+        forced_off: status == 2,
+        last_burn: read_wide(data, a) as f64 / 1e6,
+        rate_limit: read_wide(data, a + 4) as f64 / 100.0,
+        temperature: (read_wide(data, b) & 0x3FFF_FFFF) as f64 / 100.0,
+        damage: (read_wide(data, b) >> 30 & 0xF_FFFF) as f64 / 1_000.0,
+        env_loss: read_wide(data, b + 4) as f64 / 1_000.0,
+        boil: read_wide(data, c) & 0x7FFF_FFFF,
+        surface: read_wide(data, c) >> 31 & 0xFFFF,
+        assemblies: read_wide(data, c) >> 47 & 0x1FFF,
+        capacity: read_wide(data, c + 4) as f64,
+    }
+}
+
+/// `TileEntityFissionReactorCasing.getTempColor` and `getDamageColor`.
+fn fission_temp_color(temp: f64) -> u32 {
+    match temp {
+        t if t < 600.0 => 0xFF55_FF55,
+        t if t < 1_000.0 => 0xFFFF_FF55,
+        t if t < 1_200.0 => 0xFFFF_AA00,
+        t if t < 1_600.0 => 0xFFFF_5555,
+        _ => 0xFFAA_0000,
+    }
+}
+
+fn fission_damage_color(damage: f64) -> u32 {
+    match damage / fission::MAX_DAMAGE {
+        d if d < 0.25 => 0xFF55_FF55,
+        d if d < 0.5 => 0xFFFF_FF55,
+        d if d < 0.75 => 0xFFFF_AA00,
+        _ => 0xFFAA_0000,
+    }
+}
+
 /// `GuiFissionReactor`'s elements past the gauges: the inner screen, the two buttons and the big light,
-/// the temperature bar and graph. The port keeps no heat model, so the reactor sits at the ambient 300 K
-/// with no damage.
+/// the temperature bar and graph.
 fn draw_fission(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
     let [ox, oy] = origin;
-    let get = |i: usize| data.get(i).copied().unwrap_or(0).max(0);
-    let status = get(1);
-    let active = status == 1;
-    let burn = f64::from(get(2)) / 10.0;
-    let temperature = 300.0;
+    let v = fission_view(data);
+    let active = v.active;
+    let temperature = v.temperature;
     // The inner screen (45, 17, 105, 56): five lines, 1 px of spacing, centred, 0.8 scale.
     nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + 45.0, oy + 17.0, 105.0, 56.0], 0xFFFF_FFFF);
     let line = |i: usize| [ox + 50.0, oy + 20.0 + 10.0 * i as f32];
     let (state, color) = if active { ("Active", 0xFF55_FF55) } else { ("Disabled", 0xFFFF_5555) };
     labelled(game, batch, "Status: ", state, line(0), color);
-    game.native_text_scaled(batch, &format!("Burn Rate: {} mB/t", java_double(if active { burn } else { 0.0 })), line(1), 0x3C_FE9A, 0.8);
-    let heating = if active { get(2) as u64 * fission::STEAM_PER_TENTH } else { 0 };
-    game.native_text_scaled(batch, &format!("Heating Rate: {heating} mB/t"), line(2), 0x3C_FE9A, 0.8);
-    labelled(game, batch, "Temp: ", &mekanism_core::energy::format_unit(temperature, "K"), line(3), 0xFF55_FF55);
-    labelled(game, batch, "Damage: ", "0%", line(4), 0xFF55_FF55);
+    game.native_text_scaled(batch, &format!("Burn Rate: {} mB/t", java_double(v.last_burn)), line(1), 0x3C_FE9A, 0.8);
+    game.native_text_scaled(batch, &format!("Heating Rate: {} mB/t", thousands(v.boil)), line(2), 0x3C_FE9A, 0.8);
+    labelled(game, batch, "Temp: ", &mekanism_core::energy::format_unit(temperature, "K"), line(3), fission_temp_color(temperature));
+    labelled(game, batch, "Damage: ", &format!("{}%", (v.damage / fission::MAX_DAMAGE * 100.0).round()), line(4), fission_damage_color(v.damage));
     // The buttons: `TranslationButton`s tinted dark green and dark red, active only when pressing them changes something.
     let cursor = game.native_cursor();
     let mouse = [cursor[0] - ox, cursor[1] - oy];
     for (i, (rect, label)) in buttons("mekanismgenerators:fission_reactor_port").iter().enumerate() {
-        let enabled = if i == 0 { !active } else { active };
+        let enabled = if i == 0 { !active && !v.forced_off } else { active };
         let tint = if i == 0 { 0xFF00_AA00 } else { 0xFFAA_0000 };
         draw_button(game, batch, [ox + rect[0], oy + rect[1], rect[2], rect[3]], inside(mouse, *rect), enabled, tint, None);
         let tw = game.native_text_width(label);
         let rgb = if enabled { 0xFF_FFFF } else { 0xA0_A0A0 };
         game.native_text(batch, label, [ox + rect[0] + (rect[2] - tw) / 2.0, oy + rect[1] + (rect[3] - 8.0) / 2.0], rgb, true);
     }
-    // The statistics tab (`GuiFissionReactorTab.STAT`).
+    // The statistics tab (`GuiFissionReactorTab.STAT`) and the heat tab.
     draw_stats_tab(game, batch, origin, "button/stats");
+    sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
     // `GuiBigLight` (173, 76).
     nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + 173.0, oy + 76.0, 14.0, 14.0], 0xFFFF_FFFF);
     let light = if active { "light/big/enabled" } else { "light/big/disabled" };
     sprite(game, batch, light, [0.0, 0.0, 12.0, 12.0], [ox + 174.0, oy + 77.0, 12.0, 12.0]);
     // The temperature over `MAX_DAMAGE_TEMPERATURE` (1,800 K) and its graph.
-    draw_dynamic_rate_bar(game, batch, [ox + 5.0, oy + 102.0], 183.0, (temperature / 1_800.0).min(1.0) as f32);
+    draw_dynamic_rate_bar(game, batch, [ox + 5.0, oy + 102.0], 183.0, (temperature / fission::MAX_DAMAGE_TEMPERATURE).min(1.0) as f32);
     let samples = FISSION_TEMPS.with_borrow_mut(|(last, v)| {
         if *last != game.ticks as u64 {
             *last = game.ticks as u64;
@@ -11614,12 +11793,36 @@ fn screen_tooltip_inner(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2]
             lines.push(if fission_stats_open(block) { "Main" } else { "Stats" }.to_owned());
             return;
         }
+        let v = fission_view(data);
+        // `GuiHeatTab`: what the casing gave to the air this tick, then the unit.
+        if inside(at, [-26.0, 109.0, 26.0, 26.0]) {
+            lines.push(format!("Dissipated: {}/t", mekanism_core::energy::format_unit(v.env_loss, "K")));
+            lines.push("Unit: Kelvin".to_owned());
+            return;
+        }
         if fission_stats_open(block) {
             if inside(at, [5.0, 114.0, 183.0, 8.0]) {
-                let burn = f64::from(data.get(2).copied().unwrap_or(0).max(0)) / 10.0;
-                let active = data.get(1).copied().unwrap_or(0) == 1;
-                lines.push(format!("Burn Rate: {} mB/t", java_double(if active { burn } else { 0.0 })));
+                lines.push(format!("Burn Rate: {} mB/t", java_double(v.last_burn)));
             }
+            return;
+        }
+        if inside(at, [5.0, 102.0, 183.0, 8.0]) {
+            lines.push(mekanism_core::energy::format_unit(v.temperature, "K"));
+            return;
+        }
+        // The disabled Activate button of a reactor that must cool down first (`FISSION_FORCE_DISABLED`).
+        if v.forced_off && inside(at, buttons("mekanismgenerators:fission_reactor_port")[0].0) {
+            let mut row = String::new();
+            for word in "Reactor must reach safe damage and temperature levels before it can be reactivated.".split(' ') {
+                let trial = if row.is_empty() { word.to_owned() } else { format!("{row} {word}") };
+                if !row.is_empty() && game.native_text_width(&trial) > 170.0 {
+                    lines.push(std::mem::take(&mut row));
+                    row = word.to_owned();
+                } else {
+                    row = trial;
+                }
+            }
+            lines.push(row);
             return;
         }
     }
@@ -19965,6 +20168,7 @@ pub(super) fn mobs_tick(game: &mut Game<'_>) {
     if !game.native_on(MOD_ID) {
         return;
     }
+    tick_meltdowns(game);
     let ids = game.native_mob_ids(robit::TYPE);
     if ids.is_empty() {
         return;
