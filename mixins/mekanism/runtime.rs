@@ -3117,6 +3117,12 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
         _ => 0,
     };
     put_int(&mut entity.nbt, "warn", warn);
+    // `PigmentColorDetails.getColorTo`: with an empty tank, the arrow takes the colour of the recipe's pigment (sent in
+    // data[1] as the chemical's index plus one).
+    let hint = match &recipe {
+        Some((_, r)) if pigment && tank.amount == 0 => chemical_index(Some(r.output)) + 1,
+        _ => 0,
+    };
     match recipe {
         Some((stack, r)) if tank.accepts(r.output) && tank.amount + r.amount <= tank.capacity => {
             if energy.consume(usage) {
@@ -3139,7 +3145,7 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     put_tank(&mut entity.nbt, "output", &tank);
     entity.data = vec![
         (energy.stored * 1000 / capacity) as i32,
-        1000,
+        if pigment { hint } else { 1000 },
         progress as i32,
         ticks as i32,
     ];
@@ -11926,9 +11932,13 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         if done > 0.0 {
             // `GuiProgress.colored`: the Pigment Extractor's arrow runs from white to the pigment in its tank,
             // the Painting Machine's from that pigment to white.
-            let pigment = (read_wide(data, DATA_GAUGES) > 0)
+            let mut pigment = (read_wide(data, DATA_GAUGES) > 0)
                 .then(|| usize::try_from(data.get(DATA_GAUGES + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c)).map(|c| c.2))
                 .flatten();
+            // An empty Pigment Extractor tank: the pigment its input would make.
+            if pigment.is_none() && kind(block) == Some(Kind::PigmentExtractor) {
+                pigment = usize::try_from(data.get(1).copied().unwrap_or(0) - 1).ok().and_then(|c| CHEMICALS.get(c)).map(|c| c.2);
+            }
             let tint = match (kind(block), pigment) {
                 (Some(Kind::PigmentExtractor), Some(rgb)) => Some((0xFFFFFF, rgb)),
                 (Some(Kind::Painting), Some(rgb)) => Some((rgb, 0xFFFFFF)),
