@@ -13,6 +13,10 @@ pub const HEATER: &str = "mekanism:resistive_heater";
 /// time).
 pub const FUELWOOD_HEATER: &str = "mekanism:fuelwood_heater";
 pub const HEAT_PER_FUEL_TICK: f64 = 400.0;
+/// The Resistive and Fuelwood Heaters' `BasicHeatCapacitor`: capacity, inverse conduction, inverse insulation.
+pub const HEATER_HEAT_CAPACITY: f64 = 100.0;
+pub const HEATER_INVERSE_CONDUCTION: f64 = 5.0;
+pub const HEATER_INVERSE_INSULATION: f64 = 10.0;
 
 /// `general.boiler`: `waterPerTank`, `steamPerTank`, `waterConductivity`, `superheatingHeatTransfer`.
 pub const WATER_PER_BLOCK: u64 = 16_000;

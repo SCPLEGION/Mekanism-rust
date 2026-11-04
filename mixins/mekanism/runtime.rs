@@ -660,8 +660,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             Kind::Activator => tick_activator(game, pos, entity),
             Kind::Oredictionificator => tick_oredictionificator(game, entity),
             Kind::BoilerValve => tick_boiler_valve(game, pos, entity),
-            Kind::Heater => tick_heater(entity),
-            Kind::FuelwoodHeater => tick_fuelwood_heater(game, entity),
+            Kind::Heater => tick_heater(game, pos, entity),
+            Kind::FuelwoodHeater => tick_fuelwood_heater(game, pos, entity),
             Kind::BioGenerator => tick_bio_generator(game, pos, entity),
             Kind::Reaction => tick_reaction(game, pos, entity),
             Kind::Washer => tick_washer(game, pos, entity),
@@ -1285,6 +1285,68 @@ fn find_operation(
 
 // --- Heat Generator ---------------------------------------------------------------------------------
 
+/// The heat capacitor of a block that has one: (capacity, inverse conduction, inverse insulation).
+fn heat_params(k: Kind) -> Option<(f64, f64, f64)> {
+    use mekanism_core::generator as g;
+    match k {
+        Kind::HeatGenerator => Some((g::HEAT_CAPACITY, g::INVERSE_CONDUCTION_COEFFICIENT, g::INVERSE_INSULATION_COEFFICIENT)),
+        Kind::Heater | Kind::FuelwoodHeater => Some((boiler::HEATER_HEAT_CAPACITY, boiler::HEATER_INVERSE_CONDUCTION, boiler::HEATER_INVERSE_INSULATION)),
+        _ => None,
+    }
+}
+
+/// The boiler a heat block stands against, as its master valve last told it (`boiler` and `link_tick`), while that
+/// is recent.
+fn boiler_link(nbt: &Compound, now: u64) -> Option<[i32; 3]> {
+    (now.saturating_sub(get_long(nbt, "link_tick")) <= 40).then(|| get_pos(nbt, "boiler")).flatten()
+}
+
+/// `ITileHeatHandler.simulateAdjacent` for a block at `pos` with `heat`: into each colder neighbour that holds
+/// heat (the other heaters and generators, and the casing of the boiler it stands against). Returns the
+/// temperature moved.
+fn adjacent_heat(game: &mut Game<'_>, pos: [i32; 3], heat: &mut mekanism_core::heat::HeatCapacitor, link: Option<[i32; 3]>) -> f64 {
+    use mekanism_core::heat::HeatCapacitor;
+    let mut total = 0.0;
+    for d in [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]] {
+        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        let moved = if let Some(master) = link.filter(|_| boiler::is_frame(block_name(game, at))) {
+            game.native_with_mod_block_entity(master, |m| {
+                let b = boiler_of(&m.nbt);
+                if b.volume == 0 {
+                    return None;
+                }
+                let mut sink = HeatCapacitor::with_ambient(
+                    b.heat_capacity(),
+                    boiler::CASING_INVERSE_CONDUCTION,
+                    boiler::CASING_INVERSE_INSULATION,
+                    get_double(&m.nbt, "ambient").unwrap_or(mekanism_core::heat::AMBIENT_TEMP),
+                );
+                sink.heat = get_double(&m.nbt, "heat").unwrap_or(sink.heat);
+                let moved = heat.give_to(&mut sink);
+                m.nbt.insert("heat".into(), Tag::Double(sink.heat.to_bits()));
+                Some(moved)
+            })
+            .flatten()
+        } else {
+            game.native_with_mod_block_entity(at, |m| {
+                let (capacity, conduction, insulation) = heat_params(kind(&m.id)?)?;
+                let mut sink = HeatCapacitor::with_ambient(capacity, conduction, insulation, heat.ambient);
+                sink.heat = get_double(&m.nbt, "heat").unwrap_or(sink.heat);
+                let moved = heat.give_to(&mut sink);
+                m.nbt.insert("heat".into(), Tag::Double(sink.heat.to_bits()));
+                Some(moved)
+            })
+            .flatten()
+        };
+        if let Some(moved) = moved
+            && moved != 0.0
+        {
+            total += moved;
+        }
+    }
+    total
+}
+
 fn tick_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
     let mut g = HeatGenerator::new();
     g.set_ambient(ambient_at(game, pos));
@@ -1313,40 +1375,11 @@ fn tick_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     lava.insert("minecraft:lava", u64::from(g.lava));
     pull_fluid(game, pos, &mut lava, "minecraft:lava");
     g.lava = lava.amount as u32;
-    // `ITileHeatHandler.simulateAdjacent`: heat flows into every hotter-than neighbour that holds heat (here the
-    // other heat generators, the only blocks of the port with a heat capacitor of their own).
-    let own_pos = pos;
+    // `ITileHeatHandler.simulateAdjacent`: heat flows into every colder neighbour that holds heat.
     {
-        let mut adjacent = |heat: &mut mekanism_core::heat::HeatCapacitor| -> f64 {
-            let mut total = 0.0;
-            for d in [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]] {
-                let at = [own_pos[0] + d[0], own_pos[1] + d[1], own_pos[2] + d[2]];
-                let temp = heat.temperature();
-                let Some(taken) = game.native_with_mod_block_entity(at, |m| {
-                    if kind(&m.id) != Some(Kind::HeatGenerator) {
-                        return None;
-                    }
-                    let mut sink = mekanism_core::heat::HeatCapacitor::with_ambient(heat.capacity, heat.inverse_conduction, heat.inverse_insulation, heat.ambient);
-                    sink.heat = get_double(&m.nbt, "heat").unwrap_or(sink.heat);
-                    let sink_temp = sink.temperature();
-                    if temp <= sink_temp {
-                        return None;
-                    }
-                    let final_temp = (temp * heat.capacity + sink_temp * sink.capacity) / (heat.capacity + sink.capacity);
-                    let to_transfer = (temp - final_temp) / (sink.inverse_conduction + heat.inverse_conduction);
-                    sink.handle_heat(to_transfer * heat.capacity);
-                    m.nbt.insert("heat".into(), Tag::Double(sink.heat.to_bits()));
-                    Some(to_transfer)
-                }).flatten() else {
-                    continue;
-                };
-                heat.handle_heat(-taken * heat.capacity);
-                if taken != 0.0 {
-                    total += taken;
-                }
-            }
-            total
-        };
+        let own_pos = pos;
+        let link = boiler_link(&entity.nbt, game.ticks as u64);
+        let mut adjacent = |heat: &mut mekanism_core::heat::HeatCapacitor| adjacent_heat(game, own_pos, heat, link);
         g.tick_with(&mut adjacent);
     }
     // The first slot charges an item from the generator (Mekanism's energy slot).
@@ -7217,7 +7250,7 @@ pub(super) fn use_fusion(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         .and_then(|master| {
             game.native_with_mod_block_entity(master, |m| {
                 let mut injection = fusion_injection(&m.nbt);
-                let mut plasma = fusion_plasma(&m.nbt);
+                let plasma = fusion_plasma(&m.nbt);
                 if !sneaking {
                     injection = fusion::next_injection(injection);
                     put_long(&mut m.nbt, "injection", injection);
@@ -7923,10 +7956,18 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
             entity.data.extend(wide(get_long(&entity.nbt, "prod")));
         }
         if let Some(k @ (Kind::Heater | Kind::FuelwoodHeater)) = kind(&entity.id) {
-            let temp = 300.0 + get_double(&entity.nbt, "heat_out").unwrap_or(0.0) / 100.0;
-            entity.data[2] = (temp * 10.0).clamp(0.0, 32_767.0) as i32;
+            // The temperature in tenths of a kelvin over data[2] and data[3] (15 bits each), what it passes on
+            // in data[1] and what the air takes in data[DATA_SPEED] (tenths); the fuelwood heater's burn time
+            // sits in data[DATA_ENERGY_UPGRADES].
+            let tenths = |key: &str, max: f64| (get_double(&entity.nbt, key).unwrap_or(0.0) * 10.0).clamp(0.0, max) as i32;
+            let temp = tenths("temp", f64::from((1 << 30) - 1));
+            let (transfer, env) = (tenths("transfer", 32_767.0), tenths("env", 32_767.0));
+            entity.data[1] = transfer;
+            entity.data[2] = temp & 0x7FFF;
+            entity.data[3] = temp >> 15;
+            entity.data[DATA_SPEED] = env;
             if k == Kind::FuelwoodHeater {
-                entity.data[3] = get_int(&entity.nbt, "burn_time").min(32_767) as i32;
+                entity.data[DATA_ENERGY_UPGRADES] = get_int(&entity.nbt, "burn_time").min(32_767) as i32;
             } else {
                 entity.data.truncate(DATA_USAGE);
                 entity.data.extend(wide(heater_usage(&entity.nbt)));
@@ -10544,12 +10585,11 @@ fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
         Some(Kind::Solar(..)) => vec![energy, format!("Producing: {}/t", fe(read_wide(data, DATA_USAGE)))],
         // The heaters' temperature (kelvin, sent in tenths) and the usage or the fuel left.
         Some(Kind::Heater | Kind::FuelwoodHeater) => {
-            let temp = f64::from(data.get(2).copied().unwrap_or(3000).max(0)) / 10.0;
-            let temp = format!("Temp: {}", mekanism_core::energy::format_unit(temp, "K"));
+            let temp = format!("Temp: {}", mekanism_core::energy::format_unit(heater_temperature(data), "K"));
             if kind(block) == Some(Kind::Heater) {
                 vec![temp, format!("Usage: {}/t", fe(read_wide(data, DATA_USAGE)))]
             } else {
-                vec![temp, format!("Fuel: {}", data.get(3).copied().unwrap_or(0).max(0))]
+                vec![temp, format!("Fuel: {}", data.get(DATA_ENERGY_UPGRADES).copied().unwrap_or(0).max(0))]
             }
         }
         _ => vec![],
@@ -12048,6 +12088,13 @@ pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f3
     }
 }
 
+/// A heater's temperature from the data its tick packed (tenths of a kelvin over data[2] and data[3]).
+fn heater_temperature(data: &[i32]) -> f64 {
+    let low = data.get(2).copied().unwrap_or(0).max(0);
+    let high = data.get(3).copied().unwrap_or(0).max(0);
+    f64::from(low | high << 15) / 10.0
+}
+
 fn screen_tooltip_inner(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
     if miner_cfg_open(block) {
         miner_cfg_tooltip(game, at, lines);
@@ -12310,6 +12357,12 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         lines.push(format!("Temperature: {}", k(get(2))));
         lines.push(format!("Transferred: {}/t", k(get(1))));
         lines.push(format!("Dissipated: {}/t", k(get(3))));
+    } else if matches!(kind(block), Some(Kind::Heater | Kind::FuelwoodHeater)) && inside(at, [-26.0, 109.0, 26.0, 26.0]) {
+        // `GuiHeatTab` of the heaters, with the same three lines (the temperature and rates packed in the data).
+        let k = |tenths: i32| mekanism_core::energy::format_unit(f64::from(tenths.max(0)) / 10.0, "K");
+        lines.push(format!("Temperature: {}", mekanism_core::energy::format_unit(heater_temperature(data), "K")));
+        lines.push(format!("Transferred: {}/t", k(get(1))));
+        lines.push(format!("Dissipated: {}/t", k(data.get(DATA_SPEED).copied().unwrap_or(0))));
     } else if l.power.is_some() && inside(at, [-26.0, 137.0, 26.0, 26.0]) {
         // `GuiEnergyTab` of a machine: what it uses a tick and what its buffer still needs.
         let fe = mekanism_core::energy::format_fe;
@@ -13010,7 +13063,7 @@ fn find_boiler(game: &Game<'_>, start: [i32; 3]) -> Option<(boiler::Boiler, Vec<
             for z in lo[2] - 1..=hi[2] + 1 {
                 let at = [x, y, z];
                 let outside = (0..3).filter(|&k| at[k] < lo[k] || at[k] > hi[k]).count();
-                if outside == 1 && [boiler::HEATER, boiler::FUELWOOD_HEATER].contains(&block_name(game, at)) {
+                if outside == 1 && [boiler::HEATER, boiler::FUELWOOD_HEATER, HEAT_GENERATOR].contains(&block_name(game, at)) {
                     heaters.push(at);
                 }
             }
@@ -13093,13 +13146,14 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     if let Some(heat) = get_double(&entity.nbt, "heat") {
         casing.heat = heat;
     }
+    // The heaters and generators against its walls give their heat from their own tick; this tells them which boiler
+    // they stand against.
+    let now = game.ticks as u64;
     for &h in &positions(&entity.nbt, "heaters") {
-        let given = game.native_with_mod_block_entity(h, |m| {
-            let heat = get_double(&m.nbt, "heat_out").unwrap_or(0.0);
-            m.nbt.insert("heat_out".into(), Tag::Double(0f64.to_bits()));
-            heat
+        game.native_with_mod_block_entity(h, |m| {
+            m.nbt.insert("boiler".into(), Tag::IntArray(pos.to_vec()));
+            put_long(&mut m.nbt, "link_tick", now);
         });
-        casing.handle_heat(given.unwrap_or(0.0));
     }
     // `lastEnvironmentLoss`: the temperature the casing gave to the air.
     let lost = casing.lose_to_air(boiler::CASING_INVERSE_INSULATION);
@@ -13170,20 +13224,46 @@ fn tick_boiler_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEn
     Some(boiled > 0)
 }
 
-/// The Resistive Heater: each tick it turns its energy usage (100 FE by default) into 60% as much heat,
-/// which a boiler beside it takes. Unused heat stays for a second at most.
-fn tick_heater(entity: &mut ModBlockEntity) -> Option<bool> {
+/// A heater's `BasicHeatCapacitor` as it saved it.
+fn heater_heat(game: &Game<'_>, pos: [i32; 3], nbt: &Compound) -> mekanism_core::heat::HeatCapacitor {
+    let mut h = mekanism_core::heat::HeatCapacitor::with_ambient(
+        boiler::HEATER_HEAT_CAPACITY,
+        boiler::HEATER_INVERSE_CONDUCTION,
+        boiler::HEATER_INVERSE_INSULATION,
+        ambient_at(game, pos),
+    );
+    h.heat = get_double(nbt, "heat").unwrap_or(h.heat);
+    h
+}
+
+/// `simulate()` of a heater: heat into the colder neighbours, then out to the air through all six sides; saves the
+/// heat, the temperature and what moved for the screen.
+fn simulate_heater(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, mut heat: mekanism_core::heat::HeatCapacitor) {
+    let link = boiler_link(&entity.nbt, game.ticks as u64);
+    let transfer = adjacent_heat(game, pos, &mut heat, link);
+    let mut env = 0.0;
+    for _ in 0..6 {
+        env += heat.lose_to_air(boiler::HEATER_INVERSE_INSULATION);
+    }
+    entity.nbt.insert("heat".into(), Tag::Double(heat.heat.to_bits()));
+    entity.nbt.insert("temp".into(), Tag::Double(heat.temperature().to_bits()));
+    entity.nbt.insert("transfer".into(), Tag::Double(transfer.to_bits()));
+    entity.nbt.insert("env".into(), Tag::Double(env.to_bits()));
+}
+
+/// The Resistive Heater: each tick it turns its energy usage (100 FE by default) into 60% as much heat in its own
+/// capacitor, which flows into the boiler or heaters beside it and out to the air.
+fn tick_heater(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
     let usage = heater_usage(&entity.nbt);
     let mut energy = EnergyContainer::new(machine::STORAGE_MULTIPLIER * usage, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(energy.capacity);
     let active = energy.consume(usage);
-    let mut heat = get_double(&entity.nbt, "heat_out").unwrap_or(0.0);
+    let mut heat = heater_heat(game, pos, &entity.nbt);
     if active {
-        let made = usage as f64 * boiler::HEATER_EFFICIENCY;
-        heat = (heat + made).min(made * 20.0);
+        heat.handle_heat(usage as f64 * boiler::HEATER_EFFICIENCY);
     }
-    entity.nbt.insert("heat_out".into(), Tag::Double(heat.to_bits()));
     put_long(&mut entity.nbt, "energy", energy.stored);
+    simulate_heater(game, pos, entity, heat);
     Some(active)
 }
 
@@ -14759,9 +14839,8 @@ fn tick_bio_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
 }
 
 /// A fuelwood heater tick: when its burn runs out it burns the next furnace fuel of its slot; while it
-/// burns it makes 400 heat a tick for the boiler beside it (kept up to 20 ticks' worth, as the
-/// resistive heater's).
-fn tick_fuelwood_heater(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool> {
+/// burns it makes 400 heat a tick in its own capacitor, as the resistive heater does.
+fn tick_fuelwood_heater(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
     let mut burn = get_int(&entity.nbt, "burn_time");
     if burn == 0
         && let Some(Some(fuel)) = entity.items.first().cloned()
@@ -14779,13 +14858,13 @@ fn tick_fuelwood_heater(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Opt
         }
     }
     let active = burn > 0;
-    let mut heat = get_double(&entity.nbt, "heat_out").unwrap_or(0.0);
+    let mut heat = heater_heat(game, pos, &entity.nbt);
     if active {
         burn -= 1;
-        heat = (heat + boiler::HEAT_PER_FUEL_TICK).min(boiler::HEAT_PER_FUEL_TICK * 20.0);
+        heat.handle_heat(boiler::HEAT_PER_FUEL_TICK);
     }
     put_int(&mut entity.nbt, "burn_time", burn);
-    entity.nbt.insert("heat_out".into(), Tag::Double(heat.to_bits()));
+    simulate_heater(game, pos, entity, heat);
     Some(active)
 }
 

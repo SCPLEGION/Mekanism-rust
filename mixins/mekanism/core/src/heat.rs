@@ -54,6 +54,22 @@ impl HeatCapacitor {
         }
     }
 
+    /// `ITileHeatHandler.simulateAdjacent` for one side: when this capacitor is hotter than `sink` the two relax
+    /// toward their calorimetric mean through their conductions. Returns the temperature that moved (0 when it is
+    /// not hotter: the sink moves heat to us when it simulates).
+    pub fn give_to(&mut self, sink: &mut HeatCapacitor) -> f64 {
+        let (temp, sink_temp) = (self.temperature(), sink.temperature());
+        if temp <= sink_temp {
+            return 0.0;
+        }
+        let final_temp = (temp * self.capacity + sink_temp * sink.capacity) / (self.capacity + sink.capacity);
+        let to_transfer = (temp - final_temp) / (sink.inverse_conduction + self.inverse_conduction);
+        let heat = to_transfer * self.capacity;
+        self.handle_heat(-heat);
+        sink.handle_heat(heat);
+        to_transfer
+    }
+
     /// One side's loss to the air (`simulateEnvironment`'s loop body), with this side's inverse
     /// insulation; returns the temperature moved when it is hotter than ambient, else 0.
     pub fn lose_to_air(&mut self, inverse_insulation: f64) -> f64 {
@@ -74,6 +90,19 @@ mod tests {
         assert_eq!(c.temperature(), AMBIENT_TEMP);
         c.handle_heat(-1e9);
         assert_eq!(c.heat, 0.0);
+    }
+
+    #[test]
+    fn a_hot_capacitor_gives_heat_to_a_colder_sink_only() {
+        let mut hot = HeatCapacitor::new(100.0, 5.0, 10.0);
+        hot.handle_heat(100.0 * 100.0);
+        let mut cold = HeatCapacitor::new(1000.0, 1.0, 1.0);
+        let (before, total) = (hot.temperature(), hot.heat + cold.heat);
+        let moved = hot.give_to(&mut cold);
+        assert!(moved > 0.0 && hot.temperature() < before && cold.temperature() > 300.0);
+        assert!((hot.heat + cold.heat - total).abs() < 1e-6);
+        // The colder one gives nothing to the hotter.
+        assert_eq!(cold.give_to(&mut hot), 0.0);
     }
 
     #[test]
