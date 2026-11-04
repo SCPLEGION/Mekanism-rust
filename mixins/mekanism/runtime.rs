@@ -6704,6 +6704,12 @@ pub(super) fn gear_attributes(game: &mut Game<'_>, attributes: &mut Vec<(String,
         let amount = f64::from((0.333_333_34_f32 * count as f32).min(1.0));
         attributes.push(("minecraft:water_movement_efficiency".to_owned(), "mekanism:water_movement".to_owned(), amount, "add_value".to_owned()));
     }
+    // `MotorizedServoUnit.adjustAttributes`: +0.15 sneaking speed for each unit, one at most.
+    let servos = installed_modules(legs).get("mekanism:motorized_servo_unit").copied().unwrap_or(0);
+    if servos > 0 && module_on(legs, "mekanism:motorized_servo_unit") {
+        let amount = f64::from((0.15_f32 * servos as f32).min(1.0));
+        attributes.push(("minecraft:sneaking_speed".to_owned(), "mekanism:motorized_servo".to_owned(), amount, "add_value".to_owned()));
+    }
     if module_on(legs, "mekanism:gyroscopic_stabilization_unit") {
         attributes.push(("minecraft:submerged_mining_speed".to_owned(), "mekanism:submerged_mining_speed".to_owned(), 1.0, "add_value".to_owned()));
     }
@@ -22432,6 +22438,7 @@ fn radiation_server_tick(game: &mut Game<'_>) {
             }
             magnetic_attraction(g);
             nutritional_injection(g);
+            vision_enhancement_upkeep(g);
             // Told again when the digits of the level or of the dose would change (the dose is an attachment in Java).
             let (previous_level, previous_dose) = RAD_SENT.with_borrow(|s| s.get(&uuid).copied()).unwrap_or((None, None));
             let (new_level, new_dose) = (radiation::Previous::compare(previous_level, level), radiation::Previous::compare(previous_dose, dose));
@@ -22463,6 +22470,22 @@ fn suit_paste(stack: &ItemStack) -> u64 {
 
 fn set_suit_paste(stack: &mut ItemStack, amount: u64) {
     set_custom_long(stack, SUIT_PASTE_KEY, amount);
+}
+
+/// `GearConfig.mekaSuitEnergyUsageVisionEnhancement`.
+const VISION_ENERGY: u64 = 500;
+
+/// `ModuleVisionEnhancementUnit.tickServer`: the helmet's enabled unit takes 500 FE every tick (`useAllEnergy`: all or nothing).
+fn vision_enhancement_upkeep(g: &mut Game<'_>) {
+    if g.creative {
+        return;
+    }
+    if let Some(helmet) = g.armor[0].as_mut().filter(|s| &*s.item == modules::HELMET && module_on(s, "mekanism:vision_enhancement_unit")) {
+        let stored = stored_energy(helmet);
+        if stored >= VISION_ENERGY {
+            set_energy(helmet, stored - VISION_ENERGY);
+        }
+    }
 }
 
 /// `ModuleNutritionalInjectionUnit.tickServer`, for the player swapped in: while hungry and in a playing mode, the
