@@ -635,3 +635,15 @@ bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "immune", ty = "&mut Vec<String>", value = "&mut *immune" },
 ]
+
+[[injection]]
+id = "player-damage-rules"
+hook = "player_damage_rules"
+hook_version = 1
+kind = "HEAD"
+helper = "player_damage_rules.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "absorbed", ty = "f32", value = "absorbed" },
+  { name = "rules", ty = "&mut Vec<(String, f32)>", value = "&mut *rules" },
+]
