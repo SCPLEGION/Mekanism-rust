@@ -6965,6 +6965,9 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     }
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_long(&mut entity.nbt, "production", out.energy);
+    put_long(&mut entity.nbt, "last_burned", out.burned);
+    put_double(&mut entity.nbt, "transfer_loss", out.transfer_loss);
+    put_double(&mut entity.nbt, "env_loss", out.environment_loss);
     // `RenderFusionReactor`: the plasma shows while the reactor burns; its size follows the temperature
     // in units of 100 million kelvin, at the controller.
     let mut core = Compound::new();
@@ -7455,6 +7458,11 @@ fn layout(block: &str) -> Option<Layout> {
                 gauge("fuel", fusion::FUEL_CAPACITY, 84.0, 50.0, STANDARD),
                 gauge("plasma", FUSION_MAX_TEMP, 12.0, 50.0, STANDARD),
                 gauge("case", FUSION_MAX_TEMP, 66.0, 50.0, STANDARD),
+                // Packed numbers for the screens (never drawn): the heat given to water in the amount and to
+                // the air in the capacity (thousandths of a kelvin), the larger of the injection rate and the
+                // last burn.
+                gauge("stats_a", 1 << 58, 0.0, 0.0, SMALL),
+                gauge("stats_b", 1 << 58, 0.0, 0.0, SMALL),
             ],
             power: None,
             progress: None,
@@ -7757,6 +7765,15 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
                     tank.insert("minecraft:lava", st.last_boil & 0x7FFF_FFFF | (r.surface & 0xFFFF) << 31 | (r.assemblies & 0x1FFF) << 47);
                     tank.capacity = st.capacity as u64;
                 }
+            }
+        }
+        if g.key.starts_with("stats_") && kind(&entity.id) == Some(Kind::FusionPort) {
+            tank = ChemicalTank::new(g.capacity);
+            if g.key == "stats_a" {
+                tank.insert("minecraft:lava", (get_double(&entity.nbt, "transfer_loss").unwrap_or(0.0).max(0.0) * 1_000.0) as u64);
+                tank.capacity = (get_double(&entity.nbt, "env_loss").unwrap_or(0.0).max(0.0) * 1_000.0) as u64;
+            } else {
+                tank.insert("minecraft:lava", fusion_injection(&entity.nbt).max(get_long(&entity.nbt, "last_burned")));
             }
         }
         if matches!(g.key, "plasma" | "case") && kind(&entity.id) == Some(Kind::FusionPort) {
@@ -10368,13 +10385,13 @@ fn draw_nucleosynthesizer(game: &Game<'_>, batch: &mut horizon_client::hud::HudB
 
 /// The injection rate packet: the port's position and the rate (a byte).
 const FUSION_CHANNEL: &str = "mekanism:fusion_injection";
-const FUSION_TAB_Y: [f32; 2] = [6.0, 34.0];
+const FUSION_TAB_Y: [f32; 3] = [6.0, 34.0, 62.0];
 const FUSION_BACK: [f32; 4] = [6.0, 6.0, 14.0, 14.0];
 const FUSION_FIELD: [f32; 4] = [103.0, 115.0, 26.0, 11.0];
 
 thread_local! {
     /// The Fusion Reactor screen open beside the main one: the port, the tick it was last drawn and the view
-    /// (1 heat, 2 fuel).
+    /// (1 heat, 2 fuel, 3 stats).
     static FUSION_VIEW: std::cell::Cell<Option<([i32; 3], u64, u8)>> = const { std::cell::Cell::new(None) };
     static FUSION_TEXT: std::cell::RefCell<freq::TextBox> = std::cell::RefCell::new(freq::TextBox::default());
 }
@@ -10388,11 +10405,15 @@ fn fusion_view(block: &str) -> Option<u8> {
 
 /// The tabs a view shows (view numbers 1 heat, 2 fuel): the others', at their own heights.
 fn fusion_tabs(view: u8) -> Vec<(u8, f32)> {
-    (1..=2u8).filter(|&v| v != view).map(|v| (v, FUSION_TAB_Y[usize::from(v) - 1])).collect()
+    (1..=3u8).filter(|&v| v != view).map(|v| (v, FUSION_TAB_Y[usize::from(v) - 1])).collect()
 }
 
 fn fusion_tab_icon(view: u8) -> String {
-    if view == 1 { format!("{SPRITES}transmission/heat") } else { "mekanismgenerators:gui/sprites/button/fuel".to_owned() }
+    match view {
+        1 => format!("{SPRITES}transmission/heat"),
+        3 => format!("{SPRITES}button/stats"),
+        _ => "mekanismgenerators:gui/sprites/button/fuel".to_owned(),
+    }
 }
 
 fn draw_fusion_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2], view: u8) {
@@ -10459,6 +10480,26 @@ fn draw_fusion_view(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
     let progress = |game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, name: &str, at: [f32; 2], full: bool| {
         sprite(game, batch, &format!("progress/{name}/{}", if full { "full" } else { "empty" }), [0.0, 0.0, 28.0, 8.0], [ox + at[0], oy + at[1], 28.0, 8.0]);
     };
+    if view == 3 {
+        // `GuiFusionReactorStats`: what the reactor reaches air cooled and water cooled.
+        let rate = read_wide(data, DATA_GAUGES + 8 * GAUGE_SLOTS);
+        let k = |t: f64| mekanism_core::energy::format_unit(t, "K");
+        let fe = |v: u64| mekanism_core::energy::format_fe(v);
+        let mut text = |t: &str, x: f32, y: f32, rgb: u32| game.native_text(batch, t, [ox + x + 6.0, oy + y], rgb, false);
+        for (active, top, name, color) in [(false, 26.0, "Air-Cooled", 0x00_AA00), (true, 92.0, "Water-Cooled", 0x00_00AA)] {
+            text(name, 0.0, top, color);
+            text(&format!("Min. Inject Rate: {}", fusion::min_injection(active)), 4.0, top + 10.0, 0x40_4040);
+            text(&format!("Ignition Temp: {}", k(fusion::ignition(active))), 4.0, top + 20.0, 0x40_4040);
+            text(&format!("Max. Plasma Temp: {}", k(fusion::max_plasma(active, rate))), 4.0, top + 30.0, 0x40_4040);
+            let casing = fusion::max_casing(active, rate);
+            text(&format!("Max. Casing Temp: {}", k(casing)), 4.0, top + 40.0, 0x40_4040);
+            text(&format!("Passive Generation: {}/t", fe(fusion::passive_generation(casing))), 4.0, top + 50.0, 0x40_4040);
+            if active {
+                text(&format!("Steam Production: {} mB/t", thousands(fusion::steam_per_tick(casing))), 4.0, top + 60.0, 0x40_4040);
+            }
+        }
+        return;
+    }
     if view == 1 {
         let (plasma, _, _) = fusion_gauge(data, 5);
         let (case, _, _) = fusion_gauge(data, 6);
@@ -10565,7 +10606,7 @@ fn fusion_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<Strin
     let view = fusion_view(block).unwrap_or(0);
     for (v, ty) in fusion_tabs(view) {
         if inside(at, [STATS_TAB_BUTTON[0], ty + 4.0, 18.0, 18.0]) {
-            lines.push(if v == 1 { "Heat" } else { "Fuel" }.to_owned());
+            lines.push(match v { 1 => "Heat", 3 => "Stats", _ => "Fuel" }.to_owned());
             return true;
         }
     }
@@ -10573,9 +10614,19 @@ fn fusion_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<Strin
         lines.push("Back".to_owned());
         return true;
     }
+    // `GuiEnergyTab`: what the buffer holds and `getPassiveGeneration(false, true)` from the casing's temperature.
     if inside(at, [-26.0, 137.0, 26.0, 26.0]) {
-        lines.push(format!("Storing: {}", mekanism_core::energy::format_fe(read_wide(data, DATA_STORED))));
-        lines.push(format!("Producing: {}/t", mekanism_core::energy::format_fe(read_wide(data, DATA_USAGE))));
+        let fe = mekanism_core::energy::format_fe;
+        let (case, ..) = fusion_gauge(data, 6);
+        lines.push(format!("Storing: {}/{}", fe(read_wide(data, DATA_STORED)), fe(read_wide(data, DATA_CAPACITY))));
+        lines.push(format!("Producing: {}/t", fe(fusion::passive_generation(case as f64))));
+        return true;
+    }
+    // `GuiHeatTab`: what the casing gave to the water and to the air this tick.
+    if inside(at, [-26.0, 109.0, 26.0, 26.0]) {
+        let k = |v: u64| mekanism_core::energy::format_unit(v as f64 / 1_000.0, "K");
+        lines.push(format!("Transferred: {}/t", k(read_wide(data, DATA_GAUGES + 7 * GAUGE_SLOTS))));
+        lines.push(format!("Dissipated: {}/t", k(read_wide(data, DATA_GAUGES + 7 * GAUGE_SLOTS + 4))));
         return true;
     }
     let chemical = |index: usize, lines: &mut Vec<String>| {
@@ -10599,11 +10650,10 @@ fn fusion_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<Strin
             } else if hit(156.0, 84.0, SMALL) {
                 chemical(3, lines);
             } else if hit(120.0, 46.0, SMALL) {
-                lines.push(format!(
-                    "{} / {} FE",
-                    read_wide(data, DATA_STORED),
-                    read_wide(data, DATA_CAPACITY)
-                ));
+                // `GuiEnergyGauge`: "Empty" with nothing in it, else the stored and the capacity.
+                let fe = mekanism_core::energy::format_fe;
+                let (stored, capacity) = (read_wide(data, DATA_STORED), read_wide(data, DATA_CAPACITY));
+                lines.push(if stored == 0 { "Empty".to_owned() } else { format!("{}/{}", fe(stored), fe(capacity)) });
             }
             true
         }
@@ -11700,11 +11750,11 @@ fn warning_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<Stri
 pub(super) fn screen_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
     screen_tooltip_inner(game, block, data, at, lines);
     // `GuiEnergyTab` and `GuiHeatTab` end their tooltips with the unit in use.
-    let energy_tab = layout(block).is_some_and(|l| l.power.is_some()) || matches!(kind(block), Some(Kind::TurbineValve | Kind::InductionPort));
+    let energy_tab = layout(block).is_some_and(|l| l.power.is_some()) || matches!(kind(block), Some(Kind::TurbineValve | Kind::InductionPort | Kind::FusionPort));
     if energy_tab && !lines.is_empty() && inside(at, [-26.0, 137.0, 26.0, 26.0]) && !lines.iter().any(|l| l.starts_with("Unit:")) {
         lines.push("Unit: FE".to_owned());
     }
-    let heat_tab = matches!(kind(block), Some(Kind::Heater | Kind::FuelwoodHeater | Kind::Evaporation | Kind::BoilerValve | Kind::HeatGenerator));
+    let heat_tab = matches!(kind(block), Some(Kind::Heater | Kind::FuelwoodHeater | Kind::Evaporation | Kind::BoilerValve | Kind::HeatGenerator | Kind::FusionPort | Kind::FissionPort));
     if heat_tab && !lines.is_empty() && inside(at, [-26.0, 109.0, 26.0, 26.0]) && !lines.iter().any(|l| l.starts_with("Unit:")) {
         lines.push("Unit: Kelvin".to_owned());
     }

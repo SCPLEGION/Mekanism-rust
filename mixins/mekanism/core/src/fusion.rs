@@ -114,10 +114,14 @@ pub struct Tanks {
 }
 
 /// What one tick gave: energy (J), and fuel burned (mB).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Output {
     pub energy: u64,
     pub burned: u64,
+    /// `lastTransferLoss`: the heat the casing gave to water this tick.
+    pub transfer_loss: f64,
+    /// `lastEnvironmentLoss`: the heat the casing gave to the air this tick.
+    pub environment_loss: f64,
 }
 
 /// What the reactor's lasers and hohlraum do to start it, simplified: the plasma is heated to
@@ -161,6 +165,7 @@ pub fn tick(p: &mut Plasma, t: &mut Tanks, injection: u64, steam_capacity: u64) 
     }
     // Plasma to casing.
     let mut case_heat = 0.0;
+    let mut lost_to_water = 0.0;
     let plasma_case = PLASMA_CASE_CONDUCTIVITY * (p.plasma - p.case);
     p.plasma -= plasma_case / PLASMA_HEAT_CAPACITY;
     case_heat += plasma_case;
@@ -172,14 +177,55 @@ pub fn tick(p: &mut Plasma, t: &mut Tanks, injection: u64, steam_capacity: u64) 
             .min(t.water);
         t.water -= boil;
         t.steam += boil;
-        case_heat -= boil as f64 * WATER_ENTHALPY / STEAM_EFFICIENCY;
+        lost_to_water = boil as f64 * WATER_ENTHALPY / STEAM_EFFICIENCY;
+        case_heat -= lost_to_water;
     }
     // Casing to air, through the thermocouples.
     let case_air = CASING_CONDUCTIVITY * (p.case - AMBIENT);
     case_heat -= case_air;
     let energy = (case_air * THERMOCOUPLE_EFFICIENCY).max(0.0) as u64;
     p.case += case_heat;
-    Output { energy, burned }
+    Output { energy, burned, transfer_loss: lost_to_water, environment_loss: if case_air.abs() > 1e-6 { case_air } else { 0.0 } }
+}
+
+/// `getMinInjectionRate`: the lowest even injection rate that keeps the plasma burning, `active` for water cooling.
+pub fn min_injection(active: bool) -> u64 {
+    let k = if active { WATER_HEATING_RATIO } else { 0.0 };
+    let air = CASING_CONDUCTIVITY;
+    let a_min = BURN_TEMPERATURE * PLASMA_CASE_CONDUCTIVITY * (k + air)
+        / (ENERGY_PER_FUEL * (PLASMA_CASE_CONDUCTIVITY + k + air) - PLASMA_CASE_CONDUCTIVITY * (k + air));
+    2 * (a_min / 2.0).ceil() as u64
+}
+
+/// `getMaxPlasmaTemperature`; `rate` is the larger of the injection rate and the last burn.
+pub fn max_plasma(active: bool, rate: u64) -> f64 {
+    let k = if active { WATER_HEATING_RATIO } else { 0.0 };
+    let air = CASING_CONDUCTIVITY;
+    rate as f64 * ENERGY_PER_FUEL / PLASMA_CASE_CONDUCTIVITY * (PLASMA_CASE_CONDUCTIVITY + k + air) / (k + air)
+}
+
+/// `getMaxCasingTemperature`.
+pub fn max_casing(active: bool, rate: u64) -> f64 {
+    let k = if active { WATER_HEATING_RATIO } else { 0.0 };
+    ENERGY_PER_FUEL * rate as f64 / (k + CASING_CONDUCTIVITY)
+}
+
+/// `getIgnitionTemperature`.
+pub fn ignition(active: bool) -> f64 {
+    let k = if active { WATER_HEATING_RATIO } else { 0.0 };
+    let air = CASING_CONDUCTIVITY;
+    BURN_TEMPERATURE * ENERGY_PER_FUEL * (PLASMA_CASE_CONDUCTIVITY + k + air)
+        / (ENERGY_PER_FUEL * (PLASMA_CASE_CONDUCTIVITY + k + air) - PLASMA_CASE_CONDUCTIVITY * (k + air))
+}
+
+/// `getPassiveGeneration` at a casing temperature.
+pub fn passive_generation(case_temp: f64) -> u64 {
+    (THERMOCOUPLE_EFFICIENCY * CASING_CONDUCTIVITY * case_temp).max(0.0) as u64
+}
+
+/// `getSteamPerTick` at a casing temperature.
+pub fn steam_per_tick(case_temp: f64) -> u64 {
+    (STEAM_EFFICIENCY * WATER_HEATING_RATIO * case_temp / WATER_ENTHALPY).clamp(0.0, f64::from(i32::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -206,7 +252,7 @@ mod tests {
             ..Default::default()
         };
         let out = tick(&mut p, &mut t, 2, steam_capacity(2));
-        assert_eq!(out, Output::default());
+        assert_eq!(out.energy, 0);
         assert_eq!((t.deuterium, p.burning), (100, false));
     }
 
@@ -229,6 +275,17 @@ mod tests {
         // = 0.05 × 0.1 × 200 MK = 1 MJ a tick.
         assert!((p.case - 200_000_300.0).abs() < 1_000.0, "{}", p.case);
         assert!(out.energy.abs_diff(1_000_000) < 100, "{}", out.energy);
+    }
+
+    #[test]
+    fn the_statistics_follow_mekanisms_formulas() {
+        assert_eq!(min_injection(false), 2);
+        assert_eq!(min_injection(true), 2);
+        assert!((ignition(false) - 100_000_000.0 * 10_000_000.0 * 0.3 / (10_000_000.0 * 0.3 - 0.0)).abs() < 1.0);
+        // Air cooled, two a tick: 2 × 10 MJ / 0.1 = 200 MK at the casing, 1 MJ a tick passive.
+        assert_eq!(max_casing(false, 2), 200_000_000.0);
+        assert_eq!(passive_generation(max_casing(false, 2)), 1_000_000);
+        assert_eq!(steam_per_tick(2e8), 1_200_000);
     }
 
     #[test]
