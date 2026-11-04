@@ -588,3 +588,50 @@ bindings = [
   { name = "kind", ty = "&str", value = "kind" },
   { name = "hidden", ty = "&mut bool", value = "&mut *hidden" },
 ]
+
+[[injection]]
+id = "using-tick"
+hook = "using_tick"
+hook_version = 1
+kind = "HEAD"
+helper = "using_tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+  { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
+  { name = "keep", ty = "&mut bool", value = "&mut *keep" },
+]
+
+[[injection]]
+id = "hud"
+hook = "hud"
+hook_version = 1
+kind = "HEAD"
+helper = "hud.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+]
+
+[[injection]]
+id = "wheel"
+hook = "wheel"
+hook_version = 1
+kind = "HEAD"
+helper = "wheel.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "steps", ty = "f32", value = "steps" },
+  { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
+]
+
+[[injection]]
+id = "player-immunities"
+hook = "player_immunities"
+hook_version = 1
+kind = "HEAD"
+helper = "player_immunities.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "immune", ty = "&mut Vec<String>", value = "&mut *immune" },
+]

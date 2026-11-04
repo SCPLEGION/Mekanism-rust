@@ -601,6 +601,9 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     let Some(k) = kind(&entity.id) else {
         return;
     };
+    if game.ticks % 20 == 0 {
+        radiation_holder(game, pos, &entity.nbt);
+    }
     // A type whose auto-eject is off gives out through no face (the window's eject button): as if
     // every face were Input (0b10 each), which `gives_out` reads.
     let no_eject = get_int(&entity.nbt, "no_eject");
@@ -1656,9 +1659,53 @@ thread_local! {
     static TANKS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
+thread_local! {
+    /// The machines the client has seen whose working makes a sound, with their sound event.
+    static MACHINE_SOUNDS: std::cell::RefCell<std::collections::HashMap<[i32; 3], &'static str>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The sound event a machine loops while it works (`SoundEvents` in `MekanismSounds`, played by
+/// `TileComponentSound`), by block id; factories sound as the machine of their recipe.
+fn machine_sound(id: &str) -> Option<&'static str> {
+    let name = id.strip_prefix("mekanism:")?;
+    let name = ["basic_", "advanced_", "elite_", "ultimate_"].iter().find_map(|t| name.strip_prefix(t)).unwrap_or(name);
+    Some(match name {
+        "antiprotonic_nucleosynthesizer" => "mekanism:tile.machine.antiprotonic_nucleosynthesizer",
+        "chemical_crystallizer" => "mekanism:tile.machine.chemical_crystallizer",
+        "chemical_dissolution_chamber" => "mekanism:tile.machine.chemical_dissolution_chamber",
+        "chemical_infuser" => "mekanism:tile.machine.chemical_infuser",
+        "chemical_injection_chamber" | "injecting_factory" => "mekanism:tile.machine.chemical_injection_chamber",
+        "chemical_oxidizer" => "mekanism:tile.machine.chemical_oxidizer",
+        "chemical_washer" => "mekanism:tile.machine.chemical_washer",
+        "combiner" | "combining_factory" => "mekanism:tile.machine.combiner",
+        "osmium_compressor" | "compressing_factory" => "mekanism:tile.machine.compressor",
+        "crusher" | "crushing_factory" => "mekanism:tile.machine.crusher",
+        "electrolytic_separator" => "mekanism:tile.machine.electrolytic_separator",
+        "energized_smelter" | "smelting_factory" => "mekanism:tile.machine.energized_smelter",
+        "enrichment_chamber" | "enriching_factory" => "mekanism:tile.machine.enrichment_chamber",
+        "isotopic_centrifuge" => "mekanism:tile.machine.isotopic_centrifuge",
+        "metallurgic_infuser" | "infusing_factory" => "mekanism:tile.machine.metallurgic_infuser",
+        "nutritional_liquifier" => "mekanism:tile.machine.nutritional_liquifier",
+        "painting_machine" => "mekanism:tile.machine.painting_machine",
+        "pigment_extractor" => "mekanism:tile.machine.pigment_extractor",
+        "pigment_mixer" => "mekanism:tile.machine.pigment_mixer",
+        "precision_sawmill" | "sawing_factory" => "mekanism:tile.machine.precision_sawmill",
+        "pressurized_reaction_chamber" => "mekanism:tile.machine.pressurized_reaction_chamber",
+        "purification_chamber" | "purifying_factory" => "mekanism:tile.machine.purification_chamber",
+        "resistive_heater" => "mekanism:tile.machine.resistive_heater",
+        "rotary_condensentrator" => "mekanism:tile.machine.rotary_condensentrator",
+        _ => return None,
+    })
+}
+
 /// A block entity's client view arrived (`native_client_block_entity_changed`): a wind generator's rotor or a
 /// fluid tank's contents are for the world to draw.
 pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
+    if let Some(event) = machine_sound(id) {
+        MACHINE_SOUNDS.with_borrow_mut(|m| {
+            m.insert(pos, event);
+        });
+    }
     if id == "mekanismgenerators:wind_generator" {
         ROTORS.with_borrow_mut(|r| {
             r.entry(pos).or_insert((0.0, 0));
@@ -1995,6 +2042,34 @@ pub(super) fn world_quads(game: &Game<'_>, quads: &mut Vec<super::native_hooks::
     let (right, up) = game.native_camera_axes();
     let (right, up) = (right.map(|v| v as f32), up.map(|v| v as f32));
     let corner = |c: [f32; 3], x: f32, y: f32| -> [f64; 3] { std::array::from_fn(|k| f64::from(c[k] + right[k] * x + up[k] * y)) };
+    laser_beam_quads(ticks, quads);
+    radiation_quads(right, up, quads);
+    // `RenderFlame`: two crossed planes along the flight, fading over the flame's life.
+    FLAME_VIEW.with_borrow_mut(|view| {
+        for f in view.iter_mut() {
+            // A word that has just come is stamped with this tick; a flame not heard of for a while is gone.
+            if f.arrived == u64::MAX {
+                f.arrived = ticks;
+            }
+            if ticks > f.arrived + 2 {
+                continue;
+            }
+            let since = (ticks - f.arrived) as f64 + f64::from(partial);
+            let at = [0, 1, 2].map(|i| f.pos[i] + f.vel[i] * since);
+            let alpha = flamethrower::alpha(f.age as f32 + since as f32).clamp(0.0, 1.0);
+            if alpha <= 0.0 {
+                continue;
+            }
+            for corners in flamethrower::quads(at, f.vel) {
+                quads.push(super::native_hooks::NativeWorldQuad {
+                    corners,
+                    color: ((alpha * 255.0) as u32) << 24 | 0xFF_FFFF,
+                    sprite: Some("mekanism:gui/flame".into()),
+                    uv: [0.0, 0.0, 0.5, 0.1],
+                });
+            }
+        }
+    });
     SPS_FX.with_borrow_mut(|set| {
         set.retain(|pos, fx| {
             let Some((id, c)) = game.native_client_block_entity(*pos) else {
@@ -2495,24 +2570,24 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
             continue;
         };
         let light_at = [at[0].floor() as i32, at[1].floor() as i32 + 1, at[2].floor() as i32];
-        // The skin's own model, and its second texture every third tick that the Robit has moved.
-        let prefix = match ROBIT_SKINS.with_borrow(|m| m.get(&id).cloned()).as_deref() {
-            Some("mekanism:allay" | "allay") => "allay",
-            _ => "robit",
-        };
+        // The skin's own models, and its next texture every third tick that the Robit has moved
+        // (`EntityRobit.getModelTexture`).
+        let key = ROBIT_SKINS.with_borrow(|m| m.get(&id).cloned()).unwrap_or_default();
+        let skin = mekanism_core::robit_skins::name(&key).to_owned();
+        let count = mekanism_core::robit_skins::textures(&key).max(1) as u32;
         let frame = ROBIT_FRAMES.with_borrow_mut(|f| {
             let e = f.entry(id).or_insert((0, at, now));
             while e.2 < now {
                 e.2 += 1;
                 if (e.1[0] - at[0]).abs() + (e.1[2] - at[2]).abs() > 0.001 && e.2 % 3 == 0 {
-                    e.0 = (e.0 + 1) % 2;
+                    e.0 = (e.0 + 1) % count;
                 }
             }
             e.1 = at;
-            e.0
+            e.0 % count
         });
-        let suffix = if frame == 0 { "" } else { "2" };
-        for (name, full_bright) in [(format!("mekanism:{prefix}_body{suffix}"), false), (format!("mekanism:{prefix}_glow{suffix}"), true)] {
+        let suffix = if frame == 0 { String::new() } else { format!("_{frame}") };
+        for (name, full_bright) in [(format!("mekanism:robit_body_{skin}{suffix}"), false), (format!("mekanism:robit_glow_{skin}{suffix}"), true)] {
             models.push(super::native_hooks::NativeWorldModel {
                 model: name,
                 position: at,
@@ -5835,6 +5910,18 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
         portable_teleporter_use(game, claimed);
         return;
     }
+    if !*claimed && &*stack.item == GEIGER_COUNTER && game.native_on(MOD_ID) {
+        geiger_counter_use(game, claimed);
+        return;
+    }
+    if !*claimed && &*stack.item == DOSIMETER && game.native_on(MOD_ID) {
+        dosimeter_use(game, claimed);
+        return;
+    }
+    if !*claimed && &*stack.item == flamethrower::ITEM && game.native_on(MOD_ID) {
+        flamethrower_use(game, claimed);
+        return;
+    }
     if !*claimed && &*stack.item == seismic::READER && game.native_on(MOD_ID) {
         seismic_reader_use(game, claimed);
         return;
@@ -6199,19 +6286,28 @@ fn is_jetpack(stack: &ItemStack) -> bool {
     JETPACKS.contains(&&*stack.item) || (&*stack.item == modules::BODYARMOR && modules_of(stack).contains_key("mekanism:jetpack_unit"))
 }
 
+/// The chemical an item with a chemical tank holds: a scuba tank oxygen, a jetpack or flamethrower hydrogen.
+fn item_chemical(stack: &ItemStack) -> &'static str {
+    if &*stack.item == SCUBA_TANK { "mekanism:oxygen" } else { "mekanism:hydrogen" }
+}
+
 fn jetpack_capacity(stack: &ItemStack) -> u64 {
-    if &*stack.item == modules::BODYARMOR { modules::SUIT_JETPACK_CAPACITY } else { gear::JETPACK_CAPACITY }
+    if &*stack.item == SCUBA_TANK {
+        SCUBA_CAPACITY
+    } else if &*stack.item == flamethrower::ITEM {
+        flamethrower::CAPACITY
+    } else if &*stack.item == modules::BODYARMOR { modules::SUIT_JETPACK_CAPACITY } else { gear::JETPACK_CAPACITY }
 }
 
 fn jetpack_fuel(stack: &ItemStack) -> u64 {
     item_tank(stack, CHEMICAL_KEY, jetpack_capacity(stack))
-        .filter(|t| t.chemical.as_deref() == Some("mekanism:hydrogen"))
+        .filter(|t| t.chemical.as_deref() == Some(item_chemical(stack)))
         .map_or(0, |t| t.amount)
 }
 
 fn set_jetpack_fuel(stack: &mut ItemStack, amount: u64) {
     let mut tank = ChemicalTank::new(jetpack_capacity(stack));
-    tank.insert("mekanism:hydrogen", amount);
+    tank.insert(item_chemical(stack), amount);
     let mut c = Compound::new();
     put_tank(&mut c, "t", &tank);
     let value = match c.get(&JavaString::from("t")) {
@@ -6221,10 +6317,267 @@ fn set_jetpack_fuel(stack: &mut ItemStack, amount: u64) {
     set_custom_compound(stack, CHEMICAL_KEY, value);
 }
 
+/// The sounds that go on while something works (`SoundHandler.startTileSound`, `ItemFlamethrower`'s
+/// `FlamethrowerSound`): each active Industrial Alarm sounds from its block, and a flamethrower sounds
+/// from the first live flame (`flamethrower_active`) or, held and idle, near its holder (`flamethrower_idle`).
+/// Horizon's `native_loop_sound` stops a loop that is not asked for again.
+fn loop_sounds(game: &mut Game<'_>) {
+    let active: Vec<[i32; 3]> = ALARMS.with_borrow(|a| a.iter().copied().collect());
+    for pos in active {
+        if game.native_block_property(pos, "active").as_deref() == Some("true") {
+            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+            game.native_loop_sound(&format!("mekanism:alarm:{pos:?}"), "mekanism:tile.machine.industrial_alarm", Some(at), 1.0, 1.0);
+        }
+    }
+    let machines: Vec<([i32; 3], &'static str)> = MACHINE_SOUNDS.with_borrow(|m| m.iter().map(|(p, e)| (*p, *e)).collect());
+    for (pos, event) in machines {
+        if game.native_client_block_entity(pos).is_none() {
+            MACHINE_SOUNDS.with_borrow_mut(|m| m.remove(&pos));
+            continue;
+        }
+        // The machine's `lit` (a barrel's `open`) stands in for Mekanism's `active`.
+        let on = |p: &str| game.native_block_property(pos, p).as_deref() == Some("true");
+        if on("lit") || on("open") {
+            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+            game.native_loop_sound(&format!("mekanism:machine:{pos:?}"), event, Some(at), 1.0, 1.0);
+        }
+    }
+    let ticks = game.ticks as u64;
+    // A laser sounds from its front while it fires (a beam arrived in the last ticks).
+    let beams: Vec<[f64; 3]> = LASER_BEAMS.with_borrow(|b| b.iter().filter(|b| b.arrived != u64::MAX && ticks <= b.arrived + 1).map(|b| b.from).collect());
+    for from in beams {
+        game.native_loop_sound(&format!("mekanism:laser:{:?}", from.map(|v| (v * 2.0) as i64)), "mekanism:tile.machine.laser", Some(from), 1.0, 1.0);
+    }
+    let flame = FLAME_VIEW.with_borrow(|view| view.iter().find(|f| f.arrived != u64::MAX && ticks <= f.arrived + 2).map(|f| f.pos));
+    if let Some(at) = flame {
+        game.native_loop_sound("mekanism:flame", "mekanism:item.flamethrower.active", Some(at), 1.0, 1.0);
+        game.native_stop_loop_sound("mekanism:flame_idle");
+    } else if game.held_mut().as_ref().is_some_and(|s| &*s.item == flamethrower::ITEM) {
+        game.native_loop_sound("mekanism:flame_idle", "mekanism:item.flamethrower.idle", None, 0.3, 1.0);
+    }
+}
+
+thread_local! {
+    /// `HUDRenderer.prevRotationYaw` and `prevRotationPitch` (the HUD lags a turning head), and the last frame.
+    static HUD_LAG: std::cell::Cell<Option<(f32, f32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// `MekanismHUD.render`: the text of the items worn and held (bottom left, at the HUD scale 0.6), then, with a
+/// MekaSuit helmet, `HUDRenderer.renderHUD`: compass, energy of the suit, icons of its modules, all lagging the
+/// head's turn a little. Colours: `ClientConfig` defaults (opacity 0.4, `0x40F5F0`).
+pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    if !game.native_on(MOD_ID) || !game.native_playing() || game.spectator() {
+        return;
+    }
+    let (width, height) = (batch.width, batch.height);
+    let gray = 0xCFCFCF;
+    let dark = 0x7A7A7A;
+    let orange = 0xFFA160;
+    let held = game.inventory.get(game.selected).cloned().flatten();
+    let slots: [Option<ItemStack>; 6] = [game.armor[0].clone(), game.armor[1].clone(), game.armor[2].clone(), game.armor[3].clone(), held, game.offhand.clone()];
+    // Each line is a list of (text, rgb) pieces.
+    type Line = Vec<(String, u32)>;
+    let mut groups: Vec<Vec<Line>> = Vec::new();
+    for (slot, stack) in slots.iter().enumerate() {
+        let Some(stack) = stack else {
+            continue;
+        };
+        let item: &str = &stack.item;
+        let mut lines: Vec<Line> = Vec::new();
+        if JETPACKS.contains(&item) && slot == 1 {
+            let (stored, capacity) = (jetpack_fuel(stack), jetpack_capacity(stack));
+            lines.push(vec![("Jetpack Mode: Regular".into(), dark)]);
+            lines.push(vec![
+                ("Jetpack Fuel: ".into(), dark),
+                (stored.to_string(), orange),
+                (" (".into(), dark),
+                (format!("{:.0}", 100.0 * stored as f64 / capacity as f64), orange),
+                ("%)".into(), dark),
+            ]);
+        } else if item == SCUBA_TANK && slot == 1 {
+            let on = scuba_flowing(stack);
+            lines.push(vec![("Scuba Tank: ".into(), dark), (if on { "On" } else { "Off" }.into(), if on { 0x75FF89 } else { 0xFF5555 })]);
+            lines.push(vec![("Oxygen: ".into(), dark), (jetpack_fuel(stack).to_string(), orange)]);
+        } else if FREE_RUNNERS.contains(&item) && slot == 3 {
+            lines.push(vec![(format!("Runners Mode: {}", free_runner_mode(stack).label()), gray)]);
+            lines.push(vec![("Runners Energy: ".into(), 0x75FF89), (mekanism_core::energy::format_fe(stored_energy(stack)), gray)]);
+        } else if item == flamethrower::ITEM {
+            let stored = jetpack_fuel(stack);
+            lines.push(vec![("Flamethrower: ".into(), gray), if stored > 0 { (stored.to_string(), orange) } else { ("No chemicals stored.".into(), orange) }]);
+            lines.push(vec![(format!("Mode: {}", flamethrower_mode(stack).label()), 0xFFFFFF)]);
+        } else if item == DISASSEMBLER {
+            let mode = disassembler_mode(stack);
+            lines.push(vec![("Mode: ".into(), gray), (mode.label().into(), 0x559EFF)]);
+            lines.push(vec![("Efficiency: ".into(), gray), (mode.efficiency().to_string(), 0x559EFF)]);
+        } else if item == CONFIGURATOR {
+            lines.push(vec![(format!("Mode: {}", configurator_mode(stack).name()), 0xD55ECB)]);
+        }
+        if !lines.is_empty() {
+            groups.push(lines);
+        }
+    }
+    let count: usize = groups.iter().map(Vec::len).sum();
+    let scale = 0.6f32;
+    let mut text_top = height;
+    if count > 0 {
+        let y_scale = (height / scale) as i32;
+        let start = (groups.len() * 2 + count * 9) as i32;
+        let mut y = (y_scale - start) as f32;
+        text_top = (y * scale).trunc();
+        let first = batch.vertices.len();
+        for group in &groups {
+            for line in group {
+                let mut x = 2.0;
+                for (text, rgb) in line {
+                    let [_, r, g, b] = rgb.to_be_bytes();
+                    x += batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(text), x, y, horizon_client::hud::rgba(r, g, b, 0xFF), false);
+                }
+                y += 9.0;
+            }
+            y += 2.0;
+        }
+        batch.scale_since(first, 0.0, 0.0, scale, scale);
+    }
+    if !game.armor[0].as_ref().is_some_and(|s| &*s.item == modules::HELMET) {
+        return;
+    }
+    let Some(me) = game.native_player() else {
+        return;
+    };
+    // `HUDRenderer.update`, then the jitter: the HUD slips against a turning head by the root of the lag.
+    let (prev_yaw, prev_pitch) = HUD_LAG.get().unwrap_or((me.yaw, me.pitch));
+    let jitter = 6.0;
+    let (prev_yaw, prev_pitch) = (prev_yaw + (me.yaw - prev_yaw) / jitter, prev_pitch + (me.pitch - prev_pitch) / jitter);
+    HUD_LAG.set(Some((prev_yaw, prev_pitch)));
+    let abs_sqrt = |v: f32| if v < 0.0 { -v.abs().sqrt() } else { v.sqrt() };
+    let (jx, jy) = (-abs_sqrt(me.yaw - prev_yaw), -abs_sqrt(me.pitch - prev_pitch));
+    let alpha = 0x66u32;
+    let regular = 0x40F5F0u32;
+    let colour = |rgb: u32| {
+        let [_, r, g, b] = rgb.to_be_bytes();
+        horizon_client::hud::rgba(r, g, b, alpha as u8)
+    };
+    // The compass (`CompassPiP`): the plate turned with the head, tilted 60 degrees, N, E, S, W on its rim.
+    let (cx, cy) = (25.0 + 50.0 + jx, (height - 20.0).min(text_top as f32) - 80.0 + 50.0 + jy);
+    let angle = std::f32::consts::PI - me.yaw.to_radians();
+    let (sin, cos) = angle.sin_cos();
+    let tilt = |u: f32, v: f32| [cx + u * cos - v * sin, cy + 0.5 * (u * sin + v * cos)];
+    if let Some(r) = game.gui.atlas.sprites.get("mekanism:gui/hud_compass").copied() {
+        let corners = [tilt(-50.0, -50.0), tilt(-50.0, 50.0), tilt(50.0, 50.0), tilt(50.0, -50.0)];
+        batch.quad(corners, [[r.u0, r.v0], [r.u0, r.v1], [r.u1, r.v1], [r.u1, r.v0]], colour(regular));
+    }
+    let coords = format!("{}, {}, {}", me.x.floor() as i32, me.y.floor() as i32, me.z.floor() as i32);
+    let first = batch.vertices.len();
+    let w = game.native_text_width(&coords);
+    batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(&coords), cx - w / 2.0, cy - 4.0, colour(regular), false);
+    batch.scale_since(first, cx, cy, 0.7, 0.7);
+    for (letter, shift) in [("N", 0.0f32), ("E", std::f32::consts::FRAC_PI_2), ("S", std::f32::consts::PI), ("W", -std::f32::consts::FRAC_PI_2)] {
+        let (s, c) = (angle + shift).sin_cos();
+        let (ax, ay) = (cx + 50.0 * s, cy - 50.0 * c);
+        let first = batch.vertices.len();
+        batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(letter), ax - 2.5, ay - 4.0, colour(regular), false);
+        batch.scale_since(first, cx, cy, 1.0, 0.5);
+    }
+    // `renderMekaSuitEnergyIcons`: each worn piece and each Meka-Tool in hand, its icon and percent of energy.
+    let pieces: [(Option<&ItemStack>, &str, &str); 6] = [
+        (game.armor[0].as_ref(), modules::HELMET, "mekasuit_helmet"),
+        (game.armor[1].as_ref(), modules::BODYARMOR, "mekasuit_chest"),
+        (game.armor[2].as_ref(), modules::PANTS, "mekasuit_leggings"),
+        (game.armor[3].as_ref(), modules::BOOTS, "mekasuit_boots"),
+        (game.inventory.get(game.selected).and_then(|s| s.as_ref()), modules::MEKA_TOOL, "mekatool"),
+        (game.offhand.as_ref(), modules::MEKA_TOOL, "mekatool"),
+    ];
+    let shown: Vec<(&str, f64)> = pieces
+        .into_iter()
+        .filter_map(|(stack, item, icon)| {
+            let stack = stack.filter(|s| &*s.item == item)?;
+            let capacity = item_energy_of(stack)?.capacity;
+            let ratio = if capacity == 0 { 0.0 } else { stored_energy(stack) as f64 / capacity as f64 };
+            Some((icon, ratio.clamp(0.0, 1.0)))
+        })
+        .collect();
+    for (n, (icon, ratio)) in shown.into_iter().enumerate() {
+        let rgb: u32 = if ratio > 0.2 { regular } else if ratio > 0.1 { 0xFFDD4F } else { 0xFF383C };
+        let x = 10.0 + 48.0 * n as f32 + jx;
+        game.native_sprite_tinted(batch, &format!("mekanism:gui/hud_{icon}"), [0.0, 0.0, 16.0, 16.0], [x, 10.0 + jy, 16.0, 16.0], (alpha << 24) | rgb);
+        let text = horizon_client::text::Text::literal(&format!("{}%", (ratio * 100.0).round() as i64));
+        batch.text_styled(&game.gui.atlas, &text, x + 18.0, 15.0 + jy, colour(rgb), false);
+    }
+    module_icons(game, batch, jx, jy);
+}
+
+/// `HUDRenderer.renderMekaSuitModuleIcons`: the elements of the modules in the worn suit and held Meka-Tools, stacked up
+/// from the bottom right (text, then icon). Shown: the Jetpack Unit (mode and hydrogen), the Gravitational Modulating
+/// Unit and the Vision Enhancement Unit (on or off); the radiation readouts need the radiation system.
+fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, jx: f32, jy: f32) {
+    const REGULAR: u32 = 0x40F5F0;
+    let stacks: Vec<ItemStack> = [game.armor[0].clone(), game.armor[1].clone(), game.armor[2].clone(), game.armor[3].clone(), game.inventory.get(game.selected).cloned().flatten(), game.offhand.clone()]
+        .into_iter()
+        .flatten()
+        .filter(|s| modules::is_container(&s.item))
+        .collect();
+    let flag = |stack: &ItemStack, module: &str, key: &str| -> Option<u32> {
+        let n = installed_modules(stack).get(module).copied().filter(|n| *n > 0)?;
+        let setting = module_config::settings(module, n).into_iter().find(|s| s.key == key)?;
+        Some(module_setting(stack, module, &setting, n))
+    };
+    let mut elements: Vec<(&'static str, String, u32)> = Vec::new();
+    for stack in &stacks {
+        if let Some(mode) = flag(stack, "mekanism:jetpack_unit", "jetpack_mode") {
+            if flag(stack, "mekanism:jetpack_unit", "enabled") == Some(1) && flag(stack, "mekanism:jetpack_unit", "render_hud") != Some(0) {
+                let capacity = jetpack_capacity(stack);
+                let ratio = if capacity == 0 { 1.0 } else { jetpack_fuel(stack) as f64 / capacity as f64 };
+                let icon = ["jetpack_normal", "jetpack_hover", "jetpack_vector", "jetpack_off"][mode.min(3) as usize];
+                let color = if ratio > 0.2 { REGULAR } else if ratio > 0.1 { 0xFFDD4F } else { 0xFF383C };
+                elements.push((icon, format!("{}%", (ratio * 100.0).round() as i64), color));
+            }
+        }
+        for (module, icon) in [("mekanism:gravitational_modulating_unit", "gravitational_modulation_unit"), ("mekanism:vision_enhancement_unit", "vision_enhancement_unit")] {
+            if installed_modules(stack).get(module).copied().unwrap_or(0) > 0 && flag(stack, module, "render_hud") != Some(0) {
+                let on = flag(stack, module, "enabled") == Some(1);
+                elements.push((icon, if on { "On" } else { "Off" }.to_owned(), if on { REGULAR } else { 0x207A78 }));
+            }
+        }
+    }
+    for stack in &stacks {
+        let (level, max, dose) = RAD_CLIENT.get();
+        let on = |module: &str| installed_modules(stack).get(module).copied().unwrap_or(0) > 0 && flag(stack, module, "enabled") != Some(0);
+        let decay_text = |text: String, show: bool, magnitude: f64, rate: f64| {
+            if show { format!("{text} ({})", radiation::hours_minutes(radiation::decay_ticks(magnitude, rate))) } else { text }
+        };
+        let tone = |warn_from_baseline: bool, magnitude: f64| {
+            let calm = if warn_from_baseline { magnitude <= radiation::BASELINE } else { magnitude < radiation::MIN_MAGNITUDE };
+            if calm { REGULAR } else if magnitude < 0.1 { 0xFFDD4F } else { 0xFF383C }
+        };
+        if on("mekanism:geiger_unit") {
+            let text = decay_text(radiation::display(level, "Sv", 2), level > radiation::BASELINE, max, radiation::SOURCE_DECAY_RATE);
+            elements.push(("geiger_counter", text, tone(true, level)));
+        }
+        if on("mekanism:dosimeter_unit") {
+            let text = decay_text(radiation::display(dose, "Sv", 2), dose > radiation::MIN_MAGNITUDE, dose, radiation::TARGET_DECAY_RATE);
+            elements.push(("dosimeter", text, tone(false, dose)));
+        }
+    }
+    let (width, height) = (batch.width, batch.height);
+    let mut y = height - 10.0 + jy;
+    for (icon, text, rgb) in elements {
+        y -= 18.0;
+        let text_width = game.native_text_width(&text);
+        let x = width - 10.0 - (24.0 + text_width) + jx;
+        let argb = (0x66u32 << 24) | rgb;
+        let [_, r, g, b] = rgb.to_be_bytes();
+        batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(&text), x, y + 5.0, horizon_client::hud::rgba(r, g, b, 0x66), false);
+        game.native_sprite_tinted(batch, &format!("mekanism:gui/hud_{icon}"), [0.0, 0.0, 16.0, 16.0], [x + text_width + 2.0, y, 16.0, 16.0], argb);
+    }
+}
+
 /// The window's tick (`CommonPlayerTickHandler.tickEnd` for the local player): holding jump with a
 /// fuelled jetpack on, outside creative flight, thrusts in its normal mode and stops the fall, and tells
 /// the server, which spends the hydrogen.
 pub(super) fn client_tick(game: &mut Game<'_>) {
+    if !game.native_window() && game.native_on(MOD_ID) {
+        radiation_server_tick(game);
+    }
     if game.native_window() && game.native_on(MOD_ID) {
         tweaker_key(game);
         radial_key(game);
@@ -6232,6 +6585,9 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     if !game.native_window() || !game.native_on(MOD_ID) || !game.native_playing() {
         return;
     }
+    loop_sounds(game);
+    radiation_client(game);
+    scuba_client(game);
     free_runners_tick(game);
     mekasuit_sprint(game);
     mekasuit_client(game);
@@ -6327,6 +6683,14 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
             _ => {}
         }
     }
+    if channel == SCUBA_CHANNEL && game.native_on(MOD_ID) {
+        scuba_breathe(game);
+        return;
+    }
+    if channel == SCUBA_MODE_CHANNEL && game.native_on(MOD_ID) {
+        scuba_toggle(game);
+        return;
+    }
     if channel != JETPACK_CHANNEL || !game.native_on(MOD_ID) {
         return;
     }
@@ -6341,6 +6705,44 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     if let Some(p) = game.player.as_mut() {
         p.fall_distance = 0.0;
     }
+    jetpack_flames(game);
+}
+
+/// `RenderTickHandler.doJetpackRender`: flame and smoke from the two side nozzles and the middle of the pack, for a
+/// standing or crouching player (the swimming and gliding poses are not told apart here).
+fn jetpack_flames(game: &mut Game<'_>) {
+    use horizon_client::particles::{ParticleOptions, ParticleType};
+    let Some(me) = game.native_player() else {
+        return;
+    };
+    let crouching = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let velocity = game.player.as_ref().map_or([0.0; 3], |p| [p.velocity.x, p.velocity.y, p.velocity.z]);
+    let (x_angle, side_z, centre_z, eye) = if crouching { (20f64.to_radians(), -0.8, -0.9, 1.27 + 0.5) } else { (0.0, -0.54, -0.2, 1.62) };
+    let (sin_y, cos_y) = (-f64::from(me.yaw)).to_radians().sin_cos();
+    let (sin_x, cos_x) = x_angle.sin_cos();
+    let turn = |v: [f64; 3]| -> [f64; 3] {
+        let (y, z) = (v[1] * cos_x - v[2] * sin_x, v[1] * sin_x + v[2] * cos_x);
+        [v[0] * cos_y + z * sin_y, y, z * cos_y - v[0] * sin_y]
+    };
+    thread_local! {
+        static FLAME_RNG: std::cell::RefCell<bolt::Rng> = std::cell::RefCell::new(bolt::Rng::new(0x1E7));
+    }
+    let mut float = || FLAME_RNG.with_borrow_mut(|r| r.float());
+    let random = (float() - 0.5) * 0.1;
+    let nozzles = [
+        (turn([-0.43, -0.55, side_z]), true),
+        (turn([0.43, -0.55, side_z]), true),
+        (turn([(f64::from(float()) - 0.5) * 0.4, -0.86, centre_z]), false),
+    ];
+    let flame = ParticleOptions::simple(ParticleType::Flame);
+    let smoke = ParticleOptions::simple(ParticleType::Smoke);
+    for (v, jitter) in nozzles {
+        let spread = if jitter { f64::from(random) } else { 0.0 };
+        let motion = [0, 1, 2].map(|i| v[i] * 0.2 + velocity[i] + v[i] * spread);
+        let at = [me.x + v[0] + velocity[0], me.y + eye + v[1] + velocity[1], me.z + v[2] + velocity[2]];
+        game.lan_send_particles(me.dimension, &flame, None, at, motion, 1.0, 0);
+        game.lan_send_particles(me.dimension, &smoke, None, at, motion, 1.0, 0);
+    }
 }
 
 /// A right click on a chemical tank holding hydrogen with a jetpack in hand fills the jetpack, as
@@ -6350,10 +6752,11 @@ pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         return false;
     }
     let selected = game.selected;
-    let Some(held) = game.inventory.get(selected).cloned().flatten().filter(is_jetpack) else {
+    let Some(held) = game.inventory.get(selected).cloned().flatten().filter(|s| is_jetpack(s) || &*s.item == flamethrower::ITEM || &*s.item == SCUBA_TANK) else {
         return false;
     };
     let fuel = jetpack_fuel(&held);
+    let chemical = item_chemical(&held);
     let capacity = jetpack_capacity(&held);
     let room = capacity - fuel;
     let taken = game.native_with_mod_block_entity(pos, |m| {
@@ -6361,7 +6764,7 @@ pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
             return None;
         };
         let mut tank = get_tank(&m.nbt, "chemical", chem::chemical_tank(t).0);
-        if tank.chemical.as_deref() != Some("mekanism:hydrogen") {
+        if tank.chemical.as_deref() != Some(chemical) {
             return Some(0);
         }
         let n = tank.extract(room);
@@ -6372,13 +6775,150 @@ pub(super) fn fill_jetpack(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         return false;
     };
     let mut held = held;
+    let name = if &*held.item == flamethrower::ITEM { "Flamethrower" } else if &*held.item == SCUBA_TANK { "Scuba Tank" } else { "Jetpack" };
     set_jetpack_fuel(&mut held, fuel + n);
     game.inventory[selected] = Some(held);
     if let Some(player) = game.native_acting_player() {
-        let line = format!("Jetpack: {} / {} mB hydrogen", fuel + n, capacity);
+        let line = format!("{name}: {} / {} mB {}", fuel + n, capacity, chemical.trim_start_matches("mekanism:"));
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
     true
+}
+
+/// Sets a number in an item's custom data, keeping the rest of it.
+fn set_custom_long(stack: &mut ItemStack, key: &str, value: u64) {
+    let extra = stack.extra.get_or_insert_with(Default::default);
+    let at = extra.other.iter().position(|(k, d)| k == "minecraft:custom_data" && matches!(d, Tag::Compound(_)));
+    let at = at.unwrap_or_else(|| {
+        extra.other.retain(|(k, _)| k != "minecraft:custom_data");
+        extra.other.push(("minecraft:custom_data".to_owned(), Tag::Compound(Compound::new())));
+        extra.other.len() - 1
+    });
+    if let Tag::Compound(c) = &mut extra.other[at].1 {
+        put_long(c, key, value);
+    }
+}
+
+// --- Scuba Mask and Tank --------------------------------------------------------------------------
+
+const SCUBA_TANK: &str = "mekanism:scuba_tank";
+const SCUBA_MASK: &str = "mekanism:scuba_mask";
+/// `GearConfig.scubaTankCapacity`: 24 buckets of oxygen.
+const SCUBA_CAPACITY: u64 = 24_000;
+const SCUBA_MODE_KEY: &str = "mekanism:scuba_tank_mode";
+/// The window asks the server to fill the wearer's air from the tank (the server swaps the player in).
+const SCUBA_CHANNEL: &str = "mekanism:scuba";
+const SCUBA_MODE_CHANNEL: &str = "mekanism:scuba_mode";
+
+/// `ItemScubaTank.getMode`: whether the tank flows.
+fn scuba_flowing(stack: &ItemStack) -> bool {
+    custom_data(stack).is_some_and(|c| get_long(c, SCUBA_MODE_KEY) == 1)
+}
+
+/// `CommonPlayerTickHandler.isScubaMaskOn`: a mask on the head and a flowing tank with oxygen on the chest.
+fn scuba_on(game: &Game<'_>) -> bool {
+    game.armor[0].as_ref().is_some_and(|s| &*s.item == SCUBA_MASK)
+        && game.armor[1].as_ref().is_some_and(|s| &*s.item == SCUBA_TANK && scuba_flowing(s) && jetpack_fuel(s) > 0)
+}
+
+/// On the window each tick: while the mask is on and the air is short, ask for air; in water, bubbles come from it.
+fn scuba_client(game: &mut Game<'_>) {
+    if !scuba_on(game) {
+        return;
+    }
+    let short = game.player.as_ref().is_some_and(|p| p.air < MAX_AIR);
+    if short {
+        game.native_send_to_server(SCUBA_CHANNEL, &[1]);
+    }
+}
+
+/// Server side, the player swapped in: one mB of oxygen and the air missing (`CommonPlayerTickHandler.playerTick`),
+/// and every fourth tick in water the mask's bubbles (`RenderTickHandler.doScubaRender`).
+fn scuba_breathe(game: &mut Game<'_>) {
+    if !scuba_on(game) {
+        return;
+    }
+    let Some(air) = game.player.as_ref().map(|p| p.air) else {
+        return;
+    };
+    let Some(tank) = game.armor[1].as_mut() else {
+        return;
+    };
+    let stored = jetpack_fuel(tank);
+    let give = (MAX_AIR - air).max(0) as u64;
+    // The first mB is spent whatever happens, then as much as the air can take.
+    let used = (1 + give).min(stored);
+    let gained = used.saturating_sub(1).min(give);
+    set_jetpack_fuel(tank, stored - used);
+    if let Some(p) = game.player.as_mut() {
+        p.air = (air + gained as i32).min(MAX_AIR);
+    }
+    scuba_bubbles(game);
+}
+
+fn scuba_bubbles(game: &mut Game<'_>) {
+    use horizon_client::particles::{ParticleOptions, ParticleType};
+    if game.ticks % 4 != 0 {
+        return;
+    }
+    let Some(me) = game.native_player() else {
+        return;
+    };
+    let in_water = game.player.as_ref().is_some_and(|p| p.fluids.was_touching_water);
+    if !in_water {
+        return;
+    }
+    let (yaw, pitch) = (f64::from(me.yaw).to_radians(), f64::from(me.pitch).to_radians());
+    // `Entity.getViewVector`.
+    let look = [-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos()];
+    let vec = [0.4 * look[0], 0.4 * look[1] - 0.2, 0.4 * look[2]];
+    let velocity = game.player.as_ref().map_or([0.0; 3], |p| [p.velocity.x, p.velocity.y, p.velocity.z]);
+    let motion = [vec[0] * 0.2 + velocity[0], vec[1] * 0.2 + velocity[1] + 0.2, vec[2] * 0.2 + velocity[2]];
+    let at = [me.x + vec[0], me.y + 1.62 + vec[1], me.z + vec[2]];
+    let options = ParticleOptions::simple(ParticleType::Bubble);
+    game.lan_send_particles(me.dimension, &options, None, at, motion, 1.0, 0);
+}
+
+/// The Gas Mask (`CommonPlayerTickHandler.onLivingIncomingDamage`): a scuba mask with a flowing tank that has
+/// oxygen cancels the damage tagged `mekanism:api/is_preventable_magic` (magic and indirect magic).
+pub(super) fn player_immunities(game: &mut Game<'_>, immune: &mut Vec<String>) {
+    if game.native_on(MOD_ID) && scuba_on(game) {
+        immune.push("minecraft:magic".to_owned());
+        immune.push("minecraft:indirect_magic".to_owned());
+    }
+}
+
+/// `ModeChangeKey`, on the window: the mode key (M) held while the wheel turns asks the server to toggle the
+/// flow of a scuba tank in hand or worn.
+pub(super) fn wheel(game: &mut Game<'_>, steps: f32, claimed: &mut bool) {
+    if *claimed || !game.native_on(MOD_ID) || !game.native_playing() || !game.keys.contains(&winit::keyboard::KeyCode::KeyM) {
+        return;
+    }
+    if (steps.round() as i32).abs() % 2 != 1 {
+        return;
+    }
+    let held = game.inventory.get(game.selected).and_then(|s| s.as_ref()).is_some_and(|s| &*s.item == SCUBA_TANK);
+    let worn = game.armor[1].as_ref().is_some_and(|s| &*s.item == SCUBA_TANK);
+    if held || worn {
+        *claimed = true;
+        game.native_send_to_server(SCUBA_MODE_CHANNEL, &[1]);
+    }
+}
+
+/// Server side, the player swapped in: the tank in hand (or else on the chest) flips between flowing and not.
+fn scuba_toggle(game: &mut Game<'_>) {
+    let selected = game.selected;
+    let held = game.inventory.get(selected).and_then(|s| s.as_ref()).is_some_and(|s| &*s.item == SCUBA_TANK);
+    let stack = if held { game.inventory.get_mut(selected).and_then(|s| s.as_mut()) } else { game.armor[1].as_mut().filter(|s| &*s.item == SCUBA_TANK) };
+    let Some(stack) = stack else {
+        return;
+    };
+    let on = !scuba_flowing(stack);
+    set_custom_long(stack, SCUBA_MODE_KEY, u64::from(on));
+    if let Some(player) = game.native_acting_player() {
+        let line = format!("Flowing: {}", if on { "On" } else { "Off" });
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
 }
 
 // --- Free Runners -----------------------------------------------------------------------------------
@@ -14704,6 +15244,7 @@ fn tick_laser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
         let k = (0..3).map(|i| (at[i] - pos[i]) * d[i]).sum::<i32>();
         f64::from(k) - 1.002
     });
+    laser_beam_send(game, pos, d, length, firing);
     let firing = laser_hit_entities(game, entity, pos, d, length, firing);
     if firing == 0 {
         return Some(true);
@@ -20753,6 +21294,7 @@ pub(super) fn mobs_tick(game: &mut Game<'_>) {
         return;
     }
     tick_meltdowns(game);
+    flames_tick(game);
     let ids = game.native_mob_ids(robit::TYPE);
     if ids.is_empty() {
         return;
@@ -20948,6 +21490,15 @@ pub(super) fn mob_died(game: &mut Game<'_>, kind: &str, at: [f64; 3], data: Opti
 
 /// The window's client got the Robits' ids.
 pub(super) fn client_payload(channel: &str, data: &[u8]) {
+    if channel == RADIATION_CHANNEL {
+        rad_client_payload(data);
+    }
+    if channel == FLAME_CHANNEL {
+        flames_payload(data);
+    }
+    if channel == LASER_CHANNEL {
+        laser_beam_payload(data);
+    }
     if channel == ROBIT_STATE_CHANNEL {
         robit_state_payload(data);
     }
@@ -22258,4 +22809,723 @@ pub(super) fn ui_closed(game: &mut Game<'_>, id: &str) {
             game.native_send_to_server(ROBIT_CHANNEL, &out);
         }
     }
+}
+
+
+// --- Flamethrower -----------------------------------------------------------------------------------
+
+use mekanism_core::flamethrower;
+
+/// A flame the server flies (`EntityFlame`).
+struct Flame {
+    /// Who fired it, so the flame never burns them.
+    owner: Option<u128>,
+    pos: [f64; 3],
+    vel: [f64; 3],
+    age: u32,
+    mode: flamethrower::Mode,
+}
+
+/// A flame as a client has it, from the server's last word.
+struct FlameView {
+    pos: [f64; 3],
+    vel: [f64; 3],
+    age: u32,
+    arrived: u64,
+}
+
+const LASER_CHANNEL: &str = "mekanism:laser_beam";
+
+/// `sendLaserDataToPlayers`: the beam from the laser's front for `length` blocks, to every player.
+fn laser_beam_send(game: &mut Game<'_>, pos: [i32; 3], d: [i32; 3], length: f64, firing: u64) {
+    let scale = (firing as f32 / laser::LASER_USAGE as f32 / 10.0).min(0.6);
+    let mut data = Vec::with_capacity(21);
+    for k in 0..3 {
+        data.extend(((f64::from(pos[k]) + 0.5 + f64::from(d[k]) * 0.5) as f32).to_be_bytes());
+    }
+    data.extend((d.iter().position(|v| *v != 0).unwrap_or(0) as u8 * 2 + u8::from(d.iter().any(|v| *v < 0))).to_be_bytes());
+    data.extend((length as f32).to_be_bytes());
+    data.extend(scale.to_be_bytes());
+    for p in robit_players(game) {
+        game.native_send_to_player(p.uuid, LASER_CHANNEL, &data);
+    }
+}
+
+struct LaserBeam {
+    from: [f64; 3],
+    axis: usize,
+    sign: f64,
+    length: f64,
+    scale: f32,
+    arrived: u64,
+}
+
+thread_local! {
+    static LASER_BEAMS: std::cell::RefCell<Vec<LaserBeam>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A beam reached the window (21 bytes): it is drawn for five ticks (`LaserParticle`'s lifetime).
+fn laser_beam_payload(data: &[u8]) {
+    if data.len() != 21 {
+        return;
+    }
+    let f = |i: usize| f64::from(f32::from_be_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]]));
+    let code = usize::from(data[12]);
+    LASER_BEAMS.with_borrow_mut(|b| {
+        b.push(LaserBeam { from: [f(0), f(1), f(2)], axis: code / 2, sign: if code % 2 == 1 { -1.0 } else { 1.0 }, length: f(4), scale: f(5) as f32, arrived: u64::MAX });
+    });
+}
+
+/// `LaserFeatureRenderer`: two crossed planes along the beam, `scale` blocks to each side of its axis.
+fn laser_beam_quads(ticks: u64, quads: &mut Vec<super::native_hooks::NativeWorldQuad>) {
+    LASER_BEAMS.with_borrow_mut(|beams| {
+        for b in beams.iter_mut() {
+            if b.arrived == u64::MAX {
+                b.arrived = ticks;
+            }
+        }
+        beams.retain(|b| ticks < b.arrived + 5);
+        for b in beams.iter() {
+            let (u, v) = ((b.axis + 1) % 3, (b.axis + 2) % 3);
+            let half = b.length / 2.0;
+            let mut centre = b.from;
+            centre[b.axis] += b.sign * half;
+            let w = f64::from(b.scale);
+            for (wu, wv) in [(1.0, 1.0), (1.0, -1.0)] {
+                let at = |side: f64, end: f64| {
+                    let mut p = centre;
+                    p[b.axis] += b.sign * end * half;
+                    p[u] += side * w * wu * std::f64::consts::FRAC_1_SQRT_2;
+                    p[v] += side * w * wv * std::f64::consts::FRAC_1_SQRT_2;
+                    p
+                };
+                quads.push(super::native_hooks::NativeWorldQuad {
+                    corners: [at(-1.0, -1.0), at(1.0, -1.0), at(1.0, 1.0), at(-1.0, 1.0)],
+                    color: 0xFFFF_FFFF,
+                    sprite: Some("mekanism:gui/laser_beam".into()),
+                    uv: [0.0, 0.0, 1.0, 1.0],
+                });
+            }
+        }
+    });
+}
+
+const FLAME_CHANNEL: &str = "mekanism:flames";
+const FLAMETHROWER_MODE_KEY: &str = "mekanism:flamethrower_mode";
+
+thread_local! {
+    static FLAMES: std::cell::RefCell<Vec<Flame>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FLAME_VIEW: std::cell::RefCell<Vec<FlameView>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FLAME_RNG: std::cell::RefCell<Option<bolt::Rng>> = const { std::cell::RefCell::new(None) };
+}
+
+fn flamethrower_mode(stack: &ItemStack) -> flamethrower::Mode {
+    let name = custom_data(stack).and_then(|c| match c.get(&JavaString::from(FLAMETHROWER_MODE_KEY)) {
+        Some(Tag::String(s)) => s.to_string().ok(),
+        _ => None,
+    });
+    name.as_deref().and_then(flamethrower::Mode::from_name).unwrap_or_default()
+}
+
+/// A right click with the flamethrower (`ItemFlamethrower.use`): sneaking changes its mode; with hydrogen
+/// in it, the use begins and goes on while the key is held.
+fn flamethrower_use(game: &mut Game<'_>, claimed: &mut bool) {
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == flamethrower::ITEM) else {
+        return;
+    };
+    if sneaking {
+        let mode = flamethrower_mode(held).next();
+        set_custom_string(held, FLAMETHROWER_MODE_KEY, mode.name());
+        *claimed = true;
+        if let Some(player) = game.native_acting_player() {
+            game.native_action_bar(player.uuid, horizon_client::text::Text::literal(format!("Mode changed to: {}", mode.label())));
+        }
+        return;
+    }
+    if jetpack_fuel(held) > 0 {
+        game.native_start_using();
+        *claimed = true;
+    }
+}
+
+/// Each tick the use key is held (`ItemFlamethrower.onUseTick`): a mB of hydrogen makes a flame; with none the
+/// use ends.
+pub(super) fn using_tick(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut bool, keep: &mut bool) {
+    if &*stack.item != flamethrower::ITEM || !game.native_on(MOD_ID) {
+        return;
+    }
+    *claimed = true;
+    let creative = game.creative;
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == flamethrower::ITEM) else {
+        return;
+    };
+    let fuel = jetpack_fuel(held);
+    if fuel == 0 {
+        return;
+    }
+    let mode = flamethrower_mode(held);
+    if !creative {
+        set_jetpack_fuel(held, fuel - 1);
+    }
+    *keep = true;
+    let (Some(player), Some(eye)) = (game.native_player(), game.native_eye()) else {
+        return;
+    };
+    let shooter = game.player.as_ref().map_or([0.0; 3], |p| {
+        [p.velocity.x, if p.ground.on_ground { 0.0 } else { p.velocity.y }, p.velocity.z]
+    });
+    let noise = FLAME_RNG.with_borrow_mut(|r| {
+        let rng = r.get_or_insert_with(|| bolt::Rng::new(game.ticks as u64 ^ 0xF1A3));
+        [rng.gaussian(), rng.gaussian(), rng.gaussian()]
+    });
+    let start = flamethrower::start(eye, player.yaw, player.pitch, true);
+    let owner = game.native_acting_player().map(|p| p.uuid);
+    let flame = Flame { owner, pos: start, vel: flamethrower::velocity(player.yaw, player.pitch, shooter, noise), age: 0, mode };
+    // Between the eyes and where the flame starts a block hit it at once, so it cannot shoot through a wall.
+    let from = [eye[0], eye[1] - 0.1, eye[2]];
+    if let Some((_, block, face)) = game.native_clip(from, start) {
+        flame_hits_block(game, block, face, mode);
+        return;
+    }
+    FLAMES.with_borrow_mut(|f| f.push(flame));
+}
+
+/// Every tick, on the server: the flames fly, hit and fade, and the clients are told where they are.
+fn flames_tick(game: &mut Game<'_>) {
+    let mut flames = FLAMES.with_borrow_mut(std::mem::take);
+    flames.retain_mut(|f| {
+        f.age += 1;
+        if f.age > flamethrower::LIFESPAN {
+            return false;
+        }
+        let target = [0, 1, 2].map(|i| f.pos[i] + f.vel[i]);
+        let mut end = target;
+        let block = game.native_clip(f.pos, target);
+        if let Some((point, _, _)) = block {
+            end = point;
+        }
+        // The nearest mob or dropped item the flame's path meets, within a third of a block.
+        let lo = [0, 1, 2].map(|i| f.pos[i].min(end[i]) - 0.3);
+        let hi = [0, 1, 2].map(|i| f.pos[i].max(end[i]) + 0.3);
+        // A player in the way is burned unless it is the one who fired (the `pvp` rule decides).
+        if flame_hits_player(game, f.owner, lo, hi) {
+            return false;
+        }
+        let hit = game.native_entities_in(lo, hi, f.pos).into_iter().next();
+        if let Some(entity) = hit {
+            flame_hits_entity(game, entity.id, &entity.kind, f.mode);
+            return false;
+        }
+        if let Some((_, pos, face)) = block {
+            flame_hits_block(game, pos, face, f.mode);
+            return false;
+        }
+        // Water and lava put the flame out.
+        let at = [target[0].floor() as i32, target[1].floor() as i32, target[2].floor() as i32];
+        if matches!(block_name(game, at), "minecraft:water" | "minecraft:lava") {
+            flame_smoke(game, at);
+            return false;
+        }
+        f.pos = target;
+        true
+    });
+    FLAMES.with_borrow_mut(|f| {
+        flames.append(f);
+        *f = flames;
+    });
+    // The clients get every flame each tick (id-less: they only draw what the last word holds).
+    let mut data = Vec::new();
+    FLAMES.with_borrow(|f| {
+        for flame in f {
+            for v in flame.pos.iter().chain(flame.vel.iter()) {
+                data.extend((*v as f32).to_be_bytes());
+            }
+            data.extend((flame.age as u16).to_be_bytes());
+        }
+    });
+    let sent = FLAME_SENT.replace(!data.is_empty());
+    if data.is_empty() && !sent {
+        return;
+    }
+    for p in robit_players(game) {
+        game.native_send_to_player(p.uuid, FLAME_CHANNEL, &data);
+    }
+}
+
+thread_local! {
+    static FLAME_SENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The server's flames reached the window (28 bytes each: position, velocity, age).
+fn flames_payload(data: &[u8]) {
+    let view: Vec<FlameView> = data
+        .chunks_exact(26)
+        .map(|c| {
+            let f = |i: usize| f64::from(f32::from_be_bytes([c[i * 4], c[i * 4 + 1], c[i * 4 + 2], c[i * 4 + 3]]));
+            FlameView { pos: [f(0), f(1), f(2)], vel: [f(3), f(4), f(5)], age: u32::from(u16::from_be_bytes([c[24], c[25]])), arrived: u64::MAX }
+        })
+        .collect();
+    FLAME_VIEW.with_borrow_mut(|v| *v = view);
+}
+
+/// `EntityFlame.onHitEntity` for a player: ten damage and five seconds of fire, if `pvp` is on and they are not
+/// in creative or spectator mode. True when a player took the flame.
+fn flame_hits_player(game: &mut Game<'_>, owner: Option<u128>, lo: [f64; 3], hi: [f64; 3]) -> bool {
+    use horizon_core::geometry::Vec3;
+    let reach = horizon_core::geometry::Aabb::new(Vec3::new(lo[0], lo[1], lo[2]), Vec3::new(hi[0], hi[1], hi[2]));
+    let host_uuid = game.lan.as_ref().map(|h| h.host_uuid);
+    let guest_uuids: Vec<(u32, u128)> = game.lan.as_ref().map_or_else(Vec::new, |h| h.hub.guests.iter().map(|g| (g.conn, g.uuid)).collect());
+    let uuid_of = |who: super::dragon::FightWho| match who {
+        super::dragon::FightWho::Host => host_uuid,
+        super::dragon::FightWho::Guest(conn) => guest_uuids.iter().find(|(c, _)| *c == conn).map(|(_, u)| *u),
+    };
+    let Some(target) = game
+        .fight_players()
+        .into_iter()
+        .find(|p| p.alive && owner.is_none_or(|o| uuid_of(p.who) != Some(o)) && p.bounds.intersects(reach))
+    else {
+        return false;
+    };
+    // Creative and spectator players cannot be harmed (`hurt_player_by` refuses creative on its own).
+    if !game.ui.rules.bool("pvp") {
+        return true;
+    }
+    game.as_fight_player(target.who, |g| {
+        g.hurt_player_by("mekanism:flamethrower", flamethrower::DAMAGE);
+        if let Some(p) = g.player.as_mut() {
+            let _ = p.ignite_for_ticks(flamethrower::BURN_TICKS);
+        }
+    });
+    true
+}
+
+/// Smoke over `pos` (`EntityFlame.spawnParticlesAt`): ten puffs within half a block.
+fn flame_smoke(game: &mut Game<'_>, pos: [i32; 3]) {
+    let options = horizon_client::particles::ParticleOptions::simple(horizon_client::particles::ParticleType::Smoke);
+    let dimension = game.native_player().map_or("minecraft:overworld", |p| p.dimension);
+    game.lan_send_particles(dimension, &options, None, [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5], [0.5, 0.5, 0.5], 0.0, 10);
+}
+
+/// `EntityFlame.onHitEntity`: a mob burns (ten damage and five seconds of fire) unless it is fire immune; a dropped
+/// item is smelted by the heat mode once it is five seconds old, and burns up otherwise.
+fn flame_hits_entity(game: &mut Game<'_>, id: u32, kind: &str, mode: flamethrower::Mode) {
+    if kind == "minecraft:item" {
+        let Some(at) = game.dropped.iter().position(|i| i.id == id) else {
+            return;
+        };
+        if mode == flamethrower::Mode::Heat {
+            if game.dropped[at].ticks > flamethrower::SMELT_AGE {
+                let stack = game.dropped[at].stack.clone();
+                if let Some(cooking) = world_recipes!(game).cook("minecraft:smelting", &stack) {
+                    let item = &mut game.dropped[at];
+                    item.stack = stack_of(&cooking.result.item.to_string(), cooking.result.count * stack.count);
+                    item.ticks = 0;
+                    let at = [item.position.x.floor() as i32, item.position.y.floor() as i32, item.position.z.floor() as i32];
+                    flame_smoke(game, at);
+                } else if flamethrower::DESTROY_ITEMS {
+                    game.dropped.remove(at);
+                }
+            }
+        } else if flamethrower::DESTROY_ITEMS {
+            game.dropped.remove(at);
+        }
+        return;
+    }
+    let immune = game.native_with_mob(id, |m| m.kind.flags.fire_immune).unwrap_or(true);
+    if !immune {
+        game.native_hurt_mob(id, flamethrower::DAMAGE, flamethrower::BURN_TICKS);
+    }
+}
+
+/// `EntityFlame.onHitBlock` (with the aesthetic world damage on): the heat mode smelts the block, the inferno mode
+/// lights it or the air beside it.
+fn flame_hits_block(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3], mode: flamethrower::Mode) {
+    let name = block_name(game, pos).to_owned();
+    match mode {
+        flamethrower::Mode::Combat => {}
+        flamethrower::Mode::Heat => {
+            if name.is_empty() || name == "minecraft:air" {
+                return;
+            }
+            let stack = stack_of(&name, 1);
+            let Some(cooking) = world_recipes!(game).cook("minecraft:smelting", &stack) else {
+                return;
+            };
+            let (result, count) = (cooking.result.item.to_string(), cooking.result.count);
+            let is_block = world_items!(game).get(&result).is_some_and(|i| i.block.is_some());
+            flame_smoke(game, pos);
+            if is_block {
+                game.native_set_block(pos, &result, &[]);
+            } else {
+                game.native_set_block(pos, "minecraft:air", &[]);
+                let item = stack_of(&result, count);
+                game.spawn_item(item, [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5], [0.0; 3], 10);
+            }
+        }
+        flamethrower::Mode::Inferno => {
+            // Campfires and candles light; otherwise fire goes in the air on the face that was hit.
+            if let Some(lit) = game.native_block_property(pos, "lit") {
+                let lightable = name.ends_with("campfire") || name.ends_with("candle") || name.ends_with("candle_cake");
+                if lightable && lit == "false" {
+                    game.native_set_block_property(pos, "lit", "true");
+                    return;
+                }
+            }
+            let side = [pos[0] + face[0], pos[1] + face[1], pos[2] + face[2]];
+            let free = matches!(block_name(game, side), "minecraft:air" | "minecraft:cave_air");
+            // `BaseFireBlock.canBePlacedAt`: fire survives on a sturdy floor or beside something that burns (TNT does).
+            let survives = name == "minecraft:tnt" || game.native_face_sturdy([side[0], side[1] - 1, side[2]], horizon_core::geometry::Direction::Up);
+            if free && survives {
+                game.native_set_block(side, "minecraft:fire", &[]);
+            } else if name == "minecraft:tnt" {
+                // Nowhere for a fire: the block catches (`TntBlock.onCaughtFire`) and primes where it stood.
+                game.spawn_primed_tnt(horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]), false);
+                game.native_set_block(pos, "minecraft:air", &[]);
+            }
+        }
+    }
+}
+
+// ---- Radiation (`RadiationManager`, `PlayerExposure`, `RadiationEntity`, `ClientRadiation`) ----
+
+use mekanism_core::radiation;
+
+const RADIATION_CHANNEL: &str = "mekanism:radiation";
+const GEIGER_COUNTER: &str = "mekanism:geiger_counter";
+const DOSIMETER: &str = "mekanism:dosimeter";
+const HAZMAT: [&str; 4] = ["mekanism:hazmat_mask", "mekanism:hazmat_gown", "mekanism:hazmat_pants", "mekanism:hazmat_boots"];
+const SUIT: [&str; 4] = [modules::HELMET, modules::BODYARMOR, modules::PANTS, modules::BOOTS];
+
+thread_local! {
+    /// The server's radiation sources, by dimension (`RadiationLevelData`).
+    static RAD_SOURCES: std::cell::RefCell<std::collections::HashMap<String, radiation::Sources>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Each player's dose in Sv (`MekanismAttachmentTypes.RADIATION`), kept while the game runs.
+    static RAD_DOSE: std::cell::RefCell<std::collections::HashMap<u128, f64>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// What each player was last told (`PlayerExposure.playerEnvironmentalExposureMap`).
+    static RAD_SENT: std::cell::RefCell<std::collections::HashMap<u128, (Option<radiation::Previous>, Option<radiation::Previous>)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    static RAD_RNG: std::cell::RefCell<bolt::Rng> = std::cell::RefCell::new(bolt::Rng::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(7, |d| d.as_nanos() as u64)));
+    /// The window's view (`ClientRadiation`): the level here and the largest source in range.
+    static RAD_CLIENT: std::cell::Cell<(f64, f64, f64)> = const { std::cell::Cell::new((radiation::BASELINE, radiation::BASELINE, radiation::BASELINE)) };
+}
+
+thread_local! {
+    /// The radiation motes around the window's player (`RadiationParticle`, a green smoke): position, velocity, age, life, size.
+    static RAD_MOTES: std::cell::RefCell<Vec<RadMote>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Machines and tanks holding radioactive chemicals, by position: the dimension and what they would spill
+    /// (`TileEntityMekanism.preRemoveSideEffects` dumps them when the block goes).
+    static RAD_HOLDERS: std::cell::RefCell<std::collections::HashMap<[i32; 3], (String, f64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    static RAD_LOADED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RAD_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct RadMote {
+    pos: [f64; 3],
+    vel: [f64; 3],
+    age: u32,
+    life: u32,
+    size: f32,
+}
+
+const RADIATION_FILE: &str = "radiation";
+/// `radiationParticleCount` and `radiationParticleRadius` at their defaults.
+const RAD_PARTICLE_COUNT: u32 = 100;
+const RAD_PARTICLE_RADIUS: f64 = 30.0;
+
+/// `nextInt(bound)` for the radiation draws.
+fn rad_int(bound: u32) -> u32 {
+    RAD_RNG.with_borrow_mut(|r| ((f64::from(r.float()) * f64::from(bound)) as u32).min(bound - 1))
+}
+
+fn rad_float() -> f64 {
+    RAD_RNG.with_borrow_mut(|r| f64::from(r.float()))
+}
+
+/// `RadiationUtil.getRadiationResistance`: the shielding of the worn hazmat pieces and the MekaSuit pieces whose
+/// radiation shielding unit is on.
+fn rad_resistance(game: &Game<'_>) -> f64 {
+    let mut resistance = 0.0;
+    for slot in 0..4 {
+        let Some(stack) = game.armor[slot].as_ref() else {
+            continue;
+        };
+        if &*stack.item == HAZMAT[slot] {
+            resistance += radiation::shielding(slot);
+        } else if &*stack.item == SUIT[slot] {
+            let module = "mekanism:radiation_shielding_unit";
+            let installed = installed_modules(stack).get(module).copied().unwrap_or(0) > 0;
+            let off = module_config::settings(module, 1).into_iter().find(|s| s.key == "enabled").is_some_and(|s| module_setting(stack, module, &s, 1) == 0);
+            if installed && !off {
+                resistance += radiation::shielding(slot);
+            }
+        }
+    }
+    resistance
+}
+
+/// `IRadiationManager.radiate(level, pos, magnitude)`: a source on the block in the dimension.
+pub(super) fn radiate_at(dimension: &str, pos: [i32; 3], magnitude: f64) {
+    if magnitude > 0.0 {
+        RAD_SOURCES.with_borrow_mut(|all| all.entry(dimension.to_owned()).or_default().radiate(pos, magnitude));
+    }
+}
+
+/// `dumpRadiation`: the radioactivity of a chemical in `mekanism:data_maps/radioactivity` times the amount.
+fn radioactivity(chemical: &str) -> f64 {
+    match chemical {
+        "mekanism:nuclear_waste" | "mekanism:spent_nuclear_waste" => 0.01,
+        "mekanism:plutonium" => 0.02,
+        "mekanism:polonium" => 0.05,
+        _ => 0.0,
+    }
+}
+
+/// Remembers what a block entity's tanks would spill: every `{id, amount}` compound in its data that is radioactive.
+fn radiation_holder(game: &Game<'_>, pos: [i32; 3], nbt: &Compound) {
+    let mut total = 0.0;
+    for tag in nbt.values() {
+        if let Tag::Compound(c) = tag
+            && let Some(Tag::String(id)) = c.get(&JavaString::from("id"))
+            && let Ok(id) = id.to_string()
+        {
+            total += radioactivity(&id) * get_long(c, "amount") as f64;
+        }
+    }
+    RAD_HOLDERS.with_borrow_mut(|h| {
+        if total > 0.0 {
+            h.insert(pos, (game.dim.id().to_owned(), total));
+        } else {
+            h.remove(&pos);
+        }
+    });
+}
+
+/// A block is gone: a machine or tank that held radioactive chemicals spills them (`dumpRadiation`).
+pub(super) fn radiation_spill(game: &mut Game<'_>, pos: [i32; 3]) {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    if let Some((dimension, magnitude)) = RAD_HOLDERS.with_borrow_mut(|h| h.remove(&pos)) {
+        radiate_at(&dimension, pos, magnitude);
+    }
+}
+
+/// `IRadiationManager.dumpRadiation(level, pos, type, amount)`: true when the chemical was radioactive and spilled.
+pub(super) fn dump_radiation(dimension: &str, pos: [i32; 3], chemical: &str, amount: u64) -> bool {
+    let radioactivity = radioactivity(chemical);
+    if amount == 0 || radioactivity <= 0.0 {
+        return false;
+    }
+    radiate_at(dimension, pos, radioactivity * amount as f64);
+    true
+}
+
+fn rad_payload(level: f64, max: f64, dose: f64) -> Vec<u8> {
+    let mut out = level.to_be_bytes().to_vec();
+    out.extend(max.to_be_bytes());
+    out.extend(dose.to_be_bytes());
+    out
+}
+
+/// `ClientRadiation.setClientEnvironmentalRadiation`.
+fn rad_client_payload(data: &[u8]) {
+    if data.len() >= 24 {
+        let at = |i: usize| f64::from_be_bytes(data[i..i + 8].try_into().unwrap_or([0; 8]));
+        RAD_CLIENT.set((at(0), at(8), at(16)));
+    }
+}
+
+/// The server's tick: sources decay (a 1 in 20 chance a tick), then each player is exposed, dosed, hurt and told.
+fn radiation_server_tick(game: &mut Game<'_>) {
+    if !RAD_LOADED.replace(true) {
+        if let Some(text) = game.native_setting(MOD_ID, RADIATION_FILE) {
+            RAD_DOSE.with_borrow_mut(|d| {
+                for line in text.lines() {
+                    if let Some((who, dose)) = line.split_once(' ')
+                        && let (Ok(who), Ok(dose)) = (u128::from_str_radix(who, 16), dose.parse::<f64>())
+                    {
+                        d.insert(who, dose.max(radiation::BASELINE));
+                    }
+                }
+            });
+        }
+    }
+    if game.ticks % 200 == 0 && RAD_DIRTY.replace(false) {
+        let text = RAD_DOSE.with_borrow(|d| d.iter().filter(|(_, v)| **v > radiation::MIN_MAGNITUDE).map(|(k, v)| format!("{k:032x} {v}\n")).collect::<String>());
+        game.native_set_setting(MOD_ID, RADIATION_FILE, &text);
+    }
+    if rad_int(20) == 0 {
+        RAD_SOURCES.with_borrow_mut(|all| {
+            for sources in all.values_mut() {
+                sources.decay();
+            }
+            all.retain(|_, s| !s.is_empty());
+        });
+    }
+    let host_uuid = game.lan.as_ref().map(|h| h.host_uuid);
+    let guest_uuids: Vec<(u32, u128)> = game.lan.as_ref().map_or_else(Vec::new, |h| h.hub.guests.iter().map(|g| (g.conn, g.uuid)).collect());
+    for who in game.fight_players() {
+        let uuid = match who.who {
+            super::dragon::FightWho::Host => host_uuid,
+            super::dragon::FightWho::Guest(conn) => guest_uuids.iter().find(|(c, _)| *c == conn).map(|(_, u)| *u),
+        };
+        let Some(uuid) = uuid else {
+            continue;
+        };
+        if !who.alive {
+            continue;
+        }
+        let mut send: Option<(f64, f64, f64)> = None;
+        game.as_fight_player(who.who, |g| {
+            let Some(p) = g.player.as_ref() else {
+                return;
+            };
+            let pos = [p.position.x.floor() as i32, p.position.y.floor() as i32, p.position.z.floor() as i32];
+            let dimension = g.dim.id().to_owned();
+            let (level, max) = RAD_SOURCES.with_borrow(|all| all.get(&dimension).map_or((radiation::BASELINE, radiation::BASELINE), |s| s.level_at(pos)));
+            let playing = !g.creative && !g.spectator();
+            let mut dose = RAD_DOSE.with_borrow(|d| d.get(&uuid).copied()).unwrap_or(radiation::BASELINE);
+            // A 1 in 20 chance a tick: the level doses the player (through the armor), and the dose decays.
+            if rad_int(20) == 0 {
+                if level > radiation::BASELINE && playing {
+                    let gained = level / 3600.0 * radiation::through_shielding(rad_resistance(g));
+                    if gained > 0.0 {
+                        dose = (dose + gained).max(radiation::BASELINE);
+                    }
+                }
+                dose = (dose * radiation::TARGET_DECAY_RATE).max(radiation::BASELINE);
+                RAD_DOSE.with_borrow_mut(|d| d.insert(uuid, dose));
+                RAD_DIRTY.set(true);
+            }
+            // `RadiationEntity.update`: a dose that shows hurts now and then and tires the player.
+            let severity = radiation::scaled_dose_severity(dose);
+            if playing && severity > radiation::BASELINE {
+                let min = radiation::NEGATIVE_EFFECTS_MIN_SEVERITY;
+                let chance = min + rad_float() * (1.0 - min);
+                if severity > chance {
+                    let strength = (dose.ln_1p() as f32).max(1.0);
+                    if rad_int(2) == 0 {
+                        g.hurt_player_by("mekanism:radiation", strength);
+                    }
+                    if let Some(p) = g.player.as_mut() {
+                        p.cause_food_exhaustion(strength);
+                    }
+                }
+            }
+            // Told again when the digits of the level or of the dose would change (the dose is an attachment in Java).
+            let (previous_level, previous_dose) = RAD_SENT.with_borrow(|s| s.get(&uuid).copied()).unwrap_or((None, None));
+            let (new_level, new_dose) = (radiation::Previous::compare(previous_level, level), radiation::Previous::compare(previous_dose, dose));
+            if new_level.is_some() || new_dose.is_some() {
+                RAD_SENT.with_borrow_mut(|s| s.insert(uuid, (new_level.or(previous_level), new_dose.or(previous_dose))));
+                send = Some((level, max, dose));
+            }
+        });
+        if let Some((level, max, dose)) = send {
+            game.native_send_to_player(uuid, RADIATION_CHANNEL, &rad_payload(level, max, dose));
+        }
+    }
+}
+
+/// The level here and the dose of the acting player (server side).
+fn rad_player(game: &Game<'_>) -> Option<(f64, f64, f64)> {
+    let uuid = game.native_acting_player()?.uuid;
+    let p = game.player.as_ref()?;
+    let pos = [p.position.x.floor() as i32, p.position.y.floor() as i32, p.position.z.floor() as i32];
+    let (level, max) = RAD_SOURCES.with_borrow(|all| all.get(game.dim.id()).map_or((radiation::BASELINE, radiation::BASELINE), |s| s.level_at(pos)));
+    let dose = RAD_DOSE.with_borrow(|d| d.get(&uuid).copied()).unwrap_or(radiation::BASELINE);
+    Some((level, max, dose))
+}
+
+fn rad_say(game: &mut Game<'_>, label: &str, magnitude: f64, unit: &str, decay: Option<u64>) {
+    use horizon_client::text::Text;
+    let Some(uuid) = game.native_acting_player().map(|p| p.uuid) else {
+        return;
+    };
+    let color = radiation::severity_color(magnitude);
+    let line = Text::colored(format!("{label}: "), 0xCFCFCF).append(Text::colored(radiation::display(magnitude, unit, 3), color));
+    game.native_tell(uuid, line);
+    if let Some(ticks) = decay {
+        let line = Text::colored("Time to Decay: ", 0xCFCFCF).append(Text::colored(radiation::hours_minutes(ticks), color));
+        game.native_tell(uuid, line);
+    }
+}
+
+/// `ItemGeigerCounter.use`: the radiation here, and how long its source takes to decay.
+fn geiger_counter_use(game: &mut Game<'_>, claimed: &mut bool) {
+    if game.player.as_ref().is_some_and(|p| p.shift_key_down) {
+        return;
+    }
+    *claimed = true;
+    let Some((level, max, _)) = rad_player(game) else {
+        return;
+    };
+    let decay = (level > radiation::BASELINE).then(|| radiation::decay_ticks(max, radiation::SOURCE_DECAY_RATE));
+    rad_say(game, "Radiation Exposure", level, "Sv/h", decay);
+}
+
+/// `ItemDosimeter.use`: the dose the player has taken, and how long it takes to decay.
+fn dosimeter_use(game: &mut Game<'_>, claimed: &mut bool) {
+    if game.player.as_ref().is_some_and(|p| p.shift_key_down) {
+        return;
+    }
+    *claimed = true;
+    let Some((_, _, dose)) = rad_player(game) else {
+        return;
+    };
+    let decay = (dose > radiation::MIN_MAGNITUDE).then(|| radiation::decay_ticks(dose, radiation::TARGET_DECAY_RATE));
+    rad_say(game, "Radiation Exposure", dose, "Sv", decay);
+}
+
+/// The window's tick: the Geiger Counter's clicks (`GeigerSound`, a loop at 5% volume while the scale shows), and the
+/// motes (`ClientRadiation.tickClient`). A loop that is not refreshed ends by itself, so a changed scale swaps the sound.
+fn radiation_client(game: &mut Game<'_>) {
+    let (level, _, _) = RAD_CLIENT.get();
+    let scale = radiation::Scale::get(level);
+    if let Some(event) = scale.sound() {
+        game.native_loop_sound(&format!("mekanism:geiger:{event}"), event, None, 0.05, 1.0);
+        if rad_int(2) == 0
+            && let Some(at) = game.player.as_ref().map(|p| [p.position.x, p.position.y, p.position.z])
+        {
+            let count = rad_int(scale as u32 * RAD_PARTICLE_COUNT);
+            RAD_MOTES.with_borrow_mut(|motes| {
+                for _ in 0..count.min(600) {
+                    let pos = at.map(|v| v + rad_float() * RAD_PARTICLE_RADIUS * 2.0 - RAD_PARTICLE_RADIUS);
+                    // `SmokeParticle`: a little drift, rising, living 8 / (0.2..1) ticks.
+                    let vel = [0, 1, 2].map(|_| (rad_float() * 2.0 - 1.0) * 0.01);
+                    motes.push(RadMote { pos, vel, age: 0, life: (8.0 / (rad_float() * 0.8 + 0.2)) as u32 + 1, size: 0.1 * (rad_float() as f32 * 0.5 + 0.5) * 2.0 * 0.75 });
+                }
+                if motes.len() > 6000 {
+                    motes.drain(0..motes.len() - 6000);
+                }
+            });
+        }
+    }
+    RAD_MOTES.with_borrow_mut(|motes| {
+        for m in motes.iter_mut() {
+            m.age += 1;
+            m.vel[1] += 0.004;
+            for i in 0..3 {
+                m.pos[i] += m.vel[i];
+                m.vel[i] *= 0.96;
+            }
+        }
+        motes.retain(|m| m.age < m.life);
+    });
+}
+
+/// The motes as green billboards (`RadiationParticle`, colour 0.2/0.66/0.32; none on their first tick).
+fn radiation_quads(right: [f32; 3], up: [f32; 3], quads: &mut Vec<super::native_hooks::NativeWorldQuad>) {
+    RAD_MOTES.with_borrow(|motes| {
+        for m in motes.iter().filter(|m| m.age > 0) {
+            let grown = (m.age as f32 / m.life as f32).min(1.0);
+            let half = m.size * (1.0 - grown * grown * 0.5);
+            let at = |x: f32, y: f32| -> [f64; 3] { std::array::from_fn(|k| m.pos[k] + f64::from(right[k] * x + up[k] * y)) };
+            quads.push(super::native_hooks::NativeWorldQuad {
+                corners: [at(-half, -half), at(half, -half), at(half, half), at(-half, half)],
+                color: 0xFF33_A852,
+                sprite: None,
+                uv: [0.0, 0.0, 1.0, 1.0],
+            });
+        }
+    });
 }

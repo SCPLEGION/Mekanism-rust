@@ -439,6 +439,8 @@ def build_module(ns, out):
     search += [SRC / "datagen" / "generated" / n / "assets" for n in NAMESPACES]
     report["composite_models"] = flatten_models.flatten_tree(out / "assets" / ns, search)
     report["sps_textures"] = sps_textures(ns, out, search)
+    report["sounds"] = sound_files(ns, out)
+    report["hud_sprites"] = hud_sprites(ns, out)
     if ns == "mekanismgenerators":
         # The turbine's blades (`ModelTurbine`): one pair of rings per blade index.
         turbine_png = next((d / ns / "render/turbine.png" for d in search if (d / ns / "render/turbine.png").is_file()), None)
@@ -482,23 +484,29 @@ def build_module(ns, out):
             shutil.copyfile(robit_skin, out / "assets" / ns / "textures" / "item" / "robit_skin.png")
             write_json(out / "assets" / ns / "items" / "robit.json", {"model": {"type": "minecraft:model", "model": f"{ns}:item/robit_flat"}})
             report["robit_item"] = 1
-        # Skins (`MekanismRobitSkins`): the base skin and the allay's own model, each with its two textures (the
-        # texture index moves while the Robit walks).
-        for prefix, model_file, skin_names in (("robit", "robit", ("robit", "robit2")), ("allay", "robit_allay", ("allay", "allay2"))):
-            robit = next((d / ns / f"models/robit/{model_file}.json" for d in search
-                          if (d / ns / f"models/robit/{model_file}.json").is_file()), None)
-            if robit is None:
+        # The skins (`MekanismRobitSkins`, their datapack JSON): per skin and texture the body and the glowing parts,
+        # `robit_body_<skin>[_<n>]` and `robit_glow_<skin>[_<n>]` (the Robit in the world, the previews in its screen);
+        # a skin's `custom_model` replaces the base model. The texture index moves while the Robit walks.
+        body_glow = {}
+        for skin_json in sorted({f for d in search for f in (d.parent / "data" / ns / "mekanism" / "robit_skin").glob("*.json")}, key=lambda f: f.name):
+            skin_data = json.loads(skin_json.read_text())
+            model_id = skin_data.get("custom_model", f"{ns}:robit/robit")
+            model_ns, model_path = model_id.split(":")
+            model_file = next((d / model_ns / "models" / f"{model_path}.json" for d in search
+                               if (d / model_ns / "models" / f"{model_path}.json").is_file()), None)
+            if model_file is None:
                 continue
-            data = json.loads(robit.read_text())
-            for index, skin_name in enumerate(skin_names):
-                skin = next((d / ns / f"textures/entity/robit/{skin_name}.png" for d in search
-                             if (d / ns / f"textures/entity/robit/{skin_name}.png").is_file()), None)
-                if skin is None:
+            elements = json.loads(model_file.read_text())["elements"]
+            for index, texture_id in enumerate(skin_data.get("textures", [])):
+                tex_ns, tex_name = texture_id.split(":")
+                png = next((d / tex_ns / "textures/entity/robit" / f"{tex_name}.png" for d in search
+                            if (d / tex_ns / "textures/entity/robit" / f"{tex_name}.png").is_file()), None)
+                if png is None:
                     continue
+                suffix = "" if index == 0 else f"_{index}"
                 for part_name, glow in (("body", False), ("glow", True)):
-                    part = {"elements": [e for e in data["elements"] if bool(e.get("light_emission")) == glow]}
-                    suffix = "" if index == 0 else str(index + 1)
-                    worn_models.build_element_world_model(ns, f"{prefix}_{part_name}{suffix}", part, skin, out, report, (8, 0, 8))
+                    part = {"elements": [e for e in elements if bool(e.get("light_emission")) == glow]}
+                    worn_models.build_element_world_model(ns, f"robit_{part_name}_{skin_json.stem}{suffix}", part, png, out, report, (8, 0, 8))
     if ns == "mekanism":
         # The skin previews (`GuiRobitSkinSelectScroll`) turn each skin's body, one model per texture of the skin.
         robit = next((d / ns / "models/robit/robit.json" for d in search if (d / ns / "models/robit/robit.json").is_file()), None)
@@ -707,7 +715,60 @@ def sps_textures(ns, out, search):
         x, y = n % 4 * cell, n // 4 * cell
         image.crop((x, y, x + cell, y + cell)).resize((64, 64), Image.LANCZOS).save(dst / f"sps_core_{n}.png")
     shutil.copyfile(orbit, dst / "sps_orbit.png")
-    return 17
+    # The Flamethrower's flames (`RenderFlame`) draw this sprite.
+    flame = next((d / ns / "render/flame.png" for d in search if (d / ns / "render/flame.png").is_file()), None)
+    if flame is not None:
+        shutil.copyfile(flame, dst / "flame.png")
+    # The Laser's beam (`LaserParticle`) draws this sprite.
+    beam = SRC / "main/resources/assets/mekanism/textures/particle/laser.png"
+    if ns == "mekanism" and beam.is_file():
+        shutil.copyfile(beam, dst / "laser_beam.png")
+    return 19
+
+
+def sound_files(ns, out):
+    """The sounds the native mod loops (`native_loop_sound`): the Industrial Alarm and the Flamethrower, with their
+    `sounds.json` events, so Horizon's sound registry finds them under the mod's namespace."""
+    if ns != "mekanism":
+        return 0
+    import json
+    root = Path(__file__).resolve().parent.parent / "src"
+    events_file = root / "datagen/generated/mekanism/assets/mekanism/sounds.json"
+    sounds_dir = root / "main/resources/assets/mekanism/sounds"
+    if not events_file.is_file():
+        return 0
+    events = json.loads(events_file.read_text())
+    # Every machine's working hum (`tile.machine.*`) and the Flamethrower's loops.
+    names = [n for n in events if n.startswith("tile.machine.") or n.startswith("item.flamethrower.")]
+    keep = {name: events[name] for name in names}
+    files = []
+    for value in keep.values():
+        for sound in value["sounds"]:
+            files.append((sound["name"] if isinstance(sound, dict) else sound).split(":", 1)[1])
+    dst = out / "assets" / ns
+    for f in files:
+        src = sounds_dir / (f + ".ogg")
+        if not src.is_file():
+            continue
+        (dst / "sounds" / f).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst / "sounds" / (f + ".ogg"))
+    (dst / "sounds.json").write_text(json.dumps(keep, indent=2))
+    return len(files)
+
+
+def hud_sprites(ns, out):
+    """The HUD's icons (`textures/gui/sprites/hud/*`, `HUDRenderer`) as `textures/gui/hud_<name>.png`: Horizon's GUI
+    atlas holds a content mod's `textures/gui` only."""
+    src = SRC / "main/resources/assets/mekanism/textures/gui/sprites/hud"
+    if ns != "mekanism" or not src.is_dir():
+        return 0
+    dst = out / "assets" / ns / "textures/gui"
+    dst.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for icon in sorted(src.glob("*.png")):
+        shutil.copyfile(icon, dst / f"hud_{icon.name}")
+        count += 1
+    return count
 
 
 def gauge_textures(ns, out):
