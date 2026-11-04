@@ -23911,6 +23911,32 @@ fn set_suit_paste(stack: &mut ItemStack, amount: u64) {
     set_custom_long(stack, SUIT_PASTE_KEY, amount);
 }
 
+/// `ClientTickHandler.onFogLighting` and `onFog` (`ViewportEvent.ComputeFogColor`, `RenderFog`): with the helmet's Vision
+/// Enhancement Unit on and paid for, the fog turns green, its near plane goes back 8 blocks and a close far plane is pushed out
+/// (water, lava, powder snow), all scaled by the units installed. Client-side, every frame.
+pub(super) fn fog(game: &Game<'_>, fog_type: u8, fog: &mut horizon_client::fog::FogData) {
+    let Some(helmet) = game.armor[0].as_ref().filter(|s| &*s.item == modules::HELMET) else {
+        return;
+    };
+    if !module_on(helmet, "mekanism:vision_enhancement_unit") || stored_energy(helmet) < VISION_ENERGY {
+        return;
+    }
+    let installed = installed_modules(helmet).get("mekanism:vision_enhancement_unit").copied().unwrap_or(0);
+    let keep = 0.1_f32;
+    let target = [0.4_f32, 0.8, 0.4];
+    for (channel, goal) in fog.color.iter_mut().zip(target) {
+        *channel = keep * *channel + (1.0 - keep) * goal;
+    }
+    fog.environmental_start = -8.0;
+    let mut far = fog.environmental_end;
+    if far < 20.0 {
+        let scalar = if fog_type == 2 { 24.0 * far } else { 5.0 + 2.5 * (0.16_f32 * far).exp() };
+        far = scalar.min(192.0);
+    }
+    let maximum = mekanism_core::modules::max_installed(modules::HELMET, "mekanism:vision_enhancement_unit").max(1);
+    fog.environmental_end = far * (installed as f32).powf(1.25) / maximum as f32;
+}
+
 /// `GearConfig.mekaSuitEnergyUsageVisionEnhancement`.
 const VISION_ENERGY: u64 = 500;
 
