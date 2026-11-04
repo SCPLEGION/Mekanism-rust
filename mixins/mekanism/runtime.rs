@@ -11191,10 +11191,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         game.native_text(batch, "Inventory", [ox + 29.0, oy + height - 92.0], 0x40_4040, false);
     }
     if kind(block) == Some(Kind::Evaporation) {
-        // `renderTitleTextWithOffset(inputGauge.getRelativeRight(), OUTPUT_GAUGE_X)`: centred between the two
-        // gauges; the inventory label is 10 px in and 2 px down.
+        // `renderTitleTextWithOffset(inputGauge.getRelativeRight(), OUTPUT_GAUGE_X)`: centred from 24 to 172 less 4 each side; the inventory label is 10 px in and 2 px down.
         let title = game.native_screen_title().unwrap_or_default();
-        centred(game, batch, &title, ox + 22.0, 150.0, oy + 4.0, 0x40_4040);
+        centred(game, batch, &title, ox + 28.0, 140.0, oy + 4.0, 0x40_4040);
         game.native_text(batch, "Inventory", [ox + 18.0, oy + height - 92.0], 0x40_4040, false);
     }
     for row in 0..4 {
