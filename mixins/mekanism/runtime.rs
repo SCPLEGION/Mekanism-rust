@@ -3859,10 +3859,22 @@ fn drain_tank_into_bucket(game: &Game<'_>, entity: &mut ModBlockEntity, from: us
 
 /// The capacity of a chemical tank item (`Capabilities.CHEMICAL.item()`): the tiers of chemical tank.
 fn chemical_item_capacity(item: &str) -> Option<u64> {
+    if item == fusion::HOHLRAUM {
+        return Some(fusion::HOHLRAUM_CAPACITY);
+    }
     match kind(item)? {
         Kind::ChemicalTank(t) => Some(chem::chemical_tank(t).0),
         _ => None,
     }
+}
+
+/// What a chemical item takes or gives in one operation (the hohlraum's `fillRate`), and what it holds at all.
+fn chemical_item_rate(item: &str) -> u64 {
+    if item == fusion::HOHLRAUM { fusion::HOHLRAUM_FILL_RATE } else { u64::MAX }
+}
+
+fn chemical_item_accepts(item: &str, chemical: &str) -> bool {
+    item != fusion::HOHLRAUM || chemical == fusion::FUSION_FUEL
 }
 
 /// `drainTankIntoSlot(outputSlot)`: a chemical tank item in slot `from` that is full goes to the empty slot `to`.
@@ -3881,7 +3893,7 @@ fn move_full_chemical_item(entity: &mut ModBlockEntity, from: usize, to: usize) 
 
 /// The ids of the items a chemical slot takes: the chemical tanks.
 fn chemical_item_ids() -> Vec<String> {
-    BaseTier::ALL.into_iter().map(|t| format!("mekanism:{}_chemical_tank", t.name())).collect()
+    BaseTier::ALL.into_iter().map(|t| format!("mekanism:{}_chemical_tank", t.name())).chain([fusion::HOHLRAUM.to_owned()]).collect()
 }
 
 /// Writes `tank` as the chemical an item holds (its custom data under `CHEMICAL_KEY`).
@@ -3913,7 +3925,7 @@ fn fill_tank_from_item(entity: &mut ModBlockEntity, from: usize, tank: &mut Chem
     if !accepts(&chemical) || !tank.accepts(&chemical) {
         return false;
     }
-    let moved = held.amount.min(tank.capacity - tank.amount);
+    let moved = held.amount.min(tank.capacity - tank.amount).min(chemical_item_rate(&stack.item));
     if moved == 0 {
         return false;
     }
@@ -3934,10 +3946,10 @@ fn drain_tank_into_item(entity: &mut ModBlockEntity, from: usize, tank: &mut Che
         return false;
     };
     let mut held = item_tank(&stack, CHEMICAL_KEY, capacity).unwrap_or_else(|| ChemicalTank::new(capacity));
-    if !held.accepts(&chemical) {
+    if !held.accepts(&chemical) || !chemical_item_accepts(&stack.item, &chemical) {
         return false;
     }
-    let moved = tank.amount.min(held.capacity - held.amount);
+    let moved = tank.amount.min(held.capacity - held.amount).min(chemical_item_rate(&stack.item));
     if moved == 0 {
         return false;
     }
@@ -7069,6 +7081,40 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         pull_from_carriers(game, p, &mut water, "minecraft:water");
     }
     let mut plasma = fusion_plasma(&entity.nbt);
+    // `vaporiseHohlraum`: over the burn temperature and not yet burning, a full hohlraum in the reactor slot (the
+    // port's own, or any other port's) gives its fuel to the tank and starts the reaction.
+    if plasma.plasma >= fusion::BURN_TEMPERATURE && !plasma.burning {
+        let needed = fuel.capacity - fuel.amount;
+        let mut slots: Vec<[i32; 3]> = vec![pos];
+        slots.extend(ports.iter().copied().filter(|&p| p != pos));
+        for at in slots {
+            let mut take = |items: &mut Vec<Option<ItemStack>>| -> bool {
+                let Some(Some(stack)) = items.get(3).cloned() else {
+                    return false;
+                };
+                let full = stack.item.as_ref() == fusion::HOHLRAUM
+                    && item_tank(&stack, CHEMICAL_KEY, fusion::HOHLRAUM_CAPACITY)
+                        .is_some_and(|t| t.amount >= fusion::HOHLRAUM_CAPACITY && t.chemical.as_deref() == Some(fusion::FUSION_FUEL));
+                let Some(fuel_in) = full.then(|| fusion::vaporise(needed)).flatten() else {
+                    return false;
+                };
+                if fuel_in > 0 {
+                    fuel.insert(fusion::FUSION_FUEL, fuel_in);
+                }
+                items[3] = None;
+                true
+            };
+            let started = if at == pos {
+                take(&mut entity.items)
+            } else {
+                game.native_with_mod_block_entity(at, |m| take(&mut m.items)).unwrap_or(false)
+            };
+            if started {
+                plasma.burning = true;
+                break;
+            }
+        }
+    }
     let mut t = fusion::Tanks {
         deuterium: deuterium.amount,
         tritium: tritium.amount,
@@ -7130,12 +7176,27 @@ fn tick_fusion_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     put_client(game, pos, entity, &["fus_on", "fus_scaled", "fus_x", "fus_y", "fus_z"], core);
 }
 
-/// A right click with an empty hand on a Fusion Reactor's controller or port: sneaking ignites the
-/// reactor (what its lasers and a hohlraum do), else it steps the injection rate. Either way the action
-/// bar shows the reactor's state.
+/// A right click with an empty hand on a Fusion Reactor's controller or port steps the injection rate (sneaking
+/// only shows the reactor's state); the action bar shows it either way. A creative player's click on a Laser
+/// Focus Matrix of a formed reactor heats its plasma to ten times the burn temperature
+/// (`TileEntityLaserFocusMatrix.onRightClick`).
 pub(super) fn use_fusion(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     if !game.native_on(MOD_ID) || game.inventory.get(game.selected).cloned().flatten().is_some() {
         return false;
+    }
+    if block_name(game, pos) == "mekanismgenerators:laser_focus_matrix" {
+        if !game.creative {
+            return false;
+        }
+        let Some((_, ports)) = find_fusion(game, pos) else {
+            return false;
+        };
+        game.native_with_mod_block_entity(ports[0], |m| {
+            let mut plasma = fusion_plasma(&m.nbt);
+            plasma.plasma = 10.0 * fusion::BURN_TEMPERATURE;
+            put_fusion_plasma(&mut m.nbt, &plasma);
+        });
+        return true;
     }
     let master = if block_name(game, pos) == fusion::CONTROLLER {
         find_fusion(game, pos).map(|(_, ports)| ports[0])
@@ -7157,10 +7218,7 @@ pub(super) fn use_fusion(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
             game.native_with_mod_block_entity(master, |m| {
                 let mut injection = fusion_injection(&m.nbt);
                 let mut plasma = fusion_plasma(&m.nbt);
-                if sneaking {
-                    fusion::ignite(&mut plasma, injection);
-                    put_fusion_plasma(&mut m.nbt, &plasma);
-                } else {
+                if !sneaking {
                     injection = fusion::next_injection(injection);
                     put_long(&mut m.nbt, "injection", injection);
                 }
@@ -8084,6 +8142,8 @@ fn extra_slots(block: &str) -> Vec<([f32; 2], &'static str)> {
         Some(Kind::Nucleosynthesizer) => vec![([173.0, 69.0], "slot/power")],
         // The bucket slot under the water slot (`outputInputSlot`).
         Some(Kind::Evaporation) => vec![([28.0, 51.0], "slot/output")],
+        // `FusionReactorMultiblockData.reactorSlot`: the hohlraum that starts the reaction.
+        Some(Kind::FusionPort) => vec![([85.0, 39.0], "slot/normal")],
         // `ChemicalInventorySlot`s: the output's drain slot, the input's fill slot (`TileEntityChemical*`).
         Some(Kind::Oxidizer | Kind::PigmentExtractor) => vec![([152.0, 55.0], "slot/normal")],
         // `FluidInventorySlot.drain` (the bucket to fill) and the filled container's output slot.
@@ -8811,8 +8871,9 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
         let extra = extra_slots(block);
         if !extra.is_empty() {
             rules.resize(3, SlotRule::Any);
-            let chemical = !matches!(kind(block), Some(Kind::Washer | Kind::DigitalMiner | Kind::Liquifier | Kind::Assemblicator));
+            let chemical = !matches!(kind(block), Some(Kind::Washer | Kind::DigitalMiner | Kind::Liquifier | Kind::Assemblicator | Kind::FusionPort));
             rules.extend(extra.iter().map(|(_, sprite)| match *sprite {
+                "slot/normal" if kind(block) == Some(Kind::FusionPort) => SlotRule::Items(vec![fusion::HOHLRAUM.to_owned()]),
                 "slot/normal" if !chemical => SlotRule::Any,
                 "slot/normal" => SlotRule::Items(chemical_item_ids()),
                 "slot/output" => SlotRule::Refuse,
@@ -9845,8 +9906,6 @@ fn multiblock_lines(block: &str, data: &[i32]) -> Vec<String> {
 fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
     match kind(block) {
         Some(Kind::FissionPort) => &[([6.0, 75.0, 81.0, 16.0], "Activate"), ([89.0, 75.0, 81.0, 16.0], "SCRAM")],
-        // The port has no lasers or hohlraum, so a button ignites the reactor.
-        Some(Kind::FusionPort) => &[([63.0, 36.0, 60.0, 16.0], "Ignite")],
         // `GuiGasMode`: the steam dump mode, a 10 px image button.
         Some(Kind::TurbineValve) => &[([173.0, 72.0, 10.0, 10.0], "")],
         Some(Kind::ChemicalTank(_)) => &[([159.0, 72.0, 10.0, 10.0], "")],
@@ -10083,11 +10142,6 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         (Some(Kind::TurbineValve), 0) => {
             let next = (get_int(&m.nbt, "dump") + 1) % 3;
             put_int(&mut m.nbt, "dump", next)
-        }
-        (Some(Kind::FusionPort), 0) => {
-            let mut plasma = fusion_plasma(&m.nbt);
-            fusion::ignite(&mut plasma, fusion_injection(&m.nbt));
-            put_fusion_plasma(&mut m.nbt, &plasma);
         }
         (Some(Kind::FusionPort), 1) => {
             let next = fusion::next_injection(fusion_injection(&m.nbt));
@@ -14443,8 +14497,19 @@ fn tick_laser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
         put_long(&mut entity.nbt, "progress", 0);
         return Some(true);
     };
-    // A receptor takes the energy; what it has no room for is lost.
     let name = block_name(game, at).to_owned();
+    // `TileEntityLaserFocusMatrix.receiveLaserEnergy`: a formed reactor's plasma takes the energy; the beam never digs it.
+    if name == "mekanismgenerators:laser_focus_matrix" {
+        if let Some((_, ports)) = find_fusion(game, at) {
+            game.native_with_mod_block_entity(ports[0], |m| {
+                let mut plasma = fusion_plasma(&m.nbt);
+                fusion::add_laser_energy(&mut plasma, firing);
+                put_fusion_plasma(&mut m.nbt, &plasma);
+            });
+        }
+        return Some(true);
+    }
+    // A receptor takes the energy; what it has no room for is lost.
     if laser::is_receptor(&name) {
         game.native_with_mod_block_entity(at, |m| {
             let e = get_long(&m.nbt, "energy");

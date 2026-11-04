@@ -134,16 +134,30 @@ pub struct Output {
     pub environment_loss: f64,
 }
 
-/// What the reactor's lasers and hohlraum do to start it, simplified: the plasma is heated to
-/// `getMaxPlasmaTemperature` (air cooled) for the injection rate, hot enough to keep burning while the
-/// casing warms up.
-pub fn ignite(p: &mut Plasma, injection: u64) {
-    let k = CASING_CONDUCTIVITY;
-    let max = injection.max(DEFAULT_INJECTION) as f64 * ENERGY_PER_FUEL / PLASMA_CASE_CONDUCTIVITY
-        * (PLASMA_CASE_CONDUCTIVITY + k)
-        / k;
-    p.plasma = p.plasma.max(max);
-    p.burning = true;
+/// `addTemperatureFromEnergyInput`: laser energy (a Laser Focus Matrix hit by a beam) heats the plasma,
+/// ten times as much while it is not yet burning.
+pub fn add_laser_energy(p: &mut Plasma, energy: u64) {
+    if energy > 0 {
+        let heat = energy as f64 / PLASMA_HEAT_CAPACITY;
+        p.plasma += if p.burning { heat } else { heat * 10.0 };
+    }
+}
+
+/// `GeneratorsItems.HOHLRAUM`: holds up to `hohlraumMaxGas` (10) mB of D-T fuel, filled at `hohlraumFillRate` (1) a
+/// tick; a full one is the reaction starter.
+pub const HOHLRAUM: &str = "mekanismgenerators:hohlraum";
+pub const FUSION_FUEL: &str = "mekanismgenerators:fusion_fuel";
+pub const HOHLRAUM_CAPACITY: u64 = 10;
+pub const HOHLRAUM_FILL_RATE: u64 = 1;
+
+/// `vaporiseHohlraum`: the fuel a full hohlraum gives the fuel tank when `needed` mB fit in it; `None` when the
+/// tank cannot take any of it (the hohlraum stays).
+pub fn vaporise(needed: u64) -> Option<u64> {
+    if needed == 0 {
+        Some(0)
+    } else {
+        Some(needed.min(HOHLRAUM_CAPACITY))
+    }
 }
 
 /// `FusionReactorMultiblockData.tick`: inject and burn while burning and hot enough, then
@@ -274,7 +288,9 @@ mod tests {
             tritium: u64::MAX / 4,
             ..Default::default()
         };
-        ignite(&mut p, 2);
+        // A full hohlraum starts it once lasers (here: the creative click) have the plasma over the burn temperature.
+        p.plasma = 10.0 * BURN_TEMPERATURE;
+        p.burning = true;
         let mut out = Output::default();
         for _ in 0..20_000 {
             out = tick(&mut p, &mut t, 2, steam_capacity(2));
@@ -285,6 +301,19 @@ mod tests {
         // = 0.05 × 0.1 × 200 MK = 1 MJ a tick.
         assert!((p.case - 200_000_300.0).abs() < 1_000.0, "{}", p.case);
         assert!(out.energy.abs_diff(1_000_000) < 100, "{}", out.energy);
+    }
+
+    #[test]
+    fn laser_energy_heats_a_cold_plasma_ten_times_as_fast() {
+        let mut p = Plasma::default();
+        add_laser_energy(&mut p, 1_000);
+        assert_eq!(p.plasma, 300.0 + 100.0);
+        p.burning = true;
+        add_laser_energy(&mut p, 1_000);
+        assert_eq!(p.plasma, 300.0 + 100.0 + 10.0);
+        assert_eq!(vaporise(0), Some(0));
+        assert_eq!(vaporise(4), Some(4));
+        assert_eq!(vaporise(1_000), Some(10));
     }
 
     #[test]
