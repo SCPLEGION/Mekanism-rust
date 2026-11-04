@@ -57,6 +57,23 @@ const HEAT_GENERATOR: &str = "mekanismgenerators:heat_generator";
 const FACTORY_ROW: usize = 9;
 /// A factory's energy slot (`TileEntityFactory.energySlot`), after its two rows.
 const FACTORY_ENERGY: usize = 2 * FACTORY_ROW;
+/// The chemical slot of the item and chemical factories (`ChemicalInventorySlot.fillOrConvert`, at (7, 57)).
+const FACTORY_CHEM: usize = FACTORY_ENERGY + 1;
+
+/// The advanced machine whose recipes and chemicals a chemical factory runs.
+fn chem_factory(recipe: &str) -> Option<&'static chem::AdvancedMachine> {
+    let block = match recipe {
+        "compressing" => "mekanism:osmium_compressor",
+        "purifying" => "mekanism:purification_chamber",
+        "injecting" => "mekanism:chemical_injection_chamber",
+        _ => return None,
+    };
+    chem::ADVANCED_MACHINES.iter().find(|m| m.block == block)
+}
+
+fn is_chem_factory(block: &str) -> bool {
+    matches!(kind(block), Some(Kind::Factory(_, recipe, _)) if factory::takes_chemical(recipe))
+}
 
 /// What a Mekanism block entity is, from its block (and block entity) id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -318,7 +335,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         let inputs: Vec<usize> = (0..n).collect();
         let outputs: Vec<usize> = (FACTORY_ROW..FACTORY_ROW + n).collect();
         *container = Some(ModContainer {
-            slots: FACTORY_ENERGY + 1,
+            slots: FACTORY_ENERGY + 1 + usize::from(is_chem_factory(block)),
             faces: [outputs.clone(), inputs.clone(), inputs.clone(), inputs.clone(), inputs.clone(), inputs.clone()],
             inputs,
             outputs,
@@ -594,6 +611,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     } else {
         match k {
             Kind::Machine(recipe, usage) => tick_machine(game, entity, recipe, usage),
+            Kind::Factory(n, recipe, usage) if factory::takes_chemical(recipe) => tick_chem_factory(game, entity, n, recipe, usage),
             Kind::Factory(n, recipe, usage) => tick_factory(game, entity, n, recipe, usage),
             Kind::HeatGenerator => tick_generator(game, pos, entity),
             Kind::Solar(peak, storage) => tick_solar(game, pos, entity, peak, storage),
@@ -934,6 +952,93 @@ fn tick_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize, reci
         Tag::IntArray(f.progress.iter().map(|p| (*p).min(i32::MAX as u32) as i32).collect()),
     );
     Some(f.active)
+}
+
+/// The item and chemical factories (`TileEntityItemStackChemicalToItemStackFactory`): each process turns
+/// its item into another over the recipe's ticks, using the shared tank's chemical a little every tick
+/// (`ChemicalUsageMultiplier.constantUse`: the whole amount spread over the ticks) and the shared energy.
+fn tick_chem_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize, recipe_kind: &str, usage: u64) -> Option<bool> {
+    let m = chem_factory(recipe_kind)?;
+    let mut f = Factory::new(n, usage, upgrades(&entity.nbt));
+    f.machine.energy.stored = get_long(&entity.nbt, "energy").min(f.machine.energy.capacity);
+    discharge_slot(entity, FACTORY_ENERGY, &mut f.machine.energy);
+    let ticks = f.machine.ticks_required.max(1);
+    let mut tank = get_tank(&entity.nbt, "chemical", factory::CHEMICAL_PER_PROCESS * n as u64);
+    let saved = |key: &str| match entity.nbt.get(&JavaString::from(key)) {
+        Some(Tag::IntArray(v)) => v.clone(),
+        _ => vec![],
+    };
+    let (progress, used) = (saved("progress"), saved("used"));
+    let mut progress: Vec<u32> = (0..n).map(|i| progress.get(i).copied().unwrap_or(0).max(0) as u32).collect();
+    let mut used: Vec<u64> = (0..n).map(|i| used.get(i).copied().unwrap_or(0).max(0) as u64).collect();
+    let items = world_items!(game);
+    let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
+    // `fillOrConvert`: a chemical item in the slot fills the tank, or converts into some of its chemical.
+    if let Some(Some(extra)) = entity.items.get(FACTORY_CHEM).cloned()
+        && let Some(c) = mekanism_core::recipes::find_conversion(&extra.item, &in_tag)
+        && m.chemicals.contains(&c.output)
+        && tank.accepts(c.output)
+        && tank.amount + c.amount <= tank.capacity
+    {
+        tank.insert(c.output, c.amount);
+        entity.items[FACTORY_CHEM] = (extra.count > 1).then(|| ItemStack { count: extra.count - 1, ..extra });
+    }
+    if get_int(&entity.nbt, "sorting") & 1 != 0 && get_int(&entity.nbt, "sort_tick") % 20 == 0 {
+        sort_factory_inputs(game, entity, n, recipe_kind);
+    }
+    let sort_tick = get_int(&entity.nbt, "sort_tick");
+    put_int(&mut entity.nbt, "sort_tick", (sort_tick + 1) % 20);
+    let mut warn = vec![0i32; n];
+    let mut any_active = false;
+    for i in 0..n {
+        let input = entity.items.get(i).cloned().flatten();
+        let out = entity.items.get(FACTORY_ROW + i).cloned().flatten();
+        // With a chemical in the tank, only its recipes.
+        let held = tank.chemical.as_deref();
+        let found = input.as_ref().and_then(|stack| {
+            m.table
+                .iter()
+                .find(|r| held.is_none_or(|c| c == r.chemical) && stack.count >= r.input_count && r.input.matches(&stack.item, &in_tag))
+                .map(|r| (stack.clone(), *r))
+        });
+        let Some((stack, r)) = found else {
+            warn[i] = if input.is_some() { 8 } else { 0 };
+            progress[i] = 0;
+            used[i] = 0;
+            continue;
+        };
+        let max = items.get(r.output).map_or(64, |it| it.max_stack);
+        let fits = out.as_ref().is_none_or(|o| &*o.item == r.output && o.count + r.output_count <= max);
+        // The chemical for this tick: the recipe's amount over all its ticks, `used` of it spent already.
+        let total = r.chemical_amount * u64::from(chem::ADVANCED_TICKS);
+        let want = (total * u64::from(progress[i] + 1) / u64::from(ticks)).saturating_sub(used[i]);
+        let has_chemical = tank.chemical.as_deref() == Some(r.chemical) && tank.amount >= want;
+        let has_energy = f.machine.energy.stored >= f.machine.usage;
+        warn[i] = i32::from(!has_energy) | i32::from(!has_chemical) << 1 | i32::from(!fits) << 2;
+        if fits && has_chemical && has_energy {
+            f.machine.energy.consume(f.machine.usage);
+            tank.extract(want);
+            used[i] += want;
+            progress[i] += 1;
+            any_active = true;
+            if progress[i] >= ticks {
+                progress[i] = 0;
+                used[i] = 0;
+                let left = stack.count - r.input_count;
+                entity.items[i] = (left > 0).then(|| ItemStack { count: left, ..stack });
+                entity.items[FACTORY_ROW + i] = Some(match out {
+                    Some(o) => ItemStack { count: o.count + r.output_count, ..o },
+                    None => stack_of(r.output, r.output_count),
+                });
+            }
+        }
+    }
+    entity.nbt.insert("warn".into(), Tag::IntArray(warn));
+    entity.nbt.insert("progress".into(), Tag::IntArray(progress.iter().map(|p| *p as i32).collect()));
+    entity.nbt.insert("used".into(), Tag::IntArray(used.iter().map(|u| (*u).min(i32::MAX as u64) as i32).collect()));
+    put_long(&mut entity.nbt, "energy", f.machine.energy.stored);
+    put_tank(&mut entity.nbt, "chemical", &tank);
+    Some(any_active)
 }
 
 /// `TileEntityFactory.sortInventory`, once a second: each kind of input item is spread evenly over the
@@ -7208,9 +7313,14 @@ fn layout(block: &str) -> Option<Layout> {
     let large_right = |x, y| Some(([x, y], "progress/large_right", [48.0, 8.0]));
     Some(match kind(block)? {
         // GuiFactory: its slots and arrows are drawn by `factory_slots`; the power bar sits at the right.
-        Kind::Factory(..) => Layout {
+        Kind::Factory(n, recipe, _) => Layout {
             slots: [None, None, None],
-            gauges: vec![],
+            // The item and chemical factories' `GuiChemicalBar` (7, 76), 138 wide (172 in the ultimate), 4 high.
+            gauges: if factory::takes_chemical(recipe) {
+                vec![gauge("chemical", factory::CHEMICAL_PER_PROCESS * n as u64, 7.0, 76.0, [if n == 9 { 172.0 } else { 138.0 }, 4.0])]
+            } else {
+                vec![]
+            },
             // `GuiVerticalPowerBar(imageWidth - 12, 16, sawing ? 73 : 52)`.
             power: Some(PowerBar::Tall([screen_width(block) - 12.0, 16.0], if matches!(kind(block), Some(Kind::Factory(_, "sawing", _))) { 73.0 } else { 52.0 })),
             progress: None,
@@ -7902,6 +8012,8 @@ fn energy_warn(id: &str, nbt: &Compound) -> u32 {
 /// A machine screen's height: the nucleosynthesizer's is 27 taller (`DEFAULT_IMAGE_HEIGHT + 27`).
 fn screen_height(block: &str) -> f32 {
     match kind(block) {
+        // `DEFAULT_IMAGE_HEIGHT + 11` for the secondary resource bar.
+        Some(Kind::Factory(_, recipe, _)) if factory::takes_chemical(recipe) => 177.0,
         Some(Kind::Nucleosynthesizer) => 193.0,
         // `DEFAULT_IMAGE_HEIGHT + 5`.
         Some(Kind::Reaction) => 171.0,
@@ -7985,6 +8097,9 @@ fn draw_factory_slots(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
     let [ox, oy] = origin;
     let first = redstone_slot(l) + 5;
     sprite(game, batch, "slot/power", [0.0, 0.0, 18.0, 18.0], [ox + 6.0, oy + 12.0, 18.0, 18.0]);
+    if is_chem_factory(_block) {
+        sprite(game, batch, "slot/extra", [0.0, 0.0, 18.0, 18.0], [ox + 6.0, oy + 56.0, 18.0, 18.0]);
+    }
     for (i, (input, output)) in factory_slots(n).into_iter().enumerate() {
         sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + input[0] - 1.0, oy + input[1] - 1.0, 18.0, 18.0]);
         sprite(game, batch, "slot/output", [0.0, 0.0, 18.0, 18.0], [ox + output[0] - 1.0, oy + output[1] - 1.0, 18.0, 18.0]);
@@ -8620,7 +8735,7 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
         SlotRule::Items(ids)
     };
     if let Some(Kind::Factory(n, ..)) = kind(block) {
-        *rules = vec![SlotRule::Any; FACTORY_ENERGY + 1];
+        *rules = vec![SlotRule::Any; FACTORY_ENERGY + 1 + usize::from(is_chem_factory(block))];
         for i in 0..factory_slots(n).len() {
             rules[FACTORY_ROW + i] = SlotRule::Refuse;
         }
@@ -9694,6 +9809,9 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
         Some(Kind::ChemicalTank(_)) => &[([159.0, 72.0, 10.0, 10.0], "")],
         // `GuiDumpButton`: empties the infusion tank.
         Some(Kind::Infuser) => &[([16.0, 59.0, 21.0, 10.0], "")],
+        // The chemical factories' dump button (at 182 in the ultimate one).
+        Some(Kind::Factory(9, recipe, _)) if factory::takes_chemical(recipe) => &[([182.0, 76.0, 21.0, 10.0], "")],
+        Some(Kind::Factory(_, recipe, _)) if factory::takes_chemical(recipe) => &[([148.0, 76.0, 21.0, 10.0], "")],
         // `GuiDigitalMiner`: the four buttons, then the three switches (15 wide, icon underneath).
         Some(Kind::DigitalMiner) => &[
             ([87.0, 19.0, 61.0, 18.0], "Start"),
@@ -9862,6 +9980,11 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
     // `TileEntityMetallurgicInfuser.dump`: the infusion tank is emptied.
     if id == 0 && kind(&entity.id) == Some(Kind::Infuser) {
         put_tank(&mut entity.nbt, "infuse", &ChemicalTank::new(chem::INFUSER_TANK));
+        return;
+    }
+    // `IHasDumpButton.dump` of a chemical factory: the tank is emptied.
+    if id == 0 && is_chem_factory(&entity.id) {
+        entity.nbt.remove(&JavaString::from("chemical"));
         return;
     }
     // The Digital Miner's Start, Stop, Config (with the filters), Reset and its three switches.
@@ -10066,14 +10189,19 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         return;
     };
     if let Some(Kind::Factory(n, ..)) = kind(block) {
-        let mut slots = vec![None; FACTORY_ENERGY + 1];
+        let chem = is_chem_factory(block);
+        let mut slots = vec![None; FACTORY_ENERGY + 1 + usize::from(chem)];
         slots[FACTORY_ENERGY] = Some([7.0, 13.0]);
+        if chem {
+            slots[FACTORY_CHEM] = Some([7.0, 57.0]);
+        }
         for (i, (input, output)) in factory_slots(n).into_iter().enumerate() {
             slots[i] = Some(input);
             slots[FACTORY_ROW + i] = Some(output);
         }
         let w = screen_width(block);
-        *screen = Some(super::native_hooks::NativeScreen { width: w, height: 166.0, slots, inventory_y: 84.0, inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(), own_labels: false, alt: None, ..Default::default() });
+        let h = screen_height(block);
+        *screen = Some(super::native_hooks::NativeScreen { width: w, height: h, slots, inventory_y: h - 82.0, inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(), own_labels: false, alt: None, ..Default::default() });
         return;
     }
     let (w, h) = (screen_width(block), screen_height(block));
@@ -11281,6 +11409,22 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
             fill_tiled(game, batch, &texture, [bx + 1.0, by + bh - 1.0 - h, bw - 2.0, h], argb);
         }
     }
+    // The chemical factories' `GuiChemicalBar` (horizontal) and `GuiDumpButton`.
+    if is_chem_factory(block)
+        && let Some(g) = layout(block).and_then(|l| l.gauges.into_iter().next())
+    {
+        let (amount, capacity) = (read_wide(data, DATA_GAUGES), read_wide(data, DATA_GAUGES + 4).max(1));
+        let chemical = usize::try_from(data.get(DATA_GAUGES + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c));
+        let (texture, argb) = gauge_texture(chemical);
+        let [bx, by, bw, bh] = [ox + g.at[0], oy + g.at[1], g.size[0], g.size[1]];
+        nine_slice(game, batch, "bar/base", 5.0, 1.0, [bx, by, bw, bh]);
+        let w = (bw - 2.0) * (amount as f32 / capacity as f32).clamp(0.0, 1.0);
+        if w > 0.0 {
+            fill_tiled(game, batch, &texture, [bx + 1.0, by + 1.0, w, bh - 2.0], argb);
+        }
+        let dump_x = if matches!(kind(block), Some(Kind::Factory(9, ..))) { 182.0 } else { 148.0 };
+        sprite(game, batch, "button/dump", [0.0, 0.0, 21.0, 10.0], [ox + dump_x, oy + 76.0, 21.0, 10.0]);
+    }
     // `GuiDumpButton` (16, 59): the infuser's dump button, the image alone.
     if kind(block) == Some(Kind::Infuser) {
         sprite(game, batch, "button/dump", [0.0, 0.0, 21.0, 10.0], [ox + 16.0, oy + 59.0, 21.0, 10.0]);
@@ -11488,7 +11632,7 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         };
         sprite(game, batch, &format!("gauge/overlay/{overlay}"), [0.0, 0.0, size[0] - 2.0, size[1] - 2.0], [x + 1.0, y + 1.0, size[0] - 2.0, size[1] - 2.0]);
     };
-    for (i, g) in l.gauges.iter().enumerate().filter(|(_, g)| !matches!(kind(block), Some(Kind::FusionPort | Kind::ChemicalTank(_) | Kind::BioGenerator | Kind::Advanced(_) | Kind::Infuser)) && !g.key.starts_with("stats_")) {
+    for (i, g) in l.gauges.iter().enumerate().filter(|(_, g)| !matches!(kind(block), Some(Kind::FusionPort | Kind::ChemicalTank(_) | Kind::BioGenerator | Kind::Advanced(_) | Kind::Infuser | Kind::Factory(..))) && !g.key.starts_with("stats_")) {
         let at = DATA_GAUGES + i * GAUGE_SLOTS;
         let (amount, capacity) = (read_wide(data, at), read_wide(data, at + 4).max(1));
         let chemical = usize::try_from(data.get(at + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c));

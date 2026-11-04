@@ -9,11 +9,23 @@ pub const TIERS: [(&str, usize); 4] =
     [("basic", 3), ("advanced", 5), ("elite", 7), ("ultimate", 9)];
 
 /// The factory kinds this port runs: (`FactoryType` name, the machine's recipe kind, energy per tick).
-pub const KINDS: [(&str, &str, u64); 3] = [
+pub const KINDS: [(&str, &str, u64); 6] = [
     ("enriching", "enriching", 5),
     ("crushing", "crushing", 8),
     ("smelting", "smelting", 5),
+    // The item and chemical factories (`TileEntityItemStackChemicalToItemStackFactory`).
+    ("compressing", "compressing", 15),
+    ("purifying", "purifying", 10),
+    ("injecting", "injecting", 15),
 ];
+
+/// The recipe kinds that also take a chemical from the factory's tank.
+pub fn takes_chemical(recipe: &str) -> bool {
+    matches!(recipe, "compressing" | "purifying" | "injecting")
+}
+
+/// `TileEntityAdvancedElectricMachine.MAX_GAS`: what each process adds to the chemical tank.
+pub const CHEMICAL_PER_PROCESS: u64 = 210;
 
 /// A factory block id (`mekanism:elite_crushing_factory`): its processes, recipe kind and usage.
 pub fn factory(block: &str) -> Option<(usize, &'static str, u64)> {
@@ -120,6 +132,11 @@ mod tests {
             factory("mekanism:ultimate_crushing_factory"),
             Some((9, "crushing", 8))
         );
+        assert_eq!(
+            factory("mekanism:elite_injecting_factory"),
+            Some((7, "injecting", 15))
+        );
+        assert!(takes_chemical("purifying") && !takes_chemical("crushing"));
         assert_eq!(factory("mekanism:basic_infusing_factory"), None);
         assert_eq!(factory("mekanism:crusher"), None);
     }
