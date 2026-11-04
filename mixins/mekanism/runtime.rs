@@ -5950,6 +5950,7 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch
     if !game.native_on(MOD_ID) || !game.native_playing() || game.spectator() {
         return;
     }
+    radiation_overlay(game, batch);
     let (width, height) = (batch.width, batch.height);
     let gray = 0xCFCFCF;
     let dark = 0x7A7A7A;
@@ -22143,6 +22144,37 @@ fn dosimeter_use(game: &mut Game<'_>, claimed: &mut bool) {
     };
     let decay = (dose > radiation::MIN_MAGNITUDE).then(|| radiation::decay_ticks(dose, radiation::TARGET_DECAY_RATE));
     rad_say(game, "Radiation Exposure", dose, "Sv", decay);
+}
+
+thread_local! {
+    /// `RadiationOverlay.prevRadiation` and the tick it last moved at.
+    static RAD_OVERLAY: std::cell::Cell<(f64, i64)> = const { std::cell::Cell::new((0.0, -1)) };
+}
+
+/// `RadiationOverlay`: a red tint over the screen that follows the dose, moving 0.01 a tick toward 0.8 of its
+/// severity (`color = 0x701E1E00 + effect`).
+fn radiation_overlay(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    if game.creative {
+        return;
+    }
+    let (_, _, dose) = RAD_CLIENT.get();
+    let severity = radiation::scaled_dose_severity(dose) * 0.8;
+    let (mut previous, last) = RAD_OVERLAY.get();
+    let tick = game.ticks as i64;
+    if last != tick {
+        if previous < severity {
+            previous = (previous + 0.01).min(severity);
+        }
+        if previous > severity {
+            previous = (previous - 0.01).max(severity);
+        }
+        RAD_OVERLAY.set((previous, tick));
+    }
+    if severity > radiation::BASELINE {
+        let effect = (previous * 255.0) as u8;
+        let (width, height) = (batch.width, batch.height);
+        batch.fill(&game.gui.atlas, 0.0, 0.0, width, height, horizon_client::hud::rgba(0x1E, 0x1E, effect, 0x70));
+    }
 }
 
 /// The window's tick: the Geiger Counter's clicks (`GeigerSound`, a loop at 5% volume while the scale shows), and the
