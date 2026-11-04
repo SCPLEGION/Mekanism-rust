@@ -6418,6 +6418,46 @@ pub(super) fn player_immunities(game: &mut Game<'_>, immune: &mut Vec<String>) {
     }
 }
 
+/// `gear.mekaSuitEnergyUsageMagicReduce`: FE per point of magic damage the Inhalation Purification Unit takes.
+const MAGIC_REDUCE_ENERGY: u64 = 1_000;
+
+/// A module of a worn piece that is installed and on.
+fn module_on(stack: &ItemStack, module: &str) -> bool {
+    let installed = installed_modules(stack).get(module).copied().unwrap_or(0);
+    installed > 0
+        && module_config::settings(module, installed)
+            .into_iter()
+            .find(|s| s.key == "enabled")
+            .is_none_or(|s| module_setting(stack, module, &s, installed) != 0)
+}
+
+/// The MekaSuit's Inhalation Purification Unit (`ModuleInhalationPurificationUnit.getDamageAbsorbInfo`, with
+/// `ItemMekaSuitArmor.getDamageAbsorbed`): magic damage is taken whole (`magicDamageReductionRatio` 1) while a piece with
+/// the unit holds the energy for it, and paid for afterwards at 1000 FE a point.
+pub(super) fn player_damage_rules(game: &mut Game<'_>, absorbed: f32, rules: &mut Vec<(String, f32)>) {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    const UNIT: &str = "mekanism:inhalation_purification_unit";
+    let holders: Vec<usize> = (0..4).filter(|&i| game.armor[i].as_ref().is_some_and(|s| modules::is_container(&s.item) && module_on(s, UNIT))).collect();
+    if absorbed > 0.0 && !game.creative {
+        let mut owed = (MAGIC_REDUCE_ENERGY as f32 * absorbed).ceil() as u64;
+        for &i in &holders {
+            if let Some(piece) = game.armor[i].as_mut() {
+                let e = stored_energy(piece);
+                let used = e.min(owed);
+                set_energy(piece, e - used);
+                owed -= used;
+            }
+        }
+    }
+    let can_pay = holders.iter().any(|&i| game.armor[i].as_ref().is_some_and(|s| stored_energy(s) >= MAGIC_REDUCE_ENERGY));
+    if can_pay || (game.creative && !holders.is_empty()) {
+        rules.push(("minecraft:magic".to_owned(), 1.0));
+        rules.push(("minecraft:indirect_magic".to_owned(), 1.0));
+    }
+}
+
 /// `ModeChangeKey`, on the window: the mode key (M) held while the wheel turns asks the server to toggle the
 /// flow of a scuba tank in hand or worn.
 pub(super) fn wheel(game: &mut Game<'_>, steps: f32, claimed: &mut bool) {
