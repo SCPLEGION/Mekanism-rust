@@ -1365,6 +1365,10 @@ thread_local! {
     /// The personal chests this client has heard of: lid openness, the previous tick's, the tick last stepped
     /// (`TileEntityPersonalStorage` / `ChestLidController`).
     /// The industrial alarms this client has heard of.
+    /// The sorters this client has heard of, with the tick their next sound may start (`nextSound`).
+    static SORTERS: std::cell::RefCell<std::collections::HashMap<[i32; 3], u64>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Chargepads and whether they were lit last tick, for the pressure plate's click.
+    static PADS: std::cell::RefCell<std::collections::HashMap<[i32; 3], bool>> = std::cell::RefCell::new(std::collections::HashMap::new());
     static ALARMS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
     /// The transmitters whose faces are set to push or pull, as `conn_show` says (two bits a face).
     static CONNS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
@@ -1403,6 +1407,7 @@ fn machine_sound(id: &str) -> Option<&'static str> {
         "painting_machine" => "mekanism:tile.machine.painting_machine",
         "pigment_extractor" => "mekanism:tile.machine.pigment_extractor",
         "pigment_mixer" => "mekanism:tile.machine.pigment_mixer",
+        "chargepad" => "mekanism:tile.machine.chargepad",
         "precision_sawmill" | "sawing_factory" => "mekanism:tile.machine.precision_sawmill",
         "pressurized_reaction_chamber" => "mekanism:tile.machine.pressurized_reaction_chamber",
         "purification_chamber" | "purifying_factory" => "mekanism:tile.machine.purification_chamber",
@@ -1418,6 +1423,15 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
     if let Some(event) = machine_sound(id) {
         MACHINE_SOUNDS.with_borrow_mut(|m| {
             m.insert(pos, event);
+        });
+    }
+    if id == "mekanism:logistical_sorter" {
+        SORTERS.with_borrow_mut(|s| {
+            s.entry(pos).or_insert(0);
+        });
+    } else if id == chargepad::CHARGEPAD {
+        PADS.with_borrow_mut(|p| {
+            p.entry(pos).or_insert(false);
         });
     }
     if id == "mekanismgenerators:wind_generator" {
@@ -4420,6 +4434,10 @@ fn save_sorter(nbt: &mut Compound, s: &Sorter) {
 /// the sorter, until one moves something; then, with auto-eject, any item. They go into the
 /// transporters in front (or straight into an inventory there), and what fits nowhere goes back.
 fn tick_sorter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    // Active for the four ticks after it moved something (`setActive(true)`, off again at 6 ticks of the 10 left).
+    let now = game.world.game_time.max(0) as u64;
+    let moved = get_long(&entity.nbt, "moved_at");
+    put_flag(game, pos, entity, "sorter_active", moved > 0 && now.saturating_sub(moved) <= 4);
     let delay = get_int(&entity.nbt, "delay").saturating_sub(1);
     put_int(&mut entity.nbt, "delay", delay);
     if delay > 0 {
@@ -4472,6 +4490,7 @@ fn tick_sorter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
         {
             game.native_insert_item(back, horizon_core::geometry::Direction::Up, lost);
         }
+        put_long(&mut entity.nbt, "moved_at", now.max(1));
         return;
     }
 }
@@ -5873,6 +5892,38 @@ fn loop_sounds(game: &mut Game<'_>) {
         }
     }
     let ticks = game.ticks as u64;
+    // A sorter (`TileEntityLogisticalSorter.onUpdateClient`) plays its sound once, 5 to 14 seconds apart, while it is
+    // active; a chargepad clicks like a pressure plate when it starts and stops charging.
+    let sorters: Vec<[i32; 3]> = SORTERS.with_borrow(|s| s.keys().copied().collect());
+    for pos in sorters {
+        let active = game.native_client_block_entity(pos).map(|(_, c)| get_int(c, "sorter_active") != 0);
+        match active {
+            None => {
+                SORTERS.with_borrow_mut(|s| s.remove(&pos));
+            }
+            Some(true) if SORTERS.with_borrow(|s| s.get(&pos).is_some_and(|next| ticks >= *next)) => {
+                let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+                game.audio.play("mekanism:tile.machine.logistical_sorter", Some(at), 1.0, 1.0);
+                let wait = 20 * (5 + u64::from(rad_int(10)));
+                SORTERS.with_borrow_mut(|s| s.insert(pos, ticks + wait));
+            }
+            Some(_) => {}
+        }
+    }
+    let pads: Vec<([i32; 3], bool)> = PADS.with_borrow(|p| p.iter().map(|(k, v)| (*k, *v)).collect());
+    for (pos, was) in pads {
+        if game.native_client_block_entity(pos).is_none() {
+            PADS.with_borrow_mut(|p| p.remove(&pos));
+            continue;
+        }
+        let lit = game.native_block_property(pos, "lit").as_deref() == Some("true");
+        if lit != was {
+            PADS.with_borrow_mut(|p| p.insert(pos, lit));
+            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.1, f64::from(pos[2]) + 0.5];
+            let (event, pitch) = if lit { ("minecraft:block.stone_pressure_plate.click_on", 0.8) } else { ("minecraft:block.stone_pressure_plate.click_off", 0.7) };
+            game.audio.play(event, Some(at), 0.3, pitch);
+        }
+    }
     // A laser sounds from its front while it fires (a beam arrived in the last ticks).
     let beams: Vec<[f64; 3]> = LASER_BEAMS.with_borrow(|b| b.iter().filter(|b| b.arrived != u64::MAX && ticks <= b.arrived + 1).map(|b| b.from).collect());
     for from in beams {
