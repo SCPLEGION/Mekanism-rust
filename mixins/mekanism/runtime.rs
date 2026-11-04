@@ -6510,6 +6510,72 @@ pub(super) fn player_damage_rules(game: &mut Game<'_>, absorbed: f32, rules: &mu
     }
 }
 
+/// Hook `native_gear_attributes`: the Hydrostatic Repulsor Unit (`ModuleHydrostaticRepulsorUnit.adjustAttributes`: water
+/// movement efficiency of a third for each unit, one at most) and the Gyroscopic Stabilization Unit (+1 submerged mining
+/// speed) of the worn leggings. The Repulsor's swim boost (`neoforge:swim_speed`) needs an attribute Horizon lacks.
+pub(super) fn gear_attributes(game: &mut Game<'_>, attributes: &mut Vec<(String, String, f64, String)>) {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    let Some(legs) = game.armor[2].as_ref().filter(|s| modules::is_container(&s.item)) else {
+        return;
+    };
+    let count = installed_modules(legs).get("mekanism:hydrostatic_repulsor_unit").copied().unwrap_or(0);
+    if count > 0 && module_on(legs, "mekanism:hydrostatic_repulsor_unit") {
+        let amount = f64::from((0.333_333_34_f32 * count as f32).min(1.0));
+        attributes.push(("minecraft:water_movement_efficiency".to_owned(), "mekanism:water_movement".to_owned(), amount, "add_value".to_owned()));
+    }
+    if module_on(legs, "mekanism:gyroscopic_stabilization_unit") {
+        attributes.push(("minecraft:submerged_mining_speed".to_owned(), "mekanism:submerged_mining_speed".to_owned(), 1.0, "add_value".to_owned()));
+    }
+}
+
+const ELYTRA_ENERGY: u64 = 32_000;
+
+/// The chest piece's Elytra Unit, when it is on.
+fn elytra_piece(game: &Game<'_>) -> bool {
+    game.armor[1].as_ref().is_some_and(|s| modules::is_container(&s.item) && module_on(s, "mekanism:elytra_unit"))
+}
+
+/// Hook `native_glider` (`ModuleElytraUnit.adjustAttributes`): the suit glides with the energy for it, unless its Jetpack
+/// Unit hovers with hydrogen left.
+pub(super) fn glider(game: &mut Game<'_>, glider: &mut bool) {
+    if *glider || !game.native_on(MOD_ID) || !elytra_piece(game) {
+        return;
+    }
+    let Some(chest) = game.armor[1].as_ref() else {
+        return;
+    };
+    if stored_energy(chest) < ELYTRA_ENERGY {
+        return;
+    }
+    if module_on(chest, "mekanism:jetpack_unit") {
+        let installed = installed_modules(chest).get("mekanism:jetpack_unit").copied().unwrap_or(0);
+        let mode = module_config::settings("mekanism:jetpack_unit", installed).into_iter().find(|s| s.key == "jetpack_mode").map(|s| module_setting(chest, "mekanism:jetpack_unit", &s, installed));
+        // JetpackMode.HOVER
+        if mode == Some(1) && jetpack_fuel(chest) > 0 {
+            return;
+        }
+    }
+    *glider = true;
+}
+
+/// Hook `native_glide_wear` (`ItemMekaSuitArmor.onGlideDamage`): each point of wear costs the energy of the Elytra Unit,
+/// as much as the suit holds.
+pub(super) fn glide_wear(game: &mut Game<'_>, wear: u32, claimed: &mut bool) {
+    if !game.native_on(MOD_ID) || !elytra_piece(game) {
+        return;
+    }
+    *claimed = true;
+    if game.creative {
+        return;
+    }
+    if let Some(chest) = game.armor[1].as_mut() {
+        let stored = stored_energy(chest);
+        set_energy(chest, stored - stored.min(ELYTRA_ENERGY * u64::from(wear)));
+    }
+}
+
 /// `ModeChangeKey`, on the window: the mode key (M) held while the wheel turns asks the server to toggle the
 /// flow of a scuba tank in hand or worn.
 pub(super) fn wheel(game: &mut Game<'_>, steps: f32, claimed: &mut bool) {
