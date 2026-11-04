@@ -244,7 +244,9 @@ def build_mekasuit(ns, item, assets, out, textures_dirs, report):
             pts = [mekasuit_points(p, pivot) for p, _ in quad]
             uvs = [[uv[0], 1 - uv[1]] for _, uv in quad]
             poly, normal = polygon(pts, uvs)
-            per_texture.setdefault((texture, exclusive), {}).setdefault(bone, []).append((poly, normal))
+            # `MekaSuitArmor`: quads named "glass" are translucent and "_led" ones emissive (full brightness).
+            kind = "glass" if "glass" in name else "led" if "_led" in name else ""
+            per_texture.setdefault((texture, exclusive, kind), {}).setdefault(bone, []).append((poly, normal))
     hide = {True: [f"{ns}:{ADJACENT[item]}"], False: []}
     return write_layers(ns, item, per_texture, out, textures_dirs, report, hide)
 
@@ -252,7 +254,7 @@ def build_mekasuit(ns, item, assets, out, textures_dirs, report):
 def write_layers(ns, item, per_texture, out, textures_dirs, report, hide=None):
     layers = []
     for n, (key, bones) in enumerate(sorted(per_texture.items())):
-        texture, exclusive = key
+        texture, exclusive, kind = key
         tns, _, tpath = texture.partition(":")
         name = f"{item}_{n}"
         children = {bone: {"pose": [0, 0, 0, 0, 0, 0, 1, 1, 1], "polygons": [p for p, _ in quads],
@@ -271,6 +273,10 @@ def write_layers(ns, item, per_texture, out, textures_dirs, report, hide=None):
         layer = {"model": f"{ns}:{name}", "texture": f"{ns}:{name}"}
         if exclusive and hide:
             layer["hide_with"] = hide[True]
+        if kind == "led":
+            layer["emissive"] = True
+        elif kind == "glass":
+            layer["translucent"] = True
         layers.append(layer)
     if not layers:
         return False
