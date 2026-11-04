@@ -225,6 +225,14 @@ def build_mekasuit(ns, item, assets, out, textures_dirs, report):
     objs = obj_models.parse((root / "mekasuit.obj").read_text())
     mtl = obj_models.parse_mtl((root / "mekasuit.mtl").read_text())
     textures = json.loads((root / "mekasuit.json").read_text())["textures"]
+    # `MekanismModelCache.calculateOverrideMekaToolParts`: the suit parts a held Meka-Tool's model replaces.
+    held = {}
+    for side in ("left", "right"):
+        tool = root / f"mekatool_{side}.obj"
+        if tool.is_file():
+            for part in obj_models.parse(tool.read_text()):
+                if "override_" in part["name"]:
+                    held[part["name"].replace("override_", "", 1).replace("mekatool_", "", 1)] = side
     per_texture = {}
     for obj in objs:
         name = obj["name"]
@@ -246,6 +254,8 @@ def build_mekasuit(ns, item, assets, out, textures_dirs, report):
             poly, normal = polygon(pts, uvs)
             # `MekaSuitArmor`: quads named "glass" are translucent and "_led" ones emissive (full brightness).
             kind = "glass" if "glass" in name else "led" if "_led" in name else ""
+            if keyword == "chest" and name in held:
+                kind += "held_" + held[name]
             per_texture.setdefault((texture, exclusive, kind), {}).setdefault(bone, []).append((poly, normal))
     hide = {True: [f"{ns}:{ADJACENT[item]}"], False: []}
     return write_layers(ns, item, per_texture, out, textures_dirs, report, hide)
@@ -273,10 +283,12 @@ def write_layers(ns, item, per_texture, out, textures_dirs, report, hide=None):
         layer = {"model": f"{ns}:{name}", "texture": f"{ns}:{name}"}
         if exclusive and hide:
             layer["hide_with"] = hide[True]
-        if kind == "led":
+        if kind.startswith("led"):
             layer["emissive"] = True
-        elif kind == "glass":
+        elif kind.startswith("glass"):
             layer["translucent"] = True
+        if "held_" in kind:
+            layer["hide_when_held"] = {kind.split("held_")[1]: [f"{ns}:meka_tool"]}
         layers.append(layer)
     if not layers:
         return False
