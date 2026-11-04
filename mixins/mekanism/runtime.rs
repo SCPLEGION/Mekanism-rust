@@ -21869,7 +21869,6 @@ thread_local! {
     /// (`TileEntityMekanism.preRemoveSideEffects` dumps them when the block goes).
     static RAD_HOLDERS: std::cell::RefCell<std::collections::HashMap<[i32; 3], (String, f64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
     static RAD_LOADED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static RAD_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 struct RadMote {
@@ -21880,7 +21879,6 @@ struct RadMote {
     size: f32,
 }
 
-const RADIATION_FILE: &str = "radiation";
 /// `radiationParticleCount` and `radiationParticleRadius` at their defaults.
 const RAD_PARTICLE_COUNT: u32 = 100;
 const RAD_PARTICLE_RADIUS: f64 = 30.0;
@@ -21990,22 +21988,41 @@ fn rad_client_payload(data: &[u8]) {
 
 /// The server's tick: sources decay (a 1 in 20 chance a tick), then each player is exposed, dosed, hurt and told.
 fn radiation_server_tick(game: &mut Game<'_>) {
-    if !RAD_LOADED.replace(true) {
-        if let Some(text) = game.native_setting(MOD_ID, RADIATION_FILE) {
-            RAD_DOSE.with_borrow_mut(|d| {
-                for line in text.lines() {
-                    if let Some((who, dose)) = line.split_once(' ')
-                        && let (Ok(who), Ok(dose)) = (u128::from_str_radix(who, 16), dose.parse::<f64>())
-                    {
-                        d.insert(who, dose.max(radiation::BASELINE));
+    // The world's folder keeps the sources and the doses (`RadiationLevelData`, the radiation attachment).
+    let file = game.native_world_dir().map(|d| d.join("mekanism").join("radiation.txt"));
+    if file.is_some()
+        && !RAD_LOADED.replace(true)
+        && let Some(text) = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok())
+    {
+        for line in text.lines() {
+            let v: Vec<&str> = line.split_whitespace().collect();
+            match v[..] {
+                ["D", who, dose] => {
+                    if let (Ok(who), Ok(dose)) = (u128::from_str_radix(who, 16), dose.parse::<f64>()) {
+                        RAD_DOSE.with_borrow_mut(|d| d.insert(who, dose.max(radiation::BASELINE)));
                     }
                 }
-            });
+                ["S", dim, x, y, z, magnitude] => {
+                    if let (Ok(x), Ok(y), Ok(z), Ok(m)) = (x.parse(), y.parse(), z.parse(), magnitude.parse::<f64>()) {
+                        radiate_at(dim, [x, y, z], m);
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    if game.ticks % 200 == 0 && RAD_DIRTY.replace(false) {
-        let text = RAD_DOSE.with_borrow(|d| d.iter().filter(|(_, v)| **v > radiation::MIN_MAGNITUDE).map(|(k, v)| format!("{k:032x} {v}\n")).collect::<String>());
-        game.native_set_setting(MOD_ID, RADIATION_FILE, &text);
+    if game.ticks % 200 == 0
+        && let Some(file) = file
+    {
+        let mut text = RAD_DOSE.with_borrow(|d| d.iter().filter(|(_, v)| **v > radiation::MIN_MAGNITUDE).map(|(k, v)| format!("D {k:032x} {v}\n")).collect::<String>());
+        RAD_SOURCES.with_borrow(|all| {
+            for (dim, sources) in all {
+                for (p, m) in sources.iter() {
+                    text.push_str(&format!("S {dim} {} {} {} {m}\n", p[0], p[1], p[2]));
+                }
+            }
+        });
+        let _ = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&file, text));
     }
     if rad_int(20) == 0 {
         RAD_SOURCES.with_borrow_mut(|all| {
@@ -22048,7 +22065,6 @@ fn radiation_server_tick(game: &mut Game<'_>) {
                 }
                 dose = (dose * radiation::TARGET_DECAY_RATE).max(radiation::BASELINE);
                 RAD_DOSE.with_borrow_mut(|d| d.insert(uuid, dose));
-                RAD_DIRTY.set(true);
             }
             // `RadiationEntity.update`: a dose that shows hurts now and then and tires the player.
             let severity = radiation::scaled_dose_severity(dose);
@@ -22166,7 +22182,7 @@ fn radiation_client(game: &mut Game<'_>) {
     });
 }
 
-/// The motes as green billboards (`RadiationParticle`, colour 0.2/0.66/0.32; none on their first tick).
+/// The motes as green billboards of the smoke sprites (`RadiationParticle`, colour 0.2/0.66/0.32; none on their first tick).
 fn radiation_quads(right: [f32; 3], up: [f32; 3], quads: &mut Vec<super::native_hooks::NativeWorldQuad>) {
     RAD_MOTES.with_borrow(|motes| {
         for m in motes.iter().filter(|m| m.age > 0) {
@@ -22176,7 +22192,8 @@ fn radiation_quads(right: [f32; 3], up: [f32; 3], quads: &mut Vec<super::native_
             quads.push(super::native_hooks::NativeWorldQuad {
                 corners: [at(-half, -half), at(half, -half), at(half, half), at(-half, half)],
                 color: 0xFF33_A852,
-                sprite: None,
+                // `setSpriteFromAge` over the particle's textures `generic_7` to `generic_0`.
+                sprite: Some(format!("generic_{}", 7 - (m.age * 7 / m.life).min(7))),
                 uv: [0.0, 0.0, 1.0, 1.0],
             });
         }

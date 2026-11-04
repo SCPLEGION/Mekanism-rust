@@ -198,6 +198,10 @@ impl Sources {
         !self.map.is_empty()
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = ([i32; 3], f64)> + '_ {
+        self.map.iter().map(|(p, m)| (*p, *m))
+    }
+
     pub fn remove_at(&mut self, pos: [i32; 3]) -> bool {
         self.map.remove(&pos).is_some()
     }
