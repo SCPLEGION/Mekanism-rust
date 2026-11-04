@@ -1771,6 +1771,8 @@ pub(super) fn world_quads(game: &Game<'_>, quads: &mut Vec<super::native_hooks::
     let (right, up) = (right.map(|v| v as f32), up.map(|v| v as f32));
     let corner = |c: [f32; 3], x: f32, y: f32| -> [f64; 3] { std::array::from_fn(|k| f64::from(c[k] + right[k] * x + up[k] * y)) };
     laser_beam_quads(ticks, quads);
+    MAGNETIC_NOW.with(|n| n.set(now));
+    magnetic_bolt_quads(now, quads);
     radiation_quads(right, up, quads);
     // `RenderFlame`: two crossed planes along the flight, fading over the flame's life.
     FLAME_VIEW.with_borrow_mut(|view| {
@@ -20304,6 +20306,10 @@ pub(super) fn client_payload(channel: &str, data: &[u8]) {
     if channel == RADIATION_CHANNEL {
         rad_client_payload(data);
     }
+    if channel == MAGNETIC_BOLT_CHANNEL {
+        // The tick is the window's own, read when the bolt is drawn: stamp it with the last one seen.
+        magnetic_bolt_payload(data, MAGNETIC_NOW.with(|n| n.get()));
+    }
     if channel == FLAME_CHANNEL {
         flames_payload(data);
     }
@@ -22299,6 +22305,56 @@ fn nutritional_injection(g: &mut Game<'_>) {
     }
 }
 
+thread_local! {
+    /// The timestamp of the last frame drawn, for a bolt that arrives between frames.
+    static MAGNETIC_NOW: std::cell::Cell<bolt::Timestamp> = std::cell::Cell::new(bolt::Timestamp::default());
+}
+const MAGNETIC_BOLT_CHANNEL: &str = "mekanism:magnetic_bolt";
+
+thread_local! {
+    /// The lightning between a player with magnetic attraction and the items it pulls.
+    static MAGNETIC_BOLTS: std::cell::RefCell<bolt::BoltField> = std::cell::RefCell::new(bolt::BoltField::new(0x4D41_474E));
+}
+
+/// `PacketLightningRender.handle` for `LightningPreset.MAGNETIC_ATTRACTION`: a bolt of size 0.04 and life 8 ticks, the
+/// next after 4 to 12 (`SpawnFunction.noise(8, 4)`), in the owner's own slot.
+fn magnetic_bolt_payload(data: &[u8], now: bolt::Timestamp) {
+    if data.len() != 32 {
+        return;
+    }
+    let owner = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    let f = |i: usize| f32::from_be_bytes([data[4 + i * 4], data[5 + i * 4], data[6 + i * 4], data[7 + i * 4]]);
+    let segments = i32::from_be_bytes([data[28], data[29], data[30], data[31]]);
+    let effect = bolt::BoltEffect {
+        info: bolt::BoltRenderInfo::electricity(),
+        start: bolt::V3(f(0), f(1), f(2)),
+        end: bolt::V3(f(3), f(4), f(5)),
+        segments,
+        count: 1,
+        size: 0.04,
+    };
+    let delay = 4.0 + rad_float() as f32 * 8.0;
+    MAGNETIC_BOLTS.with_borrow_mut(|field| field.update(i64::from(owner), bolt::BoltSpec { effect, lifespan: 8.0, delay }, now));
+}
+
+fn magnetic_bolt_quads(now: bolt::Timestamp, quads: &mut Vec<super::native_hooks::NativeWorldQuad>) {
+    MAGNETIC_BOLTS.with_borrow_mut(|field| {
+        if field.is_empty() {
+            return;
+        }
+        for (argb, vecs) in field.states(now) {
+            for q in vecs.chunks(4).filter(|q| q.len() == 4) {
+                quads.push(super::native_hooks::NativeWorldQuad {
+                    corners: std::array::from_fn(|i| [f64::from(q[i].0), f64::from(q[i].1), f64::from(q[i].2)]),
+                    color: argb,
+                    sprite: None,
+                    uv: [0.0, 0.0, 1.0, 1.0],
+                });
+            }
+        }
+    });
+}
+
 /// `ModuleMagneticAttractionUnit.tickServer`, for the player swapped in: the boots pull the dropped items within
 /// `4 + range` blocks that can be picked up, each for `250 * range` FE.
 fn magnetic_attraction(g: &mut Game<'_>) {
@@ -22345,6 +22401,19 @@ fn magnetic_attraction(g: &mut Game<'_>) {
             set_energy(boots, stored - usage);
         }
         let needed = [diff[0].min(1.0), diff[1].min(1.0), diff[2].min(1.0)];
+        // `PacketLightningRender`: from just above the player's feet to the item, to everyone.
+        let length = (diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2]).sqrt();
+        let item = g.dropped[i].position;
+        let owner = g.native_acting_player().map_or(0, |p| (p.uuid as i32).wrapping_mul(31)).wrapping_add(i as i32);
+        let mut data = Vec::with_capacity(32);
+        data.extend(owner.to_be_bytes());
+        for v in [at.x, at.y + 0.2, at.z, item.x, item.y, item.z] {
+            data.extend((v as f32).to_be_bytes());
+        }
+        data.extend(((length * 4.0) as i32).to_be_bytes());
+        for p in robit_players(g) {
+            g.native_send_to_player(p.uuid, MAGNETIC_BOLT_CHANNEL, &data);
+        }
         let v = &mut g.dropped[i].velocity;
         v.x = (needed[0] - velocity.x) * 0.2;
         v.y = (needed[1] - velocity.y) * 0.2;
