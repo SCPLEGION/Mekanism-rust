@@ -569,6 +569,9 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     let Some(k) = kind(&entity.id) else {
         return;
     };
+    if game.ticks % 20 == 0 {
+        radiation_holder(game, pos, &entity.nbt);
+    }
     // A type whose auto-eject is off gives out through no face (the window's eject button): as if
     // every face were Input (0b10 each), which `gives_out` reads.
     let no_eject = get_int(&entity.nbt, "no_eject");
@@ -1754,6 +1757,7 @@ pub(super) fn world_quads(game: &Game<'_>, quads: &mut Vec<super::native_hooks::
     let (right, up) = (right.map(|v| v as f32), up.map(|v| v as f32));
     let corner = |c: [f32; 3], x: f32, y: f32| -> [f64; 3] { std::array::from_fn(|k| f64::from(c[k] + right[k] * x + up[k] * y)) };
     laser_beam_quads(ticks, quads);
+    radiation_quads(right, up, quads);
     // `RenderFlame`: two crossed planes along the flight, fading over the flame's life.
     FLAME_VIEW.with_borrow_mut(|view| {
         for f in view.iter_mut() {
@@ -5441,6 +5445,14 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
         portable_teleporter_use(game, claimed);
         return;
     }
+    if !*claimed && &*stack.item == GEIGER_COUNTER && game.native_on(MOD_ID) {
+        geiger_counter_use(game, claimed);
+        return;
+    }
+    if !*claimed && &*stack.item == DOSIMETER && game.native_on(MOD_ID) {
+        dosimeter_use(game, claimed);
+        return;
+    }
     if !*claimed && &*stack.item == flamethrower::ITEM && game.native_on(MOD_ID) {
         flamethrower_use(game, claimed);
         return;
@@ -6057,6 +6069,25 @@ fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
             }
         }
     }
+    for stack in &stacks {
+        let (level, max, dose) = RAD_CLIENT.get();
+        let on = |module: &str| installed_modules(stack).get(module).copied().unwrap_or(0) > 0 && flag(stack, module, "enabled") != Some(0);
+        let decay_text = |text: String, show: bool, magnitude: f64, rate: f64| {
+            if show { format!("{text} ({})", radiation::hours_minutes(radiation::decay_ticks(magnitude, rate))) } else { text }
+        };
+        let tone = |warn_from_baseline: bool, magnitude: f64| {
+            let calm = if warn_from_baseline { magnitude <= radiation::BASELINE } else { magnitude < radiation::MIN_MAGNITUDE };
+            if calm { REGULAR } else if magnitude < 0.1 { 0xFFDD4F } else { 0xFF383C }
+        };
+        if on("mekanism:geiger_unit") {
+            let text = decay_text(radiation::display(level, "Sv", 2), level > radiation::BASELINE, max, radiation::SOURCE_DECAY_RATE);
+            elements.push(("geiger_counter", text, tone(true, level)));
+        }
+        if on("mekanism:dosimeter_unit") {
+            let text = decay_text(radiation::display(dose, "Sv", 2), dose > radiation::MIN_MAGNITUDE, dose, radiation::TARGET_DECAY_RATE);
+            elements.push(("dosimeter", text, tone(false, dose)));
+        }
+    }
     let (width, height) = (batch.width, batch.height);
     let mut y = height - 10.0 + jy;
     for (icon, text, rgb) in elements {
@@ -6074,6 +6105,9 @@ fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
 /// fuelled jetpack on, outside creative flight, thrusts in its normal mode and stops the fall, and tells
 /// the server, which spends the hydrogen.
 pub(super) fn client_tick(game: &mut Game<'_>) {
+    if !game.native_window() && game.native_on(MOD_ID) {
+        radiation_server_tick(game);
+    }
     if game.native_window() && game.native_on(MOD_ID) {
         tweaker_key(game);
         radial_key(game);
@@ -6082,6 +6116,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
         return;
     }
     loop_sounds(game);
+    radiation_client(game);
     scuba_client(game);
     free_runners_tick(game);
     mekasuit_sprint(game);
@@ -20019,6 +20054,9 @@ pub(super) fn mob_died(game: &mut Game<'_>, kind: &str, at: [f64; 3], data: Opti
 
 /// The window's client got the Robits' ids.
 pub(super) fn client_payload(channel: &str, data: &[u8]) {
+    if channel == RADIATION_CHANNEL {
+        rad_client_payload(data);
+    }
     if channel == FLAME_CHANNEL {
         flames_payload(data);
     }
@@ -21709,4 +21747,347 @@ fn flame_hits_block(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3], mode: fl
             }
         }
     }
+}
+
+// ---- Radiation (`RadiationManager`, `PlayerExposure`, `RadiationEntity`, `ClientRadiation`) ----
+
+use mekanism_core::radiation;
+
+const RADIATION_CHANNEL: &str = "mekanism:radiation";
+const GEIGER_COUNTER: &str = "mekanism:geiger_counter";
+const DOSIMETER: &str = "mekanism:dosimeter";
+const HAZMAT: [&str; 4] = ["mekanism:hazmat_mask", "mekanism:hazmat_gown", "mekanism:hazmat_pants", "mekanism:hazmat_boots"];
+const SUIT: [&str; 4] = [modules::HELMET, modules::BODYARMOR, modules::PANTS, modules::BOOTS];
+
+thread_local! {
+    /// The server's radiation sources, by dimension (`RadiationLevelData`).
+    static RAD_SOURCES: std::cell::RefCell<std::collections::HashMap<String, radiation::Sources>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Each player's dose in Sv (`MekanismAttachmentTypes.RADIATION`), kept while the game runs.
+    static RAD_DOSE: std::cell::RefCell<std::collections::HashMap<u128, f64>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// What each player was last told (`PlayerExposure.playerEnvironmentalExposureMap`).
+    static RAD_SENT: std::cell::RefCell<std::collections::HashMap<u128, (Option<radiation::Previous>, Option<radiation::Previous>)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    static RAD_RNG: std::cell::RefCell<bolt::Rng> = std::cell::RefCell::new(bolt::Rng::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(7, |d| d.as_nanos() as u64)));
+    /// The window's view (`ClientRadiation`): the level here and the largest source in range.
+    static RAD_CLIENT: std::cell::Cell<(f64, f64, f64)> = const { std::cell::Cell::new((radiation::BASELINE, radiation::BASELINE, radiation::BASELINE)) };
+}
+
+thread_local! {
+    /// The radiation motes around the window's player (`RadiationParticle`, a green smoke): position, velocity, age, life, size.
+    static RAD_MOTES: std::cell::RefCell<Vec<RadMote>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Machines and tanks holding radioactive chemicals, by position: the dimension and what they would spill
+    /// (`TileEntityMekanism.preRemoveSideEffects` dumps them when the block goes).
+    static RAD_HOLDERS: std::cell::RefCell<std::collections::HashMap<[i32; 3], (String, f64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    static RAD_LOADED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RAD_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct RadMote {
+    pos: [f64; 3],
+    vel: [f64; 3],
+    age: u32,
+    life: u32,
+    size: f32,
+}
+
+const RADIATION_FILE: &str = "radiation";
+/// `radiationParticleCount` and `radiationParticleRadius` at their defaults.
+const RAD_PARTICLE_COUNT: u32 = 100;
+const RAD_PARTICLE_RADIUS: f64 = 30.0;
+
+/// `nextInt(bound)` for the radiation draws.
+fn rad_int(bound: u32) -> u32 {
+    RAD_RNG.with_borrow_mut(|r| ((f64::from(r.float()) * f64::from(bound)) as u32).min(bound - 1))
+}
+
+fn rad_float() -> f64 {
+    RAD_RNG.with_borrow_mut(|r| f64::from(r.float()))
+}
+
+/// `RadiationUtil.getRadiationResistance`: the shielding of the worn hazmat pieces and the MekaSuit pieces whose
+/// radiation shielding unit is on.
+fn rad_resistance(game: &Game<'_>) -> f64 {
+    let mut resistance = 0.0;
+    for slot in 0..4 {
+        let Some(stack) = game.armor[slot].as_ref() else {
+            continue;
+        };
+        if &*stack.item == HAZMAT[slot] {
+            resistance += radiation::shielding(slot);
+        } else if &*stack.item == SUIT[slot] {
+            let module = "mekanism:radiation_shielding_unit";
+            let installed = installed_modules(stack).get(module).copied().unwrap_or(0) > 0;
+            let off = module_config::settings(module, 1).into_iter().find(|s| s.key == "enabled").is_some_and(|s| module_setting(stack, module, &s, 1) == 0);
+            if installed && !off {
+                resistance += radiation::shielding(slot);
+            }
+        }
+    }
+    resistance
+}
+
+/// `IRadiationManager.radiate(level, pos, magnitude)`: a source on the block in the dimension.
+pub(super) fn radiate_at(dimension: &str, pos: [i32; 3], magnitude: f64) {
+    if magnitude > 0.0 {
+        RAD_SOURCES.with_borrow_mut(|all| all.entry(dimension.to_owned()).or_default().radiate(pos, magnitude));
+    }
+}
+
+/// `dumpRadiation`: the radioactivity of a chemical in `mekanism:data_maps/radioactivity` times the amount.
+fn radioactivity(chemical: &str) -> f64 {
+    match chemical {
+        "mekanism:nuclear_waste" | "mekanism:spent_nuclear_waste" => 0.01,
+        "mekanism:plutonium" => 0.02,
+        "mekanism:polonium" => 0.05,
+        _ => 0.0,
+    }
+}
+
+/// Remembers what a block entity's tanks would spill: every `{id, amount}` compound in its data that is radioactive.
+fn radiation_holder(game: &Game<'_>, pos: [i32; 3], nbt: &Compound) {
+    let mut total = 0.0;
+    for tag in nbt.values() {
+        if let Tag::Compound(c) = tag
+            && let Some(Tag::String(id)) = c.get(&JavaString::from("id"))
+            && let Ok(id) = id.to_string()
+        {
+            total += radioactivity(&id) * get_long(c, "amount") as f64;
+        }
+    }
+    RAD_HOLDERS.with_borrow_mut(|h| {
+        if total > 0.0 {
+            h.insert(pos, (game.dim.id().to_owned(), total));
+        } else {
+            h.remove(&pos);
+        }
+    });
+}
+
+/// A block is gone: a machine or tank that held radioactive chemicals spills them (`dumpRadiation`).
+pub(super) fn radiation_spill(game: &mut Game<'_>, pos: [i32; 3]) {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    if let Some((dimension, magnitude)) = RAD_HOLDERS.with_borrow_mut(|h| h.remove(&pos)) {
+        radiate_at(&dimension, pos, magnitude);
+    }
+}
+
+/// `IRadiationManager.dumpRadiation(level, pos, type, amount)`: true when the chemical was radioactive and spilled.
+pub(super) fn dump_radiation(dimension: &str, pos: [i32; 3], chemical: &str, amount: u64) -> bool {
+    let radioactivity = radioactivity(chemical);
+    if amount == 0 || radioactivity <= 0.0 {
+        return false;
+    }
+    radiate_at(dimension, pos, radioactivity * amount as f64);
+    true
+}
+
+fn rad_payload(level: f64, max: f64, dose: f64) -> Vec<u8> {
+    let mut out = level.to_be_bytes().to_vec();
+    out.extend(max.to_be_bytes());
+    out.extend(dose.to_be_bytes());
+    out
+}
+
+/// `ClientRadiation.setClientEnvironmentalRadiation`.
+fn rad_client_payload(data: &[u8]) {
+    if data.len() >= 24 {
+        let at = |i: usize| f64::from_be_bytes(data[i..i + 8].try_into().unwrap_or([0; 8]));
+        RAD_CLIENT.set((at(0), at(8), at(16)));
+    }
+}
+
+/// The server's tick: sources decay (a 1 in 20 chance a tick), then each player is exposed, dosed, hurt and told.
+fn radiation_server_tick(game: &mut Game<'_>) {
+    if !RAD_LOADED.replace(true) {
+        if let Some(text) = game.native_setting(MOD_ID, RADIATION_FILE) {
+            RAD_DOSE.with_borrow_mut(|d| {
+                for line in text.lines() {
+                    if let Some((who, dose)) = line.split_once(' ')
+                        && let (Ok(who), Ok(dose)) = (u128::from_str_radix(who, 16), dose.parse::<f64>())
+                    {
+                        d.insert(who, dose.max(radiation::BASELINE));
+                    }
+                }
+            });
+        }
+    }
+    if game.ticks % 200 == 0 && RAD_DIRTY.replace(false) {
+        let text = RAD_DOSE.with_borrow(|d| d.iter().filter(|(_, v)| **v > radiation::MIN_MAGNITUDE).map(|(k, v)| format!("{k:032x} {v}\n")).collect::<String>());
+        game.native_set_setting(MOD_ID, RADIATION_FILE, &text);
+    }
+    if rad_int(20) == 0 {
+        RAD_SOURCES.with_borrow_mut(|all| {
+            for sources in all.values_mut() {
+                sources.decay();
+            }
+            all.retain(|_, s| !s.is_empty());
+        });
+    }
+    let host_uuid = game.lan.as_ref().map(|h| h.host_uuid);
+    let guest_uuids: Vec<(u32, u128)> = game.lan.as_ref().map_or_else(Vec::new, |h| h.hub.guests.iter().map(|g| (g.conn, g.uuid)).collect());
+    for who in game.fight_players() {
+        let uuid = match who.who {
+            super::dragon::FightWho::Host => host_uuid,
+            super::dragon::FightWho::Guest(conn) => guest_uuids.iter().find(|(c, _)| *c == conn).map(|(_, u)| *u),
+        };
+        let Some(uuid) = uuid else {
+            continue;
+        };
+        if !who.alive {
+            continue;
+        }
+        let mut send: Option<(f64, f64, f64)> = None;
+        game.as_fight_player(who.who, |g| {
+            let Some(p) = g.player.as_ref() else {
+                return;
+            };
+            let pos = [p.position.x.floor() as i32, p.position.y.floor() as i32, p.position.z.floor() as i32];
+            let dimension = g.dim.id().to_owned();
+            let (level, max) = RAD_SOURCES.with_borrow(|all| all.get(&dimension).map_or((radiation::BASELINE, radiation::BASELINE), |s| s.level_at(pos)));
+            let playing = !g.creative && !g.spectator();
+            let mut dose = RAD_DOSE.with_borrow(|d| d.get(&uuid).copied()).unwrap_or(radiation::BASELINE);
+            // A 1 in 20 chance a tick: the level doses the player (through the armor), and the dose decays.
+            if rad_int(20) == 0 {
+                if level > radiation::BASELINE && playing {
+                    let gained = level / 3600.0 * radiation::through_shielding(rad_resistance(g));
+                    if gained > 0.0 {
+                        dose = (dose + gained).max(radiation::BASELINE);
+                    }
+                }
+                dose = (dose * radiation::TARGET_DECAY_RATE).max(radiation::BASELINE);
+                RAD_DOSE.with_borrow_mut(|d| d.insert(uuid, dose));
+                RAD_DIRTY.set(true);
+            }
+            // `RadiationEntity.update`: a dose that shows hurts now and then and tires the player.
+            let severity = radiation::scaled_dose_severity(dose);
+            if playing && severity > radiation::BASELINE {
+                let min = radiation::NEGATIVE_EFFECTS_MIN_SEVERITY;
+                let chance = min + rad_float() * (1.0 - min);
+                if severity > chance {
+                    let strength = (dose.ln_1p() as f32).max(1.0);
+                    if rad_int(2) == 0 {
+                        g.hurt_player_by("mekanism:radiation", strength);
+                    }
+                    if let Some(p) = g.player.as_mut() {
+                        p.cause_food_exhaustion(strength);
+                    }
+                }
+            }
+            // Told again when the digits of the level or of the dose would change (the dose is an attachment in Java).
+            let (previous_level, previous_dose) = RAD_SENT.with_borrow(|s| s.get(&uuid).copied()).unwrap_or((None, None));
+            let (new_level, new_dose) = (radiation::Previous::compare(previous_level, level), radiation::Previous::compare(previous_dose, dose));
+            if new_level.is_some() || new_dose.is_some() {
+                RAD_SENT.with_borrow_mut(|s| s.insert(uuid, (new_level.or(previous_level), new_dose.or(previous_dose))));
+                send = Some((level, max, dose));
+            }
+        });
+        if let Some((level, max, dose)) = send {
+            game.native_send_to_player(uuid, RADIATION_CHANNEL, &rad_payload(level, max, dose));
+        }
+    }
+}
+
+/// The level here and the dose of the acting player (server side).
+fn rad_player(game: &Game<'_>) -> Option<(f64, f64, f64)> {
+    let uuid = game.native_acting_player()?.uuid;
+    let p = game.player.as_ref()?;
+    let pos = [p.position.x.floor() as i32, p.position.y.floor() as i32, p.position.z.floor() as i32];
+    let (level, max) = RAD_SOURCES.with_borrow(|all| all.get(game.dim.id()).map_or((radiation::BASELINE, radiation::BASELINE), |s| s.level_at(pos)));
+    let dose = RAD_DOSE.with_borrow(|d| d.get(&uuid).copied()).unwrap_or(radiation::BASELINE);
+    Some((level, max, dose))
+}
+
+fn rad_say(game: &mut Game<'_>, label: &str, magnitude: f64, unit: &str, decay: Option<u64>) {
+    use horizon_client::text::Text;
+    let Some(uuid) = game.native_acting_player().map(|p| p.uuid) else {
+        return;
+    };
+    let color = radiation::severity_color(magnitude);
+    let line = Text::colored(format!("{label}: "), 0xCFCFCF).append(Text::colored(radiation::display(magnitude, unit, 3), color));
+    game.native_tell(uuid, line);
+    if let Some(ticks) = decay {
+        let line = Text::colored("Time to Decay: ", 0xCFCFCF).append(Text::colored(radiation::hours_minutes(ticks), color));
+        game.native_tell(uuid, line);
+    }
+}
+
+/// `ItemGeigerCounter.use`: the radiation here, and how long its source takes to decay.
+fn geiger_counter_use(game: &mut Game<'_>, claimed: &mut bool) {
+    if game.player.as_ref().is_some_and(|p| p.shift_key_down) {
+        return;
+    }
+    *claimed = true;
+    let Some((level, max, _)) = rad_player(game) else {
+        return;
+    };
+    let decay = (level > radiation::BASELINE).then(|| radiation::decay_ticks(max, radiation::SOURCE_DECAY_RATE));
+    rad_say(game, "Radiation Exposure", level, "Sv/h", decay);
+}
+
+/// `ItemDosimeter.use`: the dose the player has taken, and how long it takes to decay.
+fn dosimeter_use(game: &mut Game<'_>, claimed: &mut bool) {
+    if game.player.as_ref().is_some_and(|p| p.shift_key_down) {
+        return;
+    }
+    *claimed = true;
+    let Some((_, _, dose)) = rad_player(game) else {
+        return;
+    };
+    let decay = (dose > radiation::MIN_MAGNITUDE).then(|| radiation::decay_ticks(dose, radiation::TARGET_DECAY_RATE));
+    rad_say(game, "Radiation Exposure", dose, "Sv", decay);
+}
+
+/// The window's tick: the Geiger Counter's clicks (`GeigerSound`, a loop at 5% volume while the scale shows), and the
+/// motes (`ClientRadiation.tickClient`). A loop that is not refreshed ends by itself, so a changed scale swaps the sound.
+fn radiation_client(game: &mut Game<'_>) {
+    let (level, _, _) = RAD_CLIENT.get();
+    let scale = radiation::Scale::get(level);
+    if let Some(event) = scale.sound() {
+        game.native_loop_sound(&format!("mekanism:geiger:{event}"), event, None, 0.05, 1.0);
+        if rad_int(2) == 0
+            && let Some(at) = game.player.as_ref().map(|p| [p.position.x, p.position.y, p.position.z])
+        {
+            let count = rad_int(scale as u32 * RAD_PARTICLE_COUNT);
+            RAD_MOTES.with_borrow_mut(|motes| {
+                for _ in 0..count.min(600) {
+                    let pos = at.map(|v| v + rad_float() * RAD_PARTICLE_RADIUS * 2.0 - RAD_PARTICLE_RADIUS);
+                    // `SmokeParticle`: a little drift, rising, living 8 / (0.2..1) ticks.
+                    let vel = [0, 1, 2].map(|_| (rad_float() * 2.0 - 1.0) * 0.01);
+                    motes.push(RadMote { pos, vel, age: 0, life: (8.0 / (rad_float() * 0.8 + 0.2)) as u32 + 1, size: 0.1 * (rad_float() as f32 * 0.5 + 0.5) * 2.0 * 0.75 });
+                }
+                if motes.len() > 6000 {
+                    motes.drain(0..motes.len() - 6000);
+                }
+            });
+        }
+    }
+    RAD_MOTES.with_borrow_mut(|motes| {
+        for m in motes.iter_mut() {
+            m.age += 1;
+            m.vel[1] += 0.004;
+            for i in 0..3 {
+                m.pos[i] += m.vel[i];
+                m.vel[i] *= 0.96;
+            }
+        }
+        motes.retain(|m| m.age < m.life);
+    });
+}
+
+/// The motes as green billboards (`RadiationParticle`, colour 0.2/0.66/0.32; none on their first tick).
+fn radiation_quads(right: [f32; 3], up: [f32; 3], quads: &mut Vec<super::native_hooks::NativeWorldQuad>) {
+    RAD_MOTES.with_borrow(|motes| {
+        for m in motes.iter().filter(|m| m.age > 0) {
+            let grown = (m.age as f32 / m.life as f32).min(1.0);
+            let half = m.size * (1.0 - grown * grown * 0.5);
+            let at = |x: f32, y: f32| -> [f64; 3] { std::array::from_fn(|k| m.pos[k] + f64::from(right[k] * x + up[k] * y)) };
+            quads.push(super::native_hooks::NativeWorldQuad {
+                corners: [at(-half, -half), at(half, -half), at(half, half), at(-half, half)],
+                color: 0xFF33_A852,
+                sprite: None,
+                uv: [0.0, 0.0, 1.0, 1.0],
+            });
+        }
+    });
 }

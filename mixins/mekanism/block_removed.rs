@@ -8,5 +8,6 @@ fn on_block_removed(
     new: &str,
 ) {
     let _ = new;
+    crate::game::mekanism::radiation_spill(game, pos);
     crate::game::mekanism::clear_bounding_blocks(game, pos, old, old_properties);
 }
