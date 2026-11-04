@@ -9038,7 +9038,7 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
             rules.resize(3, SlotRule::Any);
             let chemical = !matches!(kind(block), Some(Kind::Washer | Kind::DigitalMiner | Kind::Liquifier | Kind::Assemblicator | Kind::FusionPort));
             rules.extend(extra.iter().map(|(_, sprite)| match *sprite {
-                "slot/normal" if kind(block) == Some(Kind::FusionPort) => SlotRule::Items(vec![fusion::HOHLRAUM.to_owned()]),
+                "slot/normal" if kind(block) == Some(Kind::FusionPort) => SlotRule::Check(hohlraum_ready),
                 "slot/normal" if !chemical => SlotRule::Any,
                 "slot/normal" => SlotRule::Items(chemical_item_ids()),
                 "slot/output" => SlotRule::Refuse,
