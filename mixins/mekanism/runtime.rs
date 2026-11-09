@@ -26950,6 +26950,30 @@ pub(super) fn bow_shot(game: &mut Game<'_>, bow: &ItemStack, flame: &mut bool, a
 /// block and every block of the same kind around it within the unit's farming radius (axe: the plane of the clicked face;
 /// shovel and hoe: the same level), each costing `energy_usage.axe/shovel/hoe` FE times the transform's durability use
 /// (free in creative). The first of the three that changes the clicked block wins.
+/// `ItemDictionary.useOn`: a block (or a block with a tile, even sneaking) lists its block tags in the chat.
+pub(super) fn dictionary_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3], claimed: &mut bool) {
+    if *claimed || &*stack.item != "mekanism:dictionary" || !game.native_on(MOD_ID) {
+        return;
+    }
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let has_tile = game.native_with_mod_block_entity(pos, |_| ()).is_some();
+    if sneaking && !has_tile {
+        return;
+    }
+    *claimed = true;
+    let name = block_name(game, pos).to_owned();
+    let mut tags: Vec<String> = world_items!(game).block_tags.iter().filter(|(_, set)| set.contains(&name)).map(|(tag, _)| tag.clone()).collect();
+    tags.sort();
+    if tags.is_empty() {
+        tell(game, "No key.".to_owned());
+        return;
+    }
+    tell(game, "Block Tag(s) found:".to_owned());
+    for tag in tags {
+        tell(game, format!(" - {tag}"));
+    }
+}
+
 pub(super) fn farming_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3], face: [i32; 3], claimed: &mut bool) {
     const UNIT: &str = "mekanism:farming_unit";
     if *claimed || &*stack.item != modules::MEKA_TOOL || !game.native_on(MOD_ID) || !module_on(stack, UNIT) {
