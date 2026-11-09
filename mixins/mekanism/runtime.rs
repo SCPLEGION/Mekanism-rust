@@ -23631,6 +23631,9 @@ pub(super) fn client_payload(channel: &str, data: &[u8]) {
         // The tick is the window's own, read when the bolt is drawn: stamp it with the last one seen.
         magnetic_bolt_payload(data, MAGNETIC_NOW.with(|n| n.get()));
     }
+    if channel == TOOL_AOE_BOLT_CHANNEL {
+        tool_aoe_bolt_payload(data, MAGNETIC_NOW.with(|n| n.get()));
+    }
     if channel == FLAME_CHANNEL {
         flames_payload(data);
     }
@@ -26087,6 +26090,12 @@ thread_local! {
     static MAGNETIC_NOW: std::cell::Cell<bolt::Timestamp> = std::cell::Cell::new(bolt::Timestamp::default());
 }
 const MAGNETIC_BOLT_CHANNEL: &str = "mekanism:magnetic_bolt";
+const TOOL_AOE_BOLT_CHANNEL: &str = "mekanism:tool_aoe_bolt";
+
+thread_local! {
+    /// The lightning between the block a Farming Unit worked and the blocks of its area.
+    static TOOL_AOE_BOLTS: std::cell::RefCell<bolt::BoltField> = std::cell::RefCell::new(bolt::BoltField::new(0x544F_4F4C));
+}
 
 thread_local! {
     /// The lightning between a player with magnetic attraction and the items it pulls.
@@ -26096,6 +26105,23 @@ thread_local! {
 /// `PacketLightningRender.handle` for `LightningPreset.MAGNETIC_ATTRACTION`: a bolt of size 0.04 and life 8 ticks, the
 /// next after 4 to 12 (`SpawnFunction.noise(8, 4)`), in the owner's own slot.
 fn magnetic_bolt_payload(data: &[u8], now: bolt::Timestamp) {
+    let delay = 4.0 + rad_float() as f32 * 8.0;
+    bolt_payload(&MAGNETIC_BOLTS, data, now, 0.04, 8.0, delay);
+}
+
+/// `PacketLightningRender.handle` for `LightningPreset.TOOL_AOE`: a bolt of size 0.015 and life 12 ticks, with no delay.
+fn tool_aoe_bolt_payload(data: &[u8], now: bolt::Timestamp) {
+    bolt_payload(&TOOL_AOE_BOLTS, data, now, 0.015, 12.0, 0.0);
+}
+
+fn bolt_payload(
+    field: &'static std::thread::LocalKey<std::cell::RefCell<bolt::BoltField>>,
+    data: &[u8],
+    now: bolt::Timestamp,
+    size: f32,
+    lifespan: f32,
+    delay: f32,
+) {
     if data.len() != 32 {
         return;
     }
@@ -26108,14 +26134,22 @@ fn magnetic_bolt_payload(data: &[u8], now: bolt::Timestamp) {
         end: bolt::V3(f(3), f(4), f(5)),
         segments,
         count: 1,
-        size: 0.04,
+        size,
     };
-    let delay = 4.0 + rad_float() as f32 * 8.0;
-    MAGNETIC_BOLTS.with_borrow_mut(|field| field.update(i64::from(owner), bolt::BoltSpec { effect, lifespan: 8.0, delay }, now));
+    field.with_borrow_mut(|field| field.update(i64::from(owner), bolt::BoltSpec { effect, lifespan, delay }, now));
 }
 
 fn magnetic_bolt_quads(now: bolt::Timestamp, quads: &mut Vec<super::native_hooks::NativeWorldQuad>) {
-    MAGNETIC_BOLTS.with_borrow_mut(|field| {
+    bolt_quads(&MAGNETIC_BOLTS, now, quads);
+    bolt_quads(&TOOL_AOE_BOLTS, now, quads);
+}
+
+fn bolt_quads(
+    field: &'static std::thread::LocalKey<std::cell::RefCell<bolt::BoltField>>,
+    now: bolt::Timestamp,
+    quads: &mut Vec<super::native_hooks::NativeWorldQuad>,
+) {
+    field.with_borrow_mut(|field| {
         if field.is_empty() {
             return;
         }
@@ -26467,12 +26501,39 @@ pub(super) fn farming_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3],
                     if game.native_block_transform(transformer, at, face).is_some_and(|(s, _)| s == state) {
                         pay(game);
                         game.native_apply_block_transform(transformer, at, face);
+                        tool_aoe_lightning(game, pos, at, face, axe);
                     }
                 }
             }
         }
         *claimed = true;
         return;
+    }
+}
+
+/// `PacketLightningRender(TOOL_AOE, 31 * pos.hashCode() + newPos.hashCode(), start, end, 10)` to everyone tracking: a bolt
+/// from the block worked to a block of its area, at `IToolAOEData.getLightningPos` (flat: 0.94 above the block's bottom
+/// centre; the axe's plane: the centre of the face clicked).
+fn tool_aoe_lightning(g: &mut Game<'_>, pos: [i32; 3], at: [i32; 3], face: [i32; 3], axe: bool) {
+    // `Vec3i.hashCode`: (y + z * 31) * 31 + x.
+    let hash = |p: [i32; 3]| p[1].wrapping_add(p[2].wrapping_mul(31)).wrapping_mul(31).wrapping_add(p[0]);
+    let owner = 31_i32.wrapping_mul(hash(pos)).wrapping_add(hash(at));
+    let end = |p: [i32; 3]| -> [f32; 3] {
+        if axe {
+            std::array::from_fn(|k| p[k] as f32 + 0.5 + 0.5 * face[k] as f32)
+        } else {
+            [p[0] as f32 + 0.5, p[1] as f32 + 0.94, p[2] as f32 + 0.5]
+        }
+    };
+    let (a, b) = (end(pos), end(at));
+    let mut data = Vec::with_capacity(32);
+    data.extend(owner.to_be_bytes());
+    for v in a.into_iter().chain(b) {
+        data.extend(v.to_be_bytes());
+    }
+    data.extend(10_i32.to_be_bytes());
+    for p in robit_players(g) {
+        g.native_send_to_player(p.uuid, TOOL_AOE_BOLT_CHANNEL, &data);
     }
 }
 
