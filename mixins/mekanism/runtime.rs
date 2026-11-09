@@ -5911,7 +5911,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         // A laser takes energy on every side but its front; amplifiers and tractor beams only from lasers.
         Kind::Laser if facing_away => Some(((4 * usage_const("laser", laser::LASER_USAGE)), u64::MAX)),
         Kind::Vibrator => Some(((4 * usage_const("seismicVibrator", seismic::VIBRATOR_USAGE)), u64::MAX)),
-        Kind::Chargepad => Some((chargepad::STORAGE, u64::MAX)),
+        Kind::Chargepad => Some((usage_const("chargePad", chargepad::CHARGE_RATE) * chargepad::CHECK_TICKS, u64::MAX)),
         // What it took in waits in its own buffer until its tick moves it into the frequency's.
         Kind::Entangloporter if nbt.contains_key(&JavaString::from("frequency")) => {
             Some((get_long(nbt, "energy") + qe::energy_buffer().saturating_sub(get_long(nbt, "shared_energy")), u64::MAX))
@@ -14604,7 +14604,7 @@ pub(super) fn use_teleporter(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         tell(game, "Teleporter: no link found".to_owned());
         return true;
     };
-    let cost = teleporter::energy_cost(from, target, true);
+    let cost = teleport_cost(from, target, true);
     if stored < cost {
         tell(game, format!("Teleporter: needs {cost} FE"));
         return true;
@@ -14633,7 +14633,7 @@ fn portable_teleporter_use(game: &mut Game<'_>, claimed: &mut bool) {
         tell(game, "Portable Teleporter: no link found".to_owned());
         return;
     };
-    let cost = teleporter::energy_cost(from, target, true);
+    let cost = teleport_cost(from, target, true);
     let stored = stored_energy(&held);
     if stored < cost {
         tell(game, format!("Portable Teleporter: needs {cost} FE"));
@@ -16099,7 +16099,7 @@ fn module_type(stack: &ItemStack) -> Option<String> {
 fn item_energy_of(stack: &ItemStack) -> Option<gear::ItemEnergy> {
     let mut e = gear::item_energy(&stack.item)?;
     if modules::is_container(&stack.item) {
-        (e.capacity, e.rate) = modules::energy(&installed_modules(stack));
+        (e.capacity, e.rate) = modules::energy_from(&installed_modules(stack), e.capacity, e.rate);
     }
     Some(e)
 }
@@ -16515,7 +16515,7 @@ fn charge_on_pad(game: &mut Game<'_>) {
             continue;
         };
         let stored = stored_energy(stack).min(e.capacity);
-        given = chargepad::charge(pad, e.capacity, stored, e.rate);
+        given = chargepad::charge_with(usage_const("chargePad", chargepad::CHARGE_RATE), pad, e.capacity, stored, e.rate);
         if given > 0 {
             set_energy(stack, stored + given);
             break;
@@ -16982,10 +16982,28 @@ const REACTION_TANK: u64 = 10_000;
 /// `UsageConfig.pressurizedReactionBase`: 2 FE a tick, plus the recipe's own.
 const REACTION_USAGE: u64 = 2;
 
+fn reaction_usage() -> u64 {
+    usage_const("pressurizedReactionBase", REACTION_USAGE)
+}
+
+/// `calculateEnergyCost` with the configured teleporter usages.
+fn teleport_cost(from: [f64; 3], to: [i32; 3], same_dimension: bool) -> u64 {
+    teleporter::energy_cost_with(
+        [
+            usage_const("teleporterBase", teleporter::BASE_COST),
+            usage_const("teleporterDistance", teleporter::DISTANCE_COST),
+            usage_const("teleporterDimensionPenalty", teleporter::DIMENSION_PENALTY),
+        ],
+        from,
+        to,
+        same_dimension,
+    )
+}
+
 /// The energy it holds: four ticks of its base usage, or one tick of the current recipe's when that is
 /// more (`AttributeEnergy.getStorage`).
 fn reaction_capacity(nbt: &Compound) -> u64 {
-    (machine::STORAGE_MULTIPLIER * REACTION_USAGE).max(REACTION_USAGE + get_long(nbt, "recipe_energy"))
+    (machine::STORAGE_MULTIPLIER * reaction_usage()).max(reaction_usage() + get_long(nbt, "recipe_energy"))
 }
 
 /// A reaction chamber tick: while the first slot, the water and the chemical make a recipe and there is
@@ -17022,7 +17040,7 @@ fn tick_reaction(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
                 && gas_fits
                 && fluid.amount >= r.fluid_amount
                 && input.amount >= r.chemical_amount
-                && energy.consume(REACTION_USAGE + r.energy)
+                && energy.consume(reaction_usage() + r.energy)
             {
                 active = true;
                 progress += 1;
@@ -17451,7 +17469,7 @@ fn teleporter_status(game: &mut Game<'_>, pos: [i32; 3], entity: &ModBlockEntity
     let from = [f64::from(pos[0]) + 0.5, f64::from(pos[1]), f64::from(pos[2]) + 0.5];
     match teleport_target(game, &f, from, Some(pos)) {
         None => 2,
-        Some((to, _)) if get_long(&entity.nbt, "energy") < teleporter::energy_cost(from, to, true) => 3,
+        Some((to, _)) if get_long(&entity.nbt, "energy") < teleport_cost(from, to, true) => 3,
         Some(_) => 0,
     }
 }

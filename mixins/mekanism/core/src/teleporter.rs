@@ -53,12 +53,18 @@ pub fn frame_direction(is_frame: impl Fn([i32; 3]) -> bool) -> Option<[i32; 3]> 
 
 /// `calculateEnergyCost` for one player in the same dimension: the base and 2 FE a block, rounded.
 pub fn energy_cost(from: [f64; 3], to: [i32; 3], same_dimension: bool) -> u64 {
+    energy_cost_with([BASE_COST, DISTANCE_COST, DIMENSION_PENALTY], from, to, same_dimension)
+}
+
+/// The same with the configured `[teleporterBase, teleporterDistance, teleporterDimensionPenalty]`.
+pub fn energy_cost_with(usage: [u64; 3], from: [f64; 3], to: [i32; 3], same_dimension: bool) -> u64 {
+    let [base, per_block, penalty] = usage;
     let d = (0..3)
         .map(|k| (from[k] - f64::from(to[k])).powi(2))
         .sum::<f64>()
         .sqrt();
-    let distance = (DISTANCE_COST as f64 * d).round() as u64;
-    BASE_COST + distance + if same_dimension { 0 } else { DIMENSION_PENALTY }
+    let distance = (per_block as f64 * d).round() as u64;
+    base + distance + if same_dimension { 0 } else { penalty }
 }
 
 #[cfg(test)]

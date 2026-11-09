@@ -114,8 +114,14 @@ pub fn install(item: &str, installed: &mut Installed, module: &str, n: u32) -> u
 
 /// `ModuleEnergyUnit`: each energy unit doubles the capacity and the charge rate.
 pub fn energy(installed: &Installed) -> (u64, u64) {
-    let n = installed.get("mekanism:energy_unit").copied().unwrap_or(0);
-    (BASE_CAPACITY << n, BASE_CHARGE_RATE << n)
+    energy_from(installed, BASE_CAPACITY, BASE_CHARGE_RATE)
+}
+
+/// The same from a configured base (`gear.mekatool` / `gear.mekasuit` `baseEnergyCapacity` and
+/// `baseChargeRate`).
+pub fn energy_from(installed: &Installed, capacity: u64, rate: u64) -> (u64, u64) {
+    let n = installed.get("mekanism:energy_unit").copied().unwrap_or(0).min(32);
+    (capacity.saturating_mul(1u64 << n), rate.saturating_mul(1u64 << n))
 }
 
 /// The Meka-Tool's efficiency: 4 without an Excavation Escalation Unit, and with one its fastest mode
@@ -433,6 +439,7 @@ mod tests {
         assert_eq!(install(BODYARMOR, &mut m, "mekanism:jetpack_unit", 1), 1);
         assert_eq!(install(BOOTS, &mut m, "mekanism:energy_unit", 3), 3);
         assert_eq!(energy(&m), (128_000_000, 800_000));
+        assert_eq!(energy_from(&m, 1_000, 10), (8_000, 80));
         assert_eq!(tool_efficiency(&m), 128);
     }
 

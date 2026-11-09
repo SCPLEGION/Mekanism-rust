@@ -15,7 +15,12 @@ pub const REACH: f64 = 0.4;
 /// What one check gives an item holding `stored` of `capacity`, taking `rate` a tick, from a pad
 /// holding `pad`.
 pub fn charge(pad: u64, capacity: u64, stored: u64, rate: u64) -> u64 {
-    pad.min(STORAGE)
+    charge_with(CHARGE_RATE, pad, capacity, stored, rate)
+}
+
+/// The same for a pad whose `usage.chargePad` is `usage`.
+pub fn charge_with(usage: u64, pad: u64, capacity: u64, stored: u64, rate: u64) -> u64 {
+    pad.min(usage.saturating_mul(CHECK_TICKS))
         .min(capacity.saturating_sub(stored))
         .min(rate.saturating_mul(CHECK_TICKS))
 }
