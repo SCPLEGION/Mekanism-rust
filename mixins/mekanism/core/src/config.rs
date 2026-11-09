@@ -15,6 +15,51 @@ pub struct GearConfig {
     pub disassembler_vein_mining: bool,
     /// `miningCount`: how many blocks a vein takes.
     pub disassembler_mining_count: usize,
+    /// Each energy item's (capacity, charge rate) by its config section (`maxEnergy`/`baseEnergyCapacity`, `chargeRate`).
+    pub energy: std::collections::BTreeMap<&'static str, (u64, u64)>,
+}
+
+/// The gear sections that hold an item's energy: (section, key of its capacity, capacity, charge rate), all
+/// `GearConfig` defaults.
+pub const ENERGY_SECTIONS: [(&str, &str, u64, u64); 8] = [
+    ("energy_tablet", "maxEnergy", 1_000_000, 5_000),
+    ("atomic_disassembler", "maxEnergy", 1_000_000, 5_000),
+    ("electric_bow", "maxEnergy", 120_000, 600),
+    ("free_runner", "maxEnergy", 64_000, 320),
+    ("seismic_reader", "maxEnergy", 12_000, 60),
+    ("portable_teleporter", "maxEnergy", 1_000_000, 5_000),
+    ("mekatool", "baseEnergyCapacity", 16_000_000, 100_000),
+    ("mekasuit", "baseEnergyCapacity", 16_000_000, 100_000),
+];
+
+/// The section of the item whose energy a config sets.
+pub fn energy_section(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "mekanism:energy_tablet" => "energy_tablet",
+        "mekanism:atomic_disassembler" => "atomic_disassembler",
+        "mekanism:electric_bow" => "electric_bow",
+        "mekanism:free_runners" | "mekanism:free_runners_armored" => "free_runner",
+        crate::seismic::READER => "seismic_reader",
+        "mekanism:portable_teleporter" => "portable_teleporter",
+        "mekanism:meka_tool" => "mekatool",
+        "mekanism:mekasuit_helmet" | "mekanism:mekasuit_bodyarmor" | "mekanism:mekasuit_pants" | "mekanism:mekasuit_boots" => "mekasuit",
+        _ => return None,
+    })
+}
+
+static ACTIVE: std::sync::RwLock<Option<GearConfig>> = std::sync::RwLock::new(None);
+
+/// Makes `config` the one the item energies read.
+pub fn set_active(config: &GearConfig) {
+    if let Ok(mut a) = ACTIVE.write() {
+        *a = Some(config.clone());
+    }
+}
+
+/// The (capacity, charge rate) the active config gives item `id`, if it is a configurable one.
+pub fn energy_override(id: &str) -> Option<(u64, u64)> {
+    let section = energy_section(id)?;
+    ACTIVE.read().ok()?.as_ref()?.energy.get(section).copied()
 }
 
 impl Default for GearConfig {
@@ -25,6 +70,7 @@ impl Default for GearConfig {
             disassembler_fast_mode: true,
             disassembler_vein_mining: false,
             disassembler_mining_count: 128,
+            energy: ENERGY_SECTIONS.iter().map(|(s, _, cap, rate)| (*s, (*cap, *rate))).collect(),
         }
     }
 }
@@ -46,10 +92,20 @@ impl GearConfig {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
+            let (key, value) = (key.trim(), value.trim());
+            if let Some((name, cap_key, _, _)) = ENERGY_SECTIONS.iter().find(|(n, ..)| *n == section) {
+                let n = value.replace('_', "").parse::<u64>().ok();
+                if let (Some(n), Some(e)) = (n, config.energy.get_mut(name)) {
+                    if key == *cap_key && n > 0 {
+                        e.0 = n;
+                    } else if key == "chargeRate" && n <= i32::MAX as u64 {
+                        e.1 = n;
+                    }
+                }
+            }
             if section != SECTION {
                 continue;
             }
-            let (key, value) = (key.trim(), value.trim());
             let flag = value.parse::<bool>().ok();
             let number = value.replace('_', "").parse::<u64>().ok();
             match key {
@@ -74,7 +130,7 @@ impl GearConfig {
 
     /// The file written when there is none.
     pub fn to_toml(&self) -> String {
-        format!(
+        let mut out = format!(
             "# Mekanism gear config (server config: this world only).\n\
              [{SECTION}]\n\
              # Energy (FE) one point of efficiency costs. Range 0 ~ 2147483647\n\
@@ -86,19 +142,31 @@ impl GearConfig {
              # Allow vein mining mode\n\
              veinMining = {}\n\
              # Blocks a vein takes. Range 2 ~ 1000000\n\
-             miningCount = {}\n",
+             miningCount = {}\n\
+             maxEnergy = {}\n\
+             chargeRate = {}\n",
             self.disassembler_energy_usage,
             self.disassembler_slow_mode,
             self.disassembler_fast_mode,
             self.disassembler_vein_mining,
-            self.disassembler_mining_count
-        )
+            self.disassembler_mining_count,
+            self.energy[SECTION].0,
+            self.energy[SECTION].1
+        );
+        for (name, cap_key, _, _) in ENERGY_SECTIONS {
+            if name == SECTION {
+                continue;
+            }
+            let (cap, rate) = self.energy[name];
+            out.push_str(&format!("[{name}]\n{cap_key} = {cap}\nchargeRate = {rate}\n"));
+        }
+        out
     }
 }
 
 /// `UsageConfig`: FE a tick a machine uses, for the machines whose usage the port reads from here, with the
 /// original's defaults (`defineInRange(key, default, 0, Integer.MAX_VALUE)`).
-pub const USAGE_DEFAULTS: [(&str, u64); 9] = [
+pub const USAGE_DEFAULTS: [(&str, u64); 29] = [
     ("enrichmentChamber", 5),
     ("osmiumCompressor", 15),
     ("combiner", 5),
@@ -108,6 +176,26 @@ pub const USAGE_DEFAULTS: [(&str, u64); 9] = [
     ("energizedSmelter", 5),
     ("precisionSawmill", 5),
     ("chemicalInjectionChamber", 15),
+    ("electricPump", 2),
+    ("fluidicPlenisher", 2),
+    ("chemicalWasher", 5),
+    ("rotaryCondensentrator", 2),
+    ("paintingMachine", 5),
+    ("antiprotonicNucleosynthesizer", 15),
+    ("nutritionalLiquifier", 8),
+    ("chemicalDissolutionChamber", 16),
+    ("chemicalCrystallizer", 15),
+    ("isotopicCentrifuge", 8),
+    ("modificationStation", 10),
+    ("pigmentMixer", 5),
+    ("pigmentExtractor", 5),
+    ("chemicalOxidizer", 15),
+    ("chemicalInfuser", 15),
+    ("seismicVibrator", 5),
+    ("laser", 20),
+    ("digitalMiner", 40),
+    ("formulaicAssemblicator", 5),
+    ("dimensionalStabilizer", 15),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -179,6 +267,14 @@ pub fn usage_key(recipe: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn item_energy_comes_from_the_config() {
+        let c = GearConfig::parse("[energy_tablet]\nmaxEnergy = 2_000_000\nchargeRate = 10\n[mekatool]\nbaseEnergyCapacity = 5");
+        assert_eq!(c.energy["energy_tablet"], (2_000_000, 10));
+        assert_eq!(c.energy["mekatool"], (5, 100_000));
+        assert_eq!(energy_section("mekanism:free_runners_armored"), Some("free_runner"));
+    }
+
     #[test]
     fn usage_defaults_round_trip_and_override() {
         let d = super::UsageConfig::default();

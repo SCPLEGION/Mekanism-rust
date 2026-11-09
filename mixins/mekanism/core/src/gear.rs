@@ -50,6 +50,7 @@ pub fn item_energy(id: &str) -> Option<ItemEnergy> {
             (capacity, rate, true)
         }
     };
+    let (capacity, rate) = crate::config::energy_override(id).unwrap_or((capacity, rate));
     Some(ItemEnergy {
         capacity,
         rate,
