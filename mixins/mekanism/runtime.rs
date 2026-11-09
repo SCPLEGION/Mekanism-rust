@@ -1055,6 +1055,7 @@ fn tick_chem_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize,
     let mut f = Factory::new(n, usage, upgrades(&entity.nbt));
     f.machine.energy.stored = get_long(&entity.nbt, "energy").min(f.machine.energy.capacity);
     discharge_slot(entity, FACTORY_ENERGY, &mut f.machine.energy);
+    let chem_fraction = upgrades(&entity.nbt).fraction_of(Upgrade::Chemical);
     let ticks = f.machine.ticks_required.max(1);
     let mut tank = get_tank(&entity.nbt, "chemical", factory::chemical_per_process(recipe_kind) * n as u64);
     let saved = |key: &str| match entity.nbt.get(&JavaString::from(key)) {
@@ -1106,7 +1107,8 @@ fn tick_chem_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize,
         // The infusing factory takes the infuse type as a whole when an operation ends (`TwoInputCachedRecipe`), the
         // others a little every tick.
         let per_tick = recipe_kind != "infusing";
-        let total = r.chemical_amount * u64::from(chem::ADVANCED_TICKS);
+        // The chemical upgrade spares chemical (`UpgradeUtils.getChemicalUsageMultiplier`): 200 base ticks, `M^-chemical` of the amount.
+        let total = (r.chemical_amount as f64 * f64::from(chem::ADVANCED_TICKS) * mekanism_core::upgrades::max_upgrade_multiplier().powf(-chem_fraction)).round() as u64;
         let want = if per_tick { (total * u64::from(progress[i] + 1) / u64::from(ticks)).saturating_sub(used[i]) } else { 0 };
         let has_chemical = tank.chemical.as_deref() == Some(r.chemical) && tank.amount >= if per_tick { want } else { r.chemical_amount };
         let has_energy = f.machine.energy.stored >= f.machine.usage;
@@ -3591,7 +3593,7 @@ fn tick_dissolution(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
 /// The Isotopic Centrifuge: each tick it turns its input (uranium hexafluoride, nuclear waste) into its
 /// output and pushes that to the tanks beside it.
 fn tick_centrifuge(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = machine::STORAGE_MULTIPLIER * usage_const("isotopicCentrifuge", nuclear::CENTRIFUGE_USAGE);
+    let (_, usage, _, capacity) = machine_power(&entity.nbt, usage_const("isotopicCentrifuge", nuclear::CENTRIFUGE_USAGE), None);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut input = get_tank(&entity.nbt, "input", nuclear::CENTRIFUGE_TANK);
@@ -3603,7 +3605,7 @@ fn tick_centrifuge(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
         && input.amount >= need
         && output.accepts(made)
         && output.amount + amount <= output.capacity
-        && energy.consume(usage_const("isotopicCentrifuge", nuclear::CENTRIFUGE_USAGE))
+        && energy.consume(usage)
     {
         input.extract(need);
         output.insert(made, amount);
@@ -3633,7 +3635,7 @@ fn tick_centrifuge(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
 /// The Chemical Washer: each tick, a dirty slurry piped in and water from pipes make the clean slurry,
 /// pushed out to the tanks and tubes beside it.
 fn tick_washer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = machine::STORAGE_MULTIPLIER * usage_const("chemicalWasher", nuclear::WASHER_USAGE);
+    let (_, usage, _, capacity) = machine_power(&entity.nbt, usage_const("chemicalWasher", nuclear::WASHER_USAGE), None);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut input = get_tank(&entity.nbt, "input", nuclear::WASHER_TANK);
@@ -3649,7 +3651,7 @@ fn tick_washer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
         && water.amount >= r.water
         && output.accepts(r.output)
         && output.amount + r.amount <= output.capacity
-        && energy.consume(usage_const("chemicalWasher", nuclear::WASHER_USAGE))
+        && energy.consume(usage)
     {
         input.extract(r.input_amount);
         water.extract(r.water);
@@ -3917,7 +3919,7 @@ fn tick_chemical_infuser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlo
     };
     let valid = if pigment { mekanism_core::recipes::pigment_mixing_input } else { mekanism_core::recipes::infusing_input };
     let find = if pigment { mekanism_core::recipes::find_pigment_mixing } else { mekanism_core::recipes::find_chemical_infusing };
-    let capacity = machine::STORAGE_MULTIPLIER * usage;
+    let (_, usage, _, capacity) = machine_power(&entity.nbt, usage, None);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut left = get_tank(&entity.nbt, "left", cap);
@@ -4094,7 +4096,7 @@ fn tick_infuser(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool
 /// its 24,000 mB tank, and each tick runs one `separating` operation at 4 FE: 2 mB water → 2 hydrogen +
 /// 1 oxygen, or 10 mB brine → 1 sodium + 1 chlorine. The chemicals go out to the blocks beside it.
 fn tick_separator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE;
+    let (_, _, _, capacity) = machine_power(&entity.nbt, chem::SEPARATOR_USAGE, None);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut fluid = get_tank(&entity.nbt, "fluid", chem::SEPARATOR_FLUID);
@@ -4161,7 +4163,7 @@ fn bucket_fluid(item: &str) -> Option<String> {
 /// chemical goes out to the blocks beside it. Condensentrating (chemical → fluid) needs a mode switch
 /// and fluid outputs, which come later.
 fn tick_rotary(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = machine::STORAGE_MULTIPLIER * usage_const("rotaryCondensentrator", chem::ROTARY_USAGE);
+    let (_, usage, _, capacity) = machine_power(&entity.nbt, usage_const("rotaryCondensentrator", chem::ROTARY_USAGE), None);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut fluid = get_tank(&entity.nbt, "fluid", chem::ROTARY_TANK);
@@ -4190,7 +4192,7 @@ fn tick_rotary(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
         && fluid.amount > 0
         && gas.accepts(output)
         && gas.amount < gas.capacity
-        && energy.consume(usage_const("rotaryCondensentrator", chem::ROTARY_USAGE))
+        && energy.consume(usage)
     {
         fluid.extract(1);
         gas.insert(output, 1);
@@ -6221,19 +6223,19 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Factory(n, _, usage) => Some((Factory::new(n, usage, upgrades(nbt)).machine.energy.capacity, u64::MAX)),
         Kind::EnergyCube(t) if facing_away => Some(tier::energy_cube(t)),
         Kind::Cable(rate) if !from_cable => Some((rate, rate)),
-        Kind::Oxidizer => Some((usage_const("chemicalOxidizer", chem::OXIDIZER_USAGE) * u64::from(chem::OXIDIZER_TICKS), u64::MAX)),
-        Kind::PigmentExtractor => Some((usage_const("pigmentExtractor", chem::PIGMENT_EXTRACTOR_USAGE) * u64::from(chem::PIGMENT_EXTRACTOR_TICKS), u64::MAX)),
-        Kind::PigmentMixer => Some((machine::STORAGE_MULTIPLIER * usage_const("pigmentMixer", chem::PIGMENT_MIXER_USAGE), u64::MAX)),
-        Kind::Liquifier => Some((usage_const("nutritionalLiquifier", chem::LIQUIFIER_USAGE) * u64::from(chem::LIQUIFIER_TICKS), u64::MAX)),
+        Kind::Oxidizer => Some((machine_power(nbt, usage_const("chemicalOxidizer", chem::OXIDIZER_USAGE), Some(chem::OXIDIZER_TICKS)).3, u64::MAX)),
+        Kind::PigmentExtractor => Some((machine_power(nbt, usage_const("pigmentExtractor", chem::PIGMENT_EXTRACTOR_USAGE), Some(chem::PIGMENT_EXTRACTOR_TICKS)).3, u64::MAX)),
+        Kind::PigmentMixer => Some((machine_power(nbt, usage_const("pigmentMixer", chem::PIGMENT_MIXER_USAGE), None).3, u64::MAX)),
+        Kind::Liquifier => Some((machine_power(nbt, usage_const("nutritionalLiquifier", chem::LIQUIFIER_USAGE), Some(chem::LIQUIFIER_TICKS)).3, u64::MAX)),
         Kind::Assemblicator => Some((asm_capacity(nbt), u64::MAX)),
         Kind::Stabilizer => Some((st_capacity(nbt), u64::MAX)),
         Kind::ModificationStation => Some((station_capacity(nbt), u64::MAX)),
-        Kind::Dissolution => Some((machine::STORAGE_MULTIPLIER * usage_const("chemicalDissolutionChamber", nuclear::DISSOLUTION_USAGE), u64::MAX)),
-        Kind::Centrifuge => Some((machine::STORAGE_MULTIPLIER * usage_const("isotopicCentrifuge", nuclear::CENTRIFUGE_USAGE), u64::MAX)),
-        Kind::Washer => Some((machine::STORAGE_MULTIPLIER * usage_const("chemicalWasher", nuclear::WASHER_USAGE), u64::MAX)),
-        Kind::Crystallizer => Some((machine::STORAGE_MULTIPLIER * usage_const("chemicalCrystallizer", nuclear::CRYSTALLIZER_USAGE), u64::MAX)),
-        Kind::Separator => Some((machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE, u64::MAX)),
-        Kind::Advanced(m) => Some((advanced_usage(m) * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
+        Kind::Dissolution => Some((machine_power(nbt, usage_const("chemicalDissolutionChamber", nuclear::DISSOLUTION_USAGE), Some(nuclear::DISSOLUTION_TICKS)).3, u64::MAX)),
+        Kind::Centrifuge => Some((machine_power(nbt, usage_const("isotopicCentrifuge", nuclear::CENTRIFUGE_USAGE), None).3, u64::MAX)),
+        Kind::Washer => Some((machine_power(nbt, usage_const("chemicalWasher", nuclear::WASHER_USAGE), None).3, u64::MAX)),
+        Kind::Crystallizer => Some((machine_power(nbt, usage_const("chemicalCrystallizer", nuclear::CRYSTALLIZER_USAGE), Some(nuclear::CRYSTALLIZER_TICKS)).3, u64::MAX)),
+        Kind::Separator => Some((machine_power(nbt, chem::SEPARATOR_USAGE, None).3, u64::MAX)),
+        Kind::Advanced(m) => Some((machine_power(nbt, advanced_usage(m), Some(chem::ADVANCED_TICKS)).3, u64::MAX)),
         Kind::Nucleosynthesizer => Some((machine::STORAGE_MULTIPLIER * usage_const("antiprotonicNucleosynthesizer", chem::NUCLEOSYNTHESIZER_USAGE), u64::MAX)),
         Kind::Reaction => Some((reaction_capacity(nbt), u64::MAX)),
         Kind::Teleporter => Some((teleporter::STORAGE, u64::MAX)),
@@ -6245,8 +6247,8 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Entangloporter if nbt.contains_key(&JavaString::from("frequency")) => {
             Some((get_long(nbt, "energy") + qe::energy_buffer().saturating_sub(get_long(nbt, "shared_energy")), u64::MAX))
         }
-        Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * usage_const("chemicalInfuser", chem::CHEMICAL_INFUSER_USAGE), u64::MAX)),
-        Kind::Rotary => Some((machine::STORAGE_MULTIPLIER * usage_const("rotaryCondensentrator", chem::ROTARY_USAGE), u64::MAX)),
+        Kind::ChemicalInfuser => Some((machine_power(nbt, usage_const("chemicalInfuser", chem::CHEMICAL_INFUSER_USAGE), None).3, u64::MAX)),
+        Kind::Rotary => Some((machine_power(nbt, usage_const("rotaryCondensentrator", chem::ROTARY_USAGE), None).3, u64::MAX)),
         Kind::Heater => Some((machine::STORAGE_MULTIPLIER * heater_usage(nbt), u64::MAX)),
         Kind::Pump => {
             let u = upgrades(nbt);
