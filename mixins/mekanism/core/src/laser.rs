@@ -21,18 +21,23 @@ pub const TRACTOR_SLOTS: usize = 27;
 
 /// `general.laser.energyPerDamage`: FE a point of damage to an entity in the beam takes.
 pub const ENERGY_PER_DAMAGE: u64 = 2_500;
+
+/// `energyPerDamage` of the open world's config (`ENERGY_PER_DAMAGE` is its default).
+pub fn energy_per_damage() -> u64 {
+    crate::config_files::active_int("general", "laser", "energyPerDamage", ENERGY_PER_DAMAGE)
+}
 /// Half the beam's width, as its box reaches around the beam's line.
 pub const BEAM_HALF_WIDTH: f64 = 0.25;
 
 /// The damage `energy` does to an entity in the beam, and the ticks it burns for (`fireLaser`).
 pub fn damage(energy: u64) -> (f32, i32) {
-    let value = energy as f64 / ENERGY_PER_DAMAGE as f64;
+    let value = energy as f64 / energy_per_damage() as f64;
     (value as f32, value.min(f64::from(i32::MAX)) as i32)
 }
 
 /// The energy a hit used, from the health the entity lost.
 pub fn spent(lost: f32, energy: u64) -> u64 {
-    ((f64::from(lost) * ENERGY_PER_DAMAGE as f64) as u64).min(energy)
+    ((f64::from(lost) * energy_per_damage() as f64) as u64).min(energy)
 }
 
 /// The beam's box from the laser at `pos` facing `d`, `length` blocks long from the laser's face.
@@ -70,6 +75,24 @@ pub fn to_fire(id: &str, stored: u64, min: u64, max: u64) -> u64 {
     if want <= stored { want } else { 0 }
 }
 
+/// `TileEntityLaserAmplifier.updateMinThreshold`: the new lower threshold (capped at the capacity), pulling the
+/// upper one up with it when it would pass it. Returns the new `(min, max)`.
+pub fn set_min_threshold(max: u64, capacity: u64, target: u64) -> (u64, u64) {
+    let min = target.min(capacity);
+    (min, max.max(min))
+}
+
+/// `updateMaxThreshold`: the new upper threshold (capped at the capacity), pulling the lower one down with it.
+pub fn set_max_threshold(min: u64, capacity: u64, target: u64) -> (u64, u64) {
+    let max = target.min(capacity);
+    (min.min(max), max)
+}
+
+/// The amplifier's delay counter after one tick (`onUpdateServer`): it counts up to the delay, then starts again.
+pub fn next_tick(ticks: u64, delay: u64) -> u64 {
+    if ticks < delay { ticks + 1 } else { 0 }
+}
+
 /// Digging with `energy` more into a block of `hardness` that already has `progress`: the new progress,
 /// and whether the block breaks (the progress then starts again). Unbreakable blocks take nothing.
 pub fn dig(progress: u64, energy: u64, hardness: f32) -> (u64, bool) {
@@ -77,7 +100,7 @@ pub fn dig(progress: u64, energy: u64, hardness: f32) -> (u64, bool) {
         return (progress, false);
     }
     let progress = progress.saturating_add(energy);
-    if progress as f64 >= f64::from(hardness) * ENERGY_PER_HARDNESS {
+    if progress as f64 >= f64::from(hardness) * crate::config_files::active_int("general", "laser", "energyPerHardness", ENERGY_PER_HARDNESS as u64) as f64 {
         (0, true)
     } else {
         (progress, false)
@@ -98,6 +121,22 @@ mod tests {
         assert_eq!((min[1], max[1]), (0.25, 0.75));
         let (min, max) = beam_box([0, 0, 0], [0, 0, -1], 1.0);
         assert!((max[2] + 0.001).abs() < 1e-9 && (min[2] + 1.001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn thresholds_pull_each_other() {
+        assert_eq!(set_min_threshold(100, 1_000, 500), (500, 500));
+        assert_eq!(set_min_threshold(100, 1_000, 50), (50, 100));
+        assert_eq!(set_max_threshold(80, 1_000, 20), (20, 20));
+        assert_eq!(set_max_threshold(0, 1_000, 5_000), (0, 1_000));
+    }
+
+    #[test]
+    fn delay_counts_up_and_wraps() {
+        let mut t = 0;
+        let seen: Vec<u64> = (0..6).map(|_| { t = next_tick(t, 2); t }).collect();
+        assert_eq!(seen, [1, 2, 0, 1, 2, 0]);
+        assert_eq!(next_tick(0, 0), 0);
     }
 
     #[test]

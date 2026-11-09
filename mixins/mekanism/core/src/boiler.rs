@@ -14,34 +14,77 @@ pub const HEATER: &str = "mekanism:resistive_heater";
 pub const FUELWOOD_HEATER: &str = "mekanism:fuelwood_heater";
 pub const HEAT_PER_FUEL_TICK: f64 = 400.0;
 
+/// `heatPerFuelTick` of the open world's config (`HEAT_PER_FUEL_TICK` is its default).
+pub fn heat_per_fuel_tick() -> f64 {
+    crate::config_files::active_double("general", "heater", "heatPerFuelTick", HEAT_PER_FUEL_TICK)
+}
+/// The Resistive and Fuelwood Heaters' `BasicHeatCapacitor`: capacity, inverse conduction, inverse insulation.
+pub const HEATER_HEAT_CAPACITY: f64 = 100.0;
+pub const HEATER_INVERSE_CONDUCTION: f64 = 5.0;
+pub const HEATER_INVERSE_INSULATION: f64 = 10.0;
+
 /// `general.boiler`: `waterPerTank`, `steamPerTank`, `waterConductivity`, `superheatingHeatTransfer`.
 pub const WATER_PER_BLOCK: u64 = 16_000;
+
+/// `waterPerTank` of the open world's config (`WATER_PER_BLOCK` is its default).
+pub fn water_per_block() -> u64 {
+    crate::config_files::active_int("general", "boiler", "waterPerTank", WATER_PER_BLOCK)
+}
 pub const STEAM_PER_BLOCK: u64 = 160_000;
+
+/// `steamPerTank` of the open world's config (`STEAM_PER_BLOCK` is its default).
+pub fn steam_per_block() -> u64 {
+    crate::config_files::active_int("general", "boiler", "steamPerTank", STEAM_PER_BLOCK)
+}
 const WATER_CONDUCTIVITY: f64 = 0.7;
+
+/// `waterConductivity` of the open world's config (`WATER_CONDUCTIVITY` is its default).
+pub fn water_conductivity() -> f64 {
+    crate::config_files::active_double("general", "boiler", "waterConductivity", WATER_CONDUCTIVITY)
+}
 const SUPERHEATING_HEAT_TRANSFER: f64 = 16_000_000.0;
+
+/// `superheatingHeatTransfer` of the open world's config (`SUPERHEATING_HEAT_TRANSFER` is its default).
+pub fn superheating_heat_transfer() -> f64 {
+    crate::config_files::active_double("general", "boiler", "superheatingHeatTransfer", SUPERHEATING_HEAT_TRANSFER)
+}
 /// `CASING_HEAT_CAPACITY` per block, and the casing's inverse insulation and conduction.
 pub const CASING_HEAT_CAPACITY: f64 = 50.0;
 pub const CASING_INVERSE_INSULATION: f64 = 100_000.0;
 pub const CASING_INVERSE_CONDUCTION: f64 = 1.0;
+/// `general.boiler.heatedCoolantPerTank` and `cooledCoolantPerTank`: 256 buckets a tank.
+pub const COOLANT_PER_BLOCK: u64 = 256_000;
+
+/// `heatedCoolantPerTank` of the open world's config (`COOLANT_PER_BLOCK` is its default).
+pub fn coolant_per_block() -> u64 {
+    crate::config_files::active_int("general", "boiler", "heatedCoolantPerTank", COOLANT_PER_BLOCK)
+}
+/// The heated coolant chemical and its cooled variant (`HeatedCoolant` / `CooledCoolant` data maps).
+pub const HEATED_COOLANT: &str = "mekanism:superheated_sodium";
+pub const COOLED_COOLANT: &str = "mekanism:sodium";
+/// `HeatedCoolant(sodium, thermalEnthalpy 5)` with the base conductivity 0.4 and temperature 100,000 K.
+pub const COOLANT_ENTHALPY: f64 = 5.0;
+pub const COOLANT_CONDUCTIVITY: f64 = 0.4;
+pub const COOLANT_TEMPERATURE: f64 = 100_000.0;
+
 /// `HeatUtils.BASE_BOIL_TEMP`: 100 °C.
 pub const BOIL_TEMP: f64 = 373.15;
 const STEAM_EFFICIENCY: f64 = 0.2;
 const WATER_ENTHALPY: f64 = 10.0;
 
+/// `HeatUtils.getWaterThermalEnthalpy`: `general.energy_conversion.maxEnergyPerSteam`.
+fn water_enthalpy() -> f64 {
+    crate::config_files::active_int("general", "energy_conversion", "maxEnergyPerSteam", WATER_ENTHALPY as u64) as f64
+}
+
 /// `TileEntityResistiveHeater.BASE_USAGE` and `general.resistiveEfficiency`.
 pub const HEATER_USAGE: u64 = 100;
 pub const HEATER_EFFICIENCY: f64 = 0.6;
-/// The usages a click on a heater steps through (its screen's energy usage field).
-pub const HEATER_STEPS: [u64; 5] = [100, 1_000, 10_000, 100_000, 1_000_000];
 
-pub fn next_heater_usage(now: u64) -> u64 {
-    HEATER_STEPS
-        .iter()
-        .copied()
-        .find(|&s| s > now)
-        .unwrap_or(HEATER_USAGE)
+/// `resistiveEfficiency` of the open world's config (`HEATER_EFFICIENCY` is its default).
+pub fn heater_efficiency() -> f64 {
+    crate::config_files::active_double("general", "heater", "resistiveEfficiency", HEATER_EFFICIENCY)
 }
-
 pub fn is_frame(name: &str) -> bool {
     matches!(
         name,
@@ -62,11 +105,30 @@ pub struct Boiler {
 
 impl Boiler {
     pub fn water_capacity(&self) -> u64 {
-        self.water_volume * WATER_PER_BLOCK
+        self.water_volume * water_per_block()
     }
 
     pub fn steam_capacity(&self) -> u64 {
-        self.steam_volume * STEAM_PER_BLOCK
+        self.steam_volume * steam_per_block()
+    }
+
+    /// The superheated coolant tank holds a tank's worth for each block of water space.
+    pub fn heated_coolant_capacity(&self) -> u64 {
+        self.water_volume * coolant_per_block()
+    }
+
+    /// The cooled coolant tank, for each block of steam space.
+    pub fn cooled_coolant_capacity(&self) -> u64 {
+        self.steam_volume * crate::config_files::active_int("general", "boiler", "cooledCoolantPerTank", COOLANT_PER_BLOCK)
+    }
+
+    /// The coolant step of `BoilerMultiblockData.tick`: the share of `heated` mB that gives its heat to the casing at
+    /// `temperature`, limited by the room in the cooled tank. Returns the mB cooled; the casing gains
+    /// `cooled * COOLANT_ENTHALPY` heat.
+    pub fn cool(temperature: f64, heated: u64, cooled_room: u64) -> u64 {
+        let portion = COOLANT_CONDUCTIVITY * heated as f64;
+        let to_cool = (portion * (1.0 - temperature / COOLANT_TEMPERATURE)).round();
+        (to_cool.max(0.0) as u64).min(cooled_room).min(heated)
     }
 
     pub fn heat_capacity(&self) -> f64 {
@@ -81,7 +143,7 @@ impl Boiler {
             return 0;
         }
         let boiled = self.max_boil(*heat).min(steam_room).min(water);
-        *heat -= boiled as f64 * WATER_ENTHALPY / STEAM_EFFICIENCY;
+        *heat -= boiled as f64 * water_enthalpy() / STEAM_EFFICIENCY;
         boiled
     }
 
@@ -91,9 +153,9 @@ impl Boiler {
         if capacity <= 0.0 || heat / capacity < BOIL_TEMP {
             return 0;
         }
-        let available = ((heat - BOIL_TEMP * capacity) * WATER_CONDUCTIVITY)
-            .min(SUPERHEATING_HEAT_TRANSFER * self.elements as f64);
-        (STEAM_EFFICIENCY * available / WATER_ENTHALPY).floor() as u64
+        let available = ((heat - BOIL_TEMP * capacity) * water_conductivity())
+            .min(superheating_heat_transfer() * self.elements as f64);
+        (STEAM_EFFICIENCY * available / water_enthalpy()).floor() as u64
     }
 
     /// The second rate bar's level: the max boil rate over what the elements could carry.
@@ -101,7 +163,7 @@ impl Boiler {
         if self.elements == 0 {
             return 0.0;
         }
-        (max as f64 * WATER_ENTHALPY / (self.elements as f64 * SUPERHEATING_HEAT_TRANSFER)).min(1.0)
+        (max as f64 * water_enthalpy() / (self.elements as f64 * superheating_heat_transfer())).min(1.0)
     }
 }
 
@@ -138,8 +200,15 @@ mod tests {
     }
 
     #[test]
-    fn heaters_step_their_usage() {
-        assert_eq!(next_heater_usage(100), 1_000);
-        assert_eq!(next_heater_usage(1_000_000), 100);
+    fn hot_coolant_heats_the_casing_and_cools() {
+        // 1,000 mB at 300 K: 0.4 × 1,000 × (1 - 300 / 100,000) = 398.8 → 399.
+        assert_eq!(Boiler::cool(300.0, 1_000, u64::MAX), 399);
+        // Limited by the room for the cooled coolant.
+        assert_eq!(Boiler::cool(300.0, 1_000, 100), 100);
+        // A casing hotter than the coolant gets nothing.
+        assert_eq!(Boiler::cool(200_000.0, 1_000, u64::MAX), 0);
+        let b = boiler();
+        assert_eq!(b.heated_coolant_capacity(), 256_000);
+        assert_eq!(b.cooled_coolant_capacity(), 0);
     }
 }

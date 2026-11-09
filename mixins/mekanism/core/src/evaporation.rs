@@ -10,10 +10,35 @@ pub const MAX_MULTIPLIER_TEMP: f64 = 3_000.0;
 pub const AMBIENT_TEMP: f64 = 300.0;
 /// `GeneralConfig`'s evaporation defaults.
 pub const HEAT_DISSIPATION: f64 = 0.02;
+
+/// `heatDissipation` of the open world's config (`HEAT_DISSIPATION` is its default).
+pub fn heat_dissipation() -> f64 {
+    crate::config_files::active_double("general", "thermal_evaporation", "heatDissipation", HEAT_DISSIPATION)
+}
 pub const SOLAR_MULTIPLIER: f64 = 0.2;
+
+/// `solarMultiplier` of the open world's config (`SOLAR_MULTIPLIER` is its default).
+pub fn solar_multiplier() -> f64 {
+    crate::config_files::active_double("general", "thermal_evaporation", "solarMultiplier", SOLAR_MULTIPLIER)
+}
 pub const TEMP_MULTIPLIER: f64 = 0.4;
+
+/// `tempMultiplier` of the open world's config (`TEMP_MULTIPLIER` is its default).
+pub fn config_temp_multiplier() -> f64 {
+    crate::config_files::active_double("general", "thermal_evaporation", "tempMultiplier", TEMP_MULTIPLIER)
+}
 pub const FLUID_PER_TANK: u64 = 64_000;
+
+/// `fluidPerTank` of the open world's config (`FLUID_PER_TANK` is its default).
+pub fn fluid_per_tank() -> u64 {
+    crate::config_files::active_int("general", "thermal_evaporation", "fluidPerTank", FLUID_PER_TANK)
+}
 pub const OUTPUT_TANK: u64 = 10_000;
+
+/// `outputTankCapacity` of the open world's config (`OUTPUT_TANK` is its default).
+pub fn output_tank() -> u64 {
+    crate::config_files::active_int("general", "thermal_evaporation", "outputTankCapacity", OUTPUT_TANK)
+}
 /// `recipe/evaporating/`: 10 mB of water make 1 mB of brine (`brine.json`), and 10 mB of brine 1 mB
 /// of lithium (`lithium.json`).
 pub const WATER_PER_BRINE: u64 = 10;
@@ -29,25 +54,25 @@ pub fn evaporating(fluid: &str) -> Option<&'static str> {
 
 /// The water tank grows with the tower: a quarter of its volume, times 64 buckets.
 pub fn input_capacity(height: u32) -> u64 {
-    u64::from(4 * 4 * height / 4) * FLUID_PER_TANK
+    u64::from(4 * 4 * height / 4) * fluid_per_tank()
 }
 
 /// One tick of `simulateEnvironment`, in temperature (the capacitor's heat over its capacity): each
 /// active solar adds 0.2 K, and the tower moves towards the ambient by 0.02 K per square root of the
 /// difference.
 pub fn step_temperature(temperature: f64, solars: u32, ambient: f64) -> f64 {
-    let t = temperature + f64::from(solars) * SOLAR_MULTIPLIER;
+    let t = temperature + f64::from(solars) * solar_multiplier();
     let diff = (t - ambient).abs();
     if diff < 0.001 {
         return ambient;
     }
-    let incr = HEAT_DISSIPATION * diff.sqrt();
+    let incr = heat_dissipation() * diff.sqrt();
     if t > ambient { t - incr } else { t + incr }
 }
 
 /// `tempMultiplier`: how many operations a tick a tower of `height` runs at `temperature`.
 pub fn temp_multiplier(temperature: f64, height: u32) -> f64 {
-    (temperature.min(MAX_MULTIPLIER_TEMP) - AMBIENT_TEMP) * TEMP_MULTIPLIER * f64::from(height)
+    (temperature.min(MAX_MULTIPLIER_TEMP) - AMBIENT_TEMP) * config_temp_multiplier() * f64::from(height)
         / f64::from(MAX_HEIGHT)
 }
 
@@ -94,6 +119,6 @@ mod tests {
         let m = 0.4;
         let ran: u64 = (0..9).map(|_| operations(m, &mut p)).sum();
         assert_eq!(ran, 3);
-        assert_eq!(input_capacity(3), 12 * FLUID_PER_TANK);
+        assert_eq!(input_capacity(3), 12 * fluid_per_tank());
     }
 }

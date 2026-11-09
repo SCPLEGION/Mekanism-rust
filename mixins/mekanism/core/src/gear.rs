@@ -50,6 +50,7 @@ pub fn item_energy(id: &str) -> Option<ItemEnergy> {
             (capacity, rate, true)
         }
     };
+    let (capacity, rate) = crate::config::energy_override(id).unwrap_or((capacity, rate));
     Some(ItemEnergy {
         capacity,
         rate,
@@ -102,26 +103,38 @@ pub fn discharge(item: ItemEnergy, stored: u64, target: &mut EnergyContainer) ->
     stored - (offered - left)
 }
 
-/// `ItemAtomicDisassembler.DisassemblerMode` with `GearConfig`'s defaults: vein mining is off, so the
-/// mode key cycles normal, slow, fast and off.
+/// `ItemAtomicDisassembler.DisassemblerMode`: normal, slow, fast, vein and off; slow, fast and vein can be
+/// switched off by `GearConfig` (vein is off by default).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DisassemblerMode {
     #[default]
     Normal,
     Slow,
     Fast,
+    Vein,
     Off,
 }
 
 impl DisassemblerMode {
-    pub const ALL: [DisassemblerMode; 4] = [Self::Normal, Self::Slow, Self::Fast, Self::Off];
+    pub const ALL: [DisassemblerMode; 5] = [Self::Normal, Self::Slow, Self::Fast, Self::Vein, Self::Off];
 
     pub fn efficiency(self) -> u64 {
         match self {
             Self::Normal => 20,
             Self::Slow => 8,
             Self::Fast => 128,
+            Self::Vein => 20,
             Self::Off => 0,
+        }
+    }
+
+    /// `isEnabled`.
+    pub fn enabled(self, config: &crate::config::GearConfig) -> bool {
+        match self {
+            Self::Slow => config.disassembler_slow_mode,
+            Self::Fast => config.disassembler_fast_mode,
+            Self::Vein => config.disassembler_vein_mining,
+            Self::Normal | Self::Off => true,
         }
     }
 
@@ -131,6 +144,7 @@ impl DisassemblerMode {
             Self::Normal => "normal",
             Self::Slow => "slow",
             Self::Fast => "fast",
+            Self::Vein => "vein",
             Self::Off => "off",
         }
     }
@@ -140,6 +154,7 @@ impl DisassemblerMode {
             Self::Normal => "Normal",
             Self::Slow => "Slow",
             Self::Fast => "Fast",
+            Self::Vein => "Vein",
             Self::Off => "Off",
         }
     }
@@ -148,10 +163,15 @@ impl DisassemblerMode {
         Self::ALL.into_iter().find(|m| m.name() == name)
     }
 
-    /// `adjust(1)`: the next enabled mode, wrapping around.
+    /// `adjust(1)` with every mode enabled.
     pub fn next(self) -> Self {
+        self.next_enabled(&crate::config::GearConfig { disassembler_vein_mining: true, ..Default::default() })
+    }
+
+    /// `IDisableableEnum.adjust(1)`: the next enabled mode, wrapping around.
+    pub fn next_enabled(self, config: &crate::config::GearConfig) -> Self {
         let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
-        Self::ALL[(i + 1) % Self::ALL.len()]
+        (1..=Self::ALL.len()).map(|k| Self::ALL[(i + k) % Self::ALL.len()]).find(|m| m.enabled(config)).unwrap_or(self)
     }
 }
 
@@ -160,7 +180,12 @@ pub const DISASSEMBLER_ENERGY_USAGE: u64 = 10;
 
 /// The energy breaking a block costs (`getDestroyEnergy`): half for a block that breaks instantly.
 pub fn destroy_energy(mode: DisassemblerMode, hardness: f32) -> u64 {
-    let base = DISASSEMBLER_ENERGY_USAGE * mode.efficiency();
+    destroy_energy_with(DISASSEMBLER_ENERGY_USAGE, mode, hardness)
+}
+
+/// `destroy_energy` with the config's `energyUsage`.
+pub fn destroy_energy_with(usage: u64, mode: DisassemblerMode, hardness: f32) -> u64 {
+    let base = usage * mode.efficiency();
     if hardness == 0.0 {
         (base / 2).max(1)
     } else {
@@ -171,7 +196,12 @@ pub fn destroy_energy(mode: DisassemblerMode, hardness: f32) -> u64 {
 /// `ItemAtomicDisassembler.getDestroySpeed`: the mode's efficiency while the energy for the block is
 /// there; short of it, normal mode's efficiency scaled down by how much of it is.
 pub fn destroy_speed(mode: DisassemblerMode, stored: u64, hardness: f32) -> f32 {
-    let required = destroy_energy(mode, hardness);
+    destroy_speed_with(DISASSEMBLER_ENERGY_USAGE, mode, stored, hardness)
+}
+
+/// `destroy_speed` with the config's `energyUsage`.
+pub fn destroy_speed_with(usage: u64, mode: DisassemblerMode, stored: u64, hardness: f32) -> f32 {
+    let required = destroy_energy_with(usage, mode, hardness);
     if stored < required {
         let normal = DisassemblerMode::Normal.efficiency() as f32;
         return normal * (stored as f32 / required as f32);
@@ -239,7 +269,7 @@ mod tests {
         use DisassemblerMode::*;
         assert_eq!(
             [Normal.next(), Slow.next(), Fast.next(), Off.next()],
-            [Slow, Fast, Off, Normal]
+            [Slow, Fast, Vein, Normal]
         );
         assert_eq!(destroy_energy(Fast, 2.0), 1_280);
         assert_eq!(destroy_speed(Fast, 2_000, 2.0), 128.0);
@@ -348,8 +378,37 @@ impl FreeRunnerMode {
 /// (blocks past the safe distance count as damage points) costs `fallEnergyCost` FE a point. Returns
 /// the energy it takes, or None when the runners cannot pay for all of it.
 pub fn fall_cost(fallen: f64, stored: u64) -> Option<u64> {
-    let cost = (fallen.max(0.0) * FREE_RUNNER_FALL_COST as f64).ceil() as u64;
+    let cost = (fallen.max(0.0) * crate::config::gear_int("free_runner.fallEnergyCost", FREE_RUNNER_FALL_COST) as f64).ceil() as u64;
     (cost <= stored).then_some(cost)
+}
+
+/// `CommonPlayerTickHandler.livingFall` with its ratio: `fallen` points of damage, `cost` FE a point and
+/// `ratio` of the damage absorbable. Returns the energy taken (at most `stored`) and the fall left over.
+pub fn fall_absorb(fallen: f64, stored: u64, cost: u64, ratio: f64) -> (u64, f64) {
+    if fallen <= 0.0 || ratio <= 0.0 {
+        return (0, fallen.max(0.0));
+    }
+    let required = (cost as f64 * fallen * ratio).ceil() as u64;
+    let (spent, absorbed) = if required == 0 {
+        (0, ratio)
+    } else {
+        let taken = required.min(stored);
+        (taken, ratio * taken as f64 / required as f64)
+    };
+    (spent, fallen * (1.0 - absorbed).max(0.0))
+}
+
+#[cfg(test)]
+mod fall_absorb_tests {
+    use super::*;
+
+    #[test]
+    fn fall_absorb_is_partial_when_short_of_energy() {
+        assert_eq!(fall_absorb(4.0, 1_000, 50, 1.0), (200, 0.0));
+        let (spent, left) = fall_absorb(4.0, 100, 50, 1.0);
+        assert_eq!((spent, left), (100, 2.0));
+        assert_eq!(fall_absorb(4.0, 1_000, 50, 0.5), (100, 2.0));
+    }
 }
 
 #[cfg(test)]

@@ -230,6 +230,9 @@ def shape_declaration(ns, name, declaration, report):
             # A template without a facing: the shape of the model the blockstate shows.
             declaration["shape"] = shape["facing"]["north"]
         report["shapes"] = report.get("shapes", 0) + 1
+    if name == "laser_amplifier":
+        # Its redstone output is graded (0 to 15): the bundle sets it with native_set_block_signal.
+        declaration.setdefault("properties", {})["signal_source"] = True
     if see_through(name):
         declaration.setdefault("properties", {})["occludes"] = False
         report["see_through"] = report.get("see_through", 0) + 1
@@ -357,6 +360,22 @@ def vanilla_ore(name, feature):
     return configured, placed
 
 
+def vanilla_salt():
+    """`mekanism:disk` -> `minecraft:disk` with SaltConfig's defaults (radius 2 to 3, half height 1, 2 per chunk)."""
+    feature = {"type": "minecraft:disk", "config": {
+        "state_provider": {"type": "minecraft:simple_state_provider", "state": {"Name": "mekanism:block_salt"}},
+        "target": {"predicate_type": "minecraft:matching_blocks", "blocks": ["minecraft:dirt", "minecraft:clay"]},
+        "radius": {"type": "minecraft:uniform", "min_inclusive": 2, "max_inclusive": 3},
+        "half_height": 1}}
+    placed = {"feature": "mekanism:salt", "placement": [
+        {"type": "minecraft:count", "count": 2},
+        {"type": "minecraft:in_square"},
+        {"type": "minecraft:heightmap", "heightmap": "OCEAN_FLOOR_WG"},
+        {"type": "minecraft:block_predicate_filter", "predicate": {"type": "minecraft:matching_fluids", "fluids": "minecraft:water"}},
+        {"type": "minecraft:biome"}]}
+    return feature, placed
+
+
 def copy_tree(src, dst, report, key):
     if not src.is_dir():
         return
@@ -425,10 +444,16 @@ def build_module(ns, out):
         path.write_text(json.dumps(configured, indent=2) + "\n")
         (placed_dir / path.name).write_text(json.dumps(placed, indent=2) + "\n")
         report["ores"] = report.get("ores", 0) + 1
-    # The salt disk uses Mekanism's own feature and height types; it waits for a native feature.
-    for folder in (features, placed_dir):
-        for path in folder.glob("salt*.json") if folder.is_dir() else []:
+    # The salt disk: vanilla's disk feature with the default radius, depth and count. The native mod overrides it
+    # with the world config (`mixins/mekanism/core/src/worldgen.rs`).
+    if features.is_dir():
+        placed_dir.mkdir(parents=True, exist_ok=True)
+        salt_feature, salt_placed = vanilla_salt()
+        (features / "salt.json").write_text(json.dumps(salt_feature, indent=2) + "\n")
+        (placed_dir / "salt.json").write_text(json.dumps(salt_placed, indent=2) + "\n")
+        for path in placed_dir.glob("salt_retrogen.json"):
             path.unlink()
+        report["salt"] = 1
 
     # Items told apart by a Mekanism data component (upgrades, modules): Horizon has no mod components, so
     # the type goes in vanilla's custom_data, the model is chosen by custom_model_data, and the name is
@@ -507,6 +532,19 @@ def build_module(ns, out):
                 for part_name, glow in (("body", False), ("glow", True)):
                     part = {"elements": [e for e in elements if bool(e.get("light_emission")) == glow]}
                     worn_models.build_element_world_model(ns, f"robit_{part_name}_{skin_json.stem}{suffix}", part, png, out, report, (8, 0, 8))
+    if ns == "mekanism":
+        # The skin previews (`GuiRobitSkinSelectScroll`) turn each skin's body, one model per texture of the skin.
+        robit = next((d / ns / "models/robit/robit.json" for d in search if (d / ns / "models/robit/robit.json").is_file()), None)
+        if robit is not None:
+            body = {"elements": [e for e in json.loads(robit.read_text())["elements"] if not e.get("light_emission")]}
+            for skin_json in sorted({f for d in search for f in (d.parent / "data" / ns / "mekanism" / "robit_skin").glob("*.json")}, key=lambda f: f.name):
+                for index, texture_id in enumerate(json.loads(skin_json.read_text()).get("textures", [])):
+                    tex_ns, tex_name = texture_id.split(":")
+                    png = next((d / tex_ns / "textures/entity/robit" / f"{tex_name}.png" for d in search
+                                if (d / tex_ns / "textures/entity/robit" / f"{tex_name}.png").is_file()), None)
+                    if png is not None:
+                        suffix = "" if index == 0 else f"_{index}"
+                        worn_models.build_element_world_model(ns, f"robit_preview_{skin_json.stem}{suffix}", body, png, out, report, (8, 0, 8))
     if ns == "mekanism":
         # The Personal Chest (`RenderPersonalChest`): vanilla's chest parts in Mekanism's skin, the lid turned.
         chest = next((d / ns / "textures/block/models/personal_chest.png" for d in search
@@ -710,7 +748,14 @@ def sps_textures(ns, out, search):
     beam = SRC / "main/resources/assets/mekanism/textures/particle/laser.png"
     if ns == "mekanism" and beam.is_file():
         shutil.copyfile(beam, dst / "laser_beam.png")
-    return 19
+    # The Configurator's overlays (`MekanismRenderer.overlays`) on the face looked at.
+    overlays = 0
+    for name in ("energy", "items", "fluids", "chemicals", "heat"):
+        overlay = SRC / f"main/resources/assets/mekanism/textures/block/overlay/{name}_overlay.png"
+        if overlay.is_file():
+            shutil.copyfile(overlay, dst / f"overlay_{name}.png")
+            overlays += 1
+    return 19 + overlays
 
 
 def sound_files(ns, out):

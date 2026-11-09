@@ -6,34 +6,28 @@ pub const MAX_SIZE: i32 = 18;
 
 /// `InductionCellTier`: FE a cell stores.
 pub fn cell(block: &str) -> Option<u64> {
-    Some(
-        match block
-            .strip_prefix("mekanism:")?
-            .strip_suffix("_induction_cell")?
-        {
-            "basic" => 8_000_000_000,
-            "advanced" => 64_000_000_000,
-            "elite" => 512_000_000_000,
-            "ultimate" => 4_000_000_000_000,
-            _ => return None,
-        },
-    )
+    let tier = block.strip_prefix("mekanism:")?.strip_suffix("_induction_cell")?;
+    let default = match tier {
+        "basic" => 8_000_000_000,
+        "advanced" => 64_000_000_000,
+        "elite" => 512_000_000_000,
+        "ultimate" => 4_000_000_000_000,
+        _ => return None,
+    };
+    Some(crate::config_files::active_int("tiers", "induction", &format!("{tier}Capacity"), default))
 }
 
 /// `InductionProviderTier`: FE a tick a provider adds to the matrix's transfer rate.
 pub fn provider(block: &str) -> Option<u64> {
-    Some(
-        match block
-            .strip_prefix("mekanism:")?
-            .strip_suffix("_induction_provider")?
-        {
-            "basic" => 256_000,
-            "advanced" => 2_048_000,
-            "elite" => 16_384_000,
-            "ultimate" => 131_072_000,
-            _ => return None,
-        },
-    )
+    let tier = block.strip_prefix("mekanism:")?.strip_suffix("_induction_provider")?;
+    let default = match tier {
+        "basic" => 256_000,
+        "advanced" => 2_048_000,
+        "elite" => 16_384_000,
+        "ultimate" => 131_072_000,
+        _ => return None,
+    };
+    Some(crate::config_files::active_int("tiers", "induction", &format!("{tier}Output"), default))
 }
 
 pub fn is_frame(block: &str) -> bool {
@@ -48,6 +42,9 @@ pub fn is_frame(block: &str) -> bool {
 pub struct Matrix {
     pub capacity: u64,
     pub rate: u64,
+    /// How many cells and providers it holds (`getCellCount`, `getProviderCount`).
+    pub cells: u32,
+    pub providers: u32,
 }
 
 impl Matrix {
@@ -55,8 +52,10 @@ impl Matrix {
     pub fn add_inside(&mut self, block: &str) -> bool {
         if let Some(c) = cell(block) {
             self.capacity = self.capacity.saturating_add(c);
+            self.cells += 1;
         } else if let Some(p) = provider(block) {
             self.rate = self.rate.saturating_add(p);
+            self.providers += 1;
         } else if block != "minecraft:air" {
             return false;
         }
@@ -80,7 +79,9 @@ mod tests {
             m,
             Matrix {
                 capacity: 4_008_000_000_000,
-                rate: 2_048_000
+                rate: 2_048_000,
+                cells: 2,
+                providers: 1,
             }
         );
         assert!(is_frame("mekanism:induction_port") && !is_frame("mekanism:basic_induction_cell"));

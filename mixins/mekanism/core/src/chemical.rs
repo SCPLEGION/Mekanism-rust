@@ -167,6 +167,18 @@ pub fn separate(
 
 /// `ChemicalTankTier`: (capacity, output rate) in mB.
 pub fn chemical_tank(tier: crate::tier::BaseTier) -> (u64, u64) {
+    let (capacity, output) = chemical_tank_default(tier);
+    if tier == crate::tier::BaseTier::Creative {
+        return (capacity, output);
+    }
+    let name = tier.name();
+    (
+        crate::config_files::active_int("tiers", "chemical_tanks", &format!("{name}Capacity"), capacity),
+        crate::config_files::active_int("tiers", "chemical_tanks", &format!("{name}Output"), output),
+    )
+}
+
+fn chemical_tank_default(tier: crate::tier::BaseTier) -> (u64, u64) {
     use crate::tier::BaseTier::*;
     match tier {
         Basic => (64_000, 1_000),
@@ -203,6 +215,11 @@ pub const LIQUIFIER_USAGE: u64 = 8;
 pub const LIQUIFIER_TICKS: u32 = 100;
 pub const LIQUIFIER_TANK: u64 = 10_000;
 pub const PASTE_PER_NUTRITION: u64 = 50;
+
+/// `mbPerFood` of the open world's config (`PASTE_PER_NUTRITION` is its default).
+pub fn paste_per_nutrition() -> u64 {
+    crate::config_files::active_int("general", "nutritional_paste", "mbPerFood", PASTE_PER_NUTRITION)
+}
 pub const NUTRITIONAL_PASTE: &str = "mekanism:nutritional_paste";
 
 /// An advanced electric machine (`TileEntityAdvancedElectricMachine`): an item and a chemical used each
@@ -218,6 +235,24 @@ pub struct AdvancedMachine {
 
 pub const ADVANCED_TICKS: u32 = 200;
 pub const ADVANCED_TANK: u64 = 210;
+
+/// The Metallurgic Infuser's recipes and infuse types as a factory runs them (its tank takes the infuse type as a
+/// whole: `chemical_amount` is used once, at the end of each operation).
+pub static INFUSING_FACTORY: AdvancedMachine = AdvancedMachine {
+    block: "mekanism:metallurgic_infuser",
+    usage: INFUSER_USAGE,
+    chemicals: &[
+        "mekanism:bio",
+        "mekanism:carbon",
+        "mekanism:diamond",
+        "mekanism:fungi",
+        "mekanism:gold",
+        "mekanism:redstone",
+        "mekanism:refined_obsidian",
+        "mekanism:tin",
+    ],
+    table: crate::recipe_table::METALLURGIC_INFUSING,
+};
 
 pub static ADVANCED_MACHINES: &[AdvancedMachine] = &[
     AdvancedMachine {

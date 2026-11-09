@@ -10,7 +10,8 @@ pub const MAX_RADIUS: i32 = 32;
 pub const WORLD_MIN_Y: i32 = -64;
 pub const WORLD_MAX_Y: i32 = 319;
 /// `minerSilkMultiplier`.
-pub const SILK_MULTIPLIER: u64 = 6;
+/// `GeneralConfig.minerSilkMultiplier`'s default.
+pub const SILK_MULTIPLIER: u64 = 12;
 pub const TICKS_PER_MINE: u32 = 80;
 pub const ENERGY_USAGE: u64 = 40;
 /// The energy it holds: 50 kFE, enough for a little over a minute of mining.
@@ -85,10 +86,10 @@ impl Region {
 
     /// `MinerEnergyContainer.updateMinerEnergyPerTick`: the usage grows with the radius and the height past
     /// the defaults, and silk touch multiplies it.
-    pub fn energy_per_tick(&self, base: u64, silk: bool) -> u64 {
+    pub fn energy_per_tick(&self, base: u64, silk_multiplier: Option<u64>) -> u64 {
         let mut usage = base as f64;
-        if silk {
-            usage *= SILK_MULTIPLIER as f64;
+        if let Some(multiplier) = silk_multiplier {
+            usage *= multiplier as f64;
         }
         let radius_range = f64::from(MAX_RADIUS - RADIUS);
         let height_range = f64::from(WORLD_MAX_Y - WORLD_MIN_Y + 1 - 1 - (MAX_Y - MIN_Y));
@@ -248,10 +249,10 @@ mod tests {
         assert_eq!(r.with_radius(99).radius, 32);
         assert_eq!(r.with_min_y(100).min_y, 60);
         assert_eq!(r.with_max_y(-100).max_y, 0);
-        assert_eq!(r.energy_per_tick(40, false), 40);
-        assert_eq!(r.energy_per_tick(40, true), 240);
-        assert!(r.with_radius(32).energy_per_tick(40, false) == 80);
-        assert!(r.with_max_y(319).energy_per_tick(40, false) > 40);
+        assert_eq!(r.energy_per_tick(40, None), 40);
+        assert_eq!(r.energy_per_tick(40, Some(SILK_MULTIPLIER)), 480);
+        assert!(r.with_radius(32).energy_per_tick(40, None) == 80);
+        assert!(r.with_max_y(319).energy_per_tick(40, None) > 40);
     }
 
     #[test]

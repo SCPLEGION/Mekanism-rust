@@ -12,6 +12,11 @@ pub const PLENISHER_USAGE: u64 = 2;
 pub const PLENISHER_TANK: u64 = 10_000;
 /// `general.maxPlenisherNodes`.
 pub const MAX_NODES: usize = 4_000;
+
+/// `maxPlenisherNodes` of the open world's config (`MAX_NODES` is its default).
+pub fn max_nodes() -> usize {
+    crate::config_files::active_int("general", "pump", "maxPlenisherNodes", MAX_NODES as u64) as usize
+}
 /// A placed block of fluid takes a bucket.
 pub const BUCKET: u64 = 1_000;
 
@@ -68,7 +73,7 @@ impl Plenisher {
                 .can_replace(below, spot(below), false, false)
                 .then_some(below);
         }
-        if self.used.len() >= MAX_NODES {
+        if self.used.len() >= max_nodes() {
             self.finished = true;
             return None;
         }

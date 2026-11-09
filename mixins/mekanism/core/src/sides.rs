@@ -1,5 +1,5 @@
 //! Side configuration, simplified: each face of a machine is left as the machine makes it, turned off,
-//! or limited to taking in or giving out, for each transmission type (items, chemicals, energy), as
+//! or limited to taking in or giving out, for each transmission type (items, fluids, chemicals, energy, heat), as
 //! Mekanism's `TileComponentConfig` keeps a mode per face and type. There is no screen: the Configurator
 //! cycles a face of the type it is set to.
 
@@ -10,16 +10,21 @@ pub enum Transmission {
     Item,
     Chemical,
     Energy,
+    Fluid,
+    Heat,
 }
 
 impl Transmission {
-    pub const ALL: [Transmission; 3] = [Self::Item, Self::Chemical, Self::Energy];
+    /// (Declared after the first three so their saved bits and keys keep their places.)
+    pub const ALL: [Transmission; 5] = [Self::Item, Self::Chemical, Self::Energy, Self::Fluid, Self::Heat];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Item => "items",
             Self::Chemical => "chemicals",
             Self::Energy => "energy",
+            Self::Fluid => "fluids",
+            Self::Heat => "heat",
         }
     }
 
@@ -34,12 +39,81 @@ impl Transmission {
             Self::Item => "sides_item",
             Self::Chemical => "sides_chemical",
             Self::Energy => "sides",
+            Self::Fluid => "sides_fluid",
+            Self::Heat => "sides_heat",
         }
     }
 
     /// The Configurator's next mode (`ConfiguratorMode.adjust`).
     pub fn next(self) -> Self {
         Self::ALL[(self as usize + 1) % Self::ALL.len()]
+    }
+}
+
+/// The Configurator's modes (`ItemConfigurator.ConfiguratorMode`): configure a type, empty a machine, rotate it or
+/// wrench it, in the original's order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfMode {
+    Configure(Transmission),
+    Empty,
+    Rotate,
+    Wrench,
+}
+
+impl ConfMode {
+    pub const ALL: [ConfMode; 8] = [
+        Self::Configure(Transmission::Item),
+        Self::Configure(Transmission::Fluid),
+        Self::Configure(Transmission::Chemical),
+        Self::Configure(Transmission::Energy),
+        Self::Configure(Transmission::Heat),
+        Self::Empty,
+        Self::Rotate,
+        Self::Wrench,
+    ];
+
+    /// What the item keeps: the type's name, or the mode's.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Configure(t) => t.name(),
+            Self::Empty => "empty",
+            Self::Rotate => "rotate",
+            Self::Wrench => "wrench",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.name() == name)
+    }
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|m| *m == self).unwrap_or(0)
+    }
+
+    /// `adjust(1)`.
+    pub fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    /// The mode's text (`getTextComponent`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Configure(Transmission::Item) => "Configurate (Items)",
+            Self::Configure(Transmission::Chemical) => "Configurate (Chemicals)",
+            Self::Configure(Transmission::Energy) => "Configurate (Energy)",
+            Self::Configure(Transmission::Fluid) => "Configurate (Fluids)",
+            Self::Configure(Transmission::Heat) => "Configurate (Heat)",
+            Self::Empty => "Empty",
+            Self::Rotate => "Rotate",
+            Self::Wrench => "Wrench",
+        }
+    }
+
+    pub fn transmission(self) -> Option<Transmission> {
+        match self {
+            Self::Configure(t) => Some(t),
+            _ => None,
+        }
     }
 }
 
@@ -193,8 +267,8 @@ mod tests {
     fn transmission_types_cycle_and_keep_their_own_keys() {
         use Transmission::*;
         assert_eq!(
-            [Item.next(), Chemical.next(), Energy.next()],
-            [Chemical, Energy, Item]
+            [Item.next(), Chemical.next(), Energy.next(), Fluid.next(), Heat.next()],
+            [Chemical, Energy, Fluid, Heat, Item]
         );
         assert_eq!(Transmission::from_name("chemicals"), Some(Chemical));
         assert_eq!(Energy.key(), "sides");
