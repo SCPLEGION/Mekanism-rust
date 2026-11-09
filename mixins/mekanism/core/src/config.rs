@@ -98,7 +98,7 @@ impl GearConfig {
 
 /// `UsageConfig`: FE a tick a machine uses, for the machines whose usage the port reads from here, with the
 /// original's defaults (`defineInRange(key, default, 0, Integer.MAX_VALUE)`).
-pub const USAGE_DEFAULTS: [(&str, u64); 9] = [
+pub const USAGE_DEFAULTS: [(&str, u64); 29] = [
     ("enrichmentChamber", 5),
     ("osmiumCompressor", 15),
     ("combiner", 5),
@@ -108,6 +108,26 @@ pub const USAGE_DEFAULTS: [(&str, u64); 9] = [
     ("energizedSmelter", 5),
     ("precisionSawmill", 5),
     ("chemicalInjectionChamber", 15),
+    ("electricPump", 2),
+    ("fluidicPlenisher", 2),
+    ("chemicalWasher", 5),
+    ("rotaryCondensentrator", 2),
+    ("paintingMachine", 5),
+    ("antiprotonicNucleosynthesizer", 15),
+    ("nutritionalLiquifier", 8),
+    ("chemicalDissolutionChamber", 16),
+    ("chemicalCrystallizer", 15),
+    ("isotopicCentrifuge", 8),
+    ("modificationStation", 10),
+    ("pigmentMixer", 5),
+    ("pigmentExtractor", 5),
+    ("chemicalOxidizer", 15),
+    ("chemicalInfuser", 15),
+    ("seismicVibrator", 5),
+    ("laser", 20),
+    ("digitalMiner", 40),
+    ("formulaicAssemblicator", 5),
+    ("dimensionalStabilizer", 15),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
