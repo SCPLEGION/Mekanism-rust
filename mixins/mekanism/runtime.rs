@@ -6454,6 +6454,35 @@ fn set_jetpack_fuel(stack: &mut ItemStack, amount: u64) {
     set_custom_compound(stack, CHEMICAL_KEY, value);
 }
 
+/// `JetpackSound` and `ScubaMaskSound` (`PlayerSound`): while the worn jetpack thrusts (`IJetpackItem.isJetpackActive`'s
+/// conditions as the thrust code sees them) or the mask is on and flowing, the sound follows the player. Horizon's
+/// `native_loop_sound` stops a loop that is not asked for again; the other players' sounds need their state, which is
+/// not synced (a gap).
+fn player_sounds(game: &mut Game<'_>) {
+    let Some(p) = game.player.as_ref().filter(|p| !p.spectator) else {
+        return;
+    };
+    let at = [p.position.x, p.position.y + 0.9, p.position.z];
+    let grounded = p.ground.on_ground || game.sleeping.is_some() || p.flying;
+    if scuba_on(game) {
+        game.native_loop_sound("mekanism:scuba_mask", "mekanism:item.scuba_mask", Some(at), 1.0, 1.0);
+    }
+    let Some(chest) = game.armor[1].as_ref().filter(|s| is_jetpack(s)) else {
+        return;
+    };
+    let (mode, _) = jetpack_settings(chest);
+    let ascending = game.keys.contains(&winit::keyboard::KeyCode::Space);
+    let descending = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let active = match mode {
+        3 => false,
+        1 => (ascending && !descending) || !grounded,
+        _ => ascending,
+    };
+    if active && jetpack_fuel(chest) > 0 {
+        game.native_loop_sound("mekanism:jetpack", "mekanism:item.jetpack", Some(at), 1.0, 1.0);
+    }
+}
+
 /// The sounds that go on while something works (`SoundHandler.startTileSound`, `ItemFlamethrower`'s
 /// `FlamethrowerSound`): each active Industrial Alarm sounds from its block, and a flamethrower sounds
 /// from the first live flame (`flamethrower_active`) or, held and idle, near its holder (`flamethrower_idle`).
@@ -6762,6 +6791,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
         return;
     }
     loop_sounds(game);
+    player_sounds(game);
     radiation_client(game);
     scuba_client(game);
     free_runners_tick(game);
