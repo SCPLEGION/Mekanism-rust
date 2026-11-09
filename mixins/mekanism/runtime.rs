@@ -21263,7 +21263,7 @@ fn tw_set(stack: &mut ItemStack, module: &str, s: &module_config::Setting, insta
         Some(Tag::Compound(c)) => c.clone(),
         _ => Compound::new(),
     };
-    let value = value.min(module_config::choices(s.kind, installed).saturating_sub(1) as u32);
+    let value = if matches!(s.kind, module_config::Kind::Color(_)) { value } else { value.min(module_config::choices(s.kind, installed).saturating_sub(1) as u32) };
     match module_config::encode(s.kind, value) {
         Some(text) => {
             m.insert(s.key.into(), Tag::Int(text.parse().unwrap_or(0)));
@@ -21381,19 +21381,34 @@ fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         for (i, s) in settings.iter().skip(ui.setting_scroll).take(TW_SETTING_ROWS).enumerate() {
             let row = tw_setting_row(i, o);
             game.native_text_scaled(batch, s.label, [row[0], row[1] + 1.0], 0x40_4040, 0.75);
+            if matches!(s.kind, module_config::Kind::Color(_)) {
+                // `ColorSelection`: the hex under the name, the colour in an outlined swatch over the transparency grid.
+                let color = module_setting(stack, &module, s, n);
+                game.native_text(batch, &format!("#{color:08X}"), [row[0], row[1] + 11.0], 0x40_4040, false);
+                let sw = tw_swatch(row);
+                tw_outline(game, batch, sw, 0xFF3C_FE9A);
+                tw_grid(game, batch, [sw[0] + 1.0, sw[1] + 1.0, 16.0, 16.0]);
+                game.native_fill(batch, [sw[0] + 1.0, sw[1] + 1.0, 16.0, 16.0], color);
+                continue;
+            }
             let b = tw_button(row);
             let value = module_config::value_text(s.kind, module_setting(stack, &module, s, n));
             draw_button(game, batch, b, inside(cursor, b), true, 0xFFFF_FFFF, None);
             centred(game, batch, &value, b[0], b[2], b[1] + 3.0, 0xFF_FFFF);
         }
     });
+    tw_color_draw(game, batch, o);
 }
 
 fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
+    let o = TW_UI.with_borrow(|ui| ui.origin);
+    if TW_COLOR.with_borrow(Option::is_some) {
+        tw_color_click(game, o, at, button, pressed);
+        return;
+    }
     if !pressed || button > 1 {
         return;
     }
-    let o = TW_UI.with_borrow(|ui| ui.origin);
     let slots = tw_slots(game);
     let mut send = None;
     TW_UI.with_borrow_mut(|ui| {
@@ -21424,6 +21439,14 @@ fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
             && let Some(s) = settings.get(ui.setting_scroll + i)
         {
             let now = module_setting(stack, &module, s, n);
+            if let module_config::Kind::Color(_) = s.kind {
+                // `ColorSelection.click`: only the swatch opens the picker window.
+                if inside(at, tw_swatch(tw_setting_row(i, o))) {
+                    let slot = ui.slot.unwrap_or(0);
+                    TW_COLOR.with_borrow_mut(|c| *c = Some(TwColor::new(slot, &module, s.key, now)));
+                }
+                return;
+            }
             let count = module_config::choices(s.kind, n) as u32;
             let next = if button == 1 { (now + count - 1) % count } else { (now + 1) % count };
             send = ui.slot.map(|slot| format!("{slot}|{module}|{}|{next}", s.key));
@@ -21434,7 +21457,272 @@ fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
     }
 }
 
+// --- The colour picker window of a colour setting (GuiColorWindow, ColorSelection) ---------------------------
+
+/// `GuiColorWindow` with alpha: 184 x 152, placed like `ColorSelection.click` does, ((160 - 220) / 2 and (120 - 150) / 2 off).
+const COLOR_WINDOW: [f32; 2] = [184.0, 152.0];
+
+struct TwColor {
+    slot: usize,
+    module: String,
+    key: String,
+    hue: f32,
+    sat: f32,
+    val: f32,
+    alpha: f32,
+    edit: horizon_client::ui::EditBox,
+    /// What the button is held on: 1 the shade picker, 2 the hue bar, 3 the alpha bar, 4 the text field.
+    drag: u8,
+}
+
+thread_local! {
+    static TW_COLOR: std::cell::RefCell<Option<TwColor>> = const { std::cell::RefCell::new(None) };
+}
+
+impl TwColor {
+    fn new(slot: usize, module: &str, key: &str, argb: u32) -> Self {
+        let mut edit = horizon_client::ui::EditBox::new(0.0, 0.0, 79.0, 12.0);
+        edit.bordered = false;
+        edit.max_length = 15;
+        edit.text_color = u32::MAX;
+        edit.focused = true;
+        let mut c = Self { slot, module: module.to_owned(), key: key.to_owned(), hue: 0.0, sat: 0.5, val: 0.5, alpha: 1.0, edit, drag: 0 };
+        c.set_color(argb);
+        c
+    }
+
+    /// `setColor`: the pickers and the text follow a colour.
+    fn set_color(&mut self, argb: u32) {
+        self.set_from(argb);
+        self.update_text();
+    }
+
+    /// `setFromColor`.
+    fn set_from(&mut self, argb: u32) {
+        let (h, s, v) = mekanism_core::color::rgb_to_hsv((argb >> 16) as u8, (argb >> 8) as u8, argb as u8);
+        (self.hue, self.sat, self.val, self.alpha) = (h, s, v, f32::from((argb >> 24) as u8) / 255.0);
+    }
+
+    /// `getColor().argb()`.
+    fn argb(&self) -> u32 {
+        mekanism_core::color::argb(mekanism_core::color::hsv_to_rgb(self.hue, self.sat, self.val), (self.alpha * 255.0).round() as u8)
+    }
+
+    fn update_text(&mut self) {
+        self.edit.set_value(&mekanism_core::color::text(self.argb(), true));
+        self.edit.move_cursor_to_end(false);
+    }
+
+    /// `updateColorFromText`.
+    fn update_from_text(&mut self) {
+        if let Some(argb) = mekanism_core::color::parse(&self.edit.value, true) {
+            self.set_from(argb);
+        }
+    }
+}
+
+fn tw_swatch(row: [f32; 4]) -> [f32; 4] {
+    [row[0] + 88.0, row[1] + 1.0, 18.0, 18.0]
+}
+
+/// `GuiGraphicsExtractor.outline`: a one pixel frame.
+fn tw_outline(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, r: [f32; 4], argb: u32) {
+    let [x, y, w, h] = r;
+    for rect in [[x, y, w, 1.0], [x, y + h - 1.0, w, 1.0], [x, y + 1.0, 1.0, h - 2.0], [x + w - 1.0, y + 1.0, 1.0, h - 2.0]] {
+        game.native_fill(batch, rect, argb);
+    }
+}
+
+/// The `transparency_grid` sprite tiled over a rectangle: a 2 x 2 checker of two greys, from the rectangle's corner.
+fn tw_grid(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, r: [f32; 4]) {
+    game.native_fill(batch, r, 0xFFF6_FCFD);
+    for dy in 0..r[3] as i32 {
+        let mut dx = (dy + 1) % 2;
+        while dx < r[2] as i32 {
+            game.native_fill(batch, [r[0] + dx as f32, r[1] + dy as f32, 1.0, 1.0], 0xFFE4_EAEB);
+            dx += 2;
+        }
+    }
+}
+
+/// The window's parts, relative to its corner: (view holder, view, shade holder, shade, hue holder, hue, alpha holder,
+/// alpha, text field, confirm).
+fn tw_color_rects(o: [f32; 2]) -> [[f32; 4]; 10] {
+    let (x, y) = (o[0] + 30.0, o[1] + 15.0);
+    let at = |r: [f32; 4]| [x + r[0], y + r[1], r[2], r[3]];
+    [
+        at([6.0, 17.0, 47.0, 82.0]),
+        at([7.0, 18.0, 45.0, 80.0]),
+        at([56.0, 17.0, 122.0, 82.0]),
+        at([57.0, 18.0, 120.0, 80.0]),
+        at([6.0, 103.0, 172.0, 10.0]),
+        at([7.0, 104.0, 170.0, 8.0]),
+        at([6.0, 115.0, 172.0, 10.0]),
+        at([7.0, 116.0, 170.0, 8.0]),
+        at([36.0, 132.0, 83.0, 12.0]),
+        at([124.0, 131.0, 54.0, 14.0]),
+    ]
+}
+
+fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2]) {
+    TW_COLOR.with_borrow_mut(|slot| {
+        let Some(c) = slot.as_mut() else {
+            return;
+        };
+        let [view_holder, view, shade_holder, shade, hue_holder, hue, alpha_holder, alpha, field, confirm] = tw_color_rects(o);
+        let cursor = game.native_cursor();
+        // A held button keeps setting what it was pressed on (`GuiPicker.onDrag`).
+        if (1..=3).contains(&c.drag) {
+            if game.native_mouse_down() {
+                match c.drag {
+                    1 => {
+                        c.sat = ((cursor[0] - shade[0]) / shade[2]).clamp(0.0, 1.0);
+                        c.val = 1.0 - ((cursor[1] - shade[1]) / shade[3]).clamp(0.0, 1.0);
+                    }
+                    2 => c.hue = ((cursor[0] - hue[0]) / hue[2]).clamp(0.0, 1.0) * 360.0,
+                    _ => c.alpha = ((cursor[0] - alpha[0]) / alpha[2]).clamp(0.0, 1.0),
+                }
+                c.update_text();
+            } else {
+                c.drag = 0;
+            }
+        } else if c.drag == 4 {
+            if game.native_mouse_down() {
+                c.edit.drag_to(&game.gui.atlas, cursor[0]);
+            } else {
+                c.drag = 0;
+            }
+        }
+        let w = [o[0] + 30.0, o[1] + 15.0, COLOR_WINDOW[0], COLOR_WINDOW[1]];
+        robit_window_plate(game, batch, w, "Color Picker");
+        let argb = c.argb();
+        let holder = |r: [f32; 4]| nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, r, 0xFFFF_FFFF);
+        for r in [view_holder, shade_holder, hue_holder, alpha_holder] {
+            holder(r);
+        }
+        // `GuiColorView`.
+        tw_grid(game, batch, view);
+        game.native_fill(batch, view, argb);
+        // `GuiShadePicker.drawTiledGradient`: ten by ten tiles, each shaded between its corners (drawn here in 2 px steps).
+        let (tile_w, tile_h) = ((shade[2] / 10.0).round(), (shade[3] / 10.0).round());
+        for i in 0..10 {
+            let (min_v, max_v) = (i as f32 / 10.0, (i + 1) as f32 / 10.0);
+            for j in 0..10 {
+                let (min_s, max_s) = (j as f32 / 10.0, (j + 1) as f32 / 10.0);
+                let corner = |s: f32, v: f32| mekanism_core::color::hsv_to_rgb(c.hue, s, v).map(f32::from);
+                let (tl, tr, bl, br) = (corner(min_s, max_v), corner(max_s, max_v), corner(min_s, min_v), corner(max_s, min_v));
+                let (x0, y0) = (shade[0] + j as f32 * tile_w, shade[1] + (9 - i) as f32 * tile_h);
+                let mut by = 0.0;
+                while by < tile_h {
+                    let mut bx = 0.0;
+                    while bx < tile_w {
+                        let (fx, fy) = ((bx + 1.0) / tile_w, (by + 1.0) / tile_h);
+                        let mix = |k: usize| {
+                            let top = tl[k] + (tr[k] - tl[k]) * fx;
+                            let bottom = bl[k] + (br[k] - bl[k]) * fx;
+                            (top + (bottom - top) * fy).round() as u32
+                        };
+                        game.native_fill(batch, [x0 + bx, y0 + by, 2.0_f32.min(tile_w - bx), 2.0_f32.min(tile_h - by)], 0xFF00_0000 | mix(0) << 16 | mix(1) << 8 | mix(2));
+                        bx += 2.0;
+                    }
+                    by += 2.0;
+                }
+            }
+        }
+        let (px, py) = (shade[0] + (c.sat * shade[2]).round() - 2.0, shade[1] + ((1.0 - c.val) * shade[3]).round() - 2.0);
+        tw_outline(game, batch, [px, py, 5.0, 5.0], 0xFFFF_FFFF);
+        game.native_fill(batch, [px + 1.0, py + 1.0, 3.0, 3.0], 0xFF00_0000 | argb & 0xFF_FFFF);
+        // `GuiHuePicker`.
+        for i in 0..hue[2] as i32 {
+            let [r, g, b] = mekanism_core::color::hsv_to_rgb(360.0 * i as f32 / hue[2], 1.0, 1.0);
+            game.native_fill(batch, [hue[0] + i as f32, hue[1], 1.0, hue[3]], mekanism_core::color::argb([r, g, b], 255));
+        }
+        let pos = (c.hue / 360.0 * (hue[2] - 3.0)).round();
+        sprite(game, batch, "slider/color_picker", [0.0, 0.0, 7.0, 12.0], [hue[0] - 2.0 + pos, hue[1] - 2.0, 7.0, 12.0]);
+        game.native_fill(batch, [hue[0] + pos, hue[1], 3.0, 8.0], mekanism_core::color::argb(mekanism_core::color::hsv_to_rgb(c.hue, 1.0, 1.0), 255));
+        // `GuiAlphaPicker`.
+        tw_grid(game, batch, alpha);
+        let rgb = mekanism_core::color::hsv_to_rgb(c.hue, c.sat, c.val);
+        for i in 0..alpha[2] as i32 {
+            game.native_fill(batch, [alpha[0] + i as f32, alpha[1], 1.0, alpha[3]], mekanism_core::color::argb(rgb, (255.0 * i as f32 / alpha[2]).round() as u8));
+        }
+        let pos = (c.alpha * (alpha[2] - 3.0)).round();
+        sprite(game, batch, "slider/color_picker", [0.0, 0.0, 7.0, 12.0], [alpha[0] - 2.0 + pos, alpha[1] - 2.0, 7.0, 12.0]);
+        tw_grid(game, batch, [alpha[0] + pos, alpha[1], 3.0, 8.0]);
+        game.native_fill(batch, [alpha[0] + pos, alpha[1], 3.0, 8.0], argb);
+        // The "RGBA:" label, right aligned to the field, the field and Confirm.
+        let label = "RGBA:";
+        game.native_text(batch, label, [w[0] + 34.0 - game.native_text_width(label), w[1] + 134.0], 0x40_4040, false);
+        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, field, 0xFFFF_FFFF);
+        [c.edit.x, c.edit.y, c.edit.width, c.edit.height] = [field[0] + 2.0, field[1], field[2] - 4.0, 12.0];
+        c.edit.focused = true;
+        c.edit.draw(batch, &game.gui.atlas, None);
+        robit_text_button(game, batch, [confirm[0], confirm[1] - 3.0, confirm[2], confirm[3] + 6.0], "Confirm");
+        let _ = cursor;
+    });
+}
+
+fn tw_color_click(game: &mut Game<'_>, o: [f32; 2], at: [f32; 2], button: u8, pressed: bool) {
+    let [_, _, _, shade, _, hue, _, alpha, field, confirm] = tw_color_rects(o);
+    let mut send = None;
+    TW_COLOR.with_borrow_mut(|slot| {
+        let Some(c) = slot.as_mut() else {
+            return;
+        };
+        if !pressed {
+            c.drag = 0;
+            return;
+        }
+        if button != 0 {
+            return;
+        }
+        // The pickers set at once and go on setting while held (`GuiPicker.onClick`).
+        if inside(at, shade) {
+            c.drag = 1;
+        } else if inside(at, hue) {
+            c.drag = 2;
+        } else if inside(at, alpha) {
+            c.drag = 3;
+        } else if inside(at, field) {
+            c.edit.click(&game.gui.atlas, at[0], false, false);
+            c.drag = 4;
+        } else if inside(at, confirm) {
+            send = Some(format!("{}|{}|{}|{}", c.slot, c.module, c.key, c.argb()));
+        }
+    });
+    if let Some(text) = send {
+        game.native_send_to_server(TW_CHANNEL, text.as_bytes());
+        TW_COLOR.with_borrow_mut(|c| *c = None);
+    }
+}
+
+/// A key in the window: Escape closes it, the field takes digits and commas (`InputValidator.DIGIT.or(',')`) and, as
+/// pasted, loses its spaces (`setPasteTransformer`).
+fn tw_color_key(game: &mut Game<'_>, key: &str, text: Option<&str>) {
+    if key == "key.keyboard.escape" {
+        TW_COLOR.with_borrow_mut(|c| *c = None);
+        return;
+    }
+    let typed: Option<String> = text.map(|t| t.chars().filter(|c| mekanism_core::color::allowed(*c)).collect()).filter(|t: &String| !t.is_empty());
+    let mut taken = TW_COLOR.with_borrow_mut(Option::take);
+    if let Some(c) = taken.as_mut() {
+        let before = c.edit.value.clone();
+        field_key(game, &mut c.edit, key, typed.as_deref());
+        if c.edit.value != before {
+            let clean: String = c.edit.value.chars().filter(|ch| mekanism_core::color::allowed(*ch)).collect();
+            if clean != c.edit.value {
+                c.edit.set_value(&clean);
+            }
+            c.update_from_text();
+        }
+    }
+    TW_COLOR.with_borrow_mut(|c| *c = taken);
+}
+
 fn tweaker_wheel(at: [f32; 2], steps: f32) {
+    if TW_COLOR.with_borrow(Option::is_some) {
+        return;
+    }
     let delta = if steps > 0.0 { -1 } else { 1 };
     TW_UI.with_borrow_mut(|ui| {
         let field = if at[0] < ui.origin[0] + 100.0 { &mut ui.scroll } else { &mut ui.setting_scroll };
@@ -21492,6 +21780,10 @@ pub(super) fn ui_click(game: &mut Game<'_>, id: &str, at: [f32; 2], button: u8, 
 
 /// A key on a mod screen: typing into the Robit's repair name box (`GuiTextField`, 50 characters).
 pub(super) fn ui_key(game: &mut Game<'_>, id: &str, key: &str, text: Option<&str>, pressed: bool) {
+    if id == TW_ID && pressed && TW_COLOR.with_borrow(Option::is_some) {
+        tw_color_key(game, key, text);
+        return;
+    }
     if id == ROBIT_SCREEN && pressed && ROBIT_WIN.with(std::cell::Cell::get) == 1 {
         // `GuiRobitRename`: Enter confirms like the button.
         if key == "key.keyboard.enter" || key == "key.keyboard.keypad_enter" {
@@ -23402,6 +23694,9 @@ fn robit_set_tab(game: &mut Game<'_>, tab: RobitTab) {
 
 /// The mod screen closed (Escape, or another screen replaced it): the Robit's inventory lets go of the cursor.
 pub(super) fn ui_closed(game: &mut Game<'_>, id: &str) {
+    if id == TW_ID {
+        TW_COLOR.with_borrow_mut(|c| *c = None);
+    }
     if id == ROBIT_SCREEN {
         ROBIT_WIN.with(|w| w.set(0));
         ROBIT_TAB.with(|t| t.set(RobitTab::Main));
