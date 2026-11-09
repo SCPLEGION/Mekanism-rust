@@ -6196,6 +6196,7 @@ fn sync_input_sets(game: &Game<'_>) {
             }
             // `ChemicalInventorySlot` of the infuser: items that turn into an infusion type.
             add("infuse_conv", mekanism_core::recipes::find_conversion(id, &in_tag).is_some_and(|c| INFUSE_TYPES.contains(&c.output)));
+            add("dissolution", nuclear::find_dissolution(id, 64, &in_tag).is_some());
             add("infusing", mekanism_core::recipe_table::METALLURGIC_INFUSING.iter().any(|r| r.input.matches(id, &in_tag)));
             add("combining_a", mekanism_core::recipe_table::COMBINING.iter().any(|r| r.main.matches(id, &in_tag)));
             add("combining_b", mekanism_core::recipe_table::COMBINING.iter().any(|r| r.extra.matches(id, &in_tag)));
@@ -6228,6 +6229,7 @@ fn input_rule(kind: &str) -> Option<horizon_client::lan::menu::SlotRule> {
         "smelting" => SlotRule::Check(|s| starts_recipe("smelting", s)),
         "sawing" => SlotRule::Check(|s| starts_recipe("sawing", s)),
         "infuse_conv" => SlotRule::Check(|s| s.item.ends_with("_chemical_tank") || starts_recipe("infuse_conv", s)),
+        "dissolution" => SlotRule::Check(|s| starts_recipe("dissolution", s)),
         "infusing" => SlotRule::Check(|s| starts_recipe("infusing", s)),
         "combining_a" => SlotRule::Check(|s| starts_recipe("combining_a", s)),
         "combining_b" => SlotRule::Check(|s| starts_recipe("combining_b", s)),
@@ -10773,6 +10775,11 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
                     if let (Some(rule), Some(slot)) = (input_rule(kind), rules.get_mut(i)) {
                         *slot = rule;
                     }
+                }
+            }
+            Some(Kind::Dissolution) => {
+                if let (Some(rule), Some(slot)) = (input_rule("dissolution"), rules.first_mut()) {
+                    *slot = rule;
                 }
             }
             Some(Kind::Infuser) => {
