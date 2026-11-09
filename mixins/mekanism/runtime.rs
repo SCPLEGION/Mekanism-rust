@@ -6700,6 +6700,36 @@ fn player_state_payload(data: &[u8], now: u64) {
     });
 }
 
+/// `(month, day)` of today (UTC; `HolidayManager` reads the local date).
+fn today() -> (u32, u32) {
+    let days = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() / 86400) as i64;
+    // Civil date from days since the epoch (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (month, day)
+}
+
+/// `Holiday.Christmas.getFilterableSounds` (`AttributeSound`): on December 25th the five machines the holiday covers play
+/// the nutcracker tunes instead, unless `holidays` is off.
+fn holiday_sound(game: &Game<'_>, event: &'static str) -> &'static str {
+    if today() != (12, 25) || game.native_setting(MOD_ID, "holidays").as_deref() == Some("false") {
+        return event;
+    }
+    match event {
+        "mekanism:tile.machine.enrichment_chamber" => "mekanism:tile.christmas.1",
+        "mekanism:tile.machine.metallurgic_infuser" => "mekanism:tile.christmas.2",
+        "mekanism:tile.machine.purification_chamber" => "mekanism:tile.christmas.3",
+        "mekanism:tile.machine.energized_smelter" => "mekanism:tile.christmas.4",
+        "mekanism:tile.machine.crusher" => "mekanism:tile.christmas.5",
+        _ => event,
+    }
+}
+
 /// The sounds that go on while something works (`SoundHandler.startTileSound`, `ItemFlamethrower`'s
 /// `FlamethrowerSound`): each active Industrial Alarm sounds from its block, and a flamethrower sounds
 /// from the first live flame (`flamethrower_active`) or, held and idle, near its holder (`flamethrower_idle`).
@@ -6733,7 +6763,7 @@ fn loop_sounds(game: &mut Game<'_>) {
         let on = |p: &str| game.native_block_property(pos, p).as_deref() == Some("true");
         if on("lit") || on("open") {
             let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
-            game.native_loop_sound(&format!("mekanism:machine:{pos:?}"), event, Some(at), 1.0, 1.0);
+            game.native_loop_sound(&format!("mekanism:machine:{pos:?}"), holiday_sound(game, event), Some(at), 1.0, 1.0);
         }
     }
     let ticks = game.ticks as u64;
