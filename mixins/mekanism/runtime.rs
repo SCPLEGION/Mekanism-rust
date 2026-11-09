@@ -1374,7 +1374,7 @@ fn adjacent_heat(game: &mut Game<'_>, pos: [i32; 3], heat: &mut mekanism_core::h
 }
 
 /// `adjacent_heat` through only the faces in `faces` (a bit per `face_index`); also returns the faces that
-/// had a heat handler beside them (the others lose their heat to the air).
+/// had a heat handler beside them.
 fn adjacent_heat_faces(game: &mut Game<'_>, pos: [i32; 3], heat: &mut mekanism_core::heat::HeatCapacitor, link: Option<[i32; 3]>, faces: u8) -> (f64, u8) {
     use mekanism_core::heat::HeatCapacitor;
     let mut total = 0.0;
@@ -8310,9 +8310,10 @@ fn tick_entangloporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlock
         let ambient = ambient_at(game, pos);
         let mut heat = mekanism_core::heat::HeatCapacitor::with_ambient(qe::HEAT_CAPACITY, qe::HEAT_INVERSE_CONDUCTION, qe::HEAT_INVERSE_INSULATION, ambient);
         heat.heat = freq.heat;
-        let (_, handled) = adjacent_heat_faces(game, pos, &mut heat, None, faces);
+        adjacent_heat_faces(game, pos, &mut heat, None, faces);
+        // `ITileHeatHandler.simulateEnvironment`: every face with a capacitor loses to the air, neighbour or not.
         for f in 0..6u8 {
-            if faces & (1 << f) != 0 && handled & (1 << f) == 0 {
+            if faces & (1 << f) != 0 {
                 heat.lose_to_air(qe::HEAT_INVERSE_INSULATION);
             }
         }
