@@ -41,6 +41,7 @@ pub enum Fits {
 /// Every module: its id, how many can be installed (`maxStackSize`) and what takes it.
 pub const MODULES: &[(&str, u32, Fits)] = &[
     ("mekanism:energy_unit", 8, Fits::Any),
+    ("mekanism:color_modulation_unit", 1, Fits::Armor),
     ("mekanism:laser_dissipation_unit", 1, Fits::Armor),
     ("mekanism:radiation_shielding_unit", 1, Fits::Armor),
     ("mekanism:excavation_escalation_unit", 4, Fits::Tool),
