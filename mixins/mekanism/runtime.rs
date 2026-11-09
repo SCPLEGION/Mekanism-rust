@@ -6121,6 +6121,7 @@ fn sync_gear_config(game: &Game<'_>) {
             config
         }
     };
+    mekanism_core::config::set_active(&config);
     if let Ok(mut g) = GEAR_CONFIG.write() {
         *g = Some((file, config));
     }
