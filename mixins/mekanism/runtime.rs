@@ -4037,20 +4037,40 @@ fn tick_separator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     drain_tank_into_item(entity, 4, &mut right);
     let warn = if fluid.amount > 0 && (left.amount >= left.capacity || right.amount >= right.capacity) { 4 } else { 0 };
     put_int(&mut entity.nbt, "warn", warn);
-    let active = chem::separate(&mut fluid, &mut left, &mut right, &mut energy);
-    push_chemical(game, pos, &mut left, None, u64::MAX, false);
-    push_chemical(game, pos, &mut right, None, u64::MAX, false);
+    let (mode_left, mode_right) = (get_int(&entity.nbt, "dump_left") % 3, get_int(&entity.nbt, "dump_right") % 3);
+    // `canFunction`: not while both tanks dump their excess and both are at the level they keep.
+    let keep = config_double("general", "auto_eject", "dumpExcessKeepRatio", 0.85).clamp(0.001, 1.0);
+    let at_target = |t: &ChemicalTank| t.amount >= (t.capacity as f64 * keep) as u64;
+    let can_function = mode_left != 1 || mode_right != 1 || !at_target(&left) || !at_target(&right);
+    let active = can_function && chem::separate(&mut fluid, &mut left, &mut right, &mut energy);
+    // `handleTank`: `ChemicalUtils.dump` at 8 mB a tick per speed upgrade doubling, or the excess over the kept level.
+    let dump_rate = 8u64 << upgrades(&entity.nbt).get(Upgrade::Speed).min(20);
+    let eject = config_int("general", "auto_eject", "chemical", 1_024).max(1) as u64;
+    for (tank, mode) in [(&mut left, mode_left), (&mut right, mode_right)] {
+        if mode == 0 || tank.amount == 0 {
+            continue;
+        }
+        let to_dump = if mode == 2 {
+            dump_rate
+        } else {
+            let target = (tank.capacity as f64 * keep) as u64;
+            if target < tank.amount { (tank.amount - target).min(eject) } else { 0 }
+        };
+        tank.extract(to_dump);
+    }
+    // `setCanTankEject`: a tank that dumps does not eject.
+    if mode_left != 2 {
+        push_chemical(game, pos, &mut left, None, u64::MAX, false);
+    }
+    if mode_right != 2 {
+        push_chemical(game, pos, &mut right, None, u64::MAX, false);
+    }
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_tank(&mut entity.nbt, "fluid", &fluid);
     put_tank(&mut entity.nbt, "left", &left);
     put_tank(&mut entity.nbt, "right", &right);
-    // The flame shows the fluid, the arrow the left gas tank.
-    entity.data = vec![
-        (fluid.amount * 1000 / chem::SEPARATOR_FLUID) as i32,
-        1000,
-        (left.amount * 1000 / chem::SEPARATOR_GAS) as i32,
-        1000,
-    ];
+    // The two dump modes, then the arrow (full while it works).
+    entity.data = vec![mode_left as i32, mode_right as i32, if active { 1000 } else { 0 }, 1000];
     Some(active)
 }
 
@@ -7688,6 +7708,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
         fission_payload(game, data);
         return;
     }
+    if channel == NUMFIELD_CHANNEL && game.native_on(MOD_ID) {
+        numfield_payload(game, data);
+        return;
+    }
     if channel == QIO_CHANNEL && game.native_on(MOD_ID) {
         qio_payload(game, data);
         return;
@@ -9594,7 +9618,8 @@ fn layout(block: &str) -> Option<Layout> {
                 gauge("right", chem::SEPARATOR_GAS, 100.0, 18.0, SMALL),
             ],
             power: Some(PowerBar::Vertical([164.0, 15.0])),
-            progress: None,
+            // `GuiProgress(tile::getActive, ProgressType.BI, 80, 30)`.
+            progress: Some(([80.0, 30.0], "progress/bidirectional", [16.0, 6.0])),
         },
         // TileEntityEnergyCube: an item there charges from the cube on the right (our slot 0) and
         // gives the cube its energy on the left (our slot 1).
@@ -9815,10 +9840,11 @@ fn layout(block: &str) -> Option<Layout> {
             power: None,
             progress: None,
         },
+        // GuiSeismicVibrator: the vertical power bar (164, 15) and the energy slot (143, 35).
         Kind::Vibrator => Layout {
             slots: [Some(([143.0, 35.0], "slot/power")), None, None],
             gauges: vec![],
-            power: Some(PowerBar::Gauge([55.0, 18.0])),
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
         },
         // `GuiInductionMatrix`: the medium energy gauge, and the two slots in the element holder (the stats
@@ -9829,10 +9855,18 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Sized([7.0, 16.0], [34.0, 56.0])),
             progress: None,
         },
-        Kind::Laser | Kind::LaserAmplifier => Layout {
+        Kind::Laser => Layout {
             slots: [None; 3],
             gauges: vec![],
             power: Some(PowerBar::Gauge([55.0, 18.0])),
+            progress: None,
+        },
+        // GuiLaserAmplifier: the standard energy gauge at (6, 10); the thresholds ride in a never-drawn gauge
+        // (the lower one in the amount, the upper one in the capacity).
+        Kind::LaserAmplifier => Layout {
+            slots: [None; 3],
+            gauges: vec![gauge("stats_a", 1 << 58, 0.0, 0.0, SMALL)],
+            power: Some(PowerBar::Sized([6.0, 10.0], STANDARD)),
             progress: None,
         },
         // TileEntityDigitalMiner and its screen: the energy slot (152, 20) and the power bar.
@@ -9947,6 +9981,11 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
         if kind(&entity.id) == Some(Kind::Plenisher) {
             entity.data[2] = get_int(&entity.nbt, "finished") as i32;
         }
+        // The Laser Amplifier's delay and redstone output mode (the thresholds ride in its gauge).
+        if kind(&entity.id) == Some(Kind::LaserAmplifier) {
+            entity.data[2] = get_int(&entity.nbt, "delay").min(32_767) as i32;
+            entity.data[3] = (get_int(&entity.nbt, "omode") % 3) as i32;
+        }
         // The progress arrow is full while it converted something this tick (`didProcess`).
         if kind(&entity.id) == Some(Kind::Oredictionificator) {
             entity.data[2] = get_int(&entity.nbt, "did") as i32;
@@ -10050,6 +10089,11 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
                     tank.capacity = st.capacity as u64;
                 }
             }
+        }
+        if g.key == "stats_a" && kind(&entity.id) == Some(Kind::LaserAmplifier) {
+            tank = ChemicalTank::new(g.capacity);
+            tank.insert("minecraft:lava", get_long(&entity.nbt, "min_threshold"));
+            tank.capacity = amplifier_max(&entity.nbt);
         }
         if g.key == "stats_a" && kind(&entity.id) == Some(Kind::SpsPort) {
             tank = ChemicalTank::new(g.capacity);
@@ -10374,7 +10418,7 @@ fn tabs(block: &str) -> u8 {
             TAB_UPGRADE | TAB_REDSTONE | TAB_SECURITY
         }
         Some(Kind::EnergyCube(_) | Kind::ChemicalTank(_)) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
-        Some(Kind::Vibrator | Kind::Heater | Kind::FuelwoodHeater) => TAB_REDSTONE | TAB_SECURITY,
+        Some(Kind::Vibrator | Kind::Heater | Kind::FuelwoodHeater | Kind::LaserAmplifier) => TAB_REDSTONE | TAB_SECURITY,
         Some(Kind::Oredictionificator) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
         Some(Kind::FluidTank(_)) => TAB_SECURITY | TAB_EDIT_MODE,
         Some(Kind::DynamicValve) => TAB_EDIT_MODE,
@@ -10404,6 +10448,8 @@ enum TabKind {
     Visuals,
     /// The container edit mode (both, fill, empty).
     EditMode,
+    /// The Laser Amplifier's redstone output mode (`GuiAmplifierTab`).
+    Amplifier,
 }
 
 fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
@@ -10424,6 +10470,11 @@ fn screen_tabs(block: &str, l: &Layout, data: &[i32]) -> Vec<Tab> {
     if t & TAB_EDIT_MODE != 0 {
         let icon = ["container_edit_mode/both", "container_edit_mode/fill", "container_edit_mode/empty"][edit_mode(l, data)];
         out.push(Tab { at: [right, 138.0], icon, argb: 0xFF36_6BD0, what: TabKind::EditMode });
+    }
+    // `GuiAmplifierTab` (imageWidth, 109): the icon follows the redstone output mode.
+    if kind(block) == Some(Kind::LaserAmplifier) {
+        let icon = ["amplifier/off", "amplifier/entity", "amplifier/contents"][amplifier_mode(data)];
+        out.push(Tab { at: [right, 109.0], icon, argb: 0xFFFF_FFFF, what: TabKind::Amplifier });
     }
     if t & TAB_UPGRADE != 0 {
         out.push(Tab { at: [right, 6.0], icon: "button/upgrade", argb: 0xFFFF_FFFF, what: TabKind::Upgrade });
@@ -10513,6 +10564,7 @@ fn tab_tooltip(block: &str, l: &Layout, data: &[i32], at: [f32; 2], lines: &mut 
         TabKind::Redstone => lines.push(redstone_of(l, data).0.name().into()),
         TabKind::Sort => lines.push("Auto-Sort".into()),
         TabKind::EditMode => lines.push(["Both", "Fill", "Empty"][edit_mode(l, data)].into()),
+        TabKind::Amplifier => lines.push(format!("Redstone Output: {}", ["Off", "Entity Detection", "Energy Contents"][amplifier_mode(data)])),
         TabKind::Visuals => {
             let (shown, too_big) = (miner_visuals_on(data), kind(block) == Some(Kind::DigitalMiner) && miner_view(block, data).radius > 64);
             lines.push(format!("Visuals: {}", if shown { "On" } else { "Off" }));
@@ -11900,6 +11952,9 @@ const BUTTON_REDSTONE_PREVIOUS: i32 = 101;
 const BUTTON_SORT: i32 = 102;
 const BUTTON_EDIT_NEXT: i32 = 103;
 const BUTTON_EDIT_PREVIOUS: i32 = 104;
+/// The Laser Amplifier's redstone output tab (`GuiInteraction.NEXT_MODE` / `PREVIOUS_MODE`).
+const BUTTON_AMPLIFIER_NEXT: i32 = 105;
+const BUTTON_AMPLIFIER_PREVIOUS: i32 = 106;
 
 /// The capacity of a multiblock's tank, from the size its master saved.
 fn multiblock_capacity(entity: &ModBlockEntity, key: &str) -> u64 {
@@ -12085,6 +12140,8 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
         // `GuiGasMode`: the steam dump mode, a 10 px image button.
         Some(Kind::TurbineValve) => &[([173.0, 72.0, 10.0, 10.0], "")],
         Some(Kind::ChemicalTank(_)) => &[([159.0, 72.0, 10.0, 10.0], "")],
+        // `GuiGasMode` x 2: the left tank's dump mode and the right's.
+        Some(Kind::Separator) => &[([7.0, 72.0, 10.0, 10.0], ""), ([159.0, 72.0, 10.0, 10.0], "")],
         // `GuiDumpButton`: empties the infusion tank.
         Some(Kind::Infuser) => &[([16.0, 59.0, 21.0, 10.0], "")],
         // The chemical factories' dump button (at 182 in the ultimate one).
@@ -12166,6 +12223,9 @@ fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], r
         frequency_click(game, block, at, right);
         return;
     }
+    if num_open(block) {
+        num_click(game, block, at, right);
+    }
     if is_filter_screen(block) {
         if is_qio_filter(block) {
             qio_filter_click(game, block, at, right);
@@ -12214,6 +12274,7 @@ fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], r
         Some(TabKind::Sort) if !right => *button = Some(BUTTON_SORT),
         Some(TabKind::EditMode) => *button = Some(if right { BUTTON_EDIT_PREVIOUS } else { BUTTON_EDIT_NEXT }),
         Some(TabKind::Visuals) if !right => miner_toggle_visuals(game),
+        Some(TabKind::Amplifier) => *button = Some(if right { BUTTON_AMPLIFIER_PREVIOUS } else { BUTTON_AMPLIFIER_NEXT }),
         _ => {}
     }
 }
@@ -12247,9 +12308,22 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         }
         return;
     }
+    // `TileEntityLaserAmplifier.nextMode` / `previousMode`: off, entity detection, energy contents.
+    if matches!(id, BUTTON_AMPLIFIER_NEXT | BUTTON_AMPLIFIER_PREVIOUS) && kind(&entity.id) == Some(Kind::LaserAmplifier) {
+        let now = get_int(&entity.nbt, "omode") % 3;
+        put_int(&mut entity.nbt, "omode", if id == BUTTON_AMPLIFIER_NEXT { (now + 1) % 3 } else { (now + 2) % 3 });
+        return;
+    }
     // The security tab (`GuiInteraction.NEXT_SECURITY_MODE` / `PREVIOUS_SECURITY_MODE`).
     if matches!(id, BUTTON_SECURITY_NEXT | BUTTON_SECURITY_PREVIOUS) && tabs(&entity.id) & TAB_SECURITY != 0 {
         sec_step(game, entity, id == BUTTON_SECURITY_NEXT);
+        return;
+    }
+    // `TileEntityElectrolyticSeparator.nextMode(tank)`.
+    if matches!(id, 0 | 1) && kind(&entity.id) == Some(Kind::Separator) {
+        let key = if id == 0 { "dump_left" } else { "dump_right" };
+        let next = (get_int(&entity.nbt, key) + 1) % 3;
+        put_int(&mut entity.nbt, key, next);
         return;
     }
     // `GasMode.getNext` on the chemical tank's button.
@@ -12498,7 +12572,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         slots,
         inventory_y: h - 82.0,
         inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(),
-        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort | Kind::FusionPort | Kind::SecurityDesk | Kind::ModificationStation)),
+        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort | Kind::FusionPort | Kind::SecurityDesk | Kind::ModificationStation | Kind::Heater | Kind::LaserAmplifier)),
         alt: None,
         ..Default::default()
     });
@@ -12618,6 +12692,8 @@ fn extras(block: &str) -> Extras {
         // `GuiTexturedElement.downArrow(imageWidth + 8, 91)` between the washer's two fluid slots.
         Some(Kind::Washer) => Extras { active_progress: vec![large(64.0, 39.0)], arrows: vec![[184.0, 91.0]], ..none },
         Some(Kind::Heater) => Extras { screen: Some([48.0, 23.0, 80.0, 42.0]), ..none },
+        // `GuiSeismicVibrator`: the screen with "Vibrating" or "Idle" and the chunk it stands in.
+        Some(Kind::Vibrator) => Extras { screen: Some([16.0, 23.0, 112.0, 40.0]), ..none },
         // `GuiDynamicTank`: the screen, and the arrow from the container slot to the output.
         Some(Kind::DynamicValve) => Extras { screen: Some([49.0, 21.0, 84.0, 46.0]), arrows: vec![[150.0, 39.0]], ..none },
         // `GuiInductionMatrix`: the same screen, no arrow.
@@ -13642,6 +13718,15 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
     }
     if let Some([x, y, w, h]) = e.screen {
         nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + x, oy + y, w, h], 0xFFFF_FFFF);
+        if kind(block) == Some(Kind::Vibrator) {
+            // `GuiInnerScreen.defaultFormat`: 5 px in, 0.8 scale, 2 px between the lines, centred upright.
+            let (cx, cz) = game.container.map_or((0, 0), |(px, _, pz)| (px.div_euclid(16), pz.div_euclid(16)));
+            let lines = [if lit { "Vibrating".to_owned() } else { "Idle".to_owned() }, format!("Chunk: {cx}, {cz}")];
+            let top = ((h - (9.0 * 2.0 + 2.0)) / 2.0).floor();
+            for (i, line) in lines.iter().enumerate() {
+                game.native_text_scaled(batch, line, [ox + x + 5.0, oy + y + top + 11.0 * i as f32], 0x3C_FE9A, 0.8);
+            }
+        }
         for (i, line) in screen_lines(block, data).iter().enumerate() {
             // `GuiInnerScreen`'s default format is centred lines at 0.8 scale with 2 px of spacing;
             // the evaporation screen clears the spacing. The others here keep their own plain style.
@@ -13882,6 +13967,19 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         centred(game, batch, &title, ox, width, oy + 3.0, 0x40_4040);
         game.native_text(batch, "Inventory", [ox + 29.0, oy + height - 92.0], 0x40_4040, false);
     }
+    if kind(block) == Some(Kind::Heater) {
+        // `renderTitleText`, and `inventoryLabelY += 2`.
+        let title = game.native_screen_title().unwrap_or_default();
+        centred(game, batch, &title, ox, width, oy + 4.0, 0x40_4040);
+        game.native_text(batch, "Inventory", [ox + 8.0, oy + height - 92.0], 0x40_4040, false);
+    }
+    if kind(block) == Some(Kind::LaserAmplifier) {
+        // `renderTitleTextWithOffset(energyGauge.getRelativeRight())`: centred from 24 to the edge, 4 px in each side.
+        let title = game.native_screen_title().unwrap_or_default();
+        centred(game, batch, &title, ox + 28.0, 144.0, oy + 4.0, 0x40_4040);
+        game.native_text(batch, "Inventory", [ox + 8.0, oy + height - 94.0], 0x40_4040, false);
+        draw_amplifier_labels(game, batch, data, origin);
+    }
     if kind(block) == Some(Kind::Evaporation) {
         // `renderTitleTextWithOffset(inputGauge.getRelativeRight(), OUTPUT_GAUGE_X)`: centred from 24 to 172 less 4 each side; the inventory label is 10 px in and 2 px down.
         let title = game.native_screen_title().unwrap_or_default();
@@ -14006,6 +14104,9 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         sprite(game, batch, "tab/heat_info_k", [0.0, 0.0, 26.0, 26.0], [ox - 26.0, oy + 109.0, 26.0, 26.0]);
     }
     draw_extras(game, batch, block, data, origin);
+    if num_open(block) {
+        draw_num_fields(game, batch, block, origin);
+    }
     if is_od(block) {
         draw_od_list(game, batch, origin);
     }
@@ -14082,6 +14183,19 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     let text_x = if l.gauges.len() > 2 { 50.0 } else { 30.0 };
     for (i, line) in multiblock_lines(block, data).iter().enumerate() {
         game.native_text(batch, line, [ox + text_x, oy + 16.0 + 10.0 * i as f32], 0x40_4040, false);
+    }
+    if kind(block) == Some(Kind::Separator) {
+        // `GuiGasMode`: the icon, and the mode's name beside it (right of the left button, left of the right one).
+        for (i, x) in [7.0_f32, 159.0].into_iter().enumerate() {
+            let (sprite_name, text) = match data.get(i).copied().unwrap_or(0) {
+                1 => ("chemical_mode/dump_excess", "Dumping Excess"),
+                2 => ("chemical_mode/dump", "Dumping"),
+                _ => ("chemical_mode/idle", "Idle"),
+            };
+            sprite(game, batch, sprite_name, [0.0, 0.0, 10.0, 10.0], [ox + x, oy + 72.0, 10.0, 10.0]);
+            let text_x = if i == 0 { x + 12.0 } else { x - 2.0 - game.native_text_width(text) };
+            game.native_text(batch, text, [ox + text_x, oy + 73.0], 0x40_4040, false);
+        }
     }
     if kind(block) == Some(Kind::TurbineValve) && data.first().copied().unwrap_or(0) > 0 {
         let mode = data.get(3).copied().unwrap_or(0);
@@ -14512,6 +14626,10 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         lines.push(format!("Temperature: {}", mekanism_core::energy::format_unit(heater_temperature(data), "K")));
         lines.push(format!("Transferred: {}/t", k(get(1))));
         lines.push(format!("Dissipated: {}/t", k(data.get(DATA_SPEED).copied().unwrap_or(0))));
+    } else if kind(block) == Some(Kind::LaserAmplifier) && inside(at, [-26.0, 137.0, 26.0, 26.0]) {
+        // `GuiEnergyTab` of the amplifier: just what it stores.
+        let fe = mekanism_core::energy::format_fe;
+        lines.push(format!("Storing: {}/{}", fe(read_wide(data, DATA_STORED)), fe(read_wide(data, DATA_CAPACITY))));
     } else if l.power.is_some() && inside(at, [-26.0, 137.0, 26.0, 26.0]) {
         // `GuiEnergyTab` of a machine: what it uses a tick and what its buffer still needs.
         let fe = mekanism_core::energy::format_fe;
@@ -15416,26 +15534,18 @@ fn tick_heater(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
     Some(active)
 }
 
+/// The usage a player typed into the screen's field (it may be 0), or `BASE_USAGE`.
 fn heater_usage(nbt: &Compound) -> u64 {
-    match get_long(nbt, "usage") {
-        0 => boiler::HEATER_USAGE,
-        n => n,
-    }
+    if get_int(nbt, "usage_set") == 1 { get_long(nbt, "usage") } else { boiler::HEATER_USAGE }
 }
 
-/// A right click with an empty hand on a Resistive Heater steps its energy usage; on a boiler valve it
-/// shows the boiler's temperature, boil rate and tanks.
+/// A sneaking right click on a boiler valve shows the boiler's temperature, boil rate and tanks.
 pub(super) fn use_boiler(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     if !game.native_on(MOD_ID) || game.inventory.get(game.selected).cloned().flatten().is_some() {
         return false;
     }
     let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
     let line = game.native_with_mod_block_entity(pos, |m| match kind(&m.id) {
-        Some(Kind::Heater) => {
-            let usage = boiler::next_heater_usage(heater_usage(&m.nbt));
-            put_long(&mut m.nbt, "usage", usage);
-            Some(Ok(format!("Resistive Heater: {usage} FE/t")))
-        }
         // A plain click on a valve opens the boiler's screen.
         Some(Kind::BoilerValve) if sneaking => Some(Err(get_pos(&m.nbt, "master"))),
         _ => None,
@@ -16770,6 +16880,219 @@ fn charge_on_pad(game: &mut Game<'_>) {
     }
 }
 
+// --- Number fields ----------------------------------------------------------------------------------
+//
+// The digit-only text fields of `GuiResistiveHeater` (energy usage) and `GuiLaserAmplifier` (delay and the
+// two thresholds). Enter (or the checkmark of the heater's digital field) sends the number, floored at 0,
+// and clears the field.
+
+const NUMFIELD_CHANNEL: &str = "mekanism:number_field";
+
+/// One field: where it is (x, y, width, height), how many digits it takes and whether it is the digital style.
+struct NumField {
+    at: [f32; 4],
+    max: usize,
+    digital: bool,
+}
+
+fn num_fields(block: &str) -> &'static [NumField] {
+    match kind(block) {
+        // `GuiTextField(this, 50, 51, 76, 12).configureDigitalInput(..).setMaxLength(7)`.
+        Some(Kind::Heater) => &[NumField { at: [50.0, 51.0, 76.0, 12.0], max: 7, digital: true }],
+        // `TEXT_BOX_START = 96`: delay (36 wide, 4 digits), lower and upper threshold (72 wide, 10 digits).
+        Some(Kind::LaserAmplifier) => &[
+            NumField { at: [96.0, 28.0, 36.0, 11.0], max: 4, digital: false },
+            NumField { at: [96.0, 43.0, 72.0, 11.0], max: 10, digital: false },
+            NumField { at: [96.0, 58.0, 72.0, 11.0], max: 10, digital: false },
+        ],
+        _ => &[],
+    }
+}
+
+thread_local! {
+    /// The block whose fields are on screen, and what is typed in them.
+    static NUM_POS: std::cell::Cell<Option<(i32, i32, i32)>> = const { std::cell::Cell::new(None) };
+    static NUM_TEXT: std::cell::RefCell<[freq::TextBox; 3]> = std::cell::RefCell::new(Default::default());
+}
+
+/// Forgets the typed text when another block's screen opens (the heater's field starts focused: `setInitialFocus`).
+fn num_sync(game: &Game<'_>, block: &str) {
+    if game.container == NUM_POS.get() {
+        return;
+    }
+    NUM_POS.set(game.container);
+    NUM_TEXT.with_borrow_mut(|t| {
+        *t = Default::default();
+        t[0].focused = kind(block) == Some(Kind::Heater);
+    });
+}
+
+fn num_open(block: &str) -> bool {
+    !num_fields(block).is_empty()
+}
+
+fn amplifier_mode(data: &[i32]) -> usize {
+    data.get(3).copied().unwrap_or(0).max(0) as usize % 3
+}
+
+/// The upper threshold of an amplifier (its storage until one is set).
+fn amplifier_max(nbt: &Compound) -> u64 {
+    match get_long(nbt, "max_threshold") {
+        0 => receptor_storage(laser::AMPLIFIER).min(i32::MAX as u64),
+        n => n,
+    }
+}
+
+/// `GuiLaserAmplifier.drawForegroundText`: the delay and the two thresholds beside their fields, in the 72 px left of
+/// x = 96 (a longer text is squeezed to fit, where Mekanism scrolls it).
+fn draw_amplifier_labels(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
+    let at = DATA_GAUGES;
+    let (min, max, delay) = (read_wide(data, at), read_wide(data, at + 4), data.get(2).copied().unwrap_or(0).max(0));
+    let fe = mekanism_core::energy::format_fe;
+    let lines = [
+        (if delay > 0 { format!("Delay: {delay}t") } else { "No Delay".to_owned() }, 30.0),
+        (format!("Min: {}", fe(min)), 45.0),
+        (format!("Max: {}", fe(max)), 60.0),
+    ];
+    for (text, y) in lines {
+        let w = game.native_text_width(&text);
+        let scale = if w > 72.0 { 72.0 / w } else { 1.0 };
+        game.native_text_scaled(batch, &text, [origin[0] + 24.0, origin[1] + y + (1.0 - scale) * 4.0], 0x40_4040, scale);
+    }
+}
+
+/// The fields of the open screen (drawn over the panel, under the tooltip).
+fn draw_num_fields(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, origin: [f32; 2]) {
+    num_sync(game, block);
+    let [ox, oy] = origin;
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    let screen = 0x3C_FE9A_u32;
+    NUM_TEXT.with_borrow(|texts| {
+        for (f, t) in num_fields(block).iter().zip(texts.iter()) {
+            let [x, y, w, h] = f.at;
+            let blink = t.focused && (game.ticks / 6) % 2 == 0;
+            let before: String = t.value.chars().take(t.cursor).collect();
+            if f.digital {
+                // `IconType.DIGITAL` (4 x 7) at the left, the text 10 px in at 0.8 scale, the checkmark in a
+                // `ButtonBackground.DIGITAL` square at the right.
+                sprite(game, batch, "digital_text_input", [0.0, 0.0, 4.0, 7.0], [ox + x + 2.0, oy + y + h / 2.0 - 4.0, 4.0, 7.0]);
+                let text_at = [ox + x + 10.0, oy + y + 5.4];
+                game.native_text_scaled(batch, &t.value, text_at, screen, 0.8);
+                if blink {
+                    game.native_text_scaled(batch, "_", [text_at[0] + game.native_text_width(&before) * 0.8, text_at[1]], screen, 0.8);
+                }
+                let check = [x + w - h, y, h, h];
+                let active = !t.value.is_empty();
+                let base = match (active, active && inside(mouse, check)) {
+                    (false, _) => "button_digital_inactive",
+                    (true, true) => "button_digital_focus",
+                    (true, false) => "button_digital",
+                };
+                nine_slice_tinted(game, batch, base, [3.0, 3.0], 1.0, [ox + check[0], oy + check[1], h, h], 0xFFFF_FFFF);
+                sprite(game, batch, "button/checkmark_digital", [0.0, 0.0, 12.0, 12.0], [ox + check[0], oy + check[1], h, h]);
+            } else {
+                // `BackgroundType.DEFAULT`: a light grey frame round a black field, the text at full size.
+                game.native_fill(batch, [ox + x - 1.0, oy + y - 1.0, w + 2.0, h + 2.0], 0xFFA0_A0A0);
+                game.native_fill(batch, [ox + x, oy + y, w, h], 0xFF00_0000);
+                let text_at = [ox + x + 6.0, oy + y + 3.0];
+                game.native_text(batch, &t.value, text_at, 0xE0_E0E0, true);
+                if blink {
+                    game.native_text(batch, "_", [text_at[0] + game.native_text_width(&before), text_at[1]], 0xE0_E0E0, true);
+                }
+            }
+        }
+    });
+}
+
+fn num_send(game: &Game<'_>, field: usize, text: &str) {
+    let Some((x, y, z)) = game.container else {
+        return;
+    };
+    // `Math.max(0, Integer.parseInt(..))`: a number past an int sends nothing, but the field clears.
+    if let Ok(value) = text.parse::<i32>() {
+        let mut data = Vec::new();
+        for c in [x, y, z] {
+            data.extend(c.to_be_bytes());
+        }
+        data.push(field as u8);
+        data.extend(value.max(0).to_be_bytes());
+        game.native_send_to_server(NUMFIELD_CHANNEL, &data);
+    }
+}
+
+/// A click: the field under the cursor takes focus, the others lose it; the heater's checkmark sends.
+fn num_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool) {
+    num_sync(game, block);
+    NUM_TEXT.with_borrow_mut(|texts| {
+        for (i, (f, t)) in num_fields(block).iter().zip(texts.iter_mut()).enumerate() {
+            let check = [f.at[0] + f.at[2] - f.at[3], f.at[1], f.at[3], f.at[3]];
+            if f.digital && !right && inside(at, check) {
+                if !t.value.is_empty() {
+                    num_send(game, i, &t.value);
+                    t.value.clear();
+                    t.cursor = 0;
+                }
+                t.focused = true;
+                continue;
+            }
+            t.focused = !right && inside(at, f.at);
+        }
+    });
+}
+
+fn num_typing(block: &str) -> bool {
+    num_open(block) && NUM_TEXT.with_borrow(|t| t.iter().any(|t| t.focused))
+}
+
+fn num_key(game: &Game<'_>, block: &str, key: &str, text: Option<&str>) {
+    NUM_TEXT.with_borrow_mut(|texts| {
+        for (i, (f, t)) in num_fields(block).iter().zip(texts.iter_mut()).enumerate() {
+            if !t.focused {
+                continue;
+            }
+            if t.key(key, text, |c| c.is_ascii_digit(), f.max) == freq::Typed::Enter {
+                if !t.value.is_empty() {
+                    num_send(game, i, &t.value);
+                    t.value.clear();
+                    t.cursor = 0;
+                }
+            }
+        }
+    });
+}
+
+/// A number from a player's field, on the server: the heater's usage, or the amplifier's delay and thresholds
+/// (`setEnergyUsageFromPacket`, `setDelay`, `setMinThresholdFromPacket`, `setMaxThresholdFromPacket`).
+fn numfield_payload(game: &mut Game<'_>, data: &[u8]) {
+    let (Some(pos), Some(&field), Some(value), Some(player)) = (data.get(..12), data.get(12), data.get(13..17), game.native_acting_player()) else {
+        return;
+    };
+    let int = |i: usize| i32::from_be_bytes([pos[i], pos[i + 1], pos[i + 2], pos[i + 3]]);
+    let pos = [int(0), int(4), int(8)];
+    let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+    let value = i32::from_be_bytes([value[0], value[1], value[2], value[3]]).max(0) as u64;
+    let k = kind(block_name(game, pos));
+    if !near || !matches!(k, Some(Kind::Heater | Kind::LaserAmplifier)) {
+        return;
+    }
+    game.native_with_mod_block_entity(pos, |m| match (k, field) {
+        (Some(Kind::Heater), 0) => {
+            put_long(&mut m.nbt, "usage", value);
+            put_int(&mut m.nbt, "usage_set", 1);
+        }
+        (Some(Kind::LaserAmplifier), 0) => put_int(&mut m.nbt, "delay", value.min(i32::MAX as u64) as u32),
+        (Some(Kind::LaserAmplifier), f @ (1 | 2)) => {
+            let capacity = receptor_storage(&m.id).min(i32::MAX as u64);
+            let (min, max) = (get_long(&m.nbt, "min_threshold"), amplifier_max(&m.nbt));
+            let (min, max) = if f == 1 { laser::set_min_threshold(max, capacity, value) } else { laser::set_max_threshold(min, capacity, value) };
+            put_long(&mut m.nbt, "min_threshold", min);
+            put_long(&mut m.nbt, "max_threshold", max);
+        }
+        _ => {}
+    });
+}
+
 // --- Lasers -----------------------------------------------------------------------------------------
 
 /// Blocks a laser's beam passes through (`ClipContext.Block.OUTLINE` with no fluids): those with no
@@ -16803,7 +17126,14 @@ fn tick_laser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
         0 => receptor_storage(&entity.id),
         n => n,
     };
-    let firing = laser::to_fire(&entity.id, stored, get_long(&entity.nbt, "min_threshold"), max);
+    // The amplifier counts up to its delay and fires only once it has (`onUpdateServer`, `toFire`).
+    let ready = entity.id != laser::AMPLIFIER || {
+        let delay = u64::from(get_int(&entity.nbt, "delay"));
+        let ticks = laser::next_tick(u64::from(get_int(&entity.nbt, "ticks")), delay);
+        put_int(&mut entity.nbt, "ticks", ticks.min(i32::MAX as u64) as u32);
+        ticks >= delay
+    };
+    let firing = if ready { laser::to_fire(&entity.id, stored, get_long(&entity.nbt, "min_threshold"), max) } else { 0 };
     let facing = game.native_block_property(pos, "facing").and_then(|f| direction(&f));
     let (Some(d), true) = (facing, firing > 0) else {
         put_long(&mut entity.nbt, "progress", 0);
@@ -17044,9 +17374,8 @@ fn store_drop(game: &Game<'_>, slots: &mut Vec<Option<ItemStack>>, mut stack: It
     Some(stack)
 }
 
-/// A right click with an empty hand on a laser or amplifier, or a sneaking one on a tractor beam, shows
-/// its energy and digging; sneaking on an amplifier with a stack sets its lower threshold to the
-/// stack's size times 10,000 (an empty sneaking hand clears it).
+/// A right click with an empty hand on a laser, or a sneaking one on a tractor beam, shows its energy
+/// and digging. The amplifier and the tractor beam open their screens.
 pub(super) fn use_laser(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     if !game.native_on(MOD_ID) {
         return false;
@@ -17058,11 +17387,9 @@ pub(super) fn use_laser(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     }
     let held = game.inventory.get(game.selected).cloned().flatten();
     let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
-    if k == Some(Kind::LaserAmplifier) && sneaking {
-        let min = held.as_ref().map_or(0, |h| u64::from(h.count) * 10_000);
-        game.native_with_mod_block_entity(pos, |m| put_long(&mut m.nbt, "min_threshold", min));
-        tell(game, format!("Laser Amplifier lower threshold: {min} FE"));
-        return true;
+    // The amplifier has a screen of its own, with fields for the thresholds.
+    if k == Some(Kind::LaserAmplifier) {
+        return false;
     }
     if held.is_some() || (k == Some(Kind::TractorBeam) && !sneaking) {
         return false;
@@ -17907,6 +18234,7 @@ pub(super) fn screen_typing(block: &str, typing: &mut bool) {
     if fission_stats_open(block) {
         *typing |= STATS_TEXT.with_borrow(|t| t.focused);
     }
+    *typing |= num_typing(block);
     if fusion_view(block) == Some(2) {
         *typing |= FUSION_TEXT.with_borrow(|t| t.focused);
     }
@@ -17925,6 +18253,10 @@ pub(super) fn screen_key(game: &mut Game<'_>, block: &str, key: &str, text: Opti
     }
     if fission_stats_open(block) {
         fission_stats_key(game, key, text);
+        return;
+    }
+    if num_open(block) {
+        num_key(game, block, key, text);
         return;
     }
     if fusion_view(block) == Some(2) {

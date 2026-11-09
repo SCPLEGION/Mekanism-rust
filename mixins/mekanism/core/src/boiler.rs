@@ -80,17 +80,6 @@ pub const HEATER_EFFICIENCY: f64 = 0.6;
 pub fn heater_efficiency() -> f64 {
     crate::config_files::active_double("general", "heater", "resistiveEfficiency", HEATER_EFFICIENCY)
 }
-/// The usages a click on a heater steps through (its screen's energy usage field).
-pub const HEATER_STEPS: [u64; 5] = [100, 1_000, 10_000, 100_000, 1_000_000];
-
-pub fn next_heater_usage(now: u64) -> u64 {
-    HEATER_STEPS
-        .iter()
-        .copied()
-        .find(|&s| s > now)
-        .unwrap_or(HEATER_USAGE)
-}
-
 pub fn is_frame(name: &str) -> bool {
     matches!(
         name,
@@ -216,11 +205,5 @@ mod tests {
         let b = boiler();
         assert_eq!(b.heated_coolant_capacity(), 256_000);
         assert_eq!(b.cooled_coolant_capacity(), 0);
-    }
-
-    #[test]
-    fn heaters_step_their_usage() {
-        assert_eq!(next_heater_usage(100), 1_000);
-        assert_eq!(next_heater_usage(1_000_000), 100);
     }
 }
