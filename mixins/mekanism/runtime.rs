@@ -128,6 +128,8 @@ enum Kind {
     ChemicalTank(BaseTier),
     /// The Radioactive Waste Barrel: radioactive chemicals only, decaying a little each second, emitting down when active.
     WasteBarrel,
+    /// The Cardboard Box: a block (its state and block entity) packed inside.
+    CardboardBox,
     DigitalMiner,
     FluidTank(BaseTier),
     /// The Chemical Dissolution Chamber: an item and a chemical each tick into a chemical.
@@ -232,6 +234,9 @@ fn kind(id: &str) -> Option<Kind> {
     }
     if id == WASTE_BARREL {
         return Some(Kind::WasteBarrel);
+    }
+    if id == CARDBOARD {
+        return Some(Kind::CardboardBox);
     }
     match id {
         qio::DRIVE_ARRAY => return Some(Kind::QioDriveArray),
@@ -742,6 +747,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 tick_waste_barrel(game, pos, entity);
                 None
             }
+            Kind::CardboardBox => None,
             Kind::Tube(rate) => {
                 tick_tube(game, pos, entity, rate);
                 None
@@ -5572,6 +5578,138 @@ fn tick_chemical_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     }
 }
 
+// --- Cardboard Box ---------------------------------------------------------------------------------
+
+const CARDBOARD: &str = "mekanism:cardboard_box";
+/// The item's `BLOCK_DATA` component, and the box block entity's `box`: `state`, `props` and the block entity `be`.
+const BLOCK_DATA_KEY: &str = "mekanism:block_data";
+
+fn has_block_data(stack: &ItemStack) -> bool {
+    matches!(custom_data(stack).and_then(|c| c.get(&JavaString::from(BLOCK_DATA_KEY))), Some(Tag::Compound(_)))
+}
+
+fn shift_down(game: &Game<'_>) -> bool {
+    game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight)
+}
+
+/// `ItemBlockCardboardBox.onItemUseFirst`: an empty box used on a block, not sneaking, packs it: its state and block
+/// entity go into the box, which takes its place. The `cardboard_blacklist` tag (the box, trial spawners, vaults, and
+/// `c:relocation_not_supported`), unbreakable blocks, `modBlacklist` namespaces and a block someone else secured stay put.
+pub(super) fn cardboard_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3], claimed: &mut bool) {
+    if *claimed || &*stack.item != CARDBOARD || !game.native_on(MOD_ID) || has_block_data(stack) || shift_down(game) {
+        return;
+    }
+    let name = block_name(game, pos).to_owned();
+    if name.is_empty() || matches!(name.as_str(), "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air") {
+        return;
+    }
+    // Whatever the verdict, the click is the box's.
+    *claimed = true;
+    let hardness = game.res.facts().get(game.world.block(pos[0], pos[1], pos[2])).hardness;
+    let namespace = name.split(':').next().unwrap_or("");
+    let listed = match config_value("general", "cardboard_box", "modBlacklist") {
+        Some(mekanism_core::config_files::Value::List(l)) => l.iter().any(|n| n == namespace),
+        _ => false,
+    };
+    let tagged = world_items!(game).block_tags.iter().any(|(tag, set)| tag.ends_with("relocation_not_supported") && set.contains(&name));
+    if hardness < 0.0 || listed || tagged || matches!(name.as_str(), CARDBOARD | "minecraft:trial_spawner" | "minecraft:vault") || sec_denied(game, pos) {
+        return;
+    }
+    let props = game.native_block_properties(pos);
+    let be = game.native_take_block_entity(pos);
+    let mut data = Compound::new();
+    data.insert("state".into(), Tag::String(name.as_str().into()));
+    let mut p = Compound::new();
+    for (k, v) in &props {
+        p.insert(k.as_str().into(), Tag::String(v.as_str().into()));
+    }
+    data.insert("props".into(), Tag::Compound(p));
+    if let Some(be) = be.clone() {
+        data.insert("be".into(), Tag::Compound(be));
+    }
+    // `stack.consume(1, player)`: a creative player keeps the box.
+    if !game.creative {
+        let held = game.held_mut();
+        if let Some(s) = held.as_mut() {
+            s.count = s.count.saturating_sub(1);
+            if s.count == 0 {
+                *held = None;
+            }
+        }
+    }
+    if !game.native_set_block(pos, CARDBOARD, &[("storage", "true")]) {
+        if let Some(be) = be {
+            game.native_put_block_entity(pos, be);
+        }
+        return;
+    }
+    game.native_with_mod_block_entity(pos, |m| m.nbt.insert("box".into(), Tag::Compound(data)));
+}
+
+/// `BlockCardboardBox.useWithoutItem`: sneaking, a click on a box with a block in it puts the block back and drops
+/// the empty box. (`Block.updateFromNeighbourShapes` and the nether-water refusal of `tryPlaceIntoWorld` are not
+/// done: a double chest stays as it was packed.)
+pub(super) fn use_cardboard_box(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || !shift_down(game) || block_name(game, pos) != CARDBOARD {
+        return false;
+    }
+    let data = game.native_with_mod_block_entity(pos, |m| match m.nbt.get(&JavaString::from("box")) {
+        Some(Tag::Compound(d)) => Some(d.clone()),
+        _ => None,
+    });
+    let Some(Some(data)) = data else {
+        return true;
+    };
+    let Some(state) = get_string(&data, "state") else {
+        return true;
+    };
+    let props: Vec<(String, String)> = match data.get(&JavaString::from("props")) {
+        Some(Tag::Compound(p)) => p.iter().filter_map(|(k, v)| match v {
+            Tag::String(v) => Some((k.to_string().ok()?, v.to_string().ok()?)),
+            _ => None,
+        }).collect(),
+        _ => Vec::new(),
+    };
+    let refs: Vec<(&str, &str)> = props.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    if !game.native_set_block(pos, &state, &refs) {
+        return true;
+    }
+    if let Some(Tag::Compound(be)) = data.get(&JavaString::from("be")) {
+        game.native_put_block_entity(pos, be.clone());
+    }
+    let item = stack_of(CARDBOARD, 1);
+    game.spawn_item(item, [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5], [0.0; 3], 10);
+    true
+}
+
+/// `BlockData.addToTooltip`: "Block data: yes" or "no", then the block and its block entity.
+fn cardboard_tooltip(stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    use horizon_client::text::Text;
+    if &*stack.item != CARDBOARD {
+        return;
+    }
+    let white = horizon_client::hud::rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    let rgb = |c: u32| horizon_client::hud::rgba((c >> 16) as u8, (c >> 8) as u8, c as u8, 0xFF);
+    let (indigo, grey) = (rgb(0x559EFF), rgb(0xCFCFCF));
+    let data = match custom_data(stack).and_then(|c| c.get(&JavaString::from(BLOCK_DATA_KEY))) {
+        Some(Tag::Compound(d)) => Some(d),
+        _ => None,
+    };
+    let answer = if data.is_some() { Text::colored("yes", rgb(0x75FF89)) } else { Text::colored("no", rgb(0xFF383C)) };
+    lines.push((Text::colored("Block data: ", indigo).append(answer), white));
+    let Some(data) = data else {
+        return;
+    };
+    if let Some(state) = get_string(data, "state") {
+        lines.push((Text::colored("Block: ", indigo).append(Text::colored(state, grey)), white));
+    }
+    if let Some(Tag::Compound(be)) = data.get(&JavaString::from("be"))
+        && let Some(id) = get_string(be, "id")
+    {
+        lines.push((Text::colored("Block Entity: ", indigo).append(Text::colored(id, grey)), white));
+    }
+}
+
 const WASTE_BARREL: &str = "mekanism:radioactive_waste_barrel";
 
 /// `GeneralConfig.radioactiveWasteBarrelMaxChemical`.
@@ -6700,6 +6838,15 @@ pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
                 set_custom_compound(&mut stack, BIN_KEY, c);
                 stack
             }
+            // A box with a block in it drops itself with the block (`BLOCK_DATA` stays in the item's components).
+            Kind::CardboardBox => {
+                let Some(Tag::Compound(data)) = m.nbt.get(&JavaString::from("box")) else {
+                    return None;
+                };
+                let mut stack = stack_of(&m.id, 1);
+                set_custom_compound(&mut stack, BLOCK_DATA_KEY, data.clone());
+                stack
+            }
             // Personal storage keeps its contents and owner (`PersonalStorageContentsLootFunction`).
             Kind::PersonalStorage => {
                 let mut c = Compound::new();
@@ -6861,6 +7008,15 @@ pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
     if custom_data(stack).is_none() {
         return;
     }
+    if &*stack.item == CARDBOARD {
+        // `getStateForPlacement`: a box with a block in it is placed as the full box (`storage`).
+        if let Some(Tag::Compound(data)) = custom_data(stack).and_then(|c| c.get(&JavaString::from(BLOCK_DATA_KEY))) {
+            let data = data.clone();
+            game.native_with_mod_block_entity(pos, |m| m.nbt.insert("box".into(), Tag::Compound(data)));
+            game.native_set_block_property(pos, "storage", "true");
+        }
+        return;
+    }
     let energy = stored_energy(stack);
     game.native_with_mod_block_entity(pos, |m| match kind(&m.id) {
         Some(Kind::EnergyCube(t)) if energy > 0 => {
@@ -6959,6 +7115,7 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
         lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
     }
     stored_tooltip(stack, lines);
+    cardboard_tooltip(stack, lines);
     // `FormulaComponent.addToTooltip`: the distinct ingredients in order of first use, with how many times each is used.
     if &*stack.item == fa::FORMULA_ITEM
         && let Some(text) = custom_data(stack).and_then(|c| get_string(c, "formula"))
