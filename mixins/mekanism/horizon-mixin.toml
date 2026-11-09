@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "38ea6e1e8f1fff3b1db386a409cb5226faa50783"
+horizon_revision = "a6dfc9c9135a3034edeb6e5198c57701d8804609"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -716,6 +716,31 @@ bindings = [
   { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
   { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
   { name = "shears", ty = "&mut bool", value = "&mut *shears" },
+]
+
+[[injection]]
+id = "bow-item"
+hook = "bow_item"
+hook_version = 1
+kind = "HEAD"
+helper = "bow_item.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "item", ty = "&str", value = "item" },
+  { name = "bow", ty = "&mut bool", value = "&mut *bow" },
+]
+
+[[injection]]
+id = "bow-shot"
+hook = "bow_shot"
+hook_version = 1
+kind = "HEAD"
+helper = "bow_shot.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "bow", ty = "&horizon_client::items::ItemStack", value = "bow" },
+  { name = "flame", ty = "&mut bool", value = "&mut *flame" },
+  { name = "allow", ty = "&mut bool", value = "&mut *allow" },
 ]
 
 [[injection]]

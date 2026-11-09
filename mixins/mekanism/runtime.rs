@@ -6382,6 +6382,10 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
         flamethrower_use(game, claimed);
         return;
     }
+    if !*claimed && &*stack.item == ELECTRIC_BOW && game.native_on(MOD_ID) {
+        electric_bow_use(game, claimed);
+        return;
+    }
     if !*claimed && &*stack.item == seismic::READER && game.native_on(MOD_ID) {
         seismic_reader_use(game, claimed);
         return;
@@ -26043,4 +26047,65 @@ fn radiation_quads(right: [f32; 3], up: [f32; 3], quads: &mut Vec<super::native_
             });
         }
     });
+}
+
+// --- Electric Bow ---------------------------------------------------------------------------------------
+
+const ELECTRIC_BOW: &str = "mekanism:electric_bow";
+const BOW_FIRE_KEY: &str = "mekanism:electric_bow_mode";
+
+fn bow_fire_mode(stack: &ItemStack) -> bool {
+    custom_data(stack).is_some_and(|c| matches!(c.get(&JavaString::from(BOW_FIRE_KEY)), Some(Tag::String(s)) if s.to_string().is_ok_and(|s| s == "fire")))
+}
+
+/// `native_bow_item`: the Electric Bow is drawn and let go like a bow.
+pub(super) fn bow_item(_game: &Game<'_>, item: &str, bow: &mut bool) {
+    *bow |= item == ELECTRIC_BOW;
+}
+
+/// Sneak + right click toggles the Electric Bow's fire mode (`ItemElectricBow.changeMode`: `ELECTRIC_BOW_MODE`).
+fn electric_bow_use(game: &mut Game<'_>, claimed: &mut bool) {
+    if !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+        return;
+    }
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == ELECTRIC_BOW) else {
+        return;
+    };
+    let fire = !bow_fire_mode(held);
+    let stored = stored_energy(held);
+    set_energy(held, stored);
+    set_custom_string(held, BOW_FIRE_KEY, if fire { "fire" } else { "normal" });
+    *claimed = true;
+    if let Some(player) = game.native_acting_player() {
+        let line = format!("Fire mode: {}", if fire { "On" } else { "Off" });
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
+}
+
+/// `ItemElectricBow.releaseUsing`: a shot takes `energyUsage` FE (`energyUsageFlame` in fire mode, which also burns the arrow);
+/// without it, or outside survival, an uncharged bow keeps its arrow. Creative players shoot for free.
+pub(super) fn bow_shot(game: &mut Game<'_>, bow: &ItemStack, flame: &mut bool, allow: &mut bool) {
+    if &*bow.item != ELECTRIC_BOW || !game.native_on(MOD_ID) {
+        return;
+    }
+    let fire = bow_fire_mode(bow);
+    *flame = fire;
+    if game.creative {
+        return;
+    }
+    let need = if fire {
+        mekanism_core::config::gear_int("electric_bow.energyUsageFlame", 1_200)
+    } else {
+        mekanism_core::config::gear_int("electric_bow.energyUsage", 120)
+    };
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == ELECTRIC_BOW) else {
+        *allow = false;
+        return;
+    };
+    let stored = stored_energy(held);
+    if stored < need {
+        *allow = false;
+        return;
+    }
+    set_energy(held, stored - need);
 }
