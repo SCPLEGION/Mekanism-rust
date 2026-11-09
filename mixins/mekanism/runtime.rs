@@ -6396,6 +6396,10 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
         free_runners_use(game, claimed);
         return;
     }
+    if !*claimed && &*stack.item == GAUGE_DROPPER && game.native_on(MOD_ID) {
+        dropper_use(game, claimed);
+        return;
+    }
     if !*claimed && &*stack.item == CANTEEN && game.native_on(MOD_ID) {
         canteen_use(game, claimed);
         return;
@@ -7187,6 +7191,13 @@ thread_local! {
 /// (`MekaSuitBarDecorator`). Stacked items show none, as the bar would cover the count.
 pub(super) fn item_bars(game: &Game<'_>, stack: &ItemStack, bar: &mut Option<(i32, u32)>, extra: &mut Vec<(i32, i32, u32)>) {
     if stack.count != 1 || !game.native_on(MOD_ID) {
+        return;
+    }
+    if &*stack.item == GAUGE_DROPPER {
+        // `ItemGaugeDropper.isBarVisible`: only with something in it, the fuller of its two tanks.
+        if let Some(t) = item_tank(stack, CHEMICAL_KEY, dropper_capacity()) {
+            *bar = Some(((13.0 * t.amount as f64 / t.capacity.max(1) as f64).round().clamp(0.0, 13.0) as i32, CHEMICALS.iter().find(|c| Some(c.0) == t.chemical.as_deref()).map_or(0xAAAAAA, |c| c.2)));
+        }
         return;
     }
     let width = |amount: u64, capacity: u64| ((13.0 * amount as f64 / capacity.max(1) as f64).round() as i32).clamp(0, 13);
@@ -12094,6 +12105,9 @@ pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32;
 }
 
 fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
+    if dropper_click(game, block, at, right, button) {
+        return;
+    }
     if is_freq_screen(block) {
         frequency_click(game, block, at, right);
         return;
@@ -12235,7 +12249,7 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         put_int(&mut entity.nbt, "sorting", u32::from(on));
         return;
     }
-    if transporter_button(entity, id) || window_button(game, pos, entity, id) || upgrade_slot_button(game, entity, id) || upgrade_button(game, pos, entity, id) {
+    if dropper_button(game, pos, entity, id) || transporter_button(entity, id) || window_button(game, pos, entity, id) || upgrade_slot_button(game, entity, id) || upgrade_button(game, pos, entity, id) {
         return;
     }
     let Some(Some(master)) = multiblock_master(entity, pos) else {
@@ -26487,4 +26501,105 @@ fn canteen_tick(game: &mut Game<'_>, ticks: u32, claimed: &mut bool, keep: &mut 
     if let Some(p) = game.player.as_mut() {
         p.health.food.eat(food as i32, paste_saturation());
     }
+}
+
+// --- Gauge Dropper --------------------------------------------------------------------------------------
+
+const GAUGE_DROPPER: &str = "mekanism:gauge_dropper";
+/// The window button of a dropper click on gauge `i`: `BUTTON_DROPPER + 4 i + action` (0 fill the dropper, 1 drain it into
+/// the tank, 2 dump the tank), `PacketDropperUse`.
+const BUTTON_DROPPER: i32 = 1000;
+
+fn dropper_capacity() -> u64 {
+    mekanism_core::config::gear_int("gauge_dropper.capacity", 16_000)
+}
+
+/// `GuiTankGauge.onClick`: with a Gauge Dropper on the cursor, a left click on a gauge fills the dropper from the tank
+/// (shift: dumps the tank), a right click drains the dropper into it.
+fn dropper_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool, button: &mut Option<i32>) -> bool {
+    if !game.carried.as_ref().is_some_and(|c| &*c.item == GAUGE_DROPPER) {
+        return false;
+    }
+    let Some(l) = layout(block) else {
+        return false;
+    };
+    for (i, g) in l.gauges.iter().enumerate() {
+        if inside(at, [g.at[0], g.at[1], g.size[0], g.size[1]]) {
+            let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);
+            let action = if right { 1 } else if shift { 2 } else { 0 };
+            *button = Some(BUTTON_DROPPER + 4 * i as i32 + action);
+            return true;
+        }
+    }
+    false
+}
+
+/// `PacketDropperUse.handle` on the server: fills the dropper from the tank, drains it into the tank, or dumps the tank,
+/// at most `gaugeDroppedTransferRate` mB a click; a dump spills a radioactive chemical's radiation.
+fn dropper_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id: i32) -> bool {
+    if !(BUTTON_DROPPER..BUTTON_DROPPER + 64).contains(&id) {
+        return false;
+    }
+    let (i, action) = (((id - BUTTON_DROPPER) / 4) as usize, (id - BUTTON_DROPPER) % 4);
+    let Some(mut carried) = game.carried.clone().filter(|c| &*c.item == GAUGE_DROPPER) else {
+        return true;
+    };
+    let Some(g) = layout(&entity.id).and_then(|l| l.gauges.get(i).copied()) else {
+        return true;
+    };
+    let mut tank = get_tank(&entity.nbt, g.key, g.capacity);
+    let rate = mekanism_core::config::gear_int("gauge_dropper.transferRate", 250).max(1);
+    let mut dropper = item_tank(&carried, CHEMICAL_KEY, dropper_capacity()).unwrap_or_else(|| ChemicalTank::new(dropper_capacity()));
+    match action {
+        2 => {
+            if let Some(chemical) = tank.chemical.clone() {
+                let dimension = game.dim.id().to_owned();
+                dump_radiation(&dimension, pos, &chemical, tank.amount);
+            }
+            tank.extract(tank.amount);
+        }
+        0 => {
+            let Some(chemical) = tank.chemical.clone() else {
+                return true;
+            };
+            let moved = dropper.insert(&chemical, tank.amount.min(rate));
+            tank.extract(moved);
+        }
+        _ => {
+            let Some(chemical) = tank.chemical.clone().or_else(|| dropper.chemical.clone()) else {
+                return true;
+            };
+            if dropper.chemical.as_deref() != Some(chemical.as_str()) || !tank.accepts(&chemical) {
+                return true;
+            }
+            let moved = tank.insert(&chemical, dropper.amount.min(rate));
+            dropper.extract(moved);
+        }
+    }
+    put_tank(&mut entity.nbt, g.key, &tank);
+    set_item_tank(&mut carried, &dropper);
+    game.carried = Some(carried);
+    true
+}
+
+/// `ItemGaugeDropper.use`: sneaking, the dropper empties its tanks where the player stands (`tryDumpContents`), spilling the
+/// radiation of a radioactive chemical.
+fn dropper_use(game: &mut Game<'_>, claimed: &mut bool) {
+    if !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+        return;
+    }
+    let Some(at) = game.player.as_ref().map(|p| [p.position.x.floor() as i32, p.position.y.floor() as i32, p.position.z.floor() as i32]) else {
+        return;
+    };
+    let dimension = game.dim.id().to_owned();
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == GAUGE_DROPPER) else {
+        return;
+    };
+    if let Some(tank) = item_tank(held, CHEMICAL_KEY, dropper_capacity()) {
+        if let Some(chemical) = tank.chemical.as_deref() {
+            dump_radiation(&dimension, at, chemical, tank.amount);
+        }
+        set_item_tank(held, &ChemicalTank::new(dropper_capacity()));
+    }
+    *claimed = true;
 }
