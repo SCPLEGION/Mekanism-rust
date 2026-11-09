@@ -9994,6 +9994,12 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
         if kind(block) == Some(Kind::DynamicValve) {
             rules[1] = SlotRule::Refuse;
         }
+        // The desk's slots (`SecurityInventorySlot`): the lock slot takes what can carry security, the unlock slot
+        // what already does.
+        if kind(block) == Some(Kind::SecurityDesk) {
+            rules[0] = SlotRule::Check(|s| item_security(s).is_some());
+            rules[1] = SlotRule::Check(|s| is_secure_item(&s.item));
+        }
         // `EnergyInventorySlot.drain` takes what can be charged, `fillOrConvert` what holds energy or turns into it.
         if kind(block) == Some(Kind::InductionPort) {
             rules[0] = energy();
