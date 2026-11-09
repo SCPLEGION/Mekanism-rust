@@ -126,6 +126,8 @@ enum Kind {
     Separator,
     GasGenerator,
     ChemicalTank(BaseTier),
+    /// The Radioactive Waste Barrel: radioactive chemicals only, decaying a little each second, emitting down when active.
+    WasteBarrel,
     DigitalMiner,
     FluidTank(BaseTier),
     /// The Chemical Dissolution Chamber: an item and a chemical each tick into a chemical.
@@ -227,6 +229,9 @@ fn kind(id: &str) -> Option<Kind> {
     }
     if id == "mekanism:industrial_alarm" {
         return Some(Kind::Alarm);
+    }
+    if id == WASTE_BARREL {
+        return Some(Kind::WasteBarrel);
     }
     match id {
         qio::DRIVE_ARRAY => return Some(Kind::QioDriveArray),
@@ -732,6 +737,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             Kind::GasGenerator => tick_gas_generator(game, pos, entity),
             Kind::ChemicalTank(t) => {
                 tick_chemical_tank(game, pos, entity, t);
+                None
+            }
+            Kind::WasteBarrel => {
+                tick_waste_barrel(game, pos, entity);
                 None
             }
             Kind::Tube(rate) => {
@@ -3102,6 +3111,9 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
             Some((key, cap))
         }
         Kind::GasGenerator if chem::fuel(chemical).is_some() => Some(("fuel", chem::GAS_GENERATOR_TANK)),
+        Kind::WasteBarrel if radioactivity(chemical) > 0.0 && get_tank(nbt, "chemical", waste_barrel_capacity()).accepts(chemical) => {
+            Some(("chemical", waste_barrel_capacity()))
+        }
         Kind::Dissolution if nuclear::dissolves_with(chemical) => Some(("input", nuclear::DISSOLUTION_TANK)),
         Kind::Centrifuge if nuclear::centrifuging(chemical).is_some() => Some(("input", nuclear::CENTRIFUGE_TANK)),
         Kind::Washer if nuclear::find_washing(chemical).is_some() => Some(("input", nuclear::WASHER_TANK)),
@@ -5559,6 +5571,53 @@ fn tick_chemical_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
         push_chemical(game, pos, &mut tank, Some([0, -1, 0]), rate, false);
         put_tank(&mut entity.nbt, "chemical", &tank);
     }
+}
+
+const WASTE_BARREL: &str = "mekanism:radioactive_waste_barrel";
+
+/// `GeneralConfig.radioactiveWasteBarrelMaxChemical`.
+fn waste_barrel_capacity() -> u64 {
+    config_int("general", "radiation", "wasteBarrelCapacity", 512_000).max(1) as u64
+}
+
+/// `TileEntityRadioactiveWasteBarrel.onUpdateServer`: the stored chemical decays by `wasteBarrelDecayAmount` every
+/// `wasteBarrelProcessTicks` (not plutonium or polonium, the `waste_barrel_decay_blacklist`), and an active barrel
+/// emits what it holds into the container below.
+fn tick_waste_barrel(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let mut tank = get_tank(&entity.nbt, "chemical", waste_barrel_capacity());
+    if let Some(chemical) = tank.chemical.clone() {
+        let decay = config_int("general", "radiation", "wasteBarrelDecayAmount", 1).max(0) as u64;
+        if decay > 0 && !matches!(chemical.as_str(), "mekanism:plutonium" | "mekanism:polonium") {
+            let ticks = get_int(&entity.nbt, "progress") + 1;
+            if i64::from(ticks) >= config_int("general", "radiation", "wasteBarrelProcessTicks", 20).max(1) {
+                put_int(&mut entity.nbt, "progress", 0);
+                tank.extract(decay);
+            } else {
+                put_int(&mut entity.nbt, "progress", ticks);
+            }
+        }
+    }
+    if get_int(&entity.nbt, "active") == 1 && tank.amount > 0 {
+        let amount = tank.amount;
+        push_chemical(game, pos, &mut tank, Some([0, -1, 0]), amount, false);
+    }
+    put_tank(&mut entity.nbt, "chemical", &tank);
+}
+
+/// `TileEntityRadioactiveWasteBarrel.onSneakRightClick`: sneaking, a right click switches the barrel's emitting.
+pub(super) fn use_waste_barrel(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || !(game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight)) {
+        return false;
+    }
+    game.native_with_mod_block_entity(pos, |m| {
+        if kind(&m.id) != Some(Kind::WasteBarrel) {
+            return false;
+        }
+        let on = get_int(&m.nbt, "active") == 1;
+        put_int(&mut m.nbt, "active", u32::from(!on));
+        true
+    })
+    .unwrap_or(false)
 }
 
 /// A pressurized tube feeds the tanks, machines and generators beside it, then lets the rest run on
@@ -8860,6 +8919,37 @@ fn port_mode(game: &Game<'_>, pos: [i32; 3]) -> Option<usize> {
 /// as a bucket of water or, with a filter upgrade, 10 mB of heavy water. Water left by the
 /// `waterSourceConversion` rule is an infinite source, so the block stays, as in Mekanism. The fluid
 /// goes up into the pipe or tank above.
+/// A source block of a pumpable fluid at `at`: its position, the chemical and the amount it gives.
+fn pump_source(game: &Game<'_>, at: [i32; 3], fluid: &str, filter: bool) -> Option<([i32; 3], &'static str, u64)> {
+    if block_name(game, at) != fluid || game.native_block_property(at, "level").as_deref() != Some("0") {
+        return None;
+    }
+    isotopes::pumped(fluid, filter).map(|(f, a)| (at, f, a))
+}
+
+/// The nearest source of `fluid` reachable through that fluid from `start`, within `pump.range` of the pump.
+fn pump_search(game: &Game<'_>, pump: [i32; 3], start: [i32; 3], fluid: &str, filter: bool) -> Option<([i32; 3], &'static str, u64)> {
+    let range = config_int("general", "pump", "range", 80) as f64;
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut queue = std::collections::VecDeque::from([start]);
+    while let Some(at) = queue.pop_front() {
+        if seen.len() > 20_000 {
+            break;
+        }
+        if let Some(found) = pump_source(game, at, fluid, filter) {
+            return Some(found);
+        }
+        for d in [[0, 1, 0], [0, 0, 1], [0, 0, -1], [1, 0, 0], [-1, 0, 0], [0, -1, 0]] {
+            let n = [at[0] + d[0], at[1] + d[1], at[2] + d[2]];
+            let dist = (0..3).map(|i| f64::from(n[i] - pump[i]).powi(2)).sum::<f64>().sqrt();
+            if dist <= range && block_name(game, n) == fluid && seen.insert(n) {
+                queue.push_back(n);
+            }
+        }
+    }
+    None
+}
+
 fn tick_pump(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
     let u = upgrades(&entity.nbt);
     let usage = u.energy_per_tick(usage_const("electricPump", isotopes::PUMP_USAGE));
@@ -8868,19 +8958,28 @@ fn tick_pump(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) ->
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut tank = get_tank(&entity.nbt, "fluid", isotopes::PUMP_TANK);
     let below = [pos[0], pos[1] - 1, pos[2]];
-    let source = (game.native_block_property(below, "level").as_deref() == Some("0"))
-        .then(|| isotopes::pumped(block_name(game, below), u.filter > 0))
-        .flatten();
+    // `suck`: the block under the pump first, then the fluid it is part of out to `pump.range` blocks (the
+    // original shuffles its remembered nodes; this takes the nearest source).
+    let fluid_here = block_name(game, below).to_string();
+    let mut found = pump_source(game, below, &fluid_here, u.filter > 0);
+    if found.is_none() && isotopes::pumped(&fluid_here, false).is_some() {
+        found = pump_search(game, pos, below, &fluid_here, u.filter > 0);
+    }
     let mut progress = get_int(&entity.nbt, "progress");
     let mut active = false;
-    match source {
-        Some((fluid, amount)) if tank.accepts(fluid) && tank.amount + amount <= tank.capacity => {
+    match found {
+        Some((at, fluid, amount)) if tank.accepts(fluid) && tank.amount + amount <= tank.capacity => {
             if energy.consume(usage) {
                 active = true;
                 progress += 1;
                 if progress >= u.ticks(isotopes::PUMP_TICKS) {
                     progress = 0;
                     tank.insert(fluid, amount);
+                    // `isInfiniteSource`: water and lava are not used up while the source-conversion game rules are on
+                    // (assumed on: no game rule is readable by mods) unless `pumpInfiniteFluidSources` is set.
+                    if config_flag("general", "pump", "pumpInfiniteFluidSources", false) {
+                        game.native_set_block(at, "minecraft:air", &[]);
+                    }
                 }
             }
         }
@@ -17635,8 +17734,10 @@ fn tick_fuelwood_heater(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBloc
     let active = burn > 0;
     let mut heat = heater_heat(game, pos, &entity.nbt);
     if active {
-        burn -= 1;
-        heat.handle_heat(boiler::heat_per_fuel_tick());
+        // `fuelwoodTickMultiplier`: the heater burns that many ticks of fuel (at most what is left) in one.
+        let ticks = burn.min(config_int("general", "heater", "fuelwoodTickMultiplier", 1).max(1) as u32);
+        burn -= ticks;
+        heat.handle_heat(boiler::heat_per_fuel_tick() * f64::from(ticks));
     }
     put_int(&mut entity.nbt, "burn_time", burn);
     simulate_heater(game, pos, entity, heat);

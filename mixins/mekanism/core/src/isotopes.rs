@@ -13,8 +13,9 @@ pub const HEAVY_WATER_PER_BLOCK: u64 = 10;
 /// What the pump gets from a source block of `fluid`, with or without a filter upgrade.
 pub fn pumped(fluid: &str, filter: bool) -> Option<(&'static str, u64)> {
     match fluid {
-        "minecraft:water" if filter => Some((crate::chemical::HEAVY_WATER, HEAVY_WATER_PER_BLOCK)),
+        "minecraft:water" if filter => Some((crate::chemical::HEAVY_WATER, crate::config_files::active_int("general", "pump", "heavyWaterAmount", HEAVY_WATER_PER_BLOCK))),
         "minecraft:water" => Some(("minecraft:water", 1_000)),
+        "minecraft:lava" => Some(("minecraft:lava", 1_000)),
         _ => None,
     }
 }
@@ -39,7 +40,7 @@ pub fn activating(chemical: &str) -> Option<(u64, &'static str)> {
 /// sees the sun.
 pub fn activator_rate(sees_sun: bool, brightness: f64) -> u64 {
     if sees_sun {
-        (ACTIVATOR_PEAK * brightness.clamp(0.0, 1.0)) as u64
+        (crate::config_files::active_int("general", "", "maxSolarNeutronActivatorRate", ACTIVATOR_PEAK as u64) as f64 * brightness.clamp(0.0, 1.0)) as u64
     } else {
         0
     }
@@ -59,7 +60,7 @@ mod tests {
             pumped("minecraft:water", true),
             Some(("mekanism:heavy_water", 10))
         );
-        assert_eq!(pumped("minecraft:lava", true), None);
+        assert_eq!(pumped("minecraft:lava", true), Some(("minecraft:lava", 1_000)));
     }
 
     #[test]

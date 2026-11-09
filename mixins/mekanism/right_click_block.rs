@@ -10,6 +10,7 @@ fn on_right_click_block(game: &mut crate::game::Game<'_>, pos: [i32; 3], face: [
     if crate::game::mekanism::protect_security(game, pos) || crate::game::mekanism::configure_side(game, pos, face) || crate::game::mekanism::install_upgrade(game, pos)
         || crate::game::mekanism::fill_jetpack(game, pos)
         || crate::game::mekanism::use_fluid_tank(game, pos)
+        || crate::game::mekanism::use_waste_barrel(game, pos)
         || crate::game::mekanism::use_fission_port(game, pos)
         || crate::game::mekanism::show_turbine(game, pos)
         || crate::game::mekanism::use_fusion(game, pos)
