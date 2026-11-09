@@ -21596,7 +21596,7 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
         let w = [o[0] + 30.0, o[1] + 15.0, COLOR_WINDOW[0], COLOR_WINDOW[1]];
         robit_window_plate(game, batch, w, "Color Picker");
         let argb = c.argb();
-        let holder = |r: [f32; 4]| nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, r, 0xFFFF_FFFF);
+        let mut holder = |r: [f32; 4]| nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, r, 0xFFFF_FFFF);
         for r in [view_holder, shade_holder, hue_holder, alpha_holder] {
             holder(r);
         }
