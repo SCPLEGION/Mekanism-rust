@@ -4443,7 +4443,7 @@ fn miner_back(game: &Game<'_>, pos: [i32; 3]) -> [i32; 3] {
 fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
     let u = upgrades(&entity.nbt);
     let usage = miner_usage(&entity.nbt);
-    let delay_length = u.ticks(miner::TICKS_PER_MINE).max(1);
+    let delay_length = u.ticks(config_int("general", "digital_miner", "ticksPerMine", i64::from(miner::TICKS_PER_MINE)).clamp(1, i64::from(u32::MAX)) as u32).max(1);
     let region = miner_region(&entity.nbt);
     let mut energy = EnergyContainer::new(miner::STORAGE.max(usage), u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(energy.capacity);
@@ -6110,6 +6110,9 @@ fn sync_gear_config(game: &Game<'_>) {
         return;
     };
     sync_usage_config(&file.with_file_name("mekanism-usage.toml"));
+    if let Some(dir) = file.parent() {
+        sync_world_configs(dir);
+    }
     if GEAR_CONFIG.read().is_ok_and(|g| g.as_ref().is_some_and(|(f, _)| *f == file)) {
         return;
     }
@@ -6124,6 +6127,66 @@ fn sync_gear_config(game: &Game<'_>) {
     mekanism_core::config::set_active(&config);
     if let Ok(mut g) = GEAR_CONFIG.write() {
         *g = Some((file, config));
+    }
+}
+
+/// `StorageConfig`, `TierConfig`, `GeneralConfig` and `WorldConfig`, read from the world's `serverconfig/mekanism-*.toml`
+/// (each written with the defaults when missing).
+static WORLD_CONFIGS: std::sync::RwLock<Option<(std::path::PathBuf, Vec<mekanism_core::config_files::Config>)>> = std::sync::RwLock::new(None);
+
+/// A value of one of those files: `file` is its name (`machine-storage`, `tiers`, `general`, `world`).
+#[allow(dead_code)]
+fn config_value(file: &str, section: &str, key: &str) -> Option<mekanism_core::config_files::Value> {
+    let guard = WORLD_CONFIGS.read().ok()?;
+    let (_, configs) = guard.as_ref()?;
+    configs.iter().find(|c| c.file_name() == format!("mekanism-{file}.toml"))?.get(section, key).cloned()
+}
+
+/// An integer of those files, else `default` (before a world is open).
+#[allow(dead_code)]
+fn config_int(file: &str, section: &str, key: &str, default: i64) -> i64 {
+    match config_value(file, section, key) {
+        Some(mekanism_core::config_files::Value::Int(v)) => v,
+        _ => default,
+    }
+}
+
+#[allow(dead_code)]
+fn config_double(file: &str, section: &str, key: &str, default: f64) -> f64 {
+    match config_value(file, section, key) {
+        Some(mekanism_core::config_files::Value::Double(v)) => v,
+        _ => default,
+    }
+}
+
+#[allow(dead_code)]
+fn config_flag(file: &str, section: &str, key: &str, default: bool) -> bool {
+    match config_value(file, section, key) {
+        Some(mekanism_core::config_files::Value::Bool(v)) => v,
+        _ => default,
+    }
+}
+
+fn sync_world_configs(dir: &std::path::Path) {
+    if WORLD_CONFIGS.read().is_ok_and(|g| g.as_ref().is_some_and(|(d, _)| d == dir)) {
+        return;
+    }
+    let configs: Vec<_> = mekanism_core::config_files::all()
+        .into_iter()
+        .map(|spec| {
+            let file = dir.join(format!("mekanism-{}.toml", spec.name));
+            match std::fs::read_to_string(&file) {
+                Ok(text) => mekanism_core::config_files::Config::parse(spec, &text),
+                Err(_) => {
+                    let config = mekanism_core::config_files::Config::defaults(spec);
+                    let _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&file, config.to_toml()));
+                    config
+                }
+            }
+        })
+        .collect();
+    if let Ok(mut g) = WORLD_CONFIGS.write() {
+        *g = Some((dir.to_path_buf(), configs));
     }
 }
 
@@ -9712,7 +9775,7 @@ fn energy_capacity(entity: &ModBlockEntity) -> u64 {
         Some(Kind::FusionPort) => fusion::ENERGY_CAPACITY,
         Some(Kind::TurbineValve) => turbine_of(&entity.nbt).energy_capacity(),
         Some(Kind::InductionPort) => get_long(&entity.nbt, "capacity"),
-        Some(Kind::LaserAmplifier | Kind::TractorBeam) => laser::RECEPTOR_STORAGE,
+        Some(Kind::LaserAmplifier | Kind::TractorBeam) => receptor_storage(&entity.id),
         Some(Kind::FissionPort | Kind::BoilerValve | Kind::SpsPort | Kind::DynamicValve) => 0,
         _ => receiver(&entity.id, &entity.nbt, true, false).map_or(0, |r| r.0),
     }
@@ -16477,14 +16540,25 @@ fn beam_passes(name: &str) -> bool {
     )
 }
 
+/// `StorageConfig.laserAmplifier` / `laserTractorBeam`: what an amplifier or tractor beam holds.
+fn receptor_storage(id: &str) -> u64 {
+    let key = if id == laser::TRACTOR_BEAM { "laserTractorBeam" } else { "laserAmplifier" };
+    config_int("machine-storage", "", key, laser::RECEPTOR_STORAGE as i64).max(1) as u64
+}
+
+/// `GeneralConfig.laserRange`.
+fn laser_range() -> i32 {
+    config_int("general", "laser", "range", i64::from(laser::RANGE)).clamp(1, 1_024) as i32
+}
+
 /// A laser, amplifier or tractor beam's tick (`TileEntityBasicLaser.onUpdateServer`): it fires what it
 /// can along its facing, up to 64 blocks. The beam's energy goes into an amplifier or tractor beam it
 /// meets, or digs into the block it meets until that breaks; a tractor beam keeps the drops.
 fn tick_laser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = if entity.id == laser::LASER { (4 * usage_const("laser", laser::LASER_USAGE)) } else { laser::RECEPTOR_STORAGE };
+    let capacity = if entity.id == laser::LASER { 4 * usage_const("laser", laser::LASER_USAGE) } else { receptor_storage(&entity.id) };
     let stored = get_long(&entity.nbt, "energy").min(capacity);
     let max = match get_long(&entity.nbt, "max_threshold") {
-        0 => laser::RECEPTOR_STORAGE,
+        0 => receptor_storage(&entity.id),
         n => n,
     };
     let firing = laser::to_fire(&entity.id, stored, get_long(&entity.nbt, "min_threshold"), max);
@@ -16495,12 +16569,12 @@ fn tick_laser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
         return Some(false);
     };
     put_long(&mut entity.nbt, "energy", stored - firing);
-    let hit = (1..=laser::RANGE).map(|k| [pos[0] + d[0] * k, pos[1] + d[1] * k, pos[2] + d[2] * k]).find(|&at| {
+    let hit = (1..=laser_range()).map(|k| [pos[0] + d[0] * k, pos[1] + d[1] * k, pos[2] + d[2] * k]).find(|&at| {
         let state = game.world.block(at[0], at[1], at[2]);
         !beam_passes(&game.res.facts().get(state).name)
     });
     // The beam reaches the face of the block it hits, or its full range.
-    let length = hit.map_or(f64::from(laser::RANGE), |at| {
+    let length = hit.map_or(f64::from(laser_range()), |at| {
         let k = (0..3).map(|i| (at[i] - pos[i]) * d[i]).sum::<i32>();
         f64::from(k) - 1.002
     });
@@ -16529,7 +16603,7 @@ fn tick_laser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
     if laser::is_receptor(&name) {
         game.native_with_mod_block_entity(at, |m| {
             let e = get_long(&m.nbt, "energy");
-            put_long(&mut m.nbt, "energy", e.saturating_add(firing).min(laser::RECEPTOR_STORAGE));
+            put_long(&mut m.nbt, "energy", e.saturating_add(firing).min(receptor_storage(&m.id)));
         });
         return Some(true);
     }
