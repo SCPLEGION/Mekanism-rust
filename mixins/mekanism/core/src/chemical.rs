@@ -167,6 +167,18 @@ pub fn separate(
 
 /// `ChemicalTankTier`: (capacity, output rate) in mB.
 pub fn chemical_tank(tier: crate::tier::BaseTier) -> (u64, u64) {
+    let (capacity, output) = chemical_tank_default(tier);
+    if tier == crate::tier::BaseTier::Creative {
+        return (capacity, output);
+    }
+    let name = tier.name();
+    (
+        crate::config_files::active_int("tiers", "chemical_tanks", &format!("{name}Capacity"), capacity),
+        crate::config_files::active_int("tiers", "chemical_tanks", &format!("{name}Output"), output),
+    )
+}
+
+fn chemical_tank_default(tier: crate::tier::BaseTier) -> (u64, u64) {
     use crate::tier::BaseTier::*;
     match tier {
         Basic => (64_000, 1_000),

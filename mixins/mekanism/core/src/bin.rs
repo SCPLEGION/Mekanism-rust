@@ -15,13 +15,14 @@ pub const DOUBLE_CLICK_TICKS: u32 = 5;
 
 /// `BinTier`: how many items a bin holds.
 pub fn capacity(tier: BaseTier) -> u64 {
-    match tier {
+    let default = match tier {
         BaseTier::Basic => 4_096,
         BaseTier::Advanced => 8_192,
         BaseTier::Elite => 32_768,
         BaseTier::Ultimate => 262_144,
         BaseTier::Creative => i64::MAX as u64,
-    }
+    };
+    crate::config_files::active_int("tiers", "bins", &format!("{}Capacity", tier.name()), default)
 }
 
 /// The bin of a block id (`mekanism:elite_bin`).

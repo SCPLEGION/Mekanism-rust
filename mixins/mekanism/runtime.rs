@@ -3043,7 +3043,7 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
             Kind::Rotary if chem::rotary_chemical(chemical).is_some() => Some(("fluid", chem::ROTARY_TANK)),
             Kind::Washer if chemical == "minecraft:water" => Some(("fluid", nuclear::WASHER_TANK)),
             Kind::Reaction if chemical == "minecraft:water" => Some(("fluid", REACTION_TANK)),
-            Kind::Entangloporter if qe_takes(nbt, "fluid", chemical) => Some(("fluid_in", qe::FLUID_BUFFER)),
+            Kind::Entangloporter if qe_takes(nbt, "fluid", chemical) => Some(("fluid_in", qe::fluid_buffer())),
             Kind::Plenisher
                 if plenisher::placeable(chemical).is_some()
                     && get_tank(nbt, "fluid", plenisher::PLENISHER_TANK).accepts(chemical) =>
@@ -3102,7 +3102,7 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
             Some(("input", REACTION_TANK))
         }
         Kind::DynamicValve if valve_takes(nbt, chemical) => Some(("buffer", dynamic_tank::VALVE_BUFFER)),
-        Kind::Entangloporter if qe_takes(nbt, "chemical", chemical) => Some(("chemical_in", qe::CHEMICAL_BUFFER)),
+        Kind::Entangloporter if qe_takes(nbt, "chemical", chemical) => Some(("chemical_in", qe::chemical_buffer())),
         _ => None,
     }
 }
@@ -4374,7 +4374,8 @@ fn put_miner_filters(nbt: &mut Compound, filters: &[miner::Filter]) {
 /// What the miner uses a tick: the upgrades' usage, times silk touch's multiplier and the region's cost.
 fn miner_usage(nbt: &Compound) -> u64 {
     let base = upgrades(nbt).energy_per_tick(usage_const("digitalMiner", miner::ENERGY_USAGE));
-    miner_region(nbt).energy_per_tick(base, get_int(nbt, "silk") == 1)
+    let silk = (get_int(nbt, "silk") == 1).then(|| config_int("general", "digital_miner", "silkMultiplier", miner::SILK_MULTIPLIER as i64).max(1) as u64);
+    miner_region(nbt).energy_per_tick(base, silk)
 }
 
 fn miner_found(nbt: &Compound) -> Vec<i32> {
@@ -5913,7 +5914,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Chargepad => Some((usage_const("chargePad", chargepad::CHARGE_RATE) * chargepad::CHECK_TICKS, u64::MAX)),
         // What it took in waits in its own buffer until its tick moves it into the frequency's.
         Kind::Entangloporter if nbt.contains_key(&JavaString::from("frequency")) => {
-            Some((get_long(nbt, "energy") + qe::ENERGY_BUFFER.saturating_sub(get_long(nbt, "shared_energy")), u64::MAX))
+            Some((get_long(nbt, "energy") + qe::energy_buffer().saturating_sub(get_long(nbt, "shared_energy")), u64::MAX))
         }
         Kind::ChemicalInfuser => Some((machine::STORAGE_MULTIPLIER * usage_const("chemicalInfuser", chem::CHEMICAL_INFUSER_USAGE), u64::MAX)),
         Kind::Rotary => Some((machine::STORAGE_MULTIPLIER * usage_const("rotaryCondensentrator", chem::ROTARY_USAGE), u64::MAX)),
@@ -6185,6 +6186,7 @@ fn sync_world_configs(dir: &std::path::Path) {
             }
         })
         .collect();
+    mekanism_core::config_files::set_active(configs.clone());
     if let Ok(mut g) = WORLD_CONFIGS.write() {
         *g = Some((dir.to_path_buf(), configs));
     }
@@ -8668,8 +8670,8 @@ fn qe_frequency(nbt: &Compound) -> Option<String> {
 /// frequency, whose tank is empty or holds it, and its own buffer does too.
 fn qe_takes(nbt: &Compound, kind: &str, chemical: &str) -> bool {
     let (shared, inbox, cap) = match kind {
-        "fluid" => ("shared_fluid", "fluid_in", qe::FLUID_BUFFER),
-        _ => ("shared_chemical", "chemical_in", qe::CHEMICAL_BUFFER),
+        "fluid" => ("shared_fluid", "fluid_in", qe::fluid_buffer()),
+        _ => ("shared_chemical", "chemical_in", qe::chemical_buffer()),
     };
     qe_frequency(nbt).is_some() && get_tank(nbt, shared, cap).accepts(chemical) && get_tank(nbt, inbox, cap).accepts(chemical)
 }
@@ -8681,18 +8683,18 @@ fn tick_entangloporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlock
         return Some(false);
     };
     let saved = || Frequency {
-        energy: get_long(&entity.nbt, "shared_energy").min(qe::ENERGY_BUFFER),
-        fluid: get_tank(&entity.nbt, "shared_fluid", qe::FLUID_BUFFER),
-        chemical: get_tank(&entity.nbt, "shared_chemical", qe::CHEMICAL_BUFFER),
+        energy: get_long(&entity.nbt, "shared_energy").min(qe::energy_buffer()),
+        fluid: get_tank(&entity.nbt, "shared_fluid", qe::fluid_buffer()),
+        chemical: get_tank(&entity.nbt, "shared_chemical", qe::chemical_buffer()),
         heat: get_double(&entity.nbt, "shared_heat").unwrap_or(mekanism_core::heat::AMBIENT_TEMP),
     };
     let mut freq = FREQUENCIES.lock().ok()?.entry(name.clone()).or_insert_with(saved).clone();
     let mut energy = get_long(&entity.nbt, "energy");
-    let mut fluid = get_tank(&entity.nbt, "fluid_in", qe::FLUID_BUFFER);
-    let mut chemical = get_tank(&entity.nbt, "chemical_in", qe::CHEMICAL_BUFFER);
+    let mut fluid = get_tank(&entity.nbt, "fluid_in", qe::fluid_buffer());
+    let mut chemical = get_tank(&entity.nbt, "chemical_in", qe::chemical_buffer());
     freq.absorb(&mut energy, &mut fluid, &mut chemical);
     if let Some(front) = game.native_block_property(pos, "facing").and_then(|f| direction(&f)) {
-        let mut out = EnergyContainer::new(qe::ENERGY_BUFFER, u64::MAX);
+        let mut out = EnergyContainer::new(qe::energy_buffer(), u64::MAX);
         out.stored = freq.energy;
         push_energy(game, pos, &mut out, Some(front), false);
         freq.energy = out.stored;

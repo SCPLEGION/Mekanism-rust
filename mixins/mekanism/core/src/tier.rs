@@ -43,6 +43,20 @@ impl BaseTier {
 
 /// `EnergyCubeTier`: capacity (FE) and output rate (FE/t) per tier.
 pub fn energy_cube(tier: BaseTier) -> (u64, u64) {
+    let (capacity, output) = energy_cube_default(tier);
+    let name = tier.name();
+    (
+        active("tiers", "energy_cubes", &format!("{name}Capacity"), capacity),
+        active("tiers", "energy_cubes", &format!("{name}Output"), output),
+    )
+}
+
+/// `TierConfig`'s value of `key` (`tiers`, `machine-storage`, ...) in the open world, else the original's default.
+fn active(file: &str, section: &str, key: &str, default: u64) -> u64 {
+    crate::config_files::active_int(file, section, key, default)
+}
+
+fn energy_cube_default(tier: BaseTier) -> (u64, u64) {
     match tier {
         BaseTier::Basic => (4_000_000, 4_000),
         BaseTier::Advanced => (16_000_000, 16_000),
@@ -72,13 +86,14 @@ mod tests {
 
 /// `CableTier`: what a universal cable of each tier carries in a tick (FE).
 pub fn universal_cable(tier: BaseTier) -> Option<u64> {
-    match tier {
-        BaseTier::Basic => Some(8_000),
-        BaseTier::Advanced => Some(128_000),
-        BaseTier::Elite => Some(1_024_000),
-        BaseTier::Ultimate => Some(8_192_000),
-        BaseTier::Creative => None,
-    }
+    let default = match tier {
+        BaseTier::Basic => 8_000,
+        BaseTier::Advanced => 128_000,
+        BaseTier::Elite => 1_024_000,
+        BaseTier::Ultimate => 8_192_000,
+        BaseTier::Creative => return None,
+    };
+    Some(active("tiers", "transmitters.energy", &format!("{}Capacity", tier.name()), default))
 }
 
 /// How much a cable holding `mine` hands a neighbouring cable holding `theirs`: half the difference,
@@ -90,17 +105,27 @@ pub fn cable_share(mine: u64, theirs: u64) -> u64 {
 /// `TubeTier`: a pressurized tube's transfer rate in mB a tick (750 to 256,000). A tube here holds one
 /// tick of it, the way a cable holds one tick of energy.
 pub fn pressurized_tube(tier: BaseTier) -> Option<u64> {
-    match tier {
-        BaseTier::Basic => Some(750),
-        BaseTier::Advanced => Some(2_000),
-        BaseTier::Elite => Some(64_000),
-        BaseTier::Ultimate => Some(256_000),
-        BaseTier::Creative => None,
-    }
+    let default = match tier {
+        BaseTier::Basic => 750,
+        BaseTier::Advanced => 2_000,
+        BaseTier::Elite => 64_000,
+        BaseTier::Ultimate => 256_000,
+        BaseTier::Creative => return None,
+    };
+    Some(active("tiers", "transmitters.chemical", &format!("{}PullAmount", tier.name()), default))
 }
 
 /// `FluidTankTier`: a fluid tank's capacity and the mB a tick it gives out of its bottom.
 pub fn fluid_tank(tier: BaseTier) -> (u64, u64) {
+    let (capacity, output) = fluid_tank_default(tier);
+    let name = tier.name();
+    (
+        active("tiers", "fluid_tanks", &format!("{name}Capacity"), capacity),
+        active("tiers", "fluid_tanks", &format!("{name}Output"), output),
+    )
+}
+
+fn fluid_tank_default(tier: BaseTier) -> (u64, u64) {
     match tier {
         BaseTier::Basic => (32_000, 1_000),
         BaseTier::Advanced => (64_000, 4_000),
@@ -113,24 +138,26 @@ pub fn fluid_tank(tier: BaseTier) -> (u64, u64) {
 /// `PipeTier`: the mB a mechanical pipe pulls in a tick (250 to 32,000). A pipe here holds one tick of
 /// it, as a pressurized tube does.
 pub fn mechanical_pipe(tier: BaseTier) -> Option<u64> {
-    match tier {
-        BaseTier::Basic => Some(250),
-        BaseTier::Advanced => Some(1_000),
-        BaseTier::Elite => Some(8_000),
-        BaseTier::Ultimate => Some(32_000),
-        BaseTier::Creative => None,
-    }
+    let default = match tier {
+        BaseTier::Basic => 250,
+        BaseTier::Advanced => 1_000,
+        BaseTier::Elite => 8_000,
+        BaseTier::Ultimate => 32_000,
+        BaseTier::Creative => return None,
+    };
+    Some(active("tiers", "transmitters.fluid", &format!("{}PullAmount", tier.name()), default))
 }
 
 /// `TransporterTier`: items a logistical transporter pulls at a time (1, 16, 32, 64).
 pub fn transporter_pull(tier: BaseTier) -> Option<u32> {
-    match tier {
-        BaseTier::Basic => Some(1),
-        BaseTier::Advanced => Some(16),
-        BaseTier::Elite => Some(32),
-        BaseTier::Ultimate => Some(64),
-        BaseTier::Creative => None,
-    }
+    let default = match tier {
+        BaseTier::Basic => 1u32,
+        BaseTier::Advanced => 16,
+        BaseTier::Elite => 32,
+        BaseTier::Ultimate => 64,
+        BaseTier::Creative => return None,
+    };
+    Some(active("tiers", "transmitters.items", &format!("{}PullAmount", tier.name()), u64::from(default)).min(u64::from(u32::MAX)) as u32)
 }
 
 #[cfg(test)]
