@@ -7717,7 +7717,7 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     }
     if game.native_on(MOD_ID) {
         match channel {
-            BREATHING_CHANNEL => return mekasuit_breathe(game),
+            BREATHING_CHANNEL => return mekasuit_breathe(game, data.first().copied().unwrap_or(1)),
             CHARGE_CHANNEL => return mekasuit_distribute(game),
             SOLAR_CHANNEL => return mekasuit_solar(game),
             _ => {}
@@ -8015,6 +8015,14 @@ pub(super) fn player_damage_rules(game: &mut Game<'_>, absorbed: f32, rules: &mu
 pub(super) fn gear_attributes(game: &mut Game<'_>, attributes: &mut Vec<(String, String, f64, String)>) {
     if !game.native_on(MOD_ID) {
         return;
+    }
+    // `SoulSurferUnit.adjustAttributes`: movement efficiency of a third for each unit on the feet, one at most.
+    if let Some(feet) = game.armor[3].as_ref().filter(|s| modules::is_container(&s.item)) {
+        let surfers = installed_modules(feet).get("mekanism:soul_surfer_unit").copied().unwrap_or(0);
+        if surfers > 0 && module_on(feet, "mekanism:soul_surfer_unit") {
+            let amount = f64::from((0.333_333_34_f32 * surfers as f32).min(1.0));
+            attributes.push(("minecraft:movement_efficiency".to_owned(), "mekanism:movement_efficiency".to_owned(), amount, "add_value".to_owned()));
+        }
     }
     let Some(legs) = game.armor[2].as_ref().filter(|s| modules::is_container(&s.item)) else {
         return;
@@ -16303,7 +16311,7 @@ pub(super) fn meka_tool_area(game: &mut Game<'_>, pos: [i32; 3]) {
         let blast = module_choice(s, "mekanism:blasting_unit", "blast_radius");
         // `ModuleVeinMiningUnit`: the excavation range only counts in extended mode.
         let vein = "mekanism:vein_mining_unit";
-        let extended = module_choice(s, vein, "extended_mode") == Some(1);
+        let extended = mekanism_core::config::gear_flag("mekatool.extendedMining", true) && module_choice(s, vein, "extended_mode") == Some(1);
         let range = if extended { [0, 2, 4, 6, 8][module_choice(s, vein, "mining_range").unwrap_or(1).min(4)] } else { 0 };
         (installed, efficiency, blast, range)
     }) else {
@@ -16411,11 +16419,26 @@ fn worn_module(game: &Game<'_>, slot: usize, item: &str, module: &str) -> bool {
     game.armor[slot].as_ref().is_some_and(|s| &*s.item == item && modules_of(s).contains_key(module))
 }
 
+/// `Entity.isInRain`: rain at the player's feet with the sky open above (the biome has to rain).
+fn is_in_rain(game: &Game<'_>) -> bool {
+    let Some(p) = game.player.as_ref() else {
+        return false;
+    };
+    let pos = [p.position.x.floor() as i32, p.position.y.floor() as i32, p.position.z.floor() as i32];
+    let (rain, _) = game.world.weather.levels(1.0);
+    rain > 0.2 && overworld(game) && can_see_sky(game, pos)
+}
+
 fn mekasuit_client(game: &mut Game<'_>) {
     let tick = SUIT_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let short_of_air = game.player.as_ref().is_some_and(|p| p.air < MAX_AIR);
-    if short_of_air && worn_module(game, 0, modules::HELMET, "mekanism:electrolytic_breathing_unit") {
-        game.native_send_to_server(BREATHING_CHANNEL, &[1]);
+    // `ModuleElectrolyticBreathingUnit.tickServer`: full rate with the mask in water, half in the rain; the hydrogen is
+    // made even while the air is full.
+    if worn_module(game, 0, modules::HELMET, "mekanism:electrolytic_breathing_unit") {
+        let water = game.player.as_ref().is_some_and(|p| p.fluids.was_eye_in_water);
+        let rain = !water && is_in_rain(game);
+        if water || rain {
+            game.native_send_to_server(BREATHING_CHANNEL, &[if water { 1 } else { 2 }]);
+        }
     }
     if tick % 20 != 0 {
         return;
@@ -16430,17 +16453,26 @@ fn mekasuit_client(game: &mut Game<'_>) {
 
 /// `ModuleElectrolyticBreathingUnit.tickServer`, under water: air for energy, and the hydrogen into a
 /// jetpack on the chest.
-fn mekasuit_breathe(game: &mut Game<'_>) {
+fn mekasuit_breathe(game: &mut Game<'_>, kind: u8) {
     let Some(helmet) = game.armor[0].as_ref().filter(|s| &*s.item == modules::HELMET) else {
         return;
     };
-    let rate = modules::breathing_rate(&modules_of(helmet));
+    let mut rate = modules::breathing_rate(&modules_of(helmet));
+    // In the rain, not in water, the production is half.
+    if kind == 2 {
+        rate /= 2;
+    }
+    // `module.getEnergyRateLimit`: no more than the energy pays for.
     let stored = stored_energy(helmet);
+    let rate = rate.min((stored / modules::BREATHING_USAGE) as u32);
+    let fill_held = module_choice(helmet, "mekanism:electrolytic_breathing_unit", "breathing.held") != Some(0);
     let Some(air) = game.player.as_ref().map(|p| p.air) else {
         return;
     };
-    let room = game.armor[1].as_ref().filter(|s| is_jetpack(s)).map_or(0, |c| jetpack_capacity(c) - jetpack_fuel(c));
-    let (oxygen, hydrogen, cost) = modules::breathe(rate, (MAX_AIR - air).max(0) as u32, room);
+    let chest_room = game.armor[1].as_ref().filter(|s| is_jetpack(s)).map_or(0, |c| jetpack_capacity(c) - jetpack_fuel(c));
+    // `fillHeld`: what the chest does not take goes into a jetpack in the hand.
+    let held_room = if fill_held { game.held().filter(|s| is_jetpack(s)).map_or(0, |h| jetpack_capacity(h) - jetpack_fuel(h)) } else { 0 };
+    let (oxygen, hydrogen, cost) = modules::breathe(rate, (MAX_AIR - air).max(0) as u32, chest_room + held_room);
     if rate == 0 || cost == 0 || stored < cost {
         return;
     }
@@ -16450,11 +16482,18 @@ fn mekasuit_breathe(game: &mut Game<'_>) {
     if let Some(p) = game.player.as_mut() {
         p.air = (p.air + oxygen as i32).min(MAX_AIR);
     }
-    if hydrogen > 0
+    let to_chest = hydrogen.min(chest_room);
+    if to_chest > 0
         && let Some(chest) = game.armor[1].as_mut()
     {
         let fuel = jetpack_fuel(chest);
-        set_jetpack_fuel(chest, fuel + hydrogen);
+        set_jetpack_fuel(chest, fuel + to_chest);
+    }
+    if hydrogen > to_chest
+        && let Some(held) = game.held_mut().as_mut().filter(|s| is_jetpack(s))
+    {
+        let fuel = jetpack_fuel(held);
+        set_jetpack_fuel(held, fuel + (hydrogen - to_chest));
     }
 }
 
@@ -22277,7 +22316,7 @@ fn module_choice(stack: &ItemStack, module: &str, key: &str) -> Option<usize> {
 }
 
 /// The Meka-Tool's efficiency with the mode its Excavation Escalation Unit is set to.
-fn tool_efficiency_of(stack: &ItemStack, installed: &modules::Installed) -> u64 {
+fn tool_efficiency_of(stack: &ItemStack, installed: &modules::Installed) -> f32 {
     modules::tool_efficiency(installed, module_choice(stack, "mekanism:excavation_escalation_unit", "excavation_mode"))
 }
 
@@ -25754,7 +25793,7 @@ fn gravitational_boost_paid(game: &mut Game<'_>) {
     let stored = stored_energy(chest);
     if stored >= extra && gravitational_boost(chest) > 0.0 {
         set_energy(chest, stored - extra);
-        player_game_event(game, "mekanism:gravity_modulate_boosted");
+        gravitational_event(game, "mekanism:gravity_modulate_boosted");
     }
 }
 
@@ -25911,8 +25950,15 @@ fn gravitational_upkeep(g: &mut Game<'_>) {
         let stored = stored_energy(chest);
         if stored >= gravitational_energy() {
             set_energy(chest, stored - gravitational_energy());
-            player_game_event(g, "mekanism:gravity_modulate");
+            gravitational_event(g, "mekanism:gravity_modulate");
         }
+    }
+}
+
+/// `ModuleGravitationalModulatingUnit.gravUnitGameEvent`: the vibration, every half second, if the config allows it.
+fn gravitational_event(g: &mut Game<'_>, event: &'static str) {
+    if mekanism_core::config::gear_flag("mekasuit.gravitationalVibrations", true) && g.ticks % 10 == 0 {
+        player_game_event(g, event);
     }
 }
 

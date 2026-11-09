@@ -21,6 +21,26 @@ pub struct GearConfig {
     pub ints: std::collections::BTreeMap<String, u64>,
     /// The damage reduction ratios by `section.key` (`GEAR_RATIOS`), each 0 to 1.
     pub ratios: std::collections::BTreeMap<String, f64>,
+    /// The switches by `section.key` (`GEAR_FLAGS`).
+    pub flags: std::collections::BTreeMap<String, bool>,
+    /// The decimals by `section.key` (`GEAR_DOUBLES`).
+    pub doubles: std::collections::BTreeMap<String, f64>,
+}
+
+/// The gear switches: (section, key, default).
+pub const GEAR_FLAGS: [(&str, &str, bool); 2] = [("mekatool", "extendedMining", true), ("mekasuit", "gravitationalVibrations", true)];
+
+/// The gear decimals: (section, key, default, min, max).
+pub const GEAR_DOUBLES: [(&str, &str, f64, f64, f64); 2] = [("mekatool", "baseEfficiency", 4.0, 0.1, 100.0), ("mekatool", "attackSpeed", -2.4, -4.0, 100.0)];
+
+/// A gear switch of the active config (`"mekatool.extendedMining"`), else `default`.
+pub fn gear_flag(full_key: &str, default: bool) -> bool {
+    ACTIVE.read().ok().and_then(|a| a.as_ref().and_then(|c| c.flags.get(full_key).copied())).unwrap_or(default)
+}
+
+/// A gear decimal of the active config (`"mekatool.baseEfficiency"`), else `default`.
+pub fn gear_double(full_key: &str, default: f64) -> f64 {
+    ACTIVE.read().ok().and_then(|a| a.as_ref().and_then(|c| c.doubles.get(full_key).copied())).unwrap_or(default)
 }
 
 /// The damage reduction ratios (`defineInRange(key, 1.0, 0, 1)`): (section, key).
@@ -150,6 +170,8 @@ impl Default for GearConfig {
             energy: ENERGY_SECTIONS.iter().map(|(s, _, cap, rate)| (*s, (*cap, *rate))).collect(),
             ratios: GEAR_RATIOS.iter().map(|(s, k)| (int_key(s, k), 1.0)).collect(),
             ints: GEAR_INTS.iter().map(|(s, k, d)| (int_key(s, k), *d)).collect(),
+            flags: GEAR_FLAGS.iter().map(|(s, k, d)| (int_key(s, k), *d)).collect(),
+            doubles: GEAR_DOUBLES.iter().map(|(s, k, d, ..)| (int_key(s, k), *d)).collect(),
         }
     }
 }
@@ -185,6 +207,19 @@ impl GearConfig {
             if let Some(r) = value.parse::<f64>().ok().filter(|r| (0.0..=1.0).contains(r)) {
                 if let Some(v) = config.ratios.get_mut(int_key(&section, key).as_str()) {
                     *v = r;
+                }
+            }
+            if let Some(b) = value.parse::<bool>().ok() {
+                if let Some(v) = config.flags.get_mut(int_key(&section, key).as_str()) {
+                    *v = b;
+                }
+            }
+            if let Some(d) = value.parse::<f64>().ok() {
+                if let Some((.., min, max)) = GEAR_DOUBLES.iter().find(|(s, k, ..)| *s == section && *k == key)
+                    && (*min..=*max).contains(&d)
+                    && let Some(v) = config.doubles.get_mut(int_key(&section, key).as_str())
+                {
+                    *v = d;
                 }
             }
             if let Some(n) = value.replace('_', "").parse::<u64>().ok().filter(|n| *n <= i32::MAX as u64) {
@@ -253,6 +288,12 @@ impl GearConfig {
         }
         for (sec, key) in GEAR_RATIOS {
             out.push_str(&format!("[{sec}]\n{key} = {:?}\n", self.ratios[int_key(sec, key).as_str()]));
+        }
+        for (sec, key, _) in GEAR_FLAGS {
+            out.push_str(&format!("[{sec}]\n{key} = {}\n", self.flags[int_key(sec, key).as_str()]));
+        }
+        for (sec, key, ..) in GEAR_DOUBLES {
+            out.push_str(&format!("[{sec}]\n{key} = {:?}\n", self.doubles[int_key(sec, key).as_str()]));
         }
         for (name, cap_key, _, _) in ENERGY_SECTIONS {
             if name == SECTION {
