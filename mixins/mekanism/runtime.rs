@@ -605,6 +605,16 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     if game.ticks % 20 == 0 {
         radiation_holder(game, pos, &entity.nbt);
     }
+    // The side configuration the Configurator's overlay shows to the clients (`ConfiguratorOverlayHandler`).
+    let configurable: Vec<Transmission> = transmissions(&entity.id).to_vec();
+    if !configurable.is_empty() {
+        let mut shown = Compound::new();
+        for t in &configurable {
+            put_long(&mut shown, t.key(), get_long(&entity.nbt, t.key()));
+        }
+        let keys: Vec<&str> = configurable.iter().map(|t| t.key()).collect();
+        put_client(game, pos, entity, &keys, shown);
+    }
     // A type whose auto-eject is off gives out through no face (the window's eject button): as if
     // every face were Input (0b10 each), which `gives_out` reads.
     let no_eject = get_int(&entity.nbt, "no_eject");
@@ -2075,6 +2085,68 @@ fn big_tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWo
 
 /// `RenderSPS` (hook point `native_world_quads`, API 45): a bolt from the face of each coil that is lit to the
 /// middle, flashes to the casing while energy comes in, the core's billboard and the specks circling it.
+/// `ConfiguratorOverlayHandler`: with a Configurator set to a transmission in hand, the face looked at on a block that
+/// configures it shows the transmission's overlay in its side's data-type colour (`0.6` opaque).
+fn configurator_overlay(game: &Game<'_>, quads: &mut Vec<super::native_hooks::NativeWorldQuad>) {
+    let main = game.inventory.get(game.selected).cloned().flatten();
+    let stack = match main {
+        Some(s) if &*s.item == CONFIGURATOR => s,
+        _ => match game.offhand.clone() {
+            Some(s) if &*s.item == CONFIGURATOR => s,
+            _ => return,
+        },
+    };
+    let side_config::ConfMode::Configure(t) = configurator_conf(&stack) else {
+        return;
+    };
+    let (Some(eye), Some(player)) = (game.native_eye(), game.player.as_ref()) else {
+        return;
+    };
+    let (yaw, pitch) = (f64::from(player.yaw).to_radians(), f64::from(player.pitch).to_radians());
+    let look = [-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos()];
+    let reach = 4.5;
+    let Some((_, block, face)) = game.native_clip(eye, [0, 1, 2].map(|i| eye[i] + look[i] * reach)) else {
+        return;
+    };
+    let Some((id, client)) = game.native_client_block_entity(block) else {
+        return;
+    };
+    if !transmissions(id).contains(&t) || !client.contains_key(&JavaString::from(t.key())) {
+        return;
+    }
+    let mode = sides_of(client, t).get(face_index(face));
+    let argb = 0x9900_0000 | mode.data_type().1;
+    let name = match t {
+        Transmission::Item => "items",
+        Transmission::Chemical => "chemicals",
+        Transmission::Energy => "energy",
+        Transmission::Fluid => "fluids",
+        Transmission::Heat => "heat",
+    };
+    let base = [f64::from(block[0]), f64::from(block[1]), f64::from(block[2])];
+    // The face's two axes: the one the normal lies on is fixed at the near edge plus a hair.
+    let axis = face.iter().position(|v| *v != 0).unwrap_or(1);
+    let (ua, va) = match axis {
+        0 => (2, 1),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+    let fixed = if face[axis] > 0 { 1.01 } else { -0.01 };
+    let corner = |u: f64, v: f64| {
+        let mut c = [base[0] + 0.5, base[1] + 0.5, base[2] + 0.5];
+        c[axis] = base[axis] + fixed;
+        c[ua] = base[ua] + u;
+        c[va] = base[va] + v;
+        c
+    };
+    quads.push(super::native_hooks::NativeWorldQuad {
+        corners: [corner(0.0, 0.0), corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0)],
+        color: argb,
+        sprite: Some(format!("mekanism:gui/overlay_{name}")),
+        uv: [0.0, 0.0, 1.0, 1.0],
+    });
+}
+
 pub(super) fn world_quads(game: &Game<'_>, quads: &mut Vec<super::native_hooks::NativeWorldQuad>) {
     let ticks = game.ticks as u64;
     let now = bolt::Timestamp { ticks: ticks as i64, partial: game.clock.fraction() as f32 };
@@ -2083,6 +2155,7 @@ pub(super) fn world_quads(game: &Game<'_>, quads: &mut Vec<super::native_hooks::
     let (right, up) = (right.map(|v| v as f32), up.map(|v| v as f32));
     let corner = |c: [f32; 3], x: f32, y: f32| -> [f64; 3] { std::array::from_fn(|k| f64::from(c[k] + right[k] * x + up[k] * y)) };
     laser_beam_quads(ticks, quads);
+    configurator_overlay(game, quads);
     MAGNETIC_NOW.with(|n| n.set(now));
     magnetic_bolt_quads(now, quads);
     radiation_quads(right, up, quads);
@@ -6990,6 +7063,9 @@ pub(super) fn item_bars(game: &Game<'_>, stack: &ItemStack, bar: &mut Option<(i3
     }
     if suit_tank {
         extra.push((12, width(jetpack_fuel(stack), jetpack_capacity(stack)), color_of(item_chemical(stack))));
+    } else if &*stack.item == modules::HELMET && modules_of(stack).contains_key(NUTRITION_UNIT) {
+        // The helmet's fluid tank (nutritional paste): the bar `MekaSuitBarDecorator` draws for a tank of the piece.
+        extra.push((12, width(suit_paste(stack), SUIT_PASTE_CAPACITY), color_of(chem::NUTRITIONAL_PASTE)));
     }
 }
 

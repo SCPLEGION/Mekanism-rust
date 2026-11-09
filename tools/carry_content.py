@@ -723,7 +723,14 @@ def sps_textures(ns, out, search):
     beam = SRC / "main/resources/assets/mekanism/textures/particle/laser.png"
     if ns == "mekanism" and beam.is_file():
         shutil.copyfile(beam, dst / "laser_beam.png")
-    return 19
+    # The Configurator's overlays (`MekanismRenderer.overlays`) on the face looked at.
+    overlays = 0
+    for name in ("energy", "items", "fluids", "chemicals", "heat"):
+        overlay = SRC / f"main/resources/assets/mekanism/textures/block/overlay/{name}_overlay.png"
+        if overlay.is_file():
+            shutil.copyfile(overlay, dst / f"overlay_{name}.png")
+            overlays += 1
+    return 19 + overlays
 
 
 def sound_files(ns, out):
