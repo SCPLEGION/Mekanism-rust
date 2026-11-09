@@ -17308,6 +17308,27 @@ fn laser_range() -> i32 {
 /// can along its facing, up to 64 blocks. The beam's energy goes into an amplifier or tractor beam it
 /// meets, or digs into the block it meets until that breaks; a tractor beam keeps the drops.
 fn tick_laser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    put_int(&mut entity.nbt, "hit", 0);
+    let result = tick_laser_fire(game, pos, entity);
+    if entity.id == laser::AMPLIFIER {
+        // The output tab (`getRedstoneLevel`): Entity Detection gives 15 while the beam found something this tick
+        // (`emittingRedstone`), Energy Contents the fill level of the storage.
+        let level = match get_int(&entity.nbt, "omode") % 3 {
+            1 if get_int(&entity.nbt, "hit") > 0 => 15,
+            2 => {
+                let capacity = receptor_storage(&entity.id);
+                let fraction = if capacity == 0 { 0.0 } else { get_long(&entity.nbt, "energy") as f64 / capacity as f64 };
+                // `Mth.lerpDiscrete(fraction, 0, 15)`.
+                (fraction as f32 * 15.0).floor().clamp(0.0, 15.0) as i32
+            }
+            _ => 0,
+        };
+        game.native_set_block_signal(pos, level);
+    }
+    result
+}
+
+fn tick_laser_fire(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
     let capacity = if entity.id == laser::LASER { 4 * usage_const("laser", laser::LASER_USAGE) } else { receptor_storage(&entity.id) };
     let stored = get_long(&entity.nbt, "energy").min(capacity);
     let max = match get_long(&entity.nbt, "max_threshold") {
@@ -17398,7 +17419,11 @@ fn laser_hit_entities(game: &mut Game<'_>, entity: &mut ModBlockEntity, pos: [i3
     let (min, max) = laser::beam_box(pos, d, length);
     let from = pos.map(|c| f64::from(c) + 0.5);
     let mut left = firing;
-    for hit in game.native_entities_in(min, max, from) {
+    let found = game.native_entities_in(min, max, from);
+    if !found.is_empty() {
+        put_int(&mut entity.nbt, "hit", 1);
+    }
+    for hit in found {
         if hit.kind == "minecraft:item" {
             if entity.id == laser::TRACTOR_BEAM
                 && let Some(stack) = game.native_take_item_entity(hit.id)
