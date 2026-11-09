@@ -8,6 +8,8 @@ pub enum Kind {
     /// A choice among `options` (in order), starting at `default`; a bounded one offers only the first
     /// `installed + extra` of them (`ModuleEnumConfig.createBounded`).
     Enum { options: &'static [&'static str], default: usize, extra: Option<usize> },
+    /// An ARGB colour (`ModuleColorConfig.argb`), edited in the colour picker window.
+    Color(u32),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -60,7 +62,7 @@ const ATTRACT: &[&str] = &["0", "1", "3", "5", "10"];
 
 pub const MODULES: &[Data] = &[
     Data { no_disable: true, ..m("mekanism:energy_unit") },
-    Data { no_disable: true, ..m("mekanism:color_modulation_unit") },
+    Data { no_disable: true, options: &[Option_ { key: "color", label: "Color", kind: Kind::Color(0xFFFF_FFFF) }], ..m("mekanism:color_modulation_unit") },
     m("mekanism:laser_dissipation_unit"),
     m("mekanism:radiation_shielding_unit"),
     Data { handles_mode_change: true, renders_hud: true, options: &[e("excavation_mode", "Excavation Speed", SPEED, 2, Some(2))], ..m("mekanism:excavation_escalation_unit") },
@@ -155,6 +157,7 @@ pub fn choices(kind: Kind, installed: u32) -> usize {
         Kind::Enum { options, extra: Some(extra), .. } => options.len().min(installed as usize + extra),
         Kind::Enum { options, .. } => options.len(),
         Kind::Bool(_) => 2,
+        Kind::Color(_) => 1,
     }
 }
 
@@ -163,6 +166,8 @@ pub fn choices(kind: Kind, installed: u32) -> usize {
 pub fn parse(kind: Kind, stored: Option<&str>, installed: u32) -> u32 {
     match kind {
         Kind::Bool(d) => u32::from(stored.map_or(d, |s| s == "1")),
+        // The int the colour is stored as, signed as Java keeps it.
+        Kind::Color(d) => stored.and_then(|s| s.parse::<i32>().ok()).map_or(d, |v| v as u32),
         Kind::Enum { default, .. } => {
             let n = choices(kind, installed);
             stored.and_then(|s| s.parse::<usize>().ok()).filter(|v| *v < n).unwrap_or(default.min(n.saturating_sub(1))) as u32
@@ -174,6 +179,7 @@ pub fn parse(kind: Kind, stored: Option<&str>, installed: u32) -> u32 {
 pub fn encode(kind: Kind, value: u32) -> Option<String> {
     match kind {
         Kind::Bool(d) => (value != u32::from(d)).then(|| (if value == 1 { "1" } else { "0" }).to_owned()),
+        Kind::Color(d) => (value != d).then(|| (value as i32).to_string()),
         Kind::Enum { default, .. } => (value as usize != default).then(|| value.to_string()),
     }
 }
@@ -182,6 +188,7 @@ pub fn encode(kind: Kind, value: u32) -> Option<String> {
 pub fn value_text(kind: Kind, value: u32) -> String {
     match kind {
         Kind::Bool(_) => (if value == 1 { "True" } else { "False" }).to_owned(),
+        Kind::Color(_) => format!("#{value:08X}"),
         Kind::Enum { options, .. } => options.get(value as usize).copied().unwrap_or("").to_owned(),
     }
 }
