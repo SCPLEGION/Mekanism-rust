@@ -20858,7 +20858,12 @@ const STN_CHANNEL: &str = "mekanism:modification_station";
 const STN_LIST: [f32; 4] = [28.0, 20.0, 120.0, 74.0];
 const STN_ROWS: usize = 6;
 const STN_REMOVE: [f32; 4] = [28.0, 96.0, 120.0, 17.0];
-const STN_KEYS: [&str; 2] = ["stn_item", "stn_mods"];
+const STN_KEYS: [&str; 3] = ["stn_item", "stn_mods", "stn_off"];
+/// The modules with an `ExclusiveFlag` (`ModuleData.isExclusive(ANY)`): their names are drawn in blue.
+const EXCLUSIVE_MODULES: [&str; 7] = [
+    "mekanism:farming_unit", "mekanism:shearing_unit", "mekanism:silk_touch_unit", "mekanism:fortune_unit",
+    "mekanism:teleportation_unit", "mekanism:jetpack_unit", "mekanism:gravitational_modulating_unit",
+];
 
 thread_local! {
     static STN_UI: std::cell::RefCell<StnUi> = std::cell::RefCell::new(StnUi::default());
@@ -20945,6 +20950,8 @@ fn tick_station(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity)
         client.insert("stn_item".into(), Tag::String(held.item.as_ref().into()));
         let listed: Vec<String> = installed_modules(held).into_iter().map(|(id, n)| format!("{id}={n}")).collect();
         client.insert("stn_mods".into(), Tag::String(listed.join(";").as_str().into()));
+        let off: Vec<String> = installed_modules(held).into_keys().filter(|id| !module_on(held, id)).collect();
+        client.insert("stn_off".into(), Tag::String(off.join(";").as_str().into()));
     }
     put_client(game, pos, entity, &STN_KEYS, client);
     Some(active)
@@ -21014,6 +21021,12 @@ fn draw_station(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, heig
     let cursor = game.native_cursor();
     let mouse = [cursor[0] - ox, cursor[1] - oy];
     let (item, installed) = stn_view(game).unwrap_or_default();
+    let disabled: Vec<String> = game
+        .container
+        .and_then(|(x, y, z)| game.native_client_block_entity([x, y, z]))
+        .and_then(|(_, c)| get_string(c, "stn_off"))
+        .map(|t| t.split(';').map(str::to_owned).collect())
+        .unwrap_or_default();
     let types = stn_types(&item);
     let title = game.native_screen_title().unwrap_or_default();
     centred(game, batch, &title, ox + 24.0, 152.0, oy + 4.0, 0x40_4040);
@@ -21048,7 +21061,15 @@ fn draw_station(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, heig
             sprite(game, batch, slot, [0.0, 0.0, 10.0, 10.0], [ox + row[0] + 1.0, oy + row[1] + 1.0, 10.0, 10.0]);
             game.native_item(batch, modules::MODULE_ITEM, [ox + row[0] + 2.0, oy + row[1] + 2.0], 8.0);
             if installed.contains_key(*id) {
-                game.native_text_scaled(batch, &module_name(id), [ox + lx + 13.0, oy + ly + 3.0 + 12.0 * i as f32], 0x40_4040, 0.7);
+                // `GuiModuleScrollList.drawName`: exclusive modules are blue, disabled ones darker (red when not exclusive).
+                let (exclusive, enabled) = (EXCLUSIVE_MODULES.contains(id), !disabled.iter().any(|d| d == id));
+                let color = match (exclusive, enabled) {
+                    (true, true) => 0x63_5BD4,
+                    (true, false) => 0x2E_2A69,
+                    (false, true) => 0x40_4040,
+                    (false, false) => 0x5E_1D1D,
+                };
+                game.native_text_scaled(batch, &module_name(id), [ox + lx + 13.0, oy + ly + 3.0 + 12.0 * i as f32], color, 0.7);
             }
         }
         let can = ui.selected.as_deref().is_some_and(|s| installed.contains_key(s));
