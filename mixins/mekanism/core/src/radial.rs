@@ -30,6 +30,7 @@ const ORANGE: u32 = 0xFFA160;
 const RED: u32 = 0xFF383C;
 const AQUA: u32 = 0x30FFF9;
 const DARK_BLUE: u32 = 0x366BD0;
+const DARK_RED: u32 = 0xC9071F;
 
 const fn s(name: &'static str, icon: &'static str, color: u32, value: u32) -> Slice {
     Slice { name, icon, color, value }
@@ -57,6 +58,18 @@ const VEIN: [Slice; 2] = [s("Vein", "vein_normal", AQUA, 0), s("Extended Vein", 
 pub const EXCAVATION: &str = "mekanism:excavation_escalation_unit";
 pub const BLASTING: &str = "mekanism:blasting_unit";
 pub const VEIN_MINING: &str = "mekanism:vein_mining_unit";
+/// The Configurator's radial (`IRadialModeItem`): `ConfMode`'s modes, `value` the index in `ConfMode::ALL`.
+pub const CONFIGURATOR: &str = "mekanism:configurator";
+
+const CONFIGURATOR_MODES: [Slice; 6] = [
+    s("Configurate (Items)", "transmission/items", GREEN, 0),
+    s("Configurate (Chemicals)", "transmission/chemicals", GREEN, 1),
+    s("Configurate (Energy)", "transmission/energy", GREEN, 2),
+    s("Empty", "empty", DARK_RED, 3),
+    s("Rotate", "rotate", YELLOW, 4),
+    s("Wrench", "wrench", PINK, 5),
+];
+
 /// The Atomic Disassembler's own radial (`IRadialModeItem`): its modes, standing in for a module of the same id.
 pub const DISASSEMBLER: &str = "mekanism:atomic_disassembler";
 
@@ -74,6 +87,7 @@ pub fn nested(module: &str) -> Option<Nested> {
         EXCAVATION => Nested { module: EXCAVATION, key: "excavation_mode", slice: s("Excavation Speed", "speed_normal", YELLOW, 0) },
         BLASTING => Nested { module: BLASTING, key: "blast_radius", slice: s("Blasting Power", "blasting_low", DARK_BLUE, 0) },
         VEIN_MINING => Nested { module: VEIN_MINING, key: "extended_mode", slice: s("Vein Mining", "vein_normal", AQUA, 0) },
+        CONFIGURATOR => Nested { module: CONFIGURATOR, key: "mode", slice: s("Configurator", "wrench", PINK, 0) },
         DISASSEMBLER => Nested { module: DISASSEMBLER, key: "mode", slice: s("Disassembler", "speed_normal", GREEN, 0) },
         _ => return None,
     })
@@ -86,6 +100,7 @@ pub fn modes(module: &str, installed: u32) -> Vec<Slice> {
         BLASTING => BLAST[..BLAST.len().min(installed as usize + 1)].to_vec(),
         VEIN_MINING => VEIN.to_vec(),
         DISASSEMBLER => DISASSEMBLER_MODES.to_vec(),
+        CONFIGURATOR => CONFIGURATOR_MODES.to_vec(),
         _ => vec![],
     }
 }

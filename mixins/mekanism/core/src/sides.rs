@@ -43,6 +43,69 @@ impl Transmission {
     }
 }
 
+/// The Configurator's modes (`ItemConfigurator.ConfiguratorMode`): configure a type, empty a machine, rotate it or
+/// wrench it. (Fluids and heat have no configuration here, so no mode of their own.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfMode {
+    Configure(Transmission),
+    Empty,
+    Rotate,
+    Wrench,
+}
+
+impl ConfMode {
+    pub const ALL: [ConfMode; 6] = [
+        Self::Configure(Transmission::Item),
+        Self::Configure(Transmission::Chemical),
+        Self::Configure(Transmission::Energy),
+        Self::Empty,
+        Self::Rotate,
+        Self::Wrench,
+    ];
+
+    /// What the item keeps: the type's name, or the mode's.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Configure(t) => t.name(),
+            Self::Empty => "empty",
+            Self::Rotate => "rotate",
+            Self::Wrench => "wrench",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.name() == name)
+    }
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|m| *m == self).unwrap_or(0)
+    }
+
+    /// `adjust(1)`.
+    pub fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    /// The mode's text (`getTextComponent`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Configure(Transmission::Item) => "Configurate (Items)",
+            Self::Configure(Transmission::Chemical) => "Configurate (Chemicals)",
+            Self::Configure(Transmission::Energy) => "Configurate (Energy)",
+            Self::Empty => "Empty",
+            Self::Rotate => "Rotate",
+            Self::Wrench => "Wrench",
+        }
+    }
+
+    pub fn transmission(self) -> Option<Transmission> {
+        match self {
+            Self::Configure(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
 /// What one face of a block does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SideMode {

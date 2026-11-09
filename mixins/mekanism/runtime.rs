@@ -3074,7 +3074,39 @@ pub(super) fn configure_side(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3])
     let Some(held) = holding.filter(|h| &*h.item == CONFIGURATOR) else {
         return false;
     };
-    let t = configurator_mode(&held);
+    let conf = configurator_conf(&held);
+    match conf {
+        // `ConfiguratorMode.WRENCH` passes the click on to the wrench's own action.
+        side_config::ConfMode::Wrench => return false,
+        side_config::ConfMode::Empty => {
+            // Every stack in the machine is dropped out of the clicked face (`InventoryUtils.dropStack`).
+            let stacks = game.native_with_mod_block_entity(pos, |m| {
+                kind(&m.id)?;
+                let taken: Vec<ItemStack> = m.items.iter_mut().filter_map(Option::take).collect();
+                Some(taken)
+            });
+            let Some(Some(stacks)) = stacks else {
+                return false;
+            };
+            let at = [f64::from(pos[0]) + 0.5 + f64::from(face[0]) * 0.6, f64::from(pos[1]) + 0.5 + f64::from(face[1]) * 0.6, f64::from(pos[2]) + 0.5 + f64::from(face[2]) * 0.6];
+            for stack in stacks {
+                game.native_drop_item(stack, at, face);
+            }
+            return true;
+        }
+        side_config::ConfMode::Rotate => {
+            // The block turns its front to the clicked face, sneaking to the opposite one (`setFacing`).
+            if game.native_block_property(pos, "facing").is_none() || kind(&game.native_block(pos)).is_none() {
+                return false;
+            }
+            let target = if game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) { [-face[0], -face[1], -face[2]] } else { face };
+            let name = DIRECTIONS[face_index(target)].0;
+            game.native_set_block_property(pos, "facing", name);
+            return true;
+        }
+        side_config::ConfMode::Configure(_) => {}
+    }
+    let t = conf.transmission().unwrap_or_default();
     // Sneaking on a transmitter cycles the connection of the face (`TileEntityTransmitter.onSneakRightClick`).
     if game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
         let changed = game.native_with_mod_block_entity(pos, |m| {
@@ -3112,6 +3144,15 @@ const CONFIGURATOR: &str = "mekanism:configurator";
 /// The key in the Configurator's custom data that holds the type it configures (Mekanism's
 /// `configurator_mode`).
 const CONFIGURATOR_KEY: &str = "mekanism:configurator_mode";
+
+/// The Configurator's mode (`ConfiguratorMode`): a type to configure, or Empty, Rotate, Wrench.
+fn configurator_conf(stack: &ItemStack) -> side_config::ConfMode {
+    let name = custom_data(stack).and_then(|c| match c.get(&JavaString::from(CONFIGURATOR_KEY)) {
+        Some(Tag::String(s)) => s.to_string().ok(),
+        _ => None,
+    });
+    name.as_deref().and_then(side_config::ConfMode::from_name).unwrap_or(side_config::ConfMode::Configure(Transmission::Item))
+}
 
 fn configurator_mode(stack: &ItemStack) -> Transmission {
     let name = custom_data(stack).and_then(|c| match c.get(&JavaString::from(CONFIGURATOR_KEY)) {
@@ -6038,11 +6079,11 @@ fn configurator_use(game: &mut Game<'_>, claimed: &mut bool) {
     let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == CONFIGURATOR) else {
         return;
     };
-    let t = configurator_mode(held).next();
-    set_custom_string(held, CONFIGURATOR_KEY, t.name());
+    let mode = configurator_conf(held).next();
+    set_custom_string(held, CONFIGURATOR_KEY, mode.name());
     *claimed = true;
     if let Some(player) = game.native_acting_player() {
-        let line = format!("Configurator: {}", t.name());
+        let line = format!("Configurator: {}", mode.label());
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
 }
@@ -6302,7 +6343,7 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
         return;
     }
     if &*stack.item == CONFIGURATOR {
-        let line = format!("Configuring: {}", configurator_mode(stack).name());
+        let line = format!("Configuring: {}", configurator_conf(stack).label());
         lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
     }
     if FREE_RUNNERS.contains(&&*stack.item) {
@@ -6624,7 +6665,7 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch
             lines.push(vec![("Mode: ".into(), gray), (mode.label().into(), 0x559EFF)]);
             lines.push(vec![("Efficiency: ".into(), gray), (mode.efficiency().to_string(), 0x559EFF)]);
         } else if item == CONFIGURATOR {
-            lines.push(vec![(format!("Mode: {}", configurator_mode(stack).name()), 0xD55ECB)]);
+            lines.push(vec![(format!("Mode: {}", configurator_conf(stack).label()), 0xD55ECB)]);
         }
         if !lines.is_empty() {
             groups.push(lines);
@@ -21291,7 +21332,7 @@ fn radial_stack<'a>(game: &'a Game<'_>, slot: usize) -> Option<&'a ItemStack> {
         13 => game.offhand.as_ref(),
         _ => None,
     }
-    .filter(|s| modules::is_container(&s.item) || &*s.item == DISASSEMBLER)
+    .filter(|s| modules::is_container(&s.item) || &*s.item == DISASSEMBLER || &*s.item == CONFIGURATOR)
 }
 
 fn tw_slots(game: &Game<'_>) -> Vec<usize> {
@@ -21876,7 +21917,21 @@ fn tweaker_payload(game: &mut Game<'_>, data: &[u8]) {
     let (Ok(slot), Ok(value)) = (slot.parse::<usize>(), value.parse::<u32>()) else {
         return;
     };
-    // The Atomic Disassembler's radial sets its mode (`IRadialModeItem.setMode`).
+    // The Configurator's and the Atomic Disassembler's radials set their item's mode (`IRadialModeItem.setMode`).
+    if module == radial::CONFIGURATOR {
+        let stack = match slot {
+            0..=3 => game.armor.get_mut(slot).and_then(Option::as_mut),
+            4..=12 => game.inventory.get_mut(slot - 4).and_then(Option::as_mut),
+            13 => game.offhand.as_mut(),
+            _ => None,
+        };
+        if let Some(stack) = stack.filter(|s| &*s.item == CONFIGURATOR)
+            && let Some(mode) = side_config::ConfMode::ALL.get(value as usize)
+        {
+            set_custom_string(stack, CONFIGURATOR_KEY, mode.name());
+        }
+        return;
+    }
     if module == radial::DISASSEMBLER {
         let stack = match slot {
             0..=3 => game.armor.get_mut(slot).and_then(Option::as_mut),
@@ -22016,6 +22071,9 @@ fn radial_roots(stack: &ItemStack) -> Vec<radial::Nested> {
     if &*stack.item == DISASSEMBLER {
         return radial::nested(radial::DISASSEMBLER).into_iter().collect();
     }
+    if &*stack.item == CONFIGURATOR {
+        return radial::nested(radial::CONFIGURATOR).into_iter().collect();
+    }
     let installed = modules_of(stack);
     installed
         .iter()
@@ -22029,6 +22087,9 @@ fn radial_roots(stack: &ItemStack) -> Vec<radial::Nested> {
 
 /// The current option of a nested module's radial.
 fn radial_current(stack: &ItemStack, module: &str) -> Option<u32> {
+    if module == radial::CONFIGURATOR {
+        return Some(configurator_conf(stack).index() as u32);
+    }
     if module == radial::DISASSEMBLER {
         return gear::DisassemblerMode::ALL.iter().position(|m| *m == disassembler_mode(stack)).map(|i| i as u32);
     }
@@ -22139,7 +22200,7 @@ fn radial_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         }
         for (i, slice) in slices.iter().enumerate() {
             let [x, y] = radial::icon_centre(i, n, RADIAL_INNER, RADIAL_OUTER);
-            sprite(game, batch, &format!("radial/{}", slice.icon), [0.0, 0.0, 18.0, 18.0], [(centre[0] + x - 12.0).round(), (centre[1] + y - 20.0).round(), 24.0, 24.0]);
+            sprite(game, batch, &if slice.icon.contains('/') { slice.icon.to_owned() } else { format!("radial/{}", slice.icon) }, [0.0, 0.0, 18.0, 18.0], [(centre[0] + x - 12.0).round(), (centre[1] + y - 20.0).round(), 24.0, 24.0]);
             labels.push(([x, y], slice.name.to_owned(), slice.color));
         }
         for ([x, y], text, rgb) in labels {
