@@ -6550,33 +6550,133 @@ fn set_jetpack_fuel(stack: &mut ItemStack, amount: u64) {
 /// conditions as the thrust code sees them) or the mask is on and flowing, the sound follows the player. Horizon's
 /// `native_loop_sound` stops a loop that is not asked for again; the other players' sounds need their state, which is
 /// not synced (a gap).
+const SOUND_JETPACK: u8 = 1;
+const SOUND_SCUBA: u8 = 2;
+const SOUND_GRAVITATIONAL: u8 = 4;
+const PLAYER_STATE_CHANNEL: &str = "mekanism:player_state";
+
+/// Which of the worn gear's sounds this window's player makes now (`PlayerState`'s jetpack, scuba and gravitational
+/// sets in the original).
+fn own_sound_flags(game: &Game<'_>) -> u8 {
+    let Some(p) = game.player.as_ref().filter(|p| !p.spectator) else {
+        return 0;
+    };
+    let grounded = p.ground.on_ground || game.sleeping.is_some() || p.flying;
+    let mut flags = 0;
+    if p.flying && !game.creative && gravitational_ready(game) {
+        flags |= SOUND_GRAVITATIONAL;
+    }
+    if scuba_on(game) {
+        flags |= SOUND_SCUBA;
+    }
+    if let Some(chest) = game.armor[1].as_ref().filter(|s| is_jetpack(s)) {
+        let (mode, _) = jetpack_settings(chest);
+        let ascending = game.keys.contains(&winit::keyboard::KeyCode::Space);
+        let descending = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+        let active = match mode {
+            3 => false,
+            1 => (ascending && !descending) || !grounded,
+            _ => ascending,
+        };
+        if active && jetpack_fuel(chest) > 0 {
+            flags |= SOUND_JETPACK;
+        }
+    }
+    flags
+}
+
+const SOUND_EVENTS: [(u8, &str, &str); 3] = [
+    (SOUND_GRAVITATIONAL, "gravitational", "mekanism:item.gravitational_modulation_unit"),
+    (SOUND_SCUBA, "scuba_mask", "mekanism:item.scuba_mask"),
+    (SOUND_JETPACK, "jetpack", "mekanism:item.jetpack"),
+];
+
+thread_local! {
+    /// Server: each player's last reported flags and the tick they came. Client: the other players' flags as the server
+    /// last told.
+    static PLAYER_FLAGS: std::cell::RefCell<std::collections::BTreeMap<u128, (u8, u64)>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    static CLIENT_TICK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SENT_FLAGS: std::cell::Cell<(u8, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The window's own sounds, and the state it reports so the server can tell the other players (as the original's
+/// `PlayerState` sync does): sent when it changes and every half second while it holds.
 fn player_sounds(game: &mut Game<'_>) {
     let Some(p) = game.player.as_ref().filter(|p| !p.spectator) else {
         return;
     };
     let at = [p.position.x, p.position.y + 0.9, p.position.z];
-    let grounded = p.ground.on_ground || game.sleeping.is_some() || p.flying;
-    // `GravitationalModulationSound`: while flying on the unit.
-    if p.flying && !p.spectator && !game.creative && gravitational_ready(game) {
-        game.native_loop_sound("mekanism:gravitational", "mekanism:item.gravitational_modulation_unit", Some(at), 1.0, 1.0);
+    let flags = own_sound_flags(game);
+    let (sent, when) = SENT_FLAGS.get();
+    let now = game.ticks as u64;
+    if flags != sent || (flags != 0 && now >= when + 10) {
+        SENT_FLAGS.set((flags, now));
+        game.native_send_to_server(PLAYER_STATE_CHANNEL, &[flags]);
     }
-    if scuba_on(game) {
-        game.native_loop_sound("mekanism:scuba_mask", "mekanism:item.scuba_mask", Some(at), 1.0, 1.0);
+    for (bit, key, event) in SOUND_EVENTS {
+        if flags & bit != 0 {
+            game.native_loop_sound(&format!("mekanism:{key}"), event, Some(at), 1.0, 1.0);
+        }
     }
-    let Some(chest) = game.armor[1].as_ref().filter(|s| is_jetpack(s)) else {
+}
+
+/// The other players' gear sounds: each loop follows its player by starting anew when they move to another 4-block cell.
+fn remote_player_sounds(game: &mut Game<'_>) {
+    let now = game.ticks as u64;
+    let others = game.native_remote_players();
+    let known: Vec<(u128, u8)> = PLAYER_FLAGS.with_borrow(|m| m.iter().filter(|(_, (_, t))| now < t + 30).map(|(u, (f, _))| (*u, *f)).collect());
+    for (uuid, pos) in others {
+        let Some((_, flags)) = known.iter().find(|(u, _)| *u == uuid) else {
+            continue;
+        };
+        let at = [pos[0], pos[1] + 0.9, pos[2]];
+        let cell = [(pos[0] / 4.0).floor() as i64, (pos[1] / 4.0).floor() as i64, (pos[2] / 4.0).floor() as i64];
+        for (bit, key, event) in SOUND_EVENTS {
+            if flags & bit != 0 {
+                game.native_loop_sound(&format!("mekanism:other:{uuid:x}:{key}:{cell:?}"), event, Some(at), 1.0, 1.0);
+            }
+        }
+    }
+}
+
+/// Server: a player's reported flags are kept, and every half second all current ones go to everyone else.
+fn player_state_report(game: &mut Game<'_>, data: &[u8]) {
+    let (Some(player), Some(&flags)) = (game.native_acting_player(), data.first()) else {
         return;
     };
-    let (mode, _) = jetpack_settings(chest);
-    let ascending = game.keys.contains(&winit::keyboard::KeyCode::Space);
-    let descending = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
-    let active = match mode {
-        3 => false,
-        1 => (ascending && !descending) || !grounded,
-        _ => ascending,
-    };
-    if active && jetpack_fuel(chest) > 0 {
-        game.native_loop_sound("mekanism:jetpack", "mekanism:item.jetpack", Some(at), 1.0, 1.0);
+    let now = game.ticks as u64;
+    PLAYER_FLAGS.with_borrow_mut(|m| m.insert(player.uuid, (flags & 7, now)));
+}
+
+fn player_state_broadcast(game: &mut Game<'_>) {
+    let now = game.ticks as u64;
+    if now % 10 != 0 {
+        return;
     }
+    let online = game.native_online_players();
+    let live: Vec<(u128, u8)> = PLAYER_FLAGS.with_borrow_mut(|m| {
+        m.retain(|u, (f, t)| online.contains(u) && (*f != 0 || now < *t + 30) && now < *t + 60);
+        m.iter().filter(|(_, (f, _))| *f != 0).map(|(u, (f, _))| (*u, *f)).collect()
+    });
+    for to in &online {
+        let mut data = vec![];
+        for (uuid, flags) in live.iter().filter(|(u, _)| u != to) {
+            data.extend_from_slice(&uuid.to_be_bytes());
+            data.push(*flags);
+        }
+        game.native_send_to_player(*to, PLAYER_STATE_CHANNEL, &data);
+    }
+}
+
+/// Client: the flags the server relays for the other players.
+fn player_state_payload(data: &[u8], now: u64) {
+    PLAYER_FLAGS.with_borrow_mut(|m| {
+        m.clear();
+        for chunk in data.chunks_exact(17) {
+            let uuid = u128::from_be_bytes(chunk[..16].try_into().unwrap_or([0; 16]));
+            m.insert(uuid, (chunk[16], now));
+        }
+    });
 }
 
 /// The sounds that go on while something works (`SoundHandler.startTileSound`, `ItemFlamethrower`'s
@@ -6893,6 +6993,7 @@ fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
 pub(super) fn client_tick(game: &mut Game<'_>) {
     if !game.native_window() && game.native_on(MOD_ID) {
         radiation_server_tick(game);
+        player_state_broadcast(game);
     }
     if game.native_window() && game.native_on(MOD_ID) {
         tweaker_key(game);
@@ -6902,7 +7003,9 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
         return;
     }
     register_game_events();
+    CLIENT_TICK.set(game.ticks as u64);
     mode_keys(game);
+    remote_player_sounds(game);
     loop_sounds(game);
     player_sounds(game);
     gravitational_client(game);
@@ -7017,6 +7120,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     }
     if channel == ROBIT_CHANNEL && game.native_on(MOD_ID) {
         robit_op_payload(game, data);
+        return;
+    }
+    if channel == PLAYER_STATE_CHANNEL && game.native_on(MOD_ID) {
+        player_state_report(game, data);
         return;
     }
     if channel == MODE_SLOT_CHANNEL && game.native_on(MOD_ID) {
@@ -22666,6 +22773,9 @@ pub(super) fn mob_died(game: &mut Game<'_>, kind: &str, at: [f64; 3], data: Opti
 
 /// The window's client got the Robits' ids.
 pub(super) fn client_payload(channel: &str, data: &[u8]) {
+    if channel == PLAYER_STATE_CHANNEL {
+        player_state_payload(data, CLIENT_TICK.get());
+    }
     if channel == RADIATION_CHANNEL {
         rad_client_payload(data);
     }
