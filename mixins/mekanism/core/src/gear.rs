@@ -102,8 +102,8 @@ pub fn discharge(item: ItemEnergy, stored: u64, target: &mut EnergyContainer) ->
     stored - (offered - left)
 }
 
-/// `ItemAtomicDisassembler.DisassemblerMode`: normal, slow, fast, vein and off. (Vein is switched on
-/// here whatever `GearConfig` says; there is no config file yet.)
+/// `ItemAtomicDisassembler.DisassemblerMode`: normal, slow, fast, vein and off; slow, fast and vein can be
+/// switched off by `GearConfig` (vein is off by default).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DisassemblerMode {
     #[default]
@@ -124,6 +124,16 @@ impl DisassemblerMode {
             Self::Fast => 128,
             Self::Vein => 20,
             Self::Off => 0,
+        }
+    }
+
+    /// `isEnabled`.
+    pub fn enabled(self, config: &crate::config::GearConfig) -> bool {
+        match self {
+            Self::Slow => config.disassembler_slow_mode,
+            Self::Fast => config.disassembler_fast_mode,
+            Self::Vein => config.disassembler_vein_mining,
+            Self::Normal | Self::Off => true,
         }
     }
 
@@ -152,10 +162,15 @@ impl DisassemblerMode {
         Self::ALL.into_iter().find(|m| m.name() == name)
     }
 
-    /// `adjust(1)`: the next enabled mode, wrapping around.
+    /// `adjust(1)` with every mode enabled.
     pub fn next(self) -> Self {
+        self.next_enabled(&crate::config::GearConfig { disassembler_vein_mining: true, ..Default::default() })
+    }
+
+    /// `IDisableableEnum.adjust(1)`: the next enabled mode, wrapping around.
+    pub fn next_enabled(self, config: &crate::config::GearConfig) -> Self {
         let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
-        Self::ALL[(i + 1) % Self::ALL.len()]
+        (1..=Self::ALL.len()).map(|k| Self::ALL[(i + k) % Self::ALL.len()]).find(|m| m.enabled(config)).unwrap_or(self)
     }
 }
 
@@ -164,7 +179,12 @@ pub const DISASSEMBLER_ENERGY_USAGE: u64 = 10;
 
 /// The energy breaking a block costs (`getDestroyEnergy`): half for a block that breaks instantly.
 pub fn destroy_energy(mode: DisassemblerMode, hardness: f32) -> u64 {
-    let base = DISASSEMBLER_ENERGY_USAGE * mode.efficiency();
+    destroy_energy_with(DISASSEMBLER_ENERGY_USAGE, mode, hardness)
+}
+
+/// `destroy_energy` with the config's `energyUsage`.
+pub fn destroy_energy_with(usage: u64, mode: DisassemblerMode, hardness: f32) -> u64 {
+    let base = usage * mode.efficiency();
     if hardness == 0.0 {
         (base / 2).max(1)
     } else {
@@ -175,7 +195,12 @@ pub fn destroy_energy(mode: DisassemblerMode, hardness: f32) -> u64 {
 /// `ItemAtomicDisassembler.getDestroySpeed`: the mode's efficiency while the energy for the block is
 /// there; short of it, normal mode's efficiency scaled down by how much of it is.
 pub fn destroy_speed(mode: DisassemblerMode, stored: u64, hardness: f32) -> f32 {
-    let required = destroy_energy(mode, hardness);
+    destroy_speed_with(DISASSEMBLER_ENERGY_USAGE, mode, stored, hardness)
+}
+
+/// `destroy_speed` with the config's `energyUsage`.
+pub fn destroy_speed_with(usage: u64, mode: DisassemblerMode, stored: u64, hardness: f32) -> f32 {
+    let required = destroy_energy_with(usage, mode, hardness);
     if stored < required {
         let normal = DisassemblerMode::Normal.efficiency() as f32;
         return normal * (stored as f32 / required as f32);
