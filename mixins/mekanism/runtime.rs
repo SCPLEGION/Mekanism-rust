@@ -21507,7 +21507,12 @@ fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
                 // `ColorSelection.click`: only the swatch opens the picker window.
                 if inside(at, tw_swatch(tw_setting_row(i, o))) {
                     let slot = ui.slot.unwrap_or(0);
-                    TW_COLOR.with_borrow_mut(|c| *c = Some(TwColor::new(slot, &module, s.key, now)));
+                    let mut window = TwColor::new(slot, &module, s.key, now);
+                    // Worn armour shows on the model beside the pickers (`ColorSelection` offers the preview for the unit's colour).
+                    if slot < 4 && module == "mekanism:color_modulation_unit" {
+                        window.preview = Some((slot, stack.clone()));
+                    }
+                    TW_COLOR.with_borrow_mut(|c| *c = Some(window));
                 }
                 return;
             }
@@ -21532,6 +21537,19 @@ fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
 
 /// `GuiColorWindow` with alpha: 184 x 152, placed like `ColorSelection.click` does, ((160 - 220) / 2 and (120 - 150) / 2 off).
 const COLOR_WINDOW: [f32; 2] = [184.0, 152.0];
+/// The armour preview beside the pickers: 83 px more window (`GuiColorWindow`'s `armorPreview`).
+const COLOR_PREVIEW_WIDTH: f32 = 83.0;
+
+impl TwColor {
+    /// Where the window's corner is: opened at (30, 15) of the tweaker, then moved.
+    fn corner(&self, o: [f32; 2]) -> [f32; 2] {
+        [o[0] + 30.0 + self.offset[0], o[1] + 15.0 + self.offset[1]]
+    }
+
+    fn width(&self) -> f32 {
+        COLOR_WINDOW[0] + if self.preview.is_some() { COLOR_PREVIEW_WIDTH } else { 0.0 }
+    }
+}
 
 struct TwColor {
     slot: usize,
@@ -21542,8 +21560,13 @@ struct TwColor {
     val: f32,
     alpha: f32,
     edit: horizon_client::ui::EditBox,
-    /// What the button is held on: 1 the shade picker, 2 the hue bar, 3 the alpha bar, 4 the text field.
+    /// What the button is held on: 1 the shade picker, 2 the hue bar, 3 the alpha bar, 4 the text field, 5 the window.
     drag: u8,
+    /// Where the window was moved to, from where it opens, and where the cursor took hold of it (`GuiWindow.onDrag`).
+    offset: [f32; 2],
+    grab: [f32; 2],
+    /// The armour piece being coloured shows beside the pickers (`GuiEntityPreview`): the worn armour slot, or none.
+    preview: Option<(usize, ItemStack)>,
 }
 
 thread_local! {
@@ -21557,7 +21580,7 @@ impl TwColor {
         edit.max_length = 15;
         edit.text_color = u32::MAX;
         edit.focused = true;
-        let mut c = Self { slot, module: module.to_owned(), key: key.to_owned(), hue: 0.0, sat: 0.5, val: 0.5, alpha: 1.0, edit, drag: 0 };
+        let mut c = Self { slot, module: module.to_owned(), key: key.to_owned(), hue: 0.0, sat: 0.5, val: 0.5, alpha: 1.0, edit, drag: 0, offset: [0.0; 2], grab: [0.0; 2], preview: None };
         c.set_color(argb);
         c
     }
@@ -21618,8 +21641,8 @@ fn tw_grid(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, r: [f32; 
 
 /// The window's parts, relative to its corner: (view holder, view, shade holder, shade, hue holder, hue, alpha holder,
 /// alpha, text field, confirm).
-fn tw_color_rects(o: [f32; 2]) -> [[f32; 4]; 10] {
-    let (x, y) = (o[0] + 30.0, o[1] + 15.0);
+fn tw_color_rects(w: [f32; 2]) -> [[f32; 4]; 10] {
+    let (x, y) = (w[0], w[1]);
     let at = |r: [f32; 4]| [x + r[0], y + r[1], r[2], r[3]];
     [
         at([6.0, 17.0, 47.0, 82.0]),
@@ -21640,8 +21663,20 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
         let Some(c) = slot.as_mut() else {
             return;
         };
-        let [view_holder, view, shade_holder, shade, hue_holder, hue, alpha_holder, alpha, field, confirm] = tw_color_rects(o);
         let cursor = game.native_cursor();
+        // The window follows the cursor while held by its title bar, inside the screen (`GuiWindow.onDrag`).
+        if c.drag == 5 {
+            if game.native_mouse_down() {
+                let home = [o[0] + 30.0, o[1] + 15.0];
+                let x = (cursor[0] - c.grab[0]).clamp(0.0, (batch.width - c.width()).max(0.0));
+                let y = (cursor[1] - c.grab[1]).clamp(0.0, (batch.height - COLOR_WINDOW[1]).max(0.0));
+                c.offset = [x - home[0], y - home[1]];
+            } else {
+                c.drag = 0;
+            }
+        }
+        let corner = c.corner(o);
+        let [view_holder, view, shade_holder, shade, hue_holder, hue, alpha_holder, alpha, field, confirm] = tw_color_rects(corner);
         // A held button keeps setting what it was pressed on (`GuiPicker.onDrag`).
         if (1..=3).contains(&c.drag) {
             if game.native_mouse_down() {
@@ -21664,7 +21699,7 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
                 c.drag = 0;
             }
         }
-        let w = [o[0] + 30.0, o[1] + 15.0, COLOR_WINDOW[0], COLOR_WINDOW[1]];
+        let w = [corner[0], corner[1], c.width(), COLOR_WINDOW[1]];
         robit_window_plate(game, batch, w, "Color Picker");
         let argb = c.argb();
         let mut holder = |r: [f32; 4]| nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, r, 0xFFFF_FFFF);
@@ -21674,30 +21709,15 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
         // `GuiColorView`.
         tw_grid(game, batch, view);
         game.native_fill(batch, view, argb);
-        // `GuiShadePicker.drawTiledGradient`: ten by ten tiles, each shaded between its corners (drawn here in 2 px steps).
+        // `GuiShadePicker.drawTiledGradient`: ten by ten tiles, each shaded between its corner colours.
         let (tile_w, tile_h) = ((shade[2] / 10.0).round(), (shade[3] / 10.0).round());
         for i in 0..10 {
             let (min_v, max_v) = (i as f32 / 10.0, (i + 1) as f32 / 10.0);
             for j in 0..10 {
                 let (min_s, max_s) = (j as f32 / 10.0, (j + 1) as f32 / 10.0);
-                let corner = |s: f32, v: f32| mekanism_core::color::hsv_to_rgb(c.hue, s, v).map(f32::from);
-                let (tl, tr, bl, br) = (corner(min_s, max_v), corner(max_s, max_v), corner(min_s, min_v), corner(max_s, min_v));
-                let (x0, y0) = (shade[0] + j as f32 * tile_w, shade[1] + (9 - i) as f32 * tile_h);
-                let mut by = 0.0;
-                while by < tile_h {
-                    let mut bx = 0.0;
-                    while bx < tile_w {
-                        let (fx, fy) = ((bx + 1.0) / tile_w, (by + 1.0) / tile_h);
-                        let mix = |k: usize| {
-                            let top = tl[k] + (tr[k] - tl[k]) * fx;
-                            let bottom = bl[k] + (br[k] - bl[k]) * fx;
-                            (top + (bottom - top) * fy).round() as u32
-                        };
-                        game.native_fill(batch, [x0 + bx, y0 + by, 2.0_f32.min(tile_w - bx), 2.0_f32.min(tile_h - by)], 0xFF00_0000 | mix(0) << 16 | mix(1) << 8 | mix(2));
-                        bx += 2.0;
-                    }
-                    by += 2.0;
-                }
+                let corner = |s: f32, v: f32| mekanism_core::color::argb(mekanism_core::color::hsv_to_rgb(c.hue, s, v), 255);
+                let colors = [corner(min_s, max_v), corner(max_s, max_v), corner(min_s, min_v), corner(max_s, min_v)];
+                game.native_fill_corners(batch, [shade[0] + j as f32 * tile_w, shade[1] + (9 - i) as f32 * tile_h, tile_w, tile_h], colors);
             }
         }
         let (px, py) = (shade[0] + (c.sat * shade[2]).round() - 2.0, shade[1] + ((1.0 - c.val) * shade[3]).round() - 2.0);
@@ -21721,6 +21741,18 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
         sprite(game, batch, "slider/color_picker", [0.0, 0.0, 7.0, 12.0], [alpha[0] - 2.0 + pos, alpha[1] - 2.0, 7.0, 12.0]);
         tw_grid(game, batch, [alpha[0] + pos, alpha[1], 3.0, 8.0]);
         game.native_fill(batch, [alpha[0] + pos, alpha[1], 3.0, 8.0], argb);
+        // `GuiEntityPreview`: the player model wearing the piece in the colour being picked.
+        if let Some((slot, stack)) = c.preview.clone() {
+            let (px, py, pw, ph) = (corner[0] + 155.0 + 26.0, corner[1] + 17.0, 80.0, COLOR_WINDOW[1] - 24.0);
+            nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, [px, py, pw, ph], 0xFFFF_FFFF);
+            let mut stack = stack;
+            if let Some(setting) = module_config::settings("mekanism:color_modulation_unit", 1).into_iter().find(|x| x.key == c.key) {
+                tw_set(&mut stack, "mekanism:color_modulation_unit", &setting, 1, argb);
+            }
+            let mut armor: [Option<ItemStack>; 4] = [None, None, None, None];
+            armor[slot] = Some(stack);
+            game.native_gui_player(batch, [px + 1.0, py + 1.0, px + pw - 1.0, py + ph - 1.0], 50.0, 0.0, &armor);
+        }
         // The "RGBA:" label, right aligned to the field, the field and Confirm.
         let label = "RGBA:";
         game.native_text(batch, label, [w[0] + 34.0 - game.native_text_width(label), w[1] + 134.0], 0x40_4040, false);
@@ -21734,7 +21766,8 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
 }
 
 fn tw_color_click(game: &mut Game<'_>, o: [f32; 2], at: [f32; 2], button: u8, pressed: bool) {
-    let [_, _, _, shade, _, hue, _, alpha, field, confirm] = tw_color_rects(o);
+    let corner = TW_COLOR.with_borrow(|c| c.as_ref().map_or([o[0] + 30.0, o[1] + 15.0], |c| c.corner(o)));
+    let [_, _, _, shade, _, hue, _, alpha, field, confirm] = tw_color_rects(corner);
     let mut send = None;
     TW_COLOR.with_borrow_mut(|slot| {
         let Some(c) = slot.as_mut() else {
@@ -21757,6 +21790,10 @@ fn tw_color_click(game: &mut Game<'_>, o: [f32; 2], at: [f32; 2], button: u8, pr
         } else if inside(at, field) {
             c.edit.click(&game.gui.atlas, at[0], false, false);
             c.drag = 4;
+        } else if inside(at, [corner[0], corner[1], c.width(), 18.0]) {
+            // The title bar takes hold of the window.
+            c.drag = 5;
+            c.grab = [at[0] - corner[0], at[1] - corner[1]];
         } else if inside(at, confirm) {
             send = Some(format!("{}|{}|{}|{}", c.slot, c.module, c.key, c.argb()));
         }
