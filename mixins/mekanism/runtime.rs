@@ -15334,6 +15334,16 @@ fn teleport_target(game: &mut Game<'_>, frequency: &str, from: [f64; 3], not: Op
     })
 }
 
+/// `PacketPortalFX`: fifty portal particles in each of the two blocks `base` and `base + dir`.
+fn portal_fx(game: &mut Game<'_>, base: [i32; 3], dir: [i32; 3]) {
+    let options = horizon_client::particles::ParticleOptions::simple(horizon_client::particles::ParticleType::Portal);
+    let dimension = game.native_player().map_or("minecraft:overworld", |p| p.dimension);
+    for pos in [base, [base[0] + dir[0], base[1] + dir[1], base[2] + dir[2]]] {
+        // The original scatters them uniformly over the block; the server's spread is a normal distribution of the same width.
+        game.lan_send_particles(dimension, &options, None, [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5], [0.3, 0.3, 0.3], 0.0, 50);
+    }
+}
+
 fn place_player(game: &mut Game<'_>, at: [f64; 3]) {
     if let Some(p) = game.player.as_mut() {
         p.position = horizon_core::geometry::Vec3::new(at[0], at[1], at[2]);
@@ -15439,7 +15449,9 @@ pub(super) fn use_teleporter(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         return true;
     }
     game.native_with_mod_block_entity(source, |m| put_long(&mut m.nbt, "energy", stored - cost));
+    portal_fx(game, from.map(|v| v.floor() as i32), [0, 1, 0]);
     place_player(game, at);
+    portal_fx(game, at.map(|v| v.floor() as i32), [0, 1, 0]);
     true
 }
 
@@ -15479,7 +15491,9 @@ fn portable_teleport(game: &mut Game<'_>) {
     if let Some(stack) = game.held_mut().as_mut() {
         set_energy(stack, stored - cost);
     }
+    portal_fx(game, from.map(|v| v.floor() as i32), [0, 1, 0]);
     place_player(game, at);
+    portal_fx(game, at.map(|v| v.floor() as i32), [0, 1, 0]);
 }
 
 // --- Dynamic Tank -----------------------------------------------------------------------------------
