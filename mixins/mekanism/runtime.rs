@@ -621,7 +621,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     TICKING.set(Some((pos, ticking)));
     let facing = game.native_block_property(pos, "facing").and_then(|f| direction(&f)).map_or(2, face_index);
     // A machine its redstone control holds back does nothing this tick and goes dark.
-    let allowed = tabs(&entity.id) & TAB_REDSTONE == 0 || redstone_allows(game, pos, entity);
+    // (The Assemblicator reads its own redstone: a pulse is stored in `pulseOperations`, and its buttons always work.)
+    let allowed = tabs(&entity.id) & TAB_REDSTONE == 0 || k == Kind::Assemblicator || redstone_allows(game, pos, entity);
     discharge_energy_slot(entity);
     let active = if !allowed {
         Some(false)
@@ -19949,6 +19950,15 @@ fn tick_assemblicator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let formula = asm_formula(game, entity);
+    // `canFunction`, and in pulse mode the pulses saved up (`pulseOperations`): each completed craft spends one.
+    let can_function = redstone_allows(game, pos, entity);
+    let pulse_mode = RedstoneControl::from_ordinal(get_int(&entity.nbt, "control")) == RedstoneControl::Pulse;
+    let mut pulses = get_int(&entity.nbt, "pulses");
+    if !pulse_mode {
+        pulses = 0;
+    } else if can_function {
+        pulses += 1;
+    }
     let mut auto = get_int(&entity.nbt, "auto") == 1;
     let mut stock = get_int(&entity.nbt, "stock") == 1;
     let mut progress = get_int(&entity.nbt, "progress");
@@ -20013,7 +20023,7 @@ fn tick_assemblicator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     }
     let mut used = false;
     let mut warn = 0;
-    if auto && let Some(f) = &formula {
+    if auto && let Some(f) = &formula && ((pulse_mode && pulses > 0) || can_function) {
         let mut can = true;
         if asm_craft(game, entity, Some(f)).is_none() {
             can = asm_move_to_grid(game, entity, f);
@@ -20022,6 +20032,7 @@ fn tick_assemblicator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
             if progress >= ticks_required {
                 if asm_single_craft(game, entity, Some(f)) {
                     progress = 0;
+                    pulses = pulses.saturating_sub(1);
                 }
             } else if energy.consume(per_tick) {
                 used = true;
@@ -20054,6 +20065,7 @@ fn tick_assemblicator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     put_int(&mut entity.nbt, "progress", progress);
     put_int(&mut entity.nbt, "auto", u32::from(auto));
     put_int(&mut entity.nbt, "stock", u32::from(stock));
+    put_int(&mut entity.nbt, "pulses", pulses);
     put_int(&mut entity.nbt, "warn", warn);
     let mut client = Compound::new();
     for (k, v) in [("asm_auto", auto), ("asm_recipe", craft.is_some()), ("asm_valid", formula.is_some()), ("asm_stock", stock), ("asm_used", used), ("asm_encode", encodable)] {
