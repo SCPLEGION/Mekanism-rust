@@ -6182,6 +6182,7 @@ fn sync_input_sets(game: &Game<'_>) {
             for kind in ["enriching", "crushing"] {
                 add(kind, mekanism_core::recipes::find(mekanism_core::recipes::table(kind), id, 64, &in_tag).is_some());
             }
+            add("infusing", mekanism_core::recipe_table::METALLURGIC_INFUSING.iter().any(|r| r.input.matches(id, &in_tag)));
             add("combining_a", mekanism_core::recipe_table::COMBINING.iter().any(|r| r.main.matches(id, &in_tag)));
             add("combining_b", mekanism_core::recipe_table::COMBINING.iter().any(|r| r.extra.matches(id, &in_tag)));
             add("sawing", mekanism_core::recipes::find_sawing(id, 64, &in_tag).is_some());
@@ -6212,6 +6213,7 @@ fn input_rule(kind: &str) -> Option<horizon_client::lan::menu::SlotRule> {
         "crushing" => SlotRule::Check(|s| starts_recipe("crushing", s)),
         "smelting" => SlotRule::Check(|s| starts_recipe("smelting", s)),
         "sawing" => SlotRule::Check(|s| starts_recipe("sawing", s)),
+        "infusing" => SlotRule::Check(|s| starts_recipe("infusing", s)),
         "combining_a" => SlotRule::Check(|s| starts_recipe("combining_a", s)),
         "combining_b" => SlotRule::Check(|s| starts_recipe("combining_b", s)),
         "purifying" => SlotRule::Check(|s| starts_recipe("purifying", s)),
@@ -10628,6 +10630,13 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
             }
         }
         rules[FACTORY_ENERGY] = convert();
+        if let Some(Kind::Factory(n, "infusing", _)) = kind(block)
+            && let Some(rule) = input_rule("infusing")
+        {
+            for slot in rules.iter_mut().take(n) {
+                *slot = rule.clone();
+            }
+        }
         if let Some(Kind::Factory(_, "combining", _)) = kind(block)
             && let Some(rule) = input_rule("combining_b")
         {
@@ -10666,6 +10675,11 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
                     if let (Some(rule), Some(slot)) = (input_rule(kind), rules.get_mut(i)) {
                         *slot = rule;
                     }
+                }
+            }
+            Some(Kind::Infuser) => {
+                if let (Some(rule), Some(slot)) = (input_rule("infusing"), rules.first_mut()) {
+                    *slot = rule;
                 }
             }
             Some(Kind::Machine(recipe, _)) => {
