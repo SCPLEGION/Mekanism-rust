@@ -26348,6 +26348,13 @@ pub(super) fn bow_item(_game: &Game<'_>, item: &str, bow: &mut bool) {
     *bow |= item == ELECTRIC_BOW;
 }
 
+/// `ItemCanteen.getUseAnimation` (DRINK) and `getUseDuration`: the drinking pose lasts `CANTEEN_TICKS`.
+pub(super) fn drink_item(_game: &Game<'_>, item: &str, ticks: &mut i32) {
+    if item == CANTEEN {
+        *ticks = CANTEEN_TICKS as i32;
+    }
+}
+
 /// Sneak + right click toggles the Electric Bow's fire mode (`ItemElectricBow.changeMode`: `ELECTRIC_BOW_MODE`).
 fn electric_bow_use(game: &mut Game<'_>, claimed: &mut bool) {
     if !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
