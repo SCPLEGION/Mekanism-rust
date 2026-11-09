@@ -23,11 +23,34 @@ pub const ANTIMATTER: &str = "mekanism:antimatter";
 /// `general.sps`: `inputPerAntimatter`, `outputTankCapacity`, `energyPerInput`; the input tank holds
 /// two antimatter's worth (`getMaxInputGas`).
 pub const INPUT_PER_ANTIMATTER: u64 = 1_000;
+
+/// `inputPerAntimatter` of the open world's config (`INPUT_PER_ANTIMATTER` is its default).
+pub fn input_per_antimatter() -> u64 {
+    crate::config_files::active_int("general", "sps", "inputPerAntimatter", INPUT_PER_ANTIMATTER)
+}
 pub const OUTPUT_CAPACITY: u64 = 1_000;
-pub const INPUT_CAPACITY: u64 = 2 * INPUT_PER_ANTIMATTER;
+
+/// `outputTankCapacity` of the open world's config (`OUTPUT_CAPACITY` is its default).
+pub fn output_capacity() -> u64 {
+    crate::config_files::active_int("general", "sps", "outputTankCapacity", OUTPUT_CAPACITY)
+}
+/// The input tank holds two antimatter's worth.
+pub fn input_capacity() -> u64 {
+    2 * input_per_antimatter()
+}
 pub const ENERGY_PER_INPUT: u64 = 1_000_000;
+
+/// `energyPerInput` of the open world's config (`ENERGY_PER_INPUT` is its default).
+pub fn energy_per_input() -> u64 {
+    crate::config_files::active_int("general", "sps", "energyPerInput", ENERGY_PER_INPUT)
+}
 /// `storage.spsPort`.
 pub const PORT_STORAGE: u64 = 1_000_000_000;
+
+/// `spsPort` of the open world's config (`PORT_STORAGE` is its default).
+pub fn port_storage() -> u64 {
+    crate::config_files::active_int("machine-storage", "", "spsPort", PORT_STORAGE)
+}
 
 pub fn is_frame(name: &str) -> bool {
     matches!(name, CASING | PORT)
@@ -57,7 +80,7 @@ pub struct Sps {
 
 impl Sps {
     pub fn can_operate(&self) -> bool {
-        self.input > 0 && self.output < OUTPUT_CAPACITY
+        self.input > 0 && self.output < output_capacity()
     }
 
     /// `process`: takes up to `operations` mB of polonium, adding an antimatter for each 1,000 mB;
@@ -68,13 +91,13 @@ impl Sps {
         }
         let taken = operations.min(self.input);
         let mut total = self.input_processed + taken;
-        if total >= INPUT_PER_ANTIMATTER {
-            let add = total / INPUT_PER_ANTIMATTER;
-            if self.output + add > OUTPUT_CAPACITY {
+        if total >= input_per_antimatter() {
+            let add = total / input_per_antimatter();
+            if self.output + add > output_capacity() {
                 return 0;
             }
             self.output += add;
-            total %= INPUT_PER_ANTIMATTER;
+            total %= input_per_antimatter();
         }
         self.input -= taken;
         self.input_processed = total;
@@ -86,9 +109,9 @@ impl Sps {
         if !self.can_operate() || received == 0 {
             return 0.0;
         }
-        let needed = (INPUT_PER_ANTIMATTER - self.input_processed)
-            + INPUT_PER_ANTIMATTER * (OUTPUT_CAPACITY - self.output - 1);
-        let processable = received as f64 / ENERGY_PER_INPUT as f64;
+        let needed = (input_per_antimatter() - self.input_processed)
+            + input_per_antimatter() * (output_capacity() - self.output - 1);
+        let processable = received as f64 / energy_per_input() as f64;
         if processable + self.progress >= needed as f64 {
             self.progress = 0.0;
             self.process(needed) as f64
@@ -109,7 +132,7 @@ impl Sps {
 
     /// `getScaledProgress`: how far the next antimatter is.
     pub fn scaled_progress(&self) -> f64 {
-        (self.input_processed as f64 + self.progress) / INPUT_PER_ANTIMATTER as f64
+        (self.input_processed as f64 + self.progress) / input_per_antimatter() as f64
     }
 }
 
@@ -155,7 +178,7 @@ mod tests {
     fn a_full_output_stops_it() {
         let mut s = Sps {
             input: 2_000,
-            output: OUTPUT_CAPACITY,
+            output: output_capacity(),
             ..Default::default()
         };
         assert_eq!(s.tick(1_000_000_000), 0.0);

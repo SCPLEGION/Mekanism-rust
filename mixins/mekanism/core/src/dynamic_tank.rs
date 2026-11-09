@@ -9,6 +9,11 @@ pub const VALVE: &str = "mekanism:dynamic_valve";
 pub const GLASS: &str = "mekanism:structural_glass";
 /// `general.dynamicTank.mBPerTank`: mB for each block of the whole box (`MultiblockData.volume`).
 pub const PER_BLOCK: u64 = 16_000 * 1_000;
+
+/// `mBPerTank` of the open world's config (`PER_BLOCK` is its default).
+pub fn per_block() -> u64 {
+    crate::config_files::active_int("general", "dynamic_tank", "mBPerTank", PER_BLOCK)
+}
 /// What a valve takes from a pipe or tube in a tick before the tank empties it into itself.
 pub const VALVE_BUFFER: u64 = 256_000;
 
@@ -18,7 +23,7 @@ pub fn is_frame(name: &str) -> bool {
 
 /// `TankMultiblockData.setVolume`: the tank's capacity for a box of `volume` blocks.
 pub fn capacity(volume: u64) -> u64 {
-    volume.saturating_mul(PER_BLOCK)
+    volume.saturating_mul(per_block())
 }
 
 /// The edges of the box need the casing itself (`CuboidStructureValidator`'s frame).
