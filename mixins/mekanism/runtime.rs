@@ -211,10 +211,10 @@ fn kind(id: &str) -> Option<Kind> {
         return Some(Kind::DigitalMiner);
     }
     if let Some((recipe, usage)) = machine::machine(id) {
-        return Some(Kind::Machine(recipe, usage));
+        return Some(Kind::Machine(recipe, usage_of(recipe, usage)));
     }
     if let Some((processes, recipe, usage)) = factory::factory(id) {
-        return Some(Kind::Factory(processes, recipe, usage));
+        return Some(Kind::Factory(processes, recipe, usage_of(recipe, usage)));
     }
     if id == HEAT_GENERATOR {
         return Some(Kind::HeatGenerator);
@@ -3615,7 +3615,7 @@ fn tick_crystallizer(entity: &mut ModBlockEntity) -> Option<bool> {
 /// osmium ingot → osmium).
 fn tick_advanced(game: &mut Game<'_>, entity: &mut ModBlockEntity, m: &'static chem::AdvancedMachine) -> Option<bool> {
     let ticks = chem::ADVANCED_TICKS;
-    let capacity = m.usage * u64::from(ticks);
+    let capacity = advanced_usage(m) * u64::from(ticks);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut tank = get_tank(&entity.nbt, "chemical", chem::ADVANCED_TANK);
@@ -3665,7 +3665,7 @@ fn tick_advanced(game: &mut Game<'_>, entity: &mut ModBlockEntity, m: &'static c
             if fits
                 && tank.chemical.as_deref() == Some(r.chemical)
                 && tank.amount >= r.chemical_amount
-                && energy.consume(m.usage)
+                && energy.consume(advanced_usage(m))
             {
                 active = true;
                 tank.extract(r.chemical_amount);
@@ -3874,7 +3874,7 @@ fn tick_painting(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<boo
 /// recipe's output after 200 ticks at 5 FE a tick (`metallurgic_infusing`: iron + 10 carbon → enriched
 /// iron).
 fn tick_infuser(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = chem::INFUSER_USAGE * u64::from(chem::INFUSER_TICKS);
+    let capacity = usage_of("infusing", chem::INFUSER_USAGE) * u64::from(chem::INFUSER_TICKS);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut tank = get_tank(&entity.nbt, "infuse", chem::INFUSER_TANK);
@@ -3916,7 +3916,7 @@ fn tick_infuser(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool
                 None => true,
                 Some(o) => &*o.item == r.output && o.count + r.output_count <= max,
             };
-            if fits && energy.consume(chem::INFUSER_USAGE) {
+            if fits && energy.consume(usage_of("infusing", chem::INFUSER_USAGE)) {
                 active = true;
                 progress += 1;
                 if progress >= chem::INFUSER_TICKS {
@@ -5830,7 +5830,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Washer => Some((machine::STORAGE_MULTIPLIER * nuclear::WASHER_USAGE, u64::MAX)),
         Kind::Crystallizer => Some((machine::STORAGE_MULTIPLIER * nuclear::CRYSTALLIZER_USAGE, u64::MAX)),
         Kind::Separator => Some((machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE, u64::MAX)),
-        Kind::Advanced(m) => Some((m.usage * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
+        Kind::Advanced(m) => Some((advanced_usage(m) * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
         Kind::Nucleosynthesizer => Some((machine::STORAGE_MULTIPLIER * chem::NUCLEOSYNTHESIZER_USAGE, u64::MAX)),
         Kind::Reaction => Some((reaction_capacity(nbt), u64::MAX)),
         Kind::Teleporter => Some((teleporter::STORAGE, u64::MAX)),
@@ -5860,7 +5860,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
             let rate = get_long(nbt, "rate");
             Some(if get_long(nbt, "master") == 1 { (get_long(nbt, "capacity"), rate) } else { (rate, rate) })
         }
-        Kind::Infuser => Some((chem::INFUSER_USAGE * u64::from(chem::INFUSER_TICKS), u64::MAX)),
+        Kind::Infuser => Some((usage_of("infusing", chem::INFUSER_USAGE) * u64::from(chem::INFUSER_TICKS), u64::MAX)),
         Kind::Painting => Some((chem::PAINTING_USAGE * u64::from(chem::PAINTING_TICKS), u64::MAX)),
         // An SPS port takes energy in input mode (`TileEntitySPSPort`).
         Kind::SpsPort if get_long(nbt, "output") == 0 => Some((sps::PORT_STORAGE, u64::MAX)),
@@ -6036,6 +6036,7 @@ fn sync_gear_config(game: &Game<'_>) {
     let Some(file) = game.native_world_dir().map(|d| d.join("serverconfig").join("mekanism-gear.toml")) else {
         return;
     };
+    sync_usage_config(&file.with_file_name("mekanism-usage.toml"));
     if GEAR_CONFIG.read().is_ok_and(|g| g.as_ref().is_some_and(|(f, _)| *f == file)) {
         return;
     }
@@ -6049,6 +6050,43 @@ fn sync_gear_config(game: &Game<'_>) {
     };
     if let Ok(mut g) = GEAR_CONFIG.write() {
         *g = Some((file, config));
+    }
+}
+
+/// `UsageConfig`, read from the world's `serverconfig/mekanism-usage.toml` (written with the defaults when missing).
+static USAGE_CONFIG: std::sync::RwLock<Option<(std::path::PathBuf, mekanism_core::config::UsageConfig)>> = std::sync::RwLock::new(None);
+
+/// A machine's FE a tick: the config's value for the recipe kind's machine, else `default`.
+fn usage_of(recipe: &str, default: u64) -> u64 {
+    let Some(key) = mekanism_core::config::usage_key(recipe) else {
+        return default;
+    };
+    USAGE_CONFIG.read().ok().and_then(|g| g.as_ref().map(|(_, c)| c.get(key, default))).unwrap_or(default)
+}
+
+fn advanced_usage(m: &chem::AdvancedMachine) -> u64 {
+    let recipe = match m.block {
+        "mekanism:purification_chamber" => "purifying",
+        "mekanism:osmium_compressor" => "compressing",
+        _ => "injecting",
+    };
+    usage_of(recipe, m.usage)
+}
+
+fn sync_usage_config(file: &std::path::Path) {
+    if USAGE_CONFIG.read().is_ok_and(|g| g.as_ref().is_some_and(|(f, _)| f == file)) {
+        return;
+    }
+    let config = match std::fs::read_to_string(file) {
+        Ok(text) => mekanism_core::config::UsageConfig::parse(&text),
+        Err(_) => {
+            let config = mekanism_core::config::UsageConfig::default();
+            let _ = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(file, config.to_toml()));
+            config
+        }
+    };
+    if let Ok(mut g) = USAGE_CONFIG.write() {
+        *g = Some((file.to_path_buf(), config));
     }
 }
 
@@ -9651,9 +9689,9 @@ fn base_usage(k: Kind) -> Option<u64> {
         Kind::Nucleosynthesizer => chem::NUCLEOSYNTHESIZER_USAGE,
         Kind::ChemicalInfuser => chem::CHEMICAL_INFUSER_USAGE,
         Kind::Rotary => chem::ROTARY_USAGE,
-        Kind::Infuser => chem::INFUSER_USAGE,
+        Kind::Infuser => usage_of("infusing", chem::INFUSER_USAGE),
         Kind::Painting => chem::PAINTING_USAGE,
-        Kind::Advanced(m) => m.usage,
+        Kind::Advanced(m) => advanced_usage(m),
         Kind::Pump => isotopes::PUMP_USAGE,
         Kind::Plenisher => plenisher::PLENISHER_USAGE,
         Kind::ModificationStation => modules::STATION_USAGE,
