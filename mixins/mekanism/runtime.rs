@@ -6724,18 +6724,11 @@ fn player_state_payload(data: &[u8], now: u64) {
     });
 }
 
-/// `(month, day)` of today (UTC; `HolidayManager` reads the local date).
+/// `(month, day)` of today on the player's clock (`LocalDate.now()`).
 fn today() -> (u32, u32) {
-    let days = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() / 86400) as i64;
-    // Civil date from days since the epoch (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (month, day)
+    use chrono::Datelike;
+    let now = chrono::Local::now();
+    (now.month(), now.day())
 }
 
 /// `Holiday.Christmas.getFilterableSounds` (`AttributeSound`): on December 25th the five machines the holiday covers play
