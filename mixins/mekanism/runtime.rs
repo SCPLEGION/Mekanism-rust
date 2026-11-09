@@ -1286,11 +1286,7 @@ pub(super) fn install_upgrade(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
     let want = if sneaking { held.count } else { 1 };
     let installed = game.native_with_mod_block_entity(pos, |m| {
-        let target = self::kind(&m.id);
-        if !matches!(target, Some(Kind::Machine(..) | Kind::Factory(..) | Kind::DigitalMiner | Kind::Pump | Kind::Plenisher))
-            || (kind == Upgrade::Filter && target != Some(Kind::Pump))
-            || (kind == Upgrade::Anchor && target != Some(Kind::DigitalMiner))
-        {
+        if !supported_upgrades(&m.id).contains(&kind) {
             return None;
         }
         let mut u = upgrades(&m.nbt);
@@ -3362,6 +3358,24 @@ fn push_chemical(
     }
 }
 
+/// What a machine's upgrades make of its energy and speed (`MachineEnergyContainer.updateEnergyPerTick`/`updateMaxEnergy`,
+/// `UpgradeUtils.getTicks`): the upgrades, the energy per tick, the ticks one operation takes (0 with none), and the
+/// most it stores: `max(STORAGE_MULTIPLIER, ticks)` ticks of that usage.
+fn machine_power(nbt: &Compound, base_usage: u64, base_ticks: Option<u32>) -> (Upgrades, u64, u32, u64) {
+    let u = upgrades(nbt);
+    let usage = u.energy_per_tick(base_usage);
+    let ticks = base_ticks.map_or(0, |t| u.ticks(t));
+    let capacity = usage.saturating_mul(u64::from(ticks).max(machine::STORAGE_MULTIPLIER)).max(usage);
+    (u, usage, ticks, capacity)
+}
+
+/// The operations a continuous machine (a recipe each tick, one tick long) does in a tick with its speed upgrades
+/// (`UpgradeUtils.getOperationsPerTick`).
+fn upgraded_operations(u: &Upgrades) -> u64 {
+    let ticks = u.ticks_f64(1);
+    if ticks >= 1.0 { 1 } else { (1.0 / ticks).max(1.0) as u64 }
+}
+
 /// The Chemical Oxidizer: an item becomes a chemical over 100 ticks at 15 FE a tick, pushed out to the
 /// tanks beside it.
 fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, pigment: bool) -> Option<bool> {
@@ -3370,7 +3384,7 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     } else {
         (usage_const("chemicalOxidizer", chem::OXIDIZER_USAGE), chem::OXIDIZER_TICKS, chem::OXIDIZER_TANK)
     };
-    let capacity = usage * u64::from(ticks);
+    let (_, usage, ticks, capacity) = machine_power(&entity.nbt, usage, Some(ticks));
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut tank = get_tank(&entity.nbt, "output", tank_size);
@@ -3439,7 +3453,7 @@ fn tick_liquifier(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
         foods.sort();
         foods
     });
-    let capacity = usage_const("nutritionalLiquifier", chem::LIQUIFIER_USAGE) * u64::from(chem::LIQUIFIER_TICKS);
+    let (_, usage, ticks, capacity) = machine_power(&entity.nbt, usage_const("nutritionalLiquifier", chem::LIQUIFIER_USAGE), Some(chem::LIQUIFIER_TICKS));
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut tank = get_tank(&entity.nbt, "output", chem::LIQUIFIER_TANK);
@@ -3470,10 +3484,10 @@ fn tick_liquifier(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     put_int(&mut entity.nbt, "warn", warn);
     match recipe {
         Some((stack, paste, remainder)) if fits(paste, &remainder) => {
-            if energy.consume(usage_const("nutritionalLiquifier", chem::LIQUIFIER_USAGE)) {
+            if energy.consume(usage) {
                 active = true;
                 progress += 1;
-                if progress >= chem::LIQUIFIER_TICKS {
+                if progress >= ticks {
                     progress = 0;
                     tank.insert(chem::NUTRITIONAL_PASTE, paste);
                     entity.items[0] = (stack.count > 1).then(|| ItemStack { count: stack.count - 1, ..stack });
@@ -3507,7 +3521,7 @@ fn tick_liquifier(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
         (energy.stored * 1000 / capacity) as i32,
         1000,
         progress as i32,
-        chem::LIQUIFIER_TICKS as i32,
+        ticks as i32,
     ];
     Some(active)
 }
@@ -3515,7 +3529,7 @@ fn tick_liquifier(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
 /// The Chemical Dissolution Chamber: an item in the first slot and `per_tick` of the chemical piped in,
 /// every tick for 100 ticks, make the output chemical, pushed out to the tanks beside it.
 fn tick_dissolution(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = machine::STORAGE_MULTIPLIER * usage_const("chemicalDissolutionChamber", nuclear::DISSOLUTION_USAGE);
+    let (_, usage, ticks, capacity) = machine_power(&entity.nbt, usage_const("chemicalDissolutionChamber", nuclear::DISSOLUTION_USAGE), Some(nuclear::DISSOLUTION_TICKS));
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut input = get_tank(&entity.nbt, "input", nuclear::DISSOLUTION_TANK);
@@ -3545,11 +3559,11 @@ fn tick_dissolution(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
                 && output.accepts(r.output)
                 && output.amount + r.amount <= output.capacity =>
         {
-            if energy.consume(usage_const("chemicalDissolutionChamber", nuclear::DISSOLUTION_USAGE)) {
+            if energy.consume(usage) {
                 active = true;
                 input.extract(r.per_tick);
                 progress += 1;
-                if progress >= nuclear::DISSOLUTION_TICKS {
+                if progress >= ticks {
                     progress = 0;
                     output.insert(r.output, r.amount);
                     let left = stack.count - r.count;
@@ -3569,7 +3583,7 @@ fn tick_dissolution(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         (energy.stored * 1000 / capacity) as i32,
         1000,
         progress as i32,
-        nuclear::DISSOLUTION_TICKS as i32,
+        ticks as i32,
     ];
     Some(active)
 }
@@ -3662,7 +3676,7 @@ fn tick_washer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
 /// The Chemical Crystallizer: over 200 ticks, a clean slurry (or brine) piped in becomes its crystal (or
 /// salt) in the last slot.
 fn tick_crystallizer(entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = machine::STORAGE_MULTIPLIER * usage_const("chemicalCrystallizer", nuclear::CRYSTALLIZER_USAGE);
+    let (_, usage, ticks, capacity) = machine_power(&entity.nbt, usage_const("chemicalCrystallizer", nuclear::CRYSTALLIZER_USAGE), Some(nuclear::CRYSTALLIZER_TICKS));
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut input = get_tank(&entity.nbt, "input", nuclear::CRYSTALLIZER_TANK);
@@ -3675,10 +3689,10 @@ fn tick_crystallizer(entity: &mut ModBlockEntity) -> Option<bool> {
             if input.amount >= r.amount
                 && out.as_ref().is_none_or(|o| &*o.item == r.output && o.count + r.count <= 64) =>
         {
-            if energy.consume(usage_const("chemicalCrystallizer", nuclear::CRYSTALLIZER_USAGE)) {
+            if energy.consume(usage) {
                 active = true;
                 progress += 1;
-                if progress >= nuclear::CRYSTALLIZER_TICKS {
+                if progress >= ticks {
                     progress = 0;
                     input.extract(r.amount);
                     let count = out.map_or(0, |o| o.count) + r.count;
@@ -3704,7 +3718,7 @@ fn tick_crystallizer(entity: &mut ModBlockEntity) -> Option<bool> {
         (energy.stored * 1000 / capacity) as i32,
         1000,
         progress as i32,
-        nuclear::CRYSTALLIZER_TICKS as i32,
+        ticks as i32,
     ];
     Some(active)
 }
@@ -3714,12 +3728,36 @@ fn tick_crystallizer(entity: &mut ModBlockEntity) -> Option<bool> {
 /// from the blocks beside it, or from items in the middle slot (`chemical_conversion`: flint → oxygen,
 /// osmium ingot → osmium).
 fn tick_advanced(game: &mut Game<'_>, entity: &mut ModBlockEntity, m: &'static chem::AdvancedMachine) -> Option<bool> {
-    let ticks = chem::ADVANCED_TICKS;
-    let capacity = advanced_usage(m) * u64::from(ticks);
+    // Speed and energy upgrades set the ticks, the energy per tick and the buffer; the chemical a tick follows
+    // `TileEntityAdvancedElectricMachine`: statistical (the chambers, `randomizedConsumption`) or a constant share of the
+    // operation's total.
+    let (u, usage, ticks, capacity) = machine_power(&entity.nbt, advanced_usage(m), Some(chem::ADVANCED_TICKS));
+    let statistical = usage_const("randomizedConsumption", 1) != 0 && matches!(m.block, "mekanism:purification_chamber" | "mekanism:chemical_injection_chamber");
+    let chemical_upgrades = matches!(m.block, "mekanism:purification_chamber" | "mekanism:chemical_injection_chamber");
+    let mut used = get_int(&entity.nbt, "used");
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut tank = get_tank(&entity.nbt, "chemical", chem::ADVANCED_TANK);
     let mut progress = get_int(&entity.nbt, "progress");
+    // `ChemicalUsageMultiplier`: what this tick takes of the chemical.
+    let need = if statistical {
+        mekanism_core::upgrades::inverse_poisson(u.chemical_multiplier(), roll(entity))
+    } else {
+        // `UpgradeUtils.getBaseUsage`: the total over an operation, 200 unless chemical upgrades change it.
+        let total = if chemical_upgrades {
+            (f64::from(chem::ADVANCED_TICKS) * mekanism_core::upgrades::max_upgrade_multiplier().powf(u.fraction_of(Upgrade::Speed) - u.fraction_of(Upgrade::Chemical))).round() as i64
+        } else {
+            i64::from(chem::ADVANCED_TICKS)
+        };
+        let (remaining, ticks_left) = (total - i64::from(used), i64::from(ticks) - i64::from(progress));
+        if remaining < ticks_left {
+            0
+        } else if remaining == ticks_left || ticks_left <= 0 {
+            1
+        } else {
+            (remaining as f64 / ticks_left as f64) as u64
+        }
+    };
     let mut active = false;
     let items = world_items!(game);
     let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
@@ -3750,7 +3788,7 @@ fn tick_advanced(game: &mut Game<'_>, entity: &mut ModBlockEntity, m: &'static c
         (Some((_, r)), _) => {
             let max = items.get(r.output).map_or(64, |i| i.max_stack);
             let fits = out.as_ref().is_none_or(|o| &*o.item == r.output && o.count + r.output_count <= max);
-            u32::from(!(tank.chemical.as_deref() == Some(r.chemical) && tank.amount >= r.chemical_amount)) << 1 | u32::from(!fits) << 2
+            u32::from(!(tank.chemical.as_deref() == Some(r.chemical) && tank.amount >= need.max(1))) << 1 | u32::from(!fits) << 2
         }
         _ => 0,
     };
@@ -3764,14 +3802,16 @@ fn tick_advanced(game: &mut Game<'_>, entity: &mut ModBlockEntity, m: &'static c
             };
             if fits
                 && tank.chemical.as_deref() == Some(r.chemical)
-                && tank.amount >= r.chemical_amount
-                && energy.consume(advanced_usage(m))
+                && tank.amount >= need
+                && energy.consume(usage)
             {
                 active = true;
-                tank.extract(r.chemical_amount);
+                tank.extract(need);
+                used += need as u32;
                 progress += 1;
                 if progress >= ticks {
                     progress = 0;
+                    used = 0;
                     let left = stack.count - r.input_count;
                     entity.items[0] = (left > 0).then(|| ItemStack { count: left, ..stack });
                     entity.items[2] = Some(match out {
@@ -3781,8 +3821,12 @@ fn tick_advanced(game: &mut Game<'_>, entity: &mut ModBlockEntity, m: &'static c
                 }
             }
         }
-        None => progress = 0,
+        None => {
+            progress = 0;
+            used = 0;
+        }
     }
+    put_int(&mut entity.nbt, "used", used);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "chemical", &tank);
@@ -3910,7 +3954,7 @@ fn tick_chemical_infuser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlo
 /// The Painting Machine: an item and the pigment in the tank become a dyed item after 200 ticks at 5 FE a
 /// tick; the pigment is used when the operation ends (`painting`).
 fn tick_painting(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = usage_const("paintingMachine", chem::PAINTING_USAGE) * u64::from(chem::PAINTING_TICKS);
+    let (_, usage, ticks, capacity) = machine_power(&entity.nbt, usage_const("paintingMachine", chem::PAINTING_USAGE), Some(chem::PAINTING_TICKS));
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut tank = get_tank(&entity.nbt, "pigment", chem::PAINTING_TANK);
@@ -3940,10 +3984,10 @@ fn tick_painting(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<boo
         Some((stack, r)) if tank.amount >= r.chemical_amount => {
             let max = items.get(r.output).map_or(64, |i| i.max_stack);
             let fits = out.as_ref().is_none_or(|o| &*o.item == r.output && o.count + r.output_count <= max);
-            if fits && energy.consume(usage_const("paintingMachine", chem::PAINTING_USAGE)) {
+            if fits && energy.consume(usage) {
                 active = true;
                 progress += 1;
-                if progress >= chem::PAINTING_TICKS {
+                if progress >= ticks {
                     progress = 0;
                     tank.extract(r.chemical_amount);
                     let left = stack.count - r.input_count;
@@ -3964,7 +4008,7 @@ fn tick_painting(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<boo
         (energy.stored * 1000 / capacity) as i32,
         1000,
         progress as i32,
-        chem::PAINTING_TICKS as i32,
+        ticks as i32,
     ];
     Some(active)
 }
@@ -3974,7 +4018,7 @@ fn tick_painting(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<boo
 /// recipe's output after 200 ticks at 5 FE a tick (`metallurgic_infusing`: iron + 10 carbon → enriched
 /// iron).
 fn tick_infuser(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = usage_of("infusing", chem::INFUSER_USAGE) * u64::from(chem::INFUSER_TICKS);
+    let (_, usage, ticks, capacity) = machine_power(&entity.nbt, usage_of("infusing", chem::INFUSER_USAGE), Some(chem::INFUSER_TICKS));
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut tank = get_tank(&entity.nbt, "infuse", chem::INFUSER_TANK);
@@ -4016,10 +4060,10 @@ fn tick_infuser(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool
                 None => true,
                 Some(o) => &*o.item == r.output && o.count + r.output_count <= max,
             };
-            if fits && energy.consume(usage_of("infusing", chem::INFUSER_USAGE)) {
+            if fits && energy.consume(usage) {
                 active = true;
                 progress += 1;
-                if progress >= chem::INFUSER_TICKS {
+                if progress >= ticks {
                     progress = 0;
                     tank.extract(r.chemical_amount);
                     let left = stack.count - r.input_count;
@@ -4041,7 +4085,7 @@ fn tick_infuser(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool
         (tank.amount * 1000 / chem::INFUSER_TANK) as i32,
         1000,
         progress as i32,
-        chem::INFUSER_TICKS as i32,
+        ticks as i32,
     ];
     Some(active)
 }
@@ -11915,7 +11959,7 @@ fn window_button(game: &Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id
 /// (`EnumColor`), description, and the port's upgrade when it installs that one.
 const UPGRADE_TYPES: [(&str, &str, u32, &str, Option<Upgrade>); 7] = [
     ("mekanism:anchor", "Anchor", 0x59C15F, "Keeps a machine's chunk loaded.", Some(Upgrade::Anchor)),
-    ("mekanism:chemical", "Chemical", 0xFFDD4F, "Increases the efficiency of chemical-using machinery.", None),
+    ("mekanism:chemical", "Chemical", 0xFFDD4F, "Increases the efficiency of chemical-using machinery.", Some(Upgrade::Chemical)),
     ("mekanism:energy", "Energy", 0x75FF89, "Increases energy efficiency and capacity of machinery.", Some(Upgrade::Energy)),
     ("mekanism:filter", "Filter", 0x00F3D0, "A filter that separates heavy water from regular water.", Some(Upgrade::Filter)),
     ("mekanism:muffling", "Muffling", 0x559EFF, "Reduces noise generated by machinery.", None),
@@ -11925,10 +11969,36 @@ const UPGRADE_TYPES: [(&str, &str, u32, &str, Option<Upgrade>); 7] = [
 
 /// The upgrades the port installs in a block (`install_upgrade`).
 fn supported_upgrades(block: &str) -> &'static [Upgrade] {
+    // `AttributeUpgradeSupport` and the `upgrade_support` tags: most machines take speed and energy, the advanced ones
+    // (purification and injection chambers, the dissolution chamber) chemical too.
+    const SIMPLE: &[Upgrade] = &[Upgrade::Speed, Upgrade::Energy];
+    const ADVANCED: &[Upgrade] = &[Upgrade::Speed, Upgrade::Energy, Upgrade::Chemical];
     match kind(block) {
         Some(Kind::DigitalMiner) => &[Upgrade::Speed, Upgrade::Energy, Upgrade::Anchor],
-        Some(Kind::Machine(..) | Kind::Factory(..) | Kind::Plenisher) => &[Upgrade::Speed, Upgrade::Energy],
         Some(Kind::Pump) => &[Upgrade::Speed, Upgrade::Energy, Upgrade::Filter],
+        Some(Kind::Stabilizer) => &[Upgrade::Energy],
+        Some(Kind::Advanced(m)) if matches!(m.block, "mekanism:purification_chamber" | "mekanism:chemical_injection_chamber") => ADVANCED,
+        Some(Kind::Dissolution) => ADVANCED,
+        Some(
+            Kind::Machine(..)
+            | Kind::Factory(..)
+            | Kind::Plenisher
+            | Kind::Assemblicator
+            | Kind::Advanced(..)
+            | Kind::Oxidizer
+            | Kind::PigmentExtractor
+            | Kind::ChemicalInfuser
+            | Kind::Painting
+            | Kind::PigmentMixer
+            | Kind::Infuser
+            | Kind::Separator
+            | Kind::Rotary
+            | Kind::Reaction
+            | Kind::Washer
+            | Kind::Crystallizer
+            | Kind::Centrifuge
+            | Kind::Liquifier,
+        ) => SIMPLE,
         _ => &[],
     }
 }
@@ -11938,7 +12008,7 @@ fn installed_upgrades(data: &[i32]) -> Vec<(usize, u32)> {
     let count = |u: Upgrade| match u {
         Upgrade::Speed => (data.get(DATA_SPEED).copied().unwrap_or(0).max(0) & 0x3FFF) as u32,
         Upgrade::Energy => data.get(DATA_ENERGY_UPGRADES).copied().unwrap_or(0).max(0) as u32,
-        Upgrade::Filter => 0,
+        Upgrade::Filter | Upgrade::Chemical => 0,
         // Bit 14 of the speed slot (a machine's speed count is at most 8).
         Upgrade::Anchor => (data.get(DATA_SPEED).copied().unwrap_or(0).max(0) >> 14 & 1) as u32,
     };
@@ -12192,6 +12262,7 @@ fn upgrade_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
         Upgrade::Energy => &mut u.energy,
         Upgrade::Filter => &mut u.filter,
         Upgrade::Anchor => &mut u.anchor,
+        Upgrade::Chemical => &mut u.chemical,
     };
     if *field == 0 {
         return true;

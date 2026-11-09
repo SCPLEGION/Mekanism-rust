@@ -348,7 +348,9 @@ impl GearConfig {
 
 /// `UsageConfig`: FE a tick a machine uses, for the machines whose usage the port reads from here, with the
 /// original's defaults (`defineInRange(key, default, 0, Integer.MAX_VALUE)`).
-pub const USAGE_DEFAULTS: [(&str, u64); 34] = [
+pub const USAGE_DEFAULTS: [(&str, u64); 35] = [
+    // A boolean (1 is true): `UsageConfig.randomizedConsumption`.
+    ("randomizedConsumption", 1),
     ("enrichmentChamber", 5),
     ("osmiumCompressor", 15),
     ("combiner", 5),
@@ -417,10 +419,14 @@ impl UsageConfig {
             if section != "usage" {
                 continue;
             }
-            if let (Some((name, _)), Some(n)) = (
-                USAGE_DEFAULTS.iter().find(|(k, _)| *k == key.trim()),
-                value.trim().replace('_', "").parse::<u64>().ok().filter(|n| *n <= i32::MAX as u64),
-            ) {
+            let text = value.trim().replace('_', "");
+            let number = match text.as_str() {
+                "true" => Some(1),
+                "false" => Some(0),
+                _ if key.trim() == "randomizedConsumption" => None,
+                _ => text.parse::<u64>().ok().filter(|n| *n <= i32::MAX as u64),
+            };
+            if let (Some((name, _)), Some(n)) = (USAGE_DEFAULTS.iter().find(|(k, _)| *k == key.trim()), number) {
                 config.values.insert(name, n);
             }
         }
@@ -430,7 +436,11 @@ impl UsageConfig {
     pub fn to_toml(&self) -> String {
         let mut out = String::from("# Mekanism usage config (server config: this world only). Range 0 ~ 2147483647\n[usage]\n");
         for (key, _) in USAGE_DEFAULTS {
-            out.push_str(&format!("{key} = {}\n", self.values[key]));
+            if key == "randomizedConsumption" {
+                out.push_str(&format!("{key} = {}\n", self.values[key] != 0));
+            } else {
+                out.push_str(&format!("{key} = {}\n", self.values[key]));
+            }
         }
         out
     }

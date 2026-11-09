@@ -161,6 +161,7 @@ mod tests {
                 energy: 0,
                 filter: 0,
                 anchor: 0,
+                chemical: 0,
             },
         );
         assert_eq!(
@@ -178,6 +179,7 @@ mod tests {
                 energy: 0,
                 filter: 0,
                 anchor: 0,
+                chemical: 0,
             },
         );
         let mut dust = Slot {
