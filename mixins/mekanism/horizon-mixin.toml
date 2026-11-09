@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "0723317fd84e166451fe54a8e9ba10b8f1721d76"
+horizon_revision = "85983ac773731cbb157d6c3efb2c8ec262232492"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -719,6 +719,20 @@ bindings = [
 ]
 
 [[injection]]
+id = "use-item-on"
+hook = "use_item_on"
+hook_version = 1
+kind = "HEAD"
+helper = "use_item_on.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "face", ty = "[i32; 3]", value = "face" },
+  { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
+]
+
+[[injection]]
 id = "bow-item"
 hook = "bow_item"
 hook_version = 1
@@ -799,3 +813,4 @@ bindings = [
   { name = "world_root", ty = "&std::path::Path", value = "world_root" },
   { name = "entries", ty = "&mut Vec<(String, String, String)>", value = "&mut *entries" },
 ]
+
