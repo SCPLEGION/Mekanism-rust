@@ -7323,7 +7323,7 @@ pub(super) fn glide_wear(game: &mut Game<'_>, wear: u32, claimed: &mut bool) {
 /// `ModeChangeKey`, on the window: the mode key (M) held while the wheel turns asks the server to toggle the
 /// flow of a scuba tank in hand or worn.
 pub(super) fn wheel(game: &mut Game<'_>, steps: f32, claimed: &mut bool) {
-    if *claimed || !game.native_on(MOD_ID) || !game.native_playing() || !game.keys.contains(&winit::keyboard::KeyCode::KeyM) {
+    if *claimed || !game.native_on(MOD_ID) || !game.native_playing() || !key_down(game, "mode") {
         return;
     }
     if game.armor[1].as_ref().is_some_and(is_jetpack) && steps.round() != 0.0 && !game.armor[1].as_ref().is_some_and(|s| &*s.item == SCUBA_TANK) {
@@ -21359,7 +21359,7 @@ fn module_enabled(stack: &ItemStack, module: &str) -> bool {
 
 /// The key press that opens the tweaker (hook point `native_tick`, client side).
 fn tweaker_key(game: &mut Game<'_>) {
-    let down = game.keys.contains(&winit::keyboard::KeyCode::Backslash);
+    let down = key_down(game, "module_tweaker");
     let was = TW_KEY_DOWN.swap(down, std::sync::atomic::Ordering::Relaxed);
     if down && !was && game.native_playing() && game.native_ui_open().is_none() {
         TW_UI.with_borrow_mut(|ui| *ui = TwUi::default());
@@ -22049,7 +22049,7 @@ fn radial_current(stack: &ItemStack, module: &str) -> Option<u32> {
 
 /// Opens while the hand mode key is held and closes, applying the selection, when it is let go.
 fn radial_key(game: &mut Game<'_>) {
-    let down = game.keys.contains(&winit::keyboard::KeyCode::KeyN);
+    let down = key_down(game, "radial");
     let was = RADIAL_KEY_DOWN.swap(down, std::sync::atomic::Ordering::Relaxed);
     let open = RADIAL_UI.with_borrow(|ui| ui.open) && game.native_ui_open() == Some(RADIAL_ID);
     if !down && open {
@@ -24653,7 +24653,7 @@ fn gravitational_boost(chest: &ItemStack) -> f32 {
 /// `ModuleGravitationalModulatingUnit.tickClient`: flying with the boost key down and the energy for it, the player is
 /// pushed toward where they face (`moveRelative(boost, (0, 0, 1))`); the server is told so it takes the energy.
 fn gravitational_client(game: &mut Game<'_>) {
-    if !gravitational_ready(game) || game.creative || !game.keys.contains(&winit::keyboard::KeyCode::ControlLeft) {
+    if !gravitational_ready(game) || game.creative || !key_down(game, "boost") {
         return;
     }
     let Some(chest) = game.armor[1].as_ref() else {
@@ -24684,6 +24684,32 @@ fn gravitational_boost_paid(game: &mut Game<'_>) {
         set_energy(chest, stored - extra);
         player_game_event(game, "mekanism:gravity_modulate_boosted");
     }
+}
+
+/// Mekanism's keys (`MekanismKeyHandler`): name, label and default; Options > Mods lets the player rebind them.
+const KEYS: [[&str; 3]; 4] = [
+    ["mode", "Mode Change (hold, then the wheel)", "key.keyboard.m"],
+    ["module_tweaker", "Module Tweaker", "key.keyboard.backslash"],
+    ["radial", "Radial Selector", "key.keyboard.n"],
+    ["boost", "Boost", "key.keyboard.left.control"],
+];
+
+/// Whether Mekanism's key `name` is held, as the player bound it.
+fn key_down(game: &Game<'_>, name: &str) -> bool {
+    let Some([_, _, default]) = KEYS.iter().find(|k| k[0] == name) else {
+        return false;
+    };
+    horizon_client::keybinds::key_code(&game.native_mod_key(MOD_ID, name, default)).is_some_and(|code| game.keys.contains(&code))
+}
+
+/// `native_mods`: Mekanism's row in Options > Mods, with the keys above.
+pub(super) fn list_mod(_game: &mut Game<'_>, mods: &mut Vec<super::native_hooks::NativeMod>) {
+    mods.push(super::native_hooks::NativeMod {
+        id: MOD_ID.to_owned(),
+        title: "Mekanism 0.1.0".to_owned(),
+        description: "Mekanism ported to Rust: machines, generators, the MekaSuit and more.".to_owned(),
+        keys: KEYS.iter().map(|k| k.map(str::to_owned)).collect(),
+    });
 }
 
 /// `GearConfig.mekaSuitEnergyUsageGravitationalModulation`.
