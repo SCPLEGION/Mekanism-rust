@@ -126,6 +126,8 @@ enum Kind {
     Separator,
     GasGenerator,
     ChemicalTank(BaseTier),
+    /// The Radioactive Waste Barrel: radioactive chemicals only, decaying a little each second, emitting down when active.
+    WasteBarrel,
     DigitalMiner,
     FluidTank(BaseTier),
     /// The Chemical Dissolution Chamber: an item and a chemical each tick into a chemical.
@@ -227,6 +229,9 @@ fn kind(id: &str) -> Option<Kind> {
     }
     if id == "mekanism:industrial_alarm" {
         return Some(Kind::Alarm);
+    }
+    if id == WASTE_BARREL {
+        return Some(Kind::WasteBarrel);
     }
     match id {
         qio::DRIVE_ARRAY => return Some(Kind::QioDriveArray),
@@ -722,6 +727,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             Kind::GasGenerator => tick_gas_generator(game, pos, entity),
             Kind::ChemicalTank(t) => {
                 tick_chemical_tank(game, pos, entity, t);
+                None
+            }
+            Kind::WasteBarrel => {
+                tick_waste_barrel(game, pos, entity);
                 None
             }
             Kind::Tube(rate) => {
@@ -3092,6 +3101,9 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
             Some((key, cap))
         }
         Kind::GasGenerator if chem::fuel(chemical).is_some() => Some(("fuel", chem::GAS_GENERATOR_TANK)),
+        Kind::WasteBarrel if radioactivity(chemical) > 0.0 && get_tank(nbt, "chemical", waste_barrel_capacity()).accepts(chemical) => {
+            Some(("chemical", waste_barrel_capacity()))
+        }
         Kind::Dissolution if nuclear::dissolves_with(chemical) => Some(("input", nuclear::DISSOLUTION_TANK)),
         Kind::Centrifuge if nuclear::centrifuging(chemical).is_some() => Some(("input", nuclear::CENTRIFUGE_TANK)),
         Kind::Washer if nuclear::find_washing(chemical).is_some() => Some(("input", nuclear::WASHER_TANK)),
@@ -5545,6 +5557,53 @@ fn tick_chemical_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
         push_chemical(game, pos, &mut tank, Some([0, -1, 0]), rate, false);
         put_tank(&mut entity.nbt, "chemical", &tank);
     }
+}
+
+const WASTE_BARREL: &str = "mekanism:radioactive_waste_barrel";
+
+/// `GeneralConfig.radioactiveWasteBarrelMaxChemical`.
+fn waste_barrel_capacity() -> u64 {
+    config_int("general", "radiation", "wasteBarrelCapacity", 512_000).max(1) as u64
+}
+
+/// `TileEntityRadioactiveWasteBarrel.onUpdateServer`: the stored chemical decays by `wasteBarrelDecayAmount` every
+/// `wasteBarrelProcessTicks` (not plutonium or polonium, the `waste_barrel_decay_blacklist`), and an active barrel
+/// emits what it holds into the container below.
+fn tick_waste_barrel(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let mut tank = get_tank(&entity.nbt, "chemical", waste_barrel_capacity());
+    if let Some(chemical) = tank.chemical.clone() {
+        let decay = config_int("general", "radiation", "wasteBarrelDecayAmount", 1).max(0) as u64;
+        if decay > 0 && !matches!(chemical.as_str(), "mekanism:plutonium" | "mekanism:polonium") {
+            let ticks = get_int(&entity.nbt, "progress") + 1;
+            if i64::from(ticks) >= config_int("general", "radiation", "wasteBarrelProcessTicks", 20).max(1) {
+                put_int(&mut entity.nbt, "progress", 0);
+                tank.extract(decay);
+            } else {
+                put_int(&mut entity.nbt, "progress", ticks);
+            }
+        }
+    }
+    if get_int(&entity.nbt, "active") == 1 && tank.amount > 0 {
+        let amount = tank.amount;
+        push_chemical(game, pos, &mut tank, Some([0, -1, 0]), amount, false);
+    }
+    put_tank(&mut entity.nbt, "chemical", &tank);
+}
+
+/// `TileEntityRadioactiveWasteBarrel.onSneakRightClick`: sneaking, a right click switches the barrel's emitting.
+pub(super) fn use_waste_barrel(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || !(game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight)) {
+        return false;
+    }
+    game.native_with_mod_block_entity(pos, |m| {
+        if kind(&m.id) != Some(Kind::WasteBarrel) {
+            return false;
+        }
+        let on = get_int(&m.nbt, "active") == 1;
+        put_int(&mut m.nbt, "active", u32::from(!on));
+        true
+    })
+    .unwrap_or(false)
 }
 
 /// A pressurized tube feeds the tanks, machines and generators beside it, then lets the rest run on
