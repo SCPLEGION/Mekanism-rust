@@ -453,6 +453,17 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         });
         return;
     }
+    // `TileEntityChemicalTank`: the drain slot (a tank item takes the chemical) and the fill slot (it gives it).
+    if matches!(kind(block), Some(Kind::ChemicalTank(_))) {
+        *container = Some(ModContainer {
+            slots: 5,
+            faces: std::array::from_fn(|_| vec![0, 1]),
+            inputs: vec![1],
+            outputs: vec![0],
+            menu: Some("minecraft:hopper".into()),
+        });
+        return;
+    }
     // The module slot, the item to fit it into and the energy slot.
     if kind(block) == Some(Kind::ModificationStation) {
         *container = Some(ModContainer {
@@ -537,8 +548,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::InductionPort) => (vec![0, 1], vec![]),
         // Tanks, the multiblocks' ports and the machines below open a screen with no slots of their own.
         Some(
-            Kind::ChemicalTank(_)
-            | Kind::FissionPort
+            Kind::FissionPort
             | Kind::TurbineValve
             | Kind::FusionPort
             | Kind::BoilerValve
@@ -5539,6 +5549,10 @@ fn tick_chemical_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     let mut tank = get_tank(&entity.nbt, "chemical", capacity);
     let dumping = get_int(&entity.nbt, "dump") % 3;
     let creative = tier == BaseTier::Creative;
+    // `drainTankIntoSlot`, `fillTankFromSlot`.
+    drain_tank_into_item(entity, 0, &mut tank);
+    fill_tank_from_item(entity, 1, &mut tank, |_| true);
+    put_tank(&mut entity.nbt, "chemical", &tank);
     // `ChemicalUtils.dump(tank, mode, capacity / 400, transfer rate)`: dumping removes a share, dumping excess
     // what is over 85% of the tank.
     if dumping != 0 && !creative && tank.amount > 0 {
@@ -6483,6 +6497,14 @@ pub(super) fn destroy_speed(game: &Game<'_>, stack: Option<&ItemStack>, hardness
 /// Sneak + right click with the disassembler cycles its mode (Mekanism's mode key), with the new mode on
 /// the action bar. Hook point `native_use_item`, API 13.
 pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut bool) {
+    // `ItemDictionary.use`: sneaking opens the screen.
+    if !*claimed && &*stack.item == "mekanism:dictionary" && game.native_on(MOD_ID) && game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+        *claimed = true;
+        if let Some(player) = game.native_acting_player() {
+            game.native_send_to_player(player.uuid, DICT_CHANNEL, &[1]);
+        }
+        return;
+    }
     if !*claimed && &*stack.item == CONFIGURATOR {
         configurator_use(game, claimed);
         return;
@@ -7702,6 +7724,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
         tweaker_key(game);
         seismic_open(game);
         pt_open(game);
+        dict_open(game);
         radial_key(game);
     }
     if !game.native_window() || !game.native_on(MOD_ID) || !game.native_playing() {
@@ -9828,7 +9851,8 @@ fn layout(block: &str) -> Option<Layout> {
         },
         // A tank's one big gauge.
         Kind::ChemicalTank(t) => Layout {
-            slots: [None; 3],
+            // `drainSlot` (16, 16) and `fillSlot` (16, 48).
+            slots: [Some(([16.0, 16.0], "slot/output")), Some(([16.0, 48.0], "slot/normal")), None],
             // `GuiChemicalBar`: a horizontal bar of 116 x 10 (drawn by `draw_tank_screen`).
             gauges: vec![gauge("chemical", chem::chemical_tank(t).0, 42.0, 16.0, [116.0, 10.0])],
             power: None,
@@ -14037,6 +14061,11 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
             sprite(game, batch, "slot/overlay/minus", [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
         }
         // `SlotOverlay.PLUS` on the matrix's charge slot, `MINUS` on its discharge slot.
+        // `SlotOverlay.PLUS` on the tank's drain slot, `MINUS` on its fill slot.
+        if i < 2 && matches!(kind(block), Some(Kind::ChemicalTank(_))) {
+            let overlay = if i == 0 { "slot/overlay/plus" } else { "slot/overlay/minus" };
+            sprite(game, batch, overlay, [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
+        }
         if i < 2 && kind(block) == Some(Kind::InductionPort) {
             let overlay = if i == 0 { "slot/overlay/plus" } else { "slot/overlay/minus" };
             sprite(game, batch, overlay, [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
@@ -23447,7 +23476,9 @@ fn tweaker_payload(game: &mut Game<'_>, data: &[u8]) {
 
 /// The mod's own screens (hook points `native_ui_*`, API 44).
 pub(super) fn ui_draw(game: &Game<'_>, id: &str, batch: &mut horizon_client::hud::HudBatch) {
-    if id == PT_ID {
+    if id == DICT_ID {
+        dict_draw(game, batch);
+    } else if id == PT_ID {
         pt_draw(game, batch);
     } else if id == SEISMIC_ID {
         seismic_draw(game, batch);
@@ -23467,7 +23498,11 @@ pub(super) fn ui_draw(game: &Game<'_>, id: &str, batch: &mut horizon_client::hud
 }
 
 pub(super) fn ui_click(game: &mut Game<'_>, id: &str, at: [f32; 2], button: u8, pressed: bool) {
-    if id == PT_ID {
+    if id == DICT_ID {
+        if pressed {
+            dict_click(game, at, button);
+        }
+    } else if id == PT_ID {
         if pressed {
             pt_click(game, at, button);
         }
@@ -23536,7 +23571,12 @@ pub(super) fn ui_close_hook(game: &mut Game<'_>, id: &str) {
 }
 
 pub(super) fn ui_wheel(game: &mut Game<'_>, id: &str, steps: f32) {
-    if id == SEISMIC_ID {
+    if id == DICT_ID {
+        DICT_UI.with_borrow_mut(|ui| {
+            let hidden = ui.tags(&ui.shown()).len().saturating_sub(4);
+            ui.scroll = (ui.scroll as i32 - steps.signum() as i32).clamp(0, hidden as i32) as usize;
+        });
+    } else if id == SEISMIC_ID {
         seismic_scroll(if steps > 0.0 { 1 } else { -1 });
     } else if id == TW_ID {
         tweaker_wheel(game.native_cursor(), steps);
@@ -23546,6 +23586,181 @@ pub(super) fn ui_wheel(game: &mut Game<'_>, id: &str, steps: f32) {
         let rows = ROBIT_UNLOCKED.with_borrow(|u| u.len().div_ceil(3)).saturating_sub(3);
         ROBIT_SKIN_ROW.with(|r| r.set((r.get() as i32 - steps.signum() as i32).clamp(0, rows as i32) as usize));
     }
+}
+
+// --- Dictionary (GuiDictionary) ------------------------------------------------------------------------------
+
+const DICT_ID: &str = "mekanism:dictionary";
+const DICT_CHANNEL: &str = "mekanism:dictionary";
+/// `DEFAULT_IMAGE_HEIGHT + 5`.
+const DICT_WINDOW: [f32; 2] = [176.0, 171.0];
+const DICT_TARGET: [f32; 4] = [6.0, 6.0, 16.0, 16.0];
+const DICT_LIST: [f32; 4] = [7.0, 29.0, 162.0, 42.0];
+const DICT_DROPDOWN: [f32; 4] = [113.0, 73.0, 56.0, 12.0];
+/// `DictionaryTagType`, with the short names of the lang file.
+const DICT_TYPES: [&str; 10] = ["Item", "Block", "BE Type", "Fluid", "Entity Type", "Attribute", "Potion", "Mob Effect", "Enchantment", "Chemical"];
+
+thread_local! {
+    static DICT_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DICT_UI: std::cell::RefCell<DictUi> = std::cell::RefCell::new(DictUi::default());
+    /// The item and block tags of the open world, kept for the screen.
+    static DICT_TAGS: std::cell::RefCell<(Vec<(String, Vec<String>)>, Vec<(String, Vec<String>)>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+#[derive(Default)]
+struct DictUi {
+    target: Option<ItemStack>,
+    kind: usize,
+    scroll: usize,
+    open: bool,
+    origin: [f32; 2],
+}
+
+impl DictUi {
+    fn shown(&self) -> String {
+        self.target.as_ref().map(|s| s.item.to_string()).unwrap_or_default()
+    }
+
+    /// The tags of the target in the chosen type (the port knows the item and block tags).
+    fn tags(&self, item: &str) -> Vec<String> {
+        if item.is_empty() || self.kind > 1 {
+            return vec![];
+        }
+        DICT_TAGS.with_borrow(|t| {
+            let list = if self.kind == 0 { &t.0 } else { &t.1 };
+            let mut out: Vec<String> = list.iter().filter(|(_, members)| members.iter().any(|m| m == item)).map(|(tag, _)| tag.clone()).collect();
+            out.sort();
+            out
+        })
+    }
+}
+
+fn dict_open(game: &mut Game<'_>) {
+    if !DICT_PENDING.take() || game.native_ui_open().is_some() {
+        return;
+    }
+    let items = world_items!(game);
+    let collect = |m: &std::collections::HashMap<String, std::collections::HashSet<String>>| -> Vec<(String, Vec<String>)> {
+        m.iter().map(|(tag, set)| (tag.clone(), set.iter().cloned().collect())).collect()
+    };
+    let tags = (collect(&items.item_tags), collect(&items.block_tags));
+    DICT_TAGS.with_borrow_mut(|t| *t = tags);
+    DICT_UI.with_borrow_mut(|ui| *ui = DictUi::default());
+    game.native_open_ui(DICT_ID);
+}
+
+/// The player's slots as the screen draws them: the nine rows' origin and the stack in each.
+fn dict_slots(game: &Game<'_>) -> Vec<([f32; 2], Option<ItemStack>)> {
+    let h = DICT_WINDOW[1];
+    (0..36)
+        .map(|i| {
+            // The inventory's first nine are the hotbar, drawn at the bottom.
+            let (row, col) = if i < 9 { (3, i) } else { ((i - 9) / 9, (i - 9) % 9) };
+            let y = if row < 3 { h - 82.0 + 18.0 * row as f32 } else { h - 24.0 };
+            ([7.0 + 18.0 * col as f32, y - 1.0], game.inventory.get(i).cloned().flatten())
+        })
+        .collect()
+}
+
+fn dict_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    let [w, h] = DICT_WINDOW;
+    let o = [((batch.width - w) / 2.0).floor(), ((batch.height - h) / 2.0).floor()];
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - o[0], cursor[1] - o[1]];
+    nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [o[0] - 3.0, o[1] - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
+    nine_slice(game, batch, "base", 16.0, 4.0, [o[0], o[1], w, h]);
+    DICT_UI.with_borrow_mut(|ui| {
+        ui.origin = o;
+        // `renderTitleTextWithOffset(target.getRelativeRight())`, `titleLabelY -= 1`.
+        centred(game, batch, "Dictionary", o[0] + 22.0, w - 22.0, o[1] + 3.0, 0x40_4040);
+        game.native_text(batch, "Inventory", [o[0] + 8.0, o[1] + h - 96.0], 0x40_4040, false);
+        let label = "Tag Type:";
+        game.native_text(batch, label, [o[0] + 118.0 - game.native_text_width(label) - 6.0, o[1] + h - 96.0], 0x40_4040, false);
+        // The target slot (`GuiSlot` at 5, 5, hover shown) with the item in it.
+        let t = [o[0] + DICT_TARGET[0], o[1] + DICT_TARGET[1], 16.0, 16.0];
+        sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [t[0] - 1.0, t[1] - 1.0, 18.0, 18.0]);
+        if let Some(stack) = &ui.target {
+            game.native_item_stack(batch, stack, [t[0], t[1]], 16.0);
+        }
+        // The list (`GuiTextScrollList`): the tags of the target in the chosen type.
+        let tags = ui.tags(&ui.shown());
+        let hidden = tags.len().saturating_sub(4);
+        ui.scroll = ui.scroll.min(hidden);
+        let [lx, ly, lw, lh] = DICT_LIST;
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, [o[0] + lx, o[1] + ly, lw, lh], 0xFFFF_FFFF);
+        let (bar_x, bar_y, bar_max) = (lx + lw - 6.0, ly + 2.0, lh - 4.0);
+        nine_slice_tinted(game, batch, "scroll/list_border", [6.0, 6.0], 2.0, [o[0] + bar_x - 1.0, o[1] + bar_y - 1.0, 6.0, bar_max + 2.0], 0xFFFF_FFFF);
+        let thumb = if hidden > 0 { (ui.scroll as f32 / hidden as f32 * (bar_max - 4.0)).round() } else { 0.0 };
+        sprite(game, batch, "scroll/list_bar", [0.0, 0.0, 4.0, 4.0], [o[0] + bar_x, o[1] + bar_y + thumb, 4.0, 4.0]);
+        for (i, tag) in tags.iter().skip(ui.scroll).take(4).enumerate() {
+            let fit = (((lw - 10.0) / (game.native_text_width(tag) * 0.8)).min(1.0)) * 0.8;
+            game.native_text_scaled(batch, tag, [o[0] + lx + 2.0, o[1] + ly + 3.0 + 10.0 * i as f32], 0x3C_FE9A, fit);
+        }
+        // The dropdown (`GuiDropdown`): the current type, and the options below it while open.
+        let [dx, dy, dw, dh] = DICT_DROPDOWN;
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, [o[0] + dx, o[1] + dy, dw, dh], 0xFFFF_FFFF);
+        game.native_text_scaled(batch, DICT_TYPES[ui.kind], [o[0] + dx + 3.0, o[1] + dy + 3.0], 0x3C_FE9A, 0.8);
+        if ui.open {
+            let list = [dx, dy + dh - 1.0, dw, 10.0 * DICT_TYPES.len() as f32 + 2.0];
+            nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, [o[0] + list[0], o[1] + list[1], list[2], list[3]], 0xFFFF_FFFF);
+            for (i, name) in DICT_TYPES.iter().enumerate() {
+                let y = list[1] + 1.0 + 10.0 * i as f32;
+                if inside(mouse, [dx + 1.0, y, dw - 2.0, 10.0]) {
+                    game.native_fill(batch, [o[0] + dx + 1.0, o[1] + y, dw - 2.0, 1.0], 0xFF3C_FE9A);
+                    game.native_fill(batch, [o[0] + dx + 1.0, o[1] + y + 9.0, dw - 2.0, 1.0], 0xFF3C_FE9A);
+                }
+                game.native_text_scaled(batch, name, [o[0] + dx + 3.0, o[1] + y + 2.0], 0x3C_FE9A, 0.8);
+            }
+        }
+        // The player's slots; a click on one makes its item the target.
+        for (at, stack) in dict_slots(game) {
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [o[0] + at[0], o[1] + at[1], 18.0, 18.0]);
+            if let Some(stack) = stack {
+                game.native_item_stack(batch, &stack, [o[0] + at[0] + 1.0, o[1] + at[1] + 1.0], 16.0);
+            }
+        }
+    });
+}
+
+fn dict_click(game: &mut Game<'_>, at: [f32; 2], button: u8) {
+    if button != 0 {
+        return;
+    }
+    let slots = dict_slots(game);
+    DICT_UI.with_borrow_mut(|ui| {
+        let m = [at[0] - ui.origin[0], at[1] - ui.origin[1]];
+        let [dx, dy, dw, dh] = DICT_DROPDOWN;
+        if ui.open {
+            ui.open = false;
+            let first = dy + dh;
+            if inside(m, [dx, first, dw, 10.0 * DICT_TYPES.len() as f32]) {
+                ui.kind = (((m[1] - first) / 10.0) as usize).min(DICT_TYPES.len() - 1);
+                ui.scroll = 0;
+                return;
+            }
+        }
+        if inside(m, DICT_DROPDOWN) {
+            ui.open = true;
+            return;
+        }
+        // The target slot: sneaking-click clears it (`GuiDictionaryTarget.onClick`).
+        if inside(m, DICT_TARGET) {
+            ui.target = None;
+            ui.scroll = 0;
+            return;
+        }
+        let [lx, ly, lw, lh] = DICT_LIST;
+        if inside(m, [lx + lw - 6.0, ly, 6.0, lh]) {
+            let hidden = ui.tags(&ui.shown()).len().saturating_sub(4);
+            let f = ((m[1] - ly - 2.0) / (lh - 4.0)).clamp(0.0, 1.0);
+            ui.scroll = (f * hidden as f32).round() as usize;
+            return;
+        }
+        if let Some((_, Some(stack))) = slots.iter().find(|(p, _)| inside(m, [p[0], p[1], 18.0, 18.0])) {
+            ui.target = Some(ItemStack { count: 1, ..stack.clone() });
+            ui.scroll = 0;
+        }
+    });
 }
 
 // --- Portable Teleporter (GuiPortableTeleporter) -------------------------------------------------------------
@@ -24502,6 +24717,9 @@ pub(super) fn mob_died(game: &mut Game<'_>, kind: &str, at: [f64; 3], data: Opti
 pub(super) fn client_payload(channel: &str, data: &[u8]) {
     if channel == PT_CHANNEL {
         pt_payload(data);
+    }
+    if channel == DICT_CHANNEL {
+        DICT_PENDING.set(true);
     }
     if channel == SEISMIC_CHANNEL && data.len() >= 12 {
         let int = |i: usize| i32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
