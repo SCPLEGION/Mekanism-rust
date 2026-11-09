@@ -1370,9 +1370,19 @@ fn boiler_link(nbt: &Compound, now: u64) -> Option<[i32; 3]> {
 /// heat (the other heaters and generators, and the casing of the boiler it stands against). Returns the
 /// temperature moved.
 fn adjacent_heat(game: &mut Game<'_>, pos: [i32; 3], heat: &mut mekanism_core::heat::HeatCapacitor, link: Option<[i32; 3]>) -> f64 {
+    adjacent_heat_faces(game, pos, heat, link, 0x3F).0
+}
+
+/// `adjacent_heat` through only the faces in `faces` (a bit per `face_index`); also returns the faces that
+/// had a heat handler beside them (the others lose their heat to the air).
+fn adjacent_heat_faces(game: &mut Game<'_>, pos: [i32; 3], heat: &mut mekanism_core::heat::HeatCapacitor, link: Option<[i32; 3]>, faces: u8) -> (f64, u8) {
     use mekanism_core::heat::HeatCapacitor;
     let mut total = 0.0;
+    let mut handled = 0u8;
     for d in [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]] {
+        if faces & (1 << face_index(d)) == 0 {
+            continue;
+        }
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
         let moved = if let Some(master) = link.filter(|_| boiler::is_frame(block_name(game, at))) {
             game.native_with_mod_block_entity(master, |m| {
@@ -1392,6 +1402,19 @@ fn adjacent_heat(game: &mut Game<'_>, pos: [i32; 3], heat: &mut mekanism_core::h
                 Some(moved)
             })
             .flatten()
+        } else if kind(block_name(game, at)) == Some(Kind::Entangloporter) {
+            // An entangloporter beside it is a sink for its frequency's heat, through its Heat face.
+            let back = [-d[0], -d[1], -d[2]];
+            let name = game.native_with_mod_block_entity(at, |m| takes_in(&m.nbt, back, Transmission::Heat).then(|| qe_frequency(&m.nbt)).flatten()).flatten();
+            name.and_then(|name| {
+                let mut all = FREQUENCIES.lock().ok()?;
+                let freq = all.get_mut(&name)?;
+                let mut sink = HeatCapacitor::with_ambient(qe::HEAT_CAPACITY, qe::HEAT_INVERSE_CONDUCTION, qe::HEAT_INVERSE_INSULATION, heat.ambient);
+                sink.heat = freq.heat;
+                let moved = heat.give_to(&mut sink);
+                freq.heat = sink.heat;
+                Some(moved)
+            })
         } else {
             game.native_with_mod_block_entity(at, |m| {
                 let (capacity, conduction, insulation) = heat_params(kind(&m.id)?)?;
@@ -1403,13 +1426,14 @@ fn adjacent_heat(game: &mut Game<'_>, pos: [i32; 3], heat: &mut mekanism_core::h
             })
             .flatten()
         };
-        if let Some(moved) = moved
-            && moved != 0.0
-        {
-            total += moved;
+        if let Some(moved) = moved {
+            handled |= 1 << face_index(d);
+            if moved != 0.0 {
+                total += moved;
+            }
         }
     }
-    total
+    (total, handled)
 }
 
 fn tick_generator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
@@ -8214,6 +8238,7 @@ fn tick_entangloporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlock
         energy: get_long(&entity.nbt, "shared_energy").min(qe::ENERGY_BUFFER),
         fluid: get_tank(&entity.nbt, "shared_fluid", qe::FLUID_BUFFER),
         chemical: get_tank(&entity.nbt, "shared_chemical", qe::CHEMICAL_BUFFER),
+        heat: get_double(&entity.nbt, "shared_heat").unwrap_or(mekanism_core::heat::AMBIENT_TEMP),
     };
     let mut freq = FREQUENCIES.lock().ok()?.entry(name.clone()).or_insert_with(saved).clone();
     let mut energy = get_long(&entity.nbt, "energy");
@@ -8228,12 +8253,29 @@ fn tick_entangloporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlock
         push_chemical(game, pos, &mut freq.fluid, Some(front), u64::MAX, false);
         push_chemical(game, pos, &mut freq.chemical, Some(front), u64::MAX, false);
     }
+    // `TileEntityQuantumEntangloporter.simulate`: the frequency's heat flows through the faces whose Heat mode
+    // takes in, and what has no heat handler beside it is lost to the air.
+    {
+        let sides = sides_of(&entity.nbt, Transmission::Heat);
+        let faces = (0..6u8).filter(|&f| sides.get(f as usize).takes_in()).fold(0u8, |m, f| m | 1 << f);
+        let ambient = ambient_at(game, pos);
+        let mut heat = mekanism_core::heat::HeatCapacitor::with_ambient(qe::HEAT_CAPACITY, qe::HEAT_INVERSE_CONDUCTION, qe::HEAT_INVERSE_INSULATION, ambient);
+        heat.heat = freq.heat;
+        let (_, handled) = adjacent_heat_faces(game, pos, &mut heat, None, faces);
+        for f in 0..6u8 {
+            if faces & (1 << f) != 0 && handled & (1 << f) == 0 {
+                heat.lose_to_air(qe::HEAT_INVERSE_INSULATION);
+            }
+        }
+        freq.heat = heat.heat;
+    }
     put_long(&mut entity.nbt, "energy", energy);
     put_tank(&mut entity.nbt, "fluid_in", &fluid);
     put_tank(&mut entity.nbt, "chemical_in", &chemical);
     put_long(&mut entity.nbt, "shared_energy", freq.energy);
     put_tank(&mut entity.nbt, "shared_fluid", &freq.fluid);
     put_tank(&mut entity.nbt, "shared_chemical", &freq.chemical);
+    entity.nbt.insert("shared_heat".into(), Tag::Double(freq.heat.to_bits()));
     if let Ok(mut all) = FREQUENCIES.lock() {
         all.insert(name, freq);
     }
@@ -9944,7 +9986,12 @@ fn transmission_look(t: Transmission) -> (&'static str, &'static str, u32) {
 
 /// Whether a type can be ejected (`ConfigInfo.canEject`): a machine's energy only comes in.
 fn can_eject(block: &str, t: Transmission) -> bool {
-    t != Transmission::Energy || matches!(kind(block), Some(Kind::EnergyCube(_)))
+    match t {
+        Transmission::Energy => matches!(kind(block), Some(Kind::EnergyCube(_))),
+        // The entangloporter's heat only conducts (`heatConfig.setCanEject(false)`).
+        Transmission::Heat => false,
+        _ => true,
+    }
 }
 
 /// The side configuration window: where it opens on the screen (centred, 15 down), and its parts in
