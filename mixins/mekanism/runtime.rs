@@ -9010,9 +9010,11 @@ fn tick_pump(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) ->
                 if progress >= u.ticks(isotopes::PUMP_TICKS) {
                     progress = 0;
                     tank.insert(fluid, amount);
-                    // `isInfiniteSource`: water and lava are not used up while the source-conversion game rules are on
-                    // (assumed on: no game rule is readable by mods) unless `pumpInfiniteFluidSources` is set.
-                    if config_flag("general", "pump", "pumpInfiniteFluidSources", false) {
+                    // `isInfiniteSource`: water and lava are not used up while their source-conversion game rule is on,
+                    // unless `pumpInfiniteFluidSources` is set.
+                    let rule = if fluid == "minecraft:lava" { "lava_source_conversion" } else { "water_source_conversion" };
+                    let converts = game.native_game_rule(rule) != Some(0);
+                    if config_flag("general", "pump", "pumpInfiniteFluidSources", false) || !converts {
                         game.native_set_block(at, "minecraft:air", &[]);
                     }
                 }
