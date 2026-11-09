@@ -6167,6 +6167,18 @@ fn sync_usage_config(file: &std::path::Path) {
 /// (`InputRecipeCache`: a machine's input slot only takes an item that starts a recipe).
 static INPUT_SETS: std::sync::OnceLock<std::collections::HashMap<&'static str, std::collections::HashSet<String>>> = std::sync::OnceLock::new();
 
+/// `InfuseType`s (the chemicals the Metallurgic Infuser's tank holds).
+const INFUSE_TYPES: [&str; 8] = [
+    "mekanism:carbon",
+    "mekanism:redstone",
+    "mekanism:diamond",
+    "mekanism:refined_obsidian",
+    "mekanism:gold",
+    "mekanism:tin",
+    "mekanism:bio",
+    "mekanism:fungi",
+];
+
 fn sync_input_sets(game: &Game<'_>) {
     INPUT_SETS.get_or_init(|| {
         let items = world_items!(game);
@@ -6182,6 +6194,8 @@ fn sync_input_sets(game: &Game<'_>) {
             for kind in ["enriching", "crushing"] {
                 add(kind, mekanism_core::recipes::find(mekanism_core::recipes::table(kind), id, 64, &in_tag).is_some());
             }
+            // `ChemicalInventorySlot` of the infuser: items that turn into an infusion type.
+            add("infuse_conv", mekanism_core::recipes::find_conversion(id, &in_tag).is_some_and(|c| INFUSE_TYPES.contains(&c.output)));
             add("infusing", mekanism_core::recipe_table::METALLURGIC_INFUSING.iter().any(|r| r.input.matches(id, &in_tag)));
             add("combining_a", mekanism_core::recipe_table::COMBINING.iter().any(|r| r.main.matches(id, &in_tag)));
             add("combining_b", mekanism_core::recipe_table::COMBINING.iter().any(|r| r.extra.matches(id, &in_tag)));
@@ -6213,6 +6227,7 @@ fn input_rule(kind: &str) -> Option<horizon_client::lan::menu::SlotRule> {
         "crushing" => SlotRule::Check(|s| starts_recipe("crushing", s)),
         "smelting" => SlotRule::Check(|s| starts_recipe("smelting", s)),
         "sawing" => SlotRule::Check(|s| starts_recipe("sawing", s)),
+        "infuse_conv" => SlotRule::Check(|s| s.item.ends_with("_chemical_tank") || starts_recipe("infuse_conv", s)),
         "infusing" => SlotRule::Check(|s| starts_recipe("infusing", s)),
         "combining_a" => SlotRule::Check(|s| starts_recipe("combining_a", s)),
         "combining_b" => SlotRule::Check(|s| starts_recipe("combining_b", s)),
@@ -10637,6 +10652,11 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
                 *slot = rule.clone();
             }
         }
+        if let Some(Kind::Factory(_, "infusing", _)) = kind(block)
+            && let Some(rule) = input_rule("infuse_conv")
+        {
+            rules[FACTORY_CHEM] = rule;
+        }
         if let Some(Kind::Factory(_, "combining", _)) = kind(block)
             && let Some(rule) = input_rule("combining_b")
         {
@@ -10678,8 +10698,10 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
                 }
             }
             Some(Kind::Infuser) => {
-                if let (Some(rule), Some(slot)) = (input_rule("infusing"), rules.first_mut()) {
-                    *slot = rule;
+                for (i, kind) in [(0, "infusing"), (1, "infuse_conv")] {
+                    if let (Some(rule), Some(slot)) = (input_rule(kind), rules.get_mut(i)) {
+                        *slot = rule;
+                    }
                 }
             }
             Some(Kind::Machine(recipe, _)) => {
