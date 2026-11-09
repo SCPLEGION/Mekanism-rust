@@ -427,7 +427,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         return;
     }
     // The machines whose only slot is the energy slot (`EnergyInventorySlot`), which automation fills.
-    if matches!(kind(block), Some(Kind::Centrifuge | Kind::ChemicalInfuser | Kind::PigmentMixer | Kind::Washer | Kind::Stabilizer)) {
+    if matches!(kind(block), Some(Kind::Centrifuge | Kind::Activator | Kind::ChemicalInfuser | Kind::PigmentMixer | Kind::Washer | Kind::Stabilizer)) {
         // Their energy slot and chemical slots: a hopper's five slots, which the furnace's roles would spoil.
         let used: Vec<usize> = (0..3).filter(|&i| layout(block).is_some_and(|l| l.slots[i].is_some())).chain(3..3 + extra_slots(block).len()).collect();
         *container = Some(ModContainer {
@@ -562,8 +562,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::QioRedstoneAdapter
             | Kind::Alarm
             | Kind::QioExporter
-            // Their bucket slots are not ported; the screen shows their tanks.
-            | Kind::Activator,
+            ,
         ) => {
             *container = Some(ModContainer {
                 slots: 3,
@@ -9195,6 +9194,9 @@ pub(super) fn use_plenisher(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 fn tick_activator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
     let mut input = get_tank(&entity.nbt, "input", isotopes::ACTIVATOR_TANK);
     let mut output = get_tank(&entity.nbt, "output", isotopes::ACTIVATOR_TANK);
+    // `ChemicalInventorySlot.fill` and `.drain` at (5, 56) and (155, 56).
+    fill_tank_from_item(entity, 1, &mut input, |c| isotopes::activating(c).is_some());
+    drain_tank_into_item(entity, 2, &mut output);
     let sees_sun = overworld(game) && game.sky_darken() < 4 && can_see_sky(game, pos);
     let brightness = if sees_sun {
         let mut sky = game.res.environment().sample(game.world.day_time, None, None);
@@ -10047,7 +10049,7 @@ fn layout(block: &str) -> Option<Layout> {
         // TileEntityDigitalMiner and its screen: the energy slot (152, 20) and the power bar.
         // GuiSolarNeutronActivator: no energy, lit while the sun lets it work.
         Kind::Activator => Layout {
-            slots: [None, None, None],
+            slots: [None, Some(([5.0, 56.0], "slot/normal")), Some(([155.0, 56.0], "slot/normal"))],
             gauges: vec![gauge("input", isotopes::ACTIVATOR_TANK, 25.0, 13.0, STANDARD), gauge("output", isotopes::ACTIVATOR_TANK, 133.0, 13.0, STANDARD)],
             power: None,
             progress: None,
@@ -11139,7 +11141,7 @@ thread_local! {
 /// The slots of `Layout` that are chemical slots (they take chemical tank items).
 fn chemical_layout_slots(block: &str) -> &'static [usize] {
     match kind(block) {
-        Some(Kind::Centrifuge) => &[1, 2],
+        Some(Kind::Centrifuge | Kind::Activator) => &[1, 2],
         Some(Kind::ChemicalInfuser | Kind::PigmentMixer) => &[1, 2],
         Some(Kind::Painting) => &[1],
         Some(Kind::Washer) => &[1],
