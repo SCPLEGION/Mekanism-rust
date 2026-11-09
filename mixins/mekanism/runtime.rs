@@ -24394,6 +24394,31 @@ pub(super) fn fog(game: &Game<'_>, fog_type: u8, fog: &mut horizon_client::fog::
     fog.environmental_end = far * (installed as f32).powf(1.25) / maximum as f32;
 }
 
+/// `GearConfig.mekaToolEnergyUsageShearEntity` (the trim of a block costs the same): FE a shearing takes.
+const SHEAR_ENERGY: u64 = 10;
+
+/// `ModuleShearingUnit.onInteract` / `onItemUse`: shearing takes `useAllEnergy` of the Meka-Tool's energy.
+pub(super) fn shears_used(game: &mut Game<'_>, stack: &ItemStack) {
+    if &*stack.item != modules::MEKA_TOOL || !game.native_on(MOD_ID) {
+        return;
+    }
+    if let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == modules::MEKA_TOOL) {
+        let stored = stored_energy(held);
+        if stored >= SHEAR_ENERGY {
+            set_energy(held, stored - SHEAR_ENERGY);
+        }
+    }
+}
+
+/// `ModuleShearingUnit.canPerformAction`: a Meka-Tool with the unit on shears (`SHEARS_*`) while it has the energy to break a
+/// block that breaks instantly (hardness 0) in its mode.
+pub(super) fn acts_as_shears(_game: &Game<'_>, stack: &ItemStack, shears: &mut bool) {
+    if &*stack.item != modules::MEKA_TOOL || !module_on(stack, "mekanism:shearing_unit") {
+        return;
+    }
+    *shears = stored_energy(stack) >= gear::destroy_energy(disassembler_mode(stack), 0.0);
+}
+
 /// `ModuleColorModulationUnit.COLOR`'s default (`ModuleColorConfig.argb`): white, opaque.
 const COLOR_MODULATION_DEFAULT: u32 = 0xFFFF_FFFF;
 
