@@ -16551,9 +16551,26 @@ pub(super) fn player_attack(game: &mut Game<'_>, strength: f32, amount: &mut f32
         return;
     }
     let creative = game.creative;
+    // `ItemAtomicDisassembler.adjustAttributes` / `postHurtEnemy`: `maxDamage` with the energy for a hit (`energyUsageWeapon`),
+    // else scaled from `minDamage` by how much of it there is; the hit then takes up to that energy.
+    if let Some(tool) = game.held_mut().as_mut().filter(|s| &*s.item == "mekanism:atomic_disassembler") {
+        use mekanism_core::config::gear_int;
+        let cost = gear_int("atomic_disassembler.energyUsageWeapon", 2_000);
+        let (min, max) = (gear_int("atomic_disassembler.minDamage", 4) as f64, gear_int("atomic_disassembler.maxDamage", 20) as f64);
+        let stored = stored_energy(tool);
+        let have = if creative { u64::MAX } else { stored };
+        let damage = if have >= cost || cost == 0 { max } else { min + (max - min) * (have as f64 / cost as f64) };
+        *amount += damage as f32 * (0.2 + strength * strength * 0.8);
+        if !creative {
+            set_energy(tool, stored - cost.min(stored));
+        }
+        return;
+    }
     let Some(tool) = game.held_mut().as_mut().filter(|s| &*s.item == modules::MEKA_TOOL) else {
         return;
     };
+    // `ItemMekaTool.adjustAttributes`: `mekatool.baseDamage` before the Attack Amplification Unit's.
+    *amount += mekanism_core::config::gear_int("mekatool.baseDamage", 4) as f32 * (0.2 + strength * strength * 0.8);
     let stored = stored_energy(tool);
     let bonus = modules::attack_bonus(&modules_of(tool), module_choice(tool, "mekanism:attack_amplification_unit", "attack_damage"));
     let (extra, cost) = modules::attack(bonus, if creative { u64::MAX } else { stored });
@@ -25484,6 +25501,7 @@ fn radiation_server_tick(game: &mut Game<'_>) {
             }
             magnetic_attraction(g);
             nutritional_injection(g);
+            inhalation_purification(g);
             vision_enhancement_upkeep(g);
             gravitational_upkeep(g);
             // Told again when the digits of the level or of the dose would change (the dose is an attachment in Java).
@@ -25518,8 +25536,9 @@ fn paste_saturation() -> f32 {
 }
 
 /// `GearConfig.mekaSuitEnergyUsageNutritionalInjection`.
+const NUTRITION_ENERGY: u64 = 20_000;
 fn nutrition_energy() -> u64 {
-    mekanism_core::config::gear_int("mekasuit.energy_usage.nutritionalInjection", 20_000).max(1)
+    mekanism_core::config::gear_int("mekasuit.energy_usage.nutritionalInjection", NUTRITION_ENERGY).max(1)
 }
 
 /// The nutritional paste a suit holds, in mB.
@@ -26347,5 +26366,42 @@ pub(super) fn farming_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3],
         }
         *claimed = true;
         return;
+    }
+}
+
+/// `ModuleInhalationPurificationUnit.tickServer`: the helmet's enabled unit, with the energy for a whole step
+/// (`energyUsagePotionTick`), counts each timed effect of the kinds the unit is set to handle nine more ticks down for
+/// the same energy again (`speedupEffect`), stopping when the energy runs out. Creative players pay nothing.
+fn inhalation_purification(g: &mut Game<'_>) {
+    const UNIT: &str = "mekanism:inhalation_purification_unit";
+    let Some(helmet) = g.armor[0].as_ref().filter(|s| modules::is_container(&s.item) && module_on(s, UNIT)) else {
+        return;
+    };
+    // beneficial, neutral, harmful; the unit's categories in the order the effects report them.
+    let handles = [
+        module_choice(helmet, UNIT, "purification.beneficial").unwrap_or(0) != 0,
+        module_choice(helmet, UNIT, "purification.neutral").unwrap_or(0) != 0,
+        module_choice(helmet, UNIT, "purification.harmful").unwrap_or(1) != 0,
+    ];
+    let usage = mekanism_core::config::gear_int("mekasuit.energy_usage.energyUsagePotionTick", 40_000);
+    let creative = g.creative;
+    let enough = |g: &Game<'_>| creative || g.armor[0].as_ref().is_some_and(|s| stored_energy(s) >= usage);
+    if !enough(g) {
+        return;
+    }
+    for (index, category) in g.native_timed_effects() {
+        if !handles[category as usize] {
+            continue;
+        }
+        if !enough(g) {
+            break;
+        }
+        if !creative && let Some(helmet) = g.armor[0].as_mut() {
+            let e = stored_energy(helmet);
+            set_energy(helmet, e - usage);
+        }
+        for _ in 0..9 {
+            g.native_speed_up_effect(index);
+        }
     }
 }
