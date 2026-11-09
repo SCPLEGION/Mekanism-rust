@@ -57,6 +57,16 @@ const VEIN: [Slice; 2] = [s("Vein", "vein_normal", AQUA, 0), s("Extended Vein", 
 pub const EXCAVATION: &str = "mekanism:excavation_escalation_unit";
 pub const BLASTING: &str = "mekanism:blasting_unit";
 pub const VEIN_MINING: &str = "mekanism:vein_mining_unit";
+/// The Atomic Disassembler's own radial (`IRadialModeItem`): its modes, standing in for a module of the same id.
+pub const DISASSEMBLER: &str = "mekanism:atomic_disassembler";
+
+/// `DisassemblerMode` as radial slices (`value` is the index in `gear::DisassemblerMode::ALL`).
+const DISASSEMBLER_MODES: [Slice; 4] = [
+    s("Normal", "speed_normal", GREEN, 0),
+    s("Slow", "speed_slow", PINK, 1),
+    s("Fast", "speed_extreme", RED, 2),
+    s("Off", "speed_off", WHITE, 3),
+];
 
 /// The slices a module offers at the root (`addRadialModes`), if it handles the radial.
 pub fn nested(module: &str) -> Option<Nested> {
@@ -64,6 +74,7 @@ pub fn nested(module: &str) -> Option<Nested> {
         EXCAVATION => Nested { module: EXCAVATION, key: "excavation_mode", slice: s("Excavation Speed", "speed_normal", YELLOW, 0) },
         BLASTING => Nested { module: BLASTING, key: "blast_radius", slice: s("Blasting Power", "blasting_low", DARK_BLUE, 0) },
         VEIN_MINING => Nested { module: VEIN_MINING, key: "extended_mode", slice: s("Vein Mining", "vein_normal", AQUA, 0) },
+        DISASSEMBLER => Nested { module: DISASSEMBLER, key: "mode", slice: s("Disassembler", "speed_normal", GREEN, 0) },
         _ => return None,
     })
 }
@@ -74,6 +85,7 @@ pub fn modes(module: &str, installed: u32) -> Vec<Slice> {
         EXCAVATION => SPEED[..SPEED.len().min(installed as usize + 2)].to_vec(),
         BLASTING => BLAST[..BLAST.len().min(installed as usize + 1)].to_vec(),
         VEIN_MINING => VEIN.to_vec(),
+        DISASSEMBLER => DISASSEMBLER_MODES.to_vec(),
         _ => vec![],
     }
 }
