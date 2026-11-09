@@ -79,13 +79,15 @@ pub fn gear_ratio(full_key: &str) -> f64 {
 
 /// The other whole-number gear keys: (section, key, default), `defineInRange(key, default, 0, Integer.MAX_VALUE)`
 /// unless the range says otherwise. The Meka-Tool's and MekaSuit's usages sit in their `energy_usage` section.
-pub const GEAR_INTS: [(&str, &str, u64); 46] = [
+pub const GEAR_INTS: [(&str, &str, u64); 47] = [
     // `fillRate` of the tank items (mB a tick a machine's slot moves) and the paste transfer rates.
     ("flamethrower", "fillRate", 16),
     ("jetpack", "fillRate", 16),
     ("scuba_tank", "fillRate", 16),
     ("canteen", "transferRate", 128),
     ("mekasuit", "jetpackTransferRate", 256),
+    // `portableTeleporterDelay`: ticks between pressing Teleport and going (0 to 6000).
+    ("portable_teleporter", "delay", 0),
     ("mekasuit", "nutritionalTransferRate", 256),
     ("atomic_disassembler", "energyUsageWeapon", 2_000),
     ("atomic_disassembler", "minDamage", 4),

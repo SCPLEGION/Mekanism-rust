@@ -4314,6 +4314,8 @@ fn chemical_item_rate(item: &str) -> u64 {
         rate("scuba_tank.fillRate")
     } else if JETPACKS.contains(&item) {
         rate("jetpack.fillRate")
+    } else if item == modules::BODYARMOR {
+        rate("mekasuit.jetpackTransferRate")
     } else {
         u64::MAX
     }
@@ -5647,8 +5649,7 @@ pub(super) fn cardboard_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3
 }
 
 /// `BlockCardboardBox.useWithoutItem`: sneaking, a click on a box with a block in it puts the block back and drops
-/// the empty box. (`Block.updateFromNeighbourShapes` and the nether-water refusal of `tryPlaceIntoWorld` are not
-/// done: a double chest stays as it was packed.)
+/// the empty box.
 pub(super) fn use_cardboard_box(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     if !game.native_on(MOD_ID) || !shift_down(game) || block_name(game, pos) != CARDBOARD {
         return false;
@@ -5670,8 +5671,30 @@ pub(super) fn use_cardboard_box(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         }).collect(),
         _ => Vec::new(),
     };
+    // `BlockData.tryPlaceIntoWorld`: water cannot be placed in the nether (`isVaporizedOnPlacement`). With
+    // `strictUnboxing` such a block stays packed; otherwise it comes out without its water (a bucket pickup).
+    let mut props = props;
+    let mut state = state;
+    let nether = game.native_player().is_some_and(|p| p.dimension == "minecraft:the_nether");
+    if nether {
+        let water_block = state == "minecraft:water" || state == "minecraft:bubble_column";
+        let waterlogged = props.iter().any(|(k, v)| k == "waterlogged" && v == "true");
+        if water_block || waterlogged {
+            if config_flag("general", "cardboard_box", "strictUnboxing", false) {
+                return true;
+            }
+            if water_block {
+                state = "minecraft:air".to_owned();
+                props.clear();
+            } else {
+                props.iter_mut().filter(|(k, _)| k == "waterlogged").for_each(|(_, v)| *v = "false".to_owned());
+            }
+        }
+    }
     let refs: Vec<(&str, &str)> = props.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    if !game.native_set_block(pos, &state, &refs) {
+    // `Block.updateFromNeighbourShapes`: refused where it leaves air (a block that cannot stand there).
+    let placed = if state == "minecraft:air" { game.native_set_block(pos, &state, &[]) } else { game.native_set_block_adjusted(pos, &state, &refs) };
+    if !placed {
         return true;
     }
     if let Some(Tag::Compound(be)) = data.get(&JavaString::from("be")) {
@@ -7994,6 +8017,12 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     }
     register_game_events();
     CLIENT_TICK.set(game.ticks as u64);
+    if let Some(at) = PT_PENDING.get()
+        && game.ticks as u64 >= at
+    {
+        PT_PENDING.set(None);
+        game.native_send_to_server(PT_CHANNEL, &[1]);
+    }
     mode_status_tick(game);
     mode_keys(game);
     remote_player_sounds(game);
@@ -24230,6 +24259,8 @@ struct PtState {
 }
 
 thread_local! {
+    /// The tick a delayed portable teleport goes at.
+    static PT_PENDING: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static PT_STATE: std::cell::RefCell<Option<PtState>> = const { std::cell::RefCell::new(None) };
     static PT_FRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PT_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -24320,7 +24351,13 @@ fn pt_click(game: &mut Game<'_>, at: [f32; 2], button: u8) {
     let right = button == 1;
     if !right && inside(rel, PT_BUTTON) {
         if pt_ready() {
-            game.native_send_to_server(PT_CHANNEL, &[1]);
+            // `ClientTickHandler.portableTeleport`: with a delay the packet goes when it has run out.
+            let delay = mekanism_core::config::gear_int("portable_teleporter.delay", 0);
+            if delay == 0 {
+                game.native_send_to_server(PT_CHANNEL, &[1]);
+            } else {
+                PT_PENDING.set(Some(game.ticks as u64 + delay));
+            }
             game.native_close_ui();
         }
         return;
