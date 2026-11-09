@@ -7,7 +7,7 @@ fn on_right_click_block(game: &mut crate::game::Game<'_>, pos: [i32; 3], face: [
     if *canceled {
         return;
     }
-    if crate::game::mekanism::configure_side(game, pos, face) || crate::game::mekanism::install_upgrade(game, pos)
+    if crate::game::mekanism::protect_security(game, pos) || crate::game::mekanism::configure_side(game, pos, face) || crate::game::mekanism::install_upgrade(game, pos)
         || crate::game::mekanism::fill_jetpack(game, pos)
         || crate::game::mekanism::use_fluid_tank(game, pos)
         || crate::game::mekanism::use_fission_port(game, pos)
@@ -24,7 +24,6 @@ fn on_right_click_block(game: &mut crate::game::Game<'_>, pos: [i32; 3], face: [
         || crate::game::mekanism::use_plenisher(game, pos)
         || crate::game::mekanism::use_sorter(game, pos)
         || crate::game::mekanism::use_entangloporter(game, pos)
-        || crate::game::mekanism::use_modification_station(game, pos)
     {
         *canceled = true;
     }

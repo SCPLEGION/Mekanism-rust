@@ -495,3 +495,41 @@ mod tests {
         assert!((z - 0.02).abs() < 1e-6);
     }
 }
+
+/// `UsageConfig.modificationStation`: what the Modification Station takes a tick.
+pub const STATION_USAGE: u64 = 10;
+/// `TileEntityModificationStation.BASE_TICKS_REQUIRED`: half a second per install.
+pub const STATION_TICKS: u32 = 10;
+
+/// The module types `item` takes, in the order of `MODULES` (`ModuleContainer.moduleTypes`).
+pub fn supported(item: &str) -> Vec<&'static str> {
+    MODULES.iter().filter(|(id, ..)| max_installed(item, id) > 0).map(|(id, ..)| *id).collect()
+}
+
+/// Takes up to `n` of `module` out of `installed` and says how many came out.
+pub fn uninstall(installed: &mut Installed, module: &str, n: u32) -> u32 {
+    let have = installed.get(module).copied().unwrap_or(0);
+    let out = n.min(have);
+    if out == have {
+        installed.remove(module);
+    } else if out > 0 {
+        installed.insert(module.to_owned(), have - out);
+    }
+    out
+}
+
+#[cfg(test)]
+mod station_tests {
+    use super::*;
+
+    #[test]
+    fn station_lists_and_removes() {
+        assert!(supported(MEKA_TOOL).contains(&"mekanism:silk_touch_unit"));
+        assert!(!supported(HELMET).contains(&"mekanism:silk_touch_unit"));
+        let mut m = Installed::new();
+        assert_eq!(install(MEKA_TOOL, &mut m, "mekanism:energy_unit", 3), 3);
+        assert_eq!(uninstall(&mut m, "mekanism:energy_unit", 1), 1);
+        assert_eq!(uninstall(&mut m, "mekanism:energy_unit", 5), 2);
+        assert!(m.is_empty());
+    }
+}
