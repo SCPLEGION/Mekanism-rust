@@ -42,8 +42,11 @@ pub fn gear_ratio(full_key: &str) -> f64 {
 
 /// The other whole-number gear keys: (section, key, default), `defineInRange(key, default, 0, Integer.MAX_VALUE)`
 /// unless the range says otherwise. The Meka-Tool's and MekaSuit's usages sit in their `energy_usage` section.
-pub const GEAR_INTS: [(&str, &str, u64); 33] = [
+pub const GEAR_INTS: [(&str, &str, u64); 37] = [
     ("atomic_disassembler", "energyUsageWeapon", 2_000),
+    ("atomic_disassembler", "minDamage", 4),
+    ("atomic_disassembler", "maxDamage", 20),
+    ("mekatool", "baseDamage", 4),
     ("electric_bow", "energyUsage", 120),
     ("electric_bow", "energyUsageFlame", 1_200),
     ("free_runner", "fallEnergyCost", 50),
@@ -73,6 +76,7 @@ pub const GEAR_INTS: [(&str, &str, u64); 33] = [
     ("mekasuit.energy_usage", "energyUsagePotionTick", 40_000),
     ("mekasuit.energy_usage", "sprintBoost", 100),
     ("mekasuit.energy_usage", "visionEnhancement", 500),
+    ("mekasuit.energy_usage", "nutritionalInjection", 20_000),
     ("mekasuit.energy_usage", "gravitationalModulation", 1_000),
     ("mekasuit.energy_usage", "itemAttraction", 250),
     ("mekasuit.energy_usage", "hydrostaticRepulsion", 500),

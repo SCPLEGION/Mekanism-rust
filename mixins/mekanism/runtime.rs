@@ -16478,9 +16478,26 @@ pub(super) fn player_attack(game: &mut Game<'_>, strength: f32, amount: &mut f32
         return;
     }
     let creative = game.creative;
+    // `ItemAtomicDisassembler.adjustAttributes` / `postHurtEnemy`: `maxDamage` with the energy for a hit (`energyUsageWeapon`),
+    // else scaled from `minDamage` by how much of it there is; the hit then takes up to that energy.
+    if let Some(tool) = game.held_mut().as_mut().filter(|s| &*s.item == "mekanism:atomic_disassembler") {
+        use mekanism_core::config::gear_int;
+        let cost = gear_int("atomic_disassembler.energyUsageWeapon", 2_000);
+        let (min, max) = (gear_int("atomic_disassembler.minDamage", 4) as f64, gear_int("atomic_disassembler.maxDamage", 20) as f64);
+        let stored = stored_energy(tool);
+        let have = if creative { u64::MAX } else { stored };
+        let damage = if have >= cost || cost == 0 { max } else { min + (max - min) * (have as f64 / cost as f64) };
+        *amount += damage as f32 * (0.2 + strength * strength * 0.8);
+        if !creative {
+            set_energy(tool, stored - cost.min(stored));
+        }
+        return;
+    }
     let Some(tool) = game.held_mut().as_mut().filter(|s| &*s.item == modules::MEKA_TOOL) else {
         return;
     };
+    // `ItemMekaTool.adjustAttributes`: `mekatool.baseDamage` before the Attack Amplification Unit's.
+    *amount += mekanism_core::config::gear_int("mekatool.baseDamage", 4) as f32 * (0.2 + strength * strength * 0.8);
     let stored = stored_energy(tool);
     let bonus = modules::attack_bonus(&modules_of(tool));
     let (extra, cost) = modules::attack(bonus, if creative { u64::MAX } else { stored });
@@ -25435,6 +25452,9 @@ fn paste_saturation() -> f32 {
 
 /// `GearConfig.mekaSuitEnergyUsageNutritionalInjection`.
 const NUTRITION_ENERGY: u64 = 20_000;
+fn nutrition_energy() -> u64 {
+    mekanism_core::config::gear_int("mekasuit.energy_usage.nutritionalInjection", NUTRITION_ENERGY).max(1)
+}
 
 /// The nutritional paste a suit holds, in mB.
 fn suit_paste(stack: &ItemStack) -> u64 {
@@ -25797,7 +25817,7 @@ fn nutritional_injection(g: &mut Game<'_>) {
         return;
     };
     let by_paste = suit_paste(piece) / paste_per_food();
-    let by_energy = stored_energy(piece) / NUTRITION_ENERGY;
+    let by_energy = stored_energy(piece) / nutrition_energy();
     let food = by_paste.min(by_energy).min(missing as u64);
     if food == 0 {
         return;
@@ -25805,7 +25825,7 @@ fn nutritional_injection(g: &mut Game<'_>) {
     let held = suit_paste(piece);
     set_suit_paste(piece, held - food * paste_per_food());
     let stored = stored_energy(piece);
-    set_energy(piece, stored - food * NUTRITION_ENERGY);
+    set_energy(piece, stored - food * nutrition_energy());
     if let Some(p) = g.player.as_mut() {
         p.health.food.eat(food as i32, paste_saturation());
     }
