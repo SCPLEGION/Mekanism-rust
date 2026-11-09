@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "dd42de8b34aee3778a3462e000d9564cba5ed847"
+horizon_revision = "061230f6608171690bee9ba65b0483b8246a7c42"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -734,6 +734,30 @@ bindings = [
 ]
 
 [[injection]]
+id = "attack-speed"
+hook = "attack_speed"
+hook_version = 1
+kind = "HEAD"
+helper = "attack_speed.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+  { name = "add", ty = "&mut f64", value = "&mut *add" },
+]
+
+[[injection]]
+id = "drink-item"
+hook = "drink_item"
+hook_version = 1
+kind = "HEAD"
+helper = "drink_item.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "item", ty = "&str", value = "item" },
+  { name = "ticks", ty = "&mut i32", value = "&mut *ticks" },
+]
+
+[[injection]]
 id = "bow-item"
 hook = "bow_item"
 hook_version = 1
@@ -764,6 +788,17 @@ hook = "shears_used"
 hook_version = 1
 kind = "HEAD"
 helper = "shears_used.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+]
+
+[[injection]]
+id = "shears-trim"
+hook = "shears_trim"
+hook_version = 1
+kind = "HEAD"
+helper = "shears_trim.rs"
 bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },

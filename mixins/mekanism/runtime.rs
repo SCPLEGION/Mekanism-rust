@@ -4306,13 +4306,18 @@ fn chemical_item_ids() -> Vec<String> {
 
 /// Writes `tank` as the chemical an item holds (its custom data under `CHEMICAL_KEY`).
 fn set_item_tank(stack: &mut ItemStack, tank: &ChemicalTank) {
+    put_item_tank_key(stack, CHEMICAL_KEY, tank);
+}
+
+/// `set_item_tank` into the custom-data entry `key` (the Gauge Dropper's fluid tank apart from its chemical one).
+fn put_item_tank_key(stack: &mut ItemStack, key: &str, tank: &ChemicalTank) {
     let mut c = Compound::new();
     put_tank(&mut c, "t", tank);
     let value = match c.get(&JavaString::from("t")) {
         Some(Tag::Compound(t)) => t.clone(),
         _ => Compound::new(),
     };
-    set_custom_compound(stack, CHEMICAL_KEY, value);
+    set_custom_compound(stack, key, value);
 }
 
 /// `ChemicalInventorySlot.fill` (`fillTankFromSlot`): a chemical tank item in slot `from` gives what it holds
@@ -6416,6 +6421,10 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
         free_runners_use(game, claimed);
         return;
     }
+    if !*claimed && &*stack.item == GAUGE_DROPPER && game.native_on(MOD_ID) {
+        dropper_use(game, claimed);
+        return;
+    }
     if !*claimed && &*stack.item == CANTEEN && game.native_on(MOD_ID) {
         canteen_use(game, claimed);
         return;
@@ -6806,7 +6815,23 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
         if let Some(tank) = item_tank(stack, key, u64::MAX)
             && let Some(id) = tank.chemical.as_deref()
         {
-            let line = format!("Stored: {} mB {id}", tank.amount);
+            // `MekanismLang.STORED`: "Stored: <Chemical Name> - <amount> mB".
+            let name: Vec<String> = id
+                .rsplit(':')
+                .next()
+                .unwrap_or(id)
+                .split('_')
+                .map(|w| w.chars().next().map(|c| c.to_uppercase().collect::<String>() + &w[c.len_utf8()..]).unwrap_or_default())
+                .collect();
+            let digits = tank.amount.to_string();
+            let mut grouped = String::new();
+            for (i, c) in digits.chars().enumerate() {
+                if i > 0 && (digits.len() - i) % 3 == 0 {
+                    grouped.push(',');
+                }
+                grouped.push(c);
+            }
+            let line = format!("Stored: {} - {grouped} mB", name.join(" "));
             lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
         }
     }
@@ -7207,6 +7232,18 @@ thread_local! {
 /// (`MekaSuitBarDecorator`). Stacked items show none, as the bar would cover the count.
 pub(super) fn item_bars(game: &Game<'_>, stack: &ItemStack, bar: &mut Option<(i32, u32)>, extra: &mut Vec<(i32, i32, u32)>) {
     if stack.count != 1 || !game.native_on(MOD_ID) {
+        return;
+    }
+    if &*stack.item == GAUGE_DROPPER {
+        // `ItemGaugeDropper.isBarVisible`: only with something in it, the fuller of its two tanks.
+        let fuller = [FLUID_KEY, CHEMICAL_KEY]
+            .into_iter()
+            .filter_map(|k| item_tank(stack, k, dropper_capacity()))
+            .filter(|t| t.amount > 0)
+            .max_by_key(|t| t.amount);
+        if let Some(t) = fuller {
+            *bar = Some(((13.0 * t.amount as f64 / t.capacity.max(1) as f64).round().clamp(0.0, 13.0) as i32, CHEMICALS.iter().find(|c| Some(c.0) == t.chemical.as_deref()).map_or(0xAAAAAA, |c| c.2)));
+        }
         return;
     }
     let width = |amount: u64, capacity: u64| ((13.0 * amount as f64 / capacity.max(1) as f64).round() as i32).clamp(0, 13);
@@ -12151,6 +12188,9 @@ pub(super) fn screen_click(game: &Game<'_>, block: &str, data: &[i32], at: [f32;
 }
 
 fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], right: bool, button: &mut Option<i32>) {
+    if dropper_click(game, block, at, right, button) {
+        return;
+    }
     if is_freq_screen(block) {
         frequency_click(game, block, at, right);
         return;
@@ -12309,7 +12349,7 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
         put_int(&mut entity.nbt, "sorting", u32::from(on));
         return;
     }
-    if transporter_button(entity, id) || window_button(game, pos, entity, id) || upgrade_slot_button(game, entity, id) || upgrade_button(game, pos, entity, id) {
+    if dropper_button(game, pos, entity, id) || transporter_button(entity, id) || window_button(game, pos, entity, id) || upgrade_slot_button(game, entity, id) || upgrade_button(game, pos, entity, id) {
         return;
     }
     let Some(Some(master)) = multiblock_master(entity, pos) else {
@@ -23923,6 +23963,9 @@ pub(super) fn client_payload(channel: &str, data: &[u8]) {
         // The tick is the window's own, read when the bolt is drawn: stamp it with the last one seen.
         magnetic_bolt_payload(data, MAGNETIC_NOW.with(|n| n.get()));
     }
+    if channel == TOOL_AOE_BOLT_CHANNEL {
+        tool_aoe_bolt_payload(data, MAGNETIC_NOW.with(|n| n.get()));
+    }
     if channel == FLAME_CHANNEL {
         flames_payload(data);
     }
@@ -25950,11 +25993,29 @@ pub(super) fn fog(game: &Game<'_>, fog_type: u8, fog: &mut horizon_client::fog::
     fog.environmental_end = far * (installed as f32).powf(1.25) / maximum as f32;
 }
 
-/// `GearConfig.mekaToolEnergyUsageShearEntity` (the trim of a block costs the same): FE a shearing takes.
+/// `GearConfig.mekaToolEnergyUsageShearEntity`: FE a shearing of a mob takes.
 const SHEAR_ENERGY: u64 = 10;
 
 fn shear_energy() -> u64 {
     mekanism_core::config::gear_int("mekatool.energy_usage.shearEntity", SHEAR_ENERGY)
+}
+
+/// `GearConfig.mekaToolEnergyUsageShearTrim`: FE a shearing of a block (a hive, a pumpkin) takes.
+fn shear_trim_energy() -> u64 {
+    mekanism_core::config::gear_int("mekatool.energy_usage.shearTrim", SHEAR_ENERGY)
+}
+
+/// `ModuleShearingUnit.onItemUse`: shearing a block takes `shearTrim`.
+pub(super) fn shears_trim(game: &mut Game<'_>, stack: &ItemStack) {
+    if &*stack.item != modules::MEKA_TOOL || !game.native_on(MOD_ID) {
+        return;
+    }
+    if let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == modules::MEKA_TOOL) {
+        let stored = stored_energy(held);
+        if stored >= shear_trim_energy() {
+            set_energy(held, stored - shear_trim_energy());
+        }
+    }
 }
 
 /// `ModuleShearingUnit.onInteract` / `onItemUse`: shearing takes `useAllEnergy` of the Meka-Tool's energy.
@@ -26361,6 +26422,12 @@ thread_local! {
     static MAGNETIC_NOW: std::cell::Cell<bolt::Timestamp> = std::cell::Cell::new(bolt::Timestamp::default());
 }
 const MAGNETIC_BOLT_CHANNEL: &str = "mekanism:magnetic_bolt";
+const TOOL_AOE_BOLT_CHANNEL: &str = "mekanism:tool_aoe_bolt";
+
+thread_local! {
+    /// The lightning between the block a Farming Unit worked and the blocks of its area.
+    static TOOL_AOE_BOLTS: std::cell::RefCell<bolt::BoltField> = std::cell::RefCell::new(bolt::BoltField::new(0x544F_4F4C));
+}
 
 thread_local! {
     /// The lightning between a player with magnetic attraction and the items it pulls.
@@ -26370,6 +26437,23 @@ thread_local! {
 /// `PacketLightningRender.handle` for `LightningPreset.MAGNETIC_ATTRACTION`: a bolt of size 0.04 and life 8 ticks, the
 /// next after 4 to 12 (`SpawnFunction.noise(8, 4)`), in the owner's own slot.
 fn magnetic_bolt_payload(data: &[u8], now: bolt::Timestamp) {
+    let delay = 4.0 + rad_float() as f32 * 8.0;
+    bolt_payload(&MAGNETIC_BOLTS, data, now, 0.04, 8.0, delay);
+}
+
+/// `PacketLightningRender.handle` for `LightningPreset.TOOL_AOE`: a bolt of size 0.015 and life 12 ticks, with no delay.
+fn tool_aoe_bolt_payload(data: &[u8], now: bolt::Timestamp) {
+    bolt_payload(&TOOL_AOE_BOLTS, data, now, 0.015, 12.0, 0.0);
+}
+
+fn bolt_payload(
+    field: &'static std::thread::LocalKey<std::cell::RefCell<bolt::BoltField>>,
+    data: &[u8],
+    now: bolt::Timestamp,
+    size: f32,
+    lifespan: f32,
+    delay: f32,
+) {
     if data.len() != 32 {
         return;
     }
@@ -26382,14 +26466,22 @@ fn magnetic_bolt_payload(data: &[u8], now: bolt::Timestamp) {
         end: bolt::V3(f(3), f(4), f(5)),
         segments,
         count: 1,
-        size: 0.04,
+        size,
     };
-    let delay = 4.0 + rad_float() as f32 * 8.0;
-    MAGNETIC_BOLTS.with_borrow_mut(|field| field.update(i64::from(owner), bolt::BoltSpec { effect, lifespan: 8.0, delay }, now));
+    field.with_borrow_mut(|field| field.update(i64::from(owner), bolt::BoltSpec { effect, lifespan, delay }, now));
 }
 
 fn magnetic_bolt_quads(now: bolt::Timestamp, quads: &mut Vec<super::native_hooks::NativeWorldQuad>) {
-    MAGNETIC_BOLTS.with_borrow_mut(|field| {
+    bolt_quads(&MAGNETIC_BOLTS, now, quads);
+    bolt_quads(&TOOL_AOE_BOLTS, now, quads);
+}
+
+fn bolt_quads(
+    field: &'static std::thread::LocalKey<std::cell::RefCell<bolt::BoltField>>,
+    now: bolt::Timestamp,
+    quads: &mut Vec<super::native_hooks::NativeWorldQuad>,
+) {
+    field.with_borrow_mut(|field| {
         if field.is_empty() {
             return;
         }
@@ -26622,6 +26714,13 @@ pub(super) fn bow_item(_game: &Game<'_>, item: &str, bow: &mut bool) {
     *bow |= item == ELECTRIC_BOW;
 }
 
+/// `ItemCanteen.getUseAnimation` (DRINK) and `getUseDuration`: the drinking pose lasts `CANTEEN_TICKS`.
+pub(super) fn drink_item(_game: &Game<'_>, item: &str, ticks: &mut i32) {
+    if item == CANTEEN {
+        *ticks = CANTEEN_TICKS as i32;
+    }
+}
+
 /// Sneak + right click toggles the Electric Bow's fire mode (`ItemElectricBow.changeMode`: `ELECTRIC_BOW_MODE`).
 fn electric_bow_use(game: &mut Game<'_>, claimed: &mut bool) {
     if !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
@@ -26734,12 +26833,39 @@ pub(super) fn farming_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3],
                     if game.native_block_transform(transformer, at, face).is_some_and(|(s, _)| s == state) {
                         pay(game);
                         game.native_apply_block_transform(transformer, at, face);
+                        tool_aoe_lightning(game, pos, at, face, axe);
                     }
                 }
             }
         }
         *claimed = true;
         return;
+    }
+}
+
+/// `PacketLightningRender(TOOL_AOE, 31 * pos.hashCode() + newPos.hashCode(), start, end, 10)` to everyone tracking: a bolt
+/// from the block worked to a block of its area, at `IToolAOEData.getLightningPos` (flat: 0.94 above the block's bottom
+/// centre; the axe's plane: the centre of the face clicked).
+fn tool_aoe_lightning(g: &mut Game<'_>, pos: [i32; 3], at: [i32; 3], face: [i32; 3], axe: bool) {
+    // `Vec3i.hashCode`: (y + z * 31) * 31 + x.
+    let hash = |p: [i32; 3]| p[1].wrapping_add(p[2].wrapping_mul(31)).wrapping_mul(31).wrapping_add(p[0]);
+    let owner = 31_i32.wrapping_mul(hash(pos)).wrapping_add(hash(at));
+    let end = |p: [i32; 3]| -> [f32; 3] {
+        if axe {
+            std::array::from_fn(|k| p[k] as f32 + 0.5 + 0.5 * face[k] as f32)
+        } else {
+            [p[0] as f32 + 0.5, p[1] as f32 + 0.94, p[2] as f32 + 0.5]
+        }
+    };
+    let (a, b) = (end(pos), end(at));
+    let mut data = Vec::with_capacity(32);
+    data.extend(owner.to_be_bytes());
+    for v in a.into_iter().chain(b) {
+        data.extend(v.to_be_bytes());
+    }
+    data.extend(10_i32.to_be_bytes());
+    for p in robit_players(g) {
+        g.native_send_to_player(p.uuid, TOOL_AOE_BOLT_CHANNEL, &data);
     }
 }
 
@@ -26829,4 +26955,132 @@ fn canteen_tick(game: &mut Game<'_>, ticks: u32, claimed: &mut bool, keep: &mut 
     if let Some(p) = game.player.as_mut() {
         p.health.food.eat(food as i32, paste_saturation());
     }
+}
+
+// --- Gauge Dropper --------------------------------------------------------------------------------------
+
+const GAUGE_DROPPER: &str = "mekanism:gauge_dropper";
+/// The window button of a dropper click on gauge `i`: `BUTTON_DROPPER + 4 i + action` (0 fill the dropper, 1 drain it into
+/// the tank, 2 dump the tank), `PacketDropperUse`.
+const BUTTON_DROPPER: i32 = 1000;
+
+fn dropper_capacity() -> u64 {
+    mekanism_core::config::gear_int("gauge_dropper.capacity", 16_000)
+}
+
+/// The dropper's tank a chemical goes to: `ItemGaugeDropper` keeps a fluid tank apart from its chemical tanks. The port
+/// stores both as chemical tanks, so water, lava, milk and heavy water are the fluids.
+fn dropper_key(chemical: &str) -> &'static str {
+    if chemical.starts_with("minecraft:") || chemical == "mekanism:heavy_water" { FLUID_KEY } else { CHEMICAL_KEY }
+}
+
+/// `GuiTankGauge.onClick`: with a Gauge Dropper on the cursor, a left click on a gauge fills the dropper from the tank
+/// (shift: dumps the tank), a right click drains the dropper into it.
+fn dropper_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool, button: &mut Option<i32>) -> bool {
+    if !game.carried.as_ref().is_some_and(|c| &*c.item == GAUGE_DROPPER) {
+        return false;
+    }
+    let Some(l) = layout(block) else {
+        return false;
+    };
+    for (i, g) in l.gauges.iter().enumerate() {
+        if inside(at, [g.at[0], g.at[1], g.size[0], g.size[1]]) {
+            let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);
+            let action = if right { 1 } else if shift { 2 } else { 0 };
+            *button = Some(BUTTON_DROPPER + 4 * i as i32 + action);
+            return true;
+        }
+    }
+    false
+}
+
+/// `PacketDropperUse.handle` on the server: fills the dropper from the tank, drains it into the tank, or dumps the tank,
+/// at most `gaugeDroppedTransferRate` mB a click; a dump spills a radioactive chemical's radiation.
+fn dropper_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id: i32) -> bool {
+    if !(BUTTON_DROPPER..BUTTON_DROPPER + 64).contains(&id) {
+        return false;
+    }
+    let (i, action) = (((id - BUTTON_DROPPER) / 4) as usize, (id - BUTTON_DROPPER) % 4);
+    let Some(mut carried) = game.carried.clone().filter(|c| &*c.item == GAUGE_DROPPER) else {
+        return true;
+    };
+    let Some(g) = layout(&entity.id).and_then(|l| l.gauges.get(i).copied()) else {
+        return true;
+    };
+    let mut tank = get_tank(&entity.nbt, g.key, g.capacity);
+    let rate = mekanism_core::config::gear_int("gauge_dropper.transferRate", 250).max(1);
+    let load = |key: &str| item_tank(&carried, key, dropper_capacity()).unwrap_or_else(|| ChemicalTank::new(dropper_capacity()));
+    // Which of the dropper's two tanks takes part: the one that fits the gauge's chemical, else the one holding something.
+    let key = match tank.chemical.as_deref() {
+        Some(c) => dropper_key(c),
+        None => [FLUID_KEY, CHEMICAL_KEY].into_iter().find(|k| load(k).amount > 0).unwrap_or(CHEMICAL_KEY),
+    };
+    let mut dropper = load(key);
+    match action {
+        2 => {
+            if let Some(chemical) = tank.chemical.clone() {
+                let dimension = game.dim.id().to_owned();
+                dump_radiation(&dimension, pos, &chemical, tank.amount);
+            }
+            tank.extract(tank.amount);
+        }
+        0 => {
+            let Some(chemical) = tank.chemical.clone() else {
+                return true;
+            };
+            let moved = dropper.insert(&chemical, tank.amount.min(rate));
+            tank.extract(moved);
+        }
+        _ => {
+            let Some(chemical) = tank.chemical.clone().or_else(|| dropper.chemical.clone()) else {
+                return true;
+            };
+            if dropper.chemical.as_deref() != Some(chemical.as_str()) || !tank.accepts(&chemical) {
+                return true;
+            }
+            let moved = tank.insert(&chemical, dropper.amount.min(rate));
+            dropper.extract(moved);
+        }
+    }
+    put_tank(&mut entity.nbt, g.key, &tank);
+    put_item_tank_key(&mut carried, key, &dropper);
+    game.carried = Some(carried);
+    true
+}
+
+/// `ItemGaugeDropper.use`: sneaking, the dropper empties its tanks where the player stands (`tryDumpContents`), spilling the
+/// radiation of a radioactive chemical.
+fn dropper_use(game: &mut Game<'_>, claimed: &mut bool) {
+    if !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+        return;
+    }
+    let Some(at) = game.player.as_ref().map(|p| [p.position.x.floor() as i32, p.position.y.floor() as i32, p.position.z.floor() as i32]) else {
+        return;
+    };
+    let dimension = game.dim.id().to_owned();
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == GAUGE_DROPPER) else {
+        return;
+    };
+    for key in [FLUID_KEY, CHEMICAL_KEY] {
+        if let Some(tank) = item_tank(held, key, dropper_capacity()) {
+            if let Some(chemical) = tank.chemical.as_deref() {
+                dump_radiation(&dimension, at, chemical, tank.amount);
+            }
+            put_item_tank_key(held, key, &ChemicalTank::new(dropper_capacity()));
+        }
+    }
+    *claimed = true;
+}
+
+/// `ItemAtomicDisassembler.adjustAttributes` / `ItemMekaTool.adjustAttributes`: the attack speed config of the item held.
+pub(super) fn attack_speed(game: &Game<'_>, stack: &ItemStack, add: &mut f64) {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    let key = match &*stack.item {
+        DISASSEMBLER => "atomic_disassembler.attackSpeed",
+        modules::MEKA_TOOL => "mekatool.attackSpeed",
+        _ => return,
+    };
+    *add = mekanism_core::config::gear_decimal(key, -2.4);
 }
