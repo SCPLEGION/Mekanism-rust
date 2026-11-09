@@ -6838,6 +6838,31 @@ thread_local! {
 /// `MekanismHUD.render`: the text of the items worn and held (bottom left, at the HUD scale 0.6), then, with a
 /// MekaSuit helmet, `HUDRenderer.renderHUD`: compass, energy of the suit, icons of its modules, all lagging the
 /// head's turn a little. Colours: `ClientConfig` defaults (opacity 0.4, `0x40F5F0`).
+/// `IItemDecorator`s and `Item.isBarVisible`: a lone energy item shows its charge (`energyColor`), a tank item its
+/// chemical in the chemical's colour, and a MekaSuit piece its charge with the chemical bar of its jetpack above it
+/// (`MekaSuitBarDecorator`). Stacked items show none, as the bar would cover the count.
+pub(super) fn item_bars(game: &Game<'_>, stack: &ItemStack, bar: &mut Option<(i32, u32)>, extra: &mut Vec<(i32, i32, u32)>) {
+    if stack.count != 1 || !game.native_on(MOD_ID) {
+        return;
+    }
+    let width = |amount: u64, capacity: u64| ((13.0 * amount as f64 / capacity.max(1) as f64).round() as i32).clamp(0, 13);
+    let color_of = |chemical: &str| CHEMICALS.iter().find(|c| c.0 == chemical).map_or(0xAAAAAA, |c| c.2);
+    let energy = item_energy_of(stack).map(|e| (stored_energy(stack), e.capacity));
+    let tank_item = JETPACKS.contains(&&*stack.item) || &*stack.item == SCUBA_TANK || &*stack.item == flamethrower::ITEM;
+    let suit_tank = &*stack.item == modules::BODYARMOR && modules_of(stack).contains_key("mekanism:jetpack_unit");
+    if tank_item {
+        let fuel = jetpack_fuel(stack);
+        if fuel > 0 {
+            *bar = Some((width(fuel, jetpack_capacity(stack)), color_of(item_chemical(stack))));
+        }
+    } else if let Some((stored, capacity)) = energy.filter(|(stored, _)| *stored > 0) {
+        *bar = Some((width(stored, capacity), 0x3CFE9A));
+    }
+    if suit_tank {
+        extra.push((12, width(jetpack_fuel(stack), jetpack_capacity(stack)), color_of(item_chemical(stack))));
+    }
+}
+
 /// `MekaSuitEnergyLevel`: above the armour row, a bar of the energy the worn suit pieces hold together
 /// (`hudRenderMekaSuitEnergyBar`). One row of hearts is assumed for the height.
 fn suit_energy_level(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {

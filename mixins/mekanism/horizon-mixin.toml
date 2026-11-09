@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "9c559bf71cbde35417997119d36cb9208f7ab859"
+horizon_revision = "38ea6e1e8f1fff3b1db386a409cb5226faa50783"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -749,4 +749,17 @@ helper = "mods.rs"
 bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "&mut *mods" },
+]
+
+[[injection]]
+id = "item-bars"
+hook = "item_bars"
+hook_version = 1
+kind = "HEAD"
+helper = "item_bars.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+  { name = "bar", ty = "&mut Option<(i32, u32)>", value = "&mut *bar" },
+  { name = "extra", ty = "&mut Vec<(i32, i32, u32)>", value = "&mut *extra" },
 ]
