@@ -6790,7 +6790,23 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
         if let Some(tank) = item_tank(stack, key, u64::MAX)
             && let Some(id) = tank.chemical.as_deref()
         {
-            let line = format!("Stored: {} mB {id}", tank.amount);
+            // `MekanismLang.STORED`: "Stored: <Chemical Name> - <amount> mB".
+            let name: Vec<String> = id
+                .rsplit(':')
+                .next()
+                .unwrap_or(id)
+                .split('_')
+                .map(|w| w.chars().next().map(|c| c.to_uppercase().collect::<String>() + &w[c.len_utf8()..]).unwrap_or_default())
+                .collect();
+            let digits = tank.amount.to_string();
+            let mut grouped = String::new();
+            for (i, c) in digits.chars().enumerate() {
+                if i > 0 && (digits.len() - i) % 3 == 0 {
+                    grouped.push(',');
+                }
+                grouped.push(c);
+            }
+            let line = format!("Stored: {} - {grouped} mB", name.join(" "));
             lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
         }
     }
