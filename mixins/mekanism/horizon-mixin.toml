@@ -681,3 +681,15 @@ bindings = [
   { name = "wear", ty = "u32", value = "wear" },
   { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
 ]
+
+[[injection]]
+id = "fog"
+hook = "fog"
+hook_version = 1
+kind = "HEAD"
+helper = "fog.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "fog_type", ty = "u8", value = "fog_type" },
+  { name = "fog", ty = "&mut horizon_client::fog::FogData", value = "&mut *fog" },
+]
