@@ -6941,6 +6941,55 @@ fn stored_tooltip(stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text
 }
 
 /// "Stored Energy: 1.2 MFE" under a Mekanism item that holds energy.
+/// The block items that carry `MekanismDataComponents.DETAILS` (`registerDetails`, `ItemBlockTooltip`): their stored
+/// energy, chemicals and the like show only while the details key is held. Generated from `MekanismBlocks`.
+const DETAILS_ITEMS: [&str; 44] = [
+    "mekanism:security_desk",
+    "mekanism:industrial_alarm",
+    "mekanism:enrichment_chamber",
+    "mekanism:osmium_compressor",
+    "mekanism:combiner",
+    "mekanism:crusher",
+    "mekanism:digital_miner",
+    "mekanism:metallurgic_infuser",
+    "mekanism:purification_chamber",
+    "mekanism:energized_smelter",
+    "mekanism:electric_pump",
+    "mekanism:chargepad",
+    "mekanism:logistical_sorter",
+    "mekanism:rotary_condensentrator",
+    "mekanism:chemical_oxidizer",
+    "mekanism:chemical_infuser",
+    "mekanism:chemical_injection_chamber",
+    "mekanism:electrolytic_separator",
+    "mekanism:precision_sawmill",
+    "mekanism:chemical_dissolution_chamber",
+    "mekanism:chemical_washer",
+    "mekanism:chemical_crystallizer",
+    "mekanism:seismic_vibrator",
+    "mekanism:pressurized_reaction_chamber",
+    "mekanism:isotopic_centrifuge",
+    "mekanism:nutritional_liquifier",
+    "mekanism:fluidic_plenisher",
+    "mekanism:laser",
+    "mekanism:solar_neutron_activator",
+    "mekanism:oredictionificator",
+    "mekanism:formulaic_assemblicator",
+    "mekanism:fuelwood_heater",
+    "mekanism:modification_station",
+    "mekanism:antiprotonic_nucleosynthesizer",
+    "mekanism:pigment_extractor",
+    "mekanism:pigment_mixer",
+    "mekanism:painting_machine",
+    "mekanism:dimensional_stabilizer",
+    "mekanism:qio_drive_array",
+    "mekanism:qio_dashboard",
+    "mekanism:qio_importer",
+    "mekanism:qio_exporter",
+    "mekanism:qio_redstone_adapter",
+    "mekanism:block_bio_fuel",
+];
+
 /// `MekanismDataComponents.DESCRIPTION`: the blocks that have a description (`IHasDescription`) show it while the
 /// description key (Shift + N) is held, else "Hold Shift + N for a description."
 fn description_tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
@@ -6980,6 +7029,15 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
     if !game.native_on(MOD_ID) || !stack.item.starts_with("mekanism") {
         return;
     }
+    let keep = lines.len();
+    tooltip_body(game, stack, lines);
+    finish_tooltip(game, stack, lines, keep);
+}
+
+fn tooltip_body(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    if !game.native_on(MOD_ID) || !stack.item.starts_with("mekanism") {
+        return;
+    }
     if &*stack.item == CONFIGURATOR {
         let line = format!("Configuring: {}", configurator_conf(stack).label());
         lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
@@ -6994,7 +7052,6 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
         lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
     }
     stored_tooltip(stack, lines);
-    description_tooltip(game, stack, lines);
     // `FormulaComponent.addToTooltip`: the distinct ingredients in order of first use, with how many times each is used.
     if &*stack.item == fa::FORMULA_ITEM
         && let Some(text) = custom_data(stack).and_then(|c| get_string(c, "formula"))
@@ -7052,6 +7109,19 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
     }
     let line = format!("Stored Energy: {}", mekanism_core::energy::format_fe(energy));
     lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0x55, 0xFF, 0xFF, 0xFF)));
+}
+
+/// `ItemTooltipUtils.shouldHideDetails` and the DETAILS appender: a block item with the details component shows what
+/// it holds only while the details key (left Shift) is held, else "Hold Left Shift for details."; then the description.
+fn finish_tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>, keep: usize) {
+    if DETAILS_ITEMS.contains(&&*stack.item) {
+        if !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+            lines.truncate(keep);
+            let hold = horizon_client::text::Text::translate("tooltip.mekanism.hold_for_details", &[horizon_client::text::Text::colored("Left Shift", 0x5555FF)]);
+            lines.push((hold, horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+        }
+    }
+    description_tooltip(game, stack, lines);
 }
 
 // --- Jetpack ----------------------------------------------------------------------------------------
