@@ -378,7 +378,7 @@ impl FreeRunnerMode {
 /// (blocks past the safe distance count as damage points) costs `fallEnergyCost` FE a point. Returns
 /// the energy it takes, or None when the runners cannot pay for all of it.
 pub fn fall_cost(fallen: f64, stored: u64) -> Option<u64> {
-    let cost = (fallen.max(0.0) * FREE_RUNNER_FALL_COST as f64).ceil() as u64;
+    let cost = (fallen.max(0.0) * crate::config::gear_int("free_runner.fallEnergyCost", FREE_RUNNER_FALL_COST) as f64).ceil() as u64;
     (cost <= stored).then_some(cost)
 }
 
