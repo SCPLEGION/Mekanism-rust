@@ -1,5 +1,6 @@
-//! Mekanism's server config (`GearConfig`, the part the port reads), with the original's defaults. It lives in the
-//! world's `serverconfig/mekanism-gear.toml` as Mekanism keeps it: `[atomic_disassembler]` with the same key names.
+//! Mekanism's server config (the parts the port reads), with the original's defaults and key names. `GearConfig`
+//! lives in the world's `serverconfig/mekanism-gear.toml` (`[atomic_disassembler]`), `UsageConfig` in
+//! `serverconfig/mekanism-usage.toml` (`[usage]`). Only the keys the port reads are written.
 
 /// `GearConfig`'s Atomic Disassembler section.
 #[derive(Clone, Debug, PartialEq)]
@@ -95,8 +96,97 @@ impl GearConfig {
     }
 }
 
+/// `UsageConfig`: FE a tick a machine uses, for the machines whose usage the port reads from here, with the
+/// original's defaults (`defineInRange(key, default, 0, Integer.MAX_VALUE)`).
+pub const USAGE_DEFAULTS: [(&str, u64); 9] = [
+    ("enrichmentChamber", 5),
+    ("osmiumCompressor", 15),
+    ("combiner", 5),
+    ("crusher", 8),
+    ("metallurgicInfuser", 5),
+    ("purificationChamber", 10),
+    ("energizedSmelter", 5),
+    ("precisionSawmill", 5),
+    ("chemicalInjectionChamber", 15),
+];
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageConfig {
+    values: std::collections::BTreeMap<&'static str, u64>,
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        Self { values: USAGE_DEFAULTS.into_iter().collect() }
+    }
+}
+
+impl UsageConfig {
+    /// A machine's usage; an unknown key gives `default`.
+    pub fn get(&self, key: &str, default: u64) -> u64 {
+        self.values.get(key).copied().unwrap_or(default)
+    }
+
+    pub fn parse(text: &str) -> Self {
+        let mut config = Self::default();
+        let mut section = String::new();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                section = name.trim().to_owned();
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if section != "usage" {
+                continue;
+            }
+            if let (Some((name, _)), Some(n)) = (
+                USAGE_DEFAULTS.iter().find(|(k, _)| *k == key.trim()),
+                value.trim().replace('_', "").parse::<u64>().ok().filter(|n| *n <= i32::MAX as u64),
+            ) {
+                config.values.insert(name, n);
+            }
+        }
+        config
+    }
+
+    pub fn to_toml(&self) -> String {
+        let mut out = String::from("# Mekanism usage config (server config: this world only). Range 0 ~ 2147483647\n[usage]\n");
+        for (key, _) in USAGE_DEFAULTS {
+            out.push_str(&format!("{key} = {}\n", self.values[key]));
+        }
+        out
+    }
+}
+
+/// The `UsageConfig` key of the machine a recipe kind belongs to (a factory uses its machine's).
+pub fn usage_key(recipe: &str) -> Option<&'static str> {
+    Some(match recipe {
+        "enriching" => "enrichmentChamber",
+        "crushing" => "crusher",
+        "smelting" => "energizedSmelter",
+        "sawing" => "precisionSawmill",
+        "combining" => "combiner",
+        "compressing" => "osmiumCompressor",
+        "injecting" => "chemicalInjectionChamber",
+        "purifying" => "purificationChamber",
+        "infusing" => "metallurgicInfuser",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_defaults_round_trip_and_override() {
+        let d = super::UsageConfig::default();
+        assert_eq!(d.get("crusher", 0), 8);
+        assert_eq!(super::UsageConfig::parse(&d.to_toml()), d);
+        assert_eq!(super::UsageConfig::parse("[usage]\ncrusher = 20\nbogus = 3").get("crusher", 0), 20);
+    }
+
     use super::*;
 
     #[test]

@@ -211,10 +211,10 @@ fn kind(id: &str) -> Option<Kind> {
         return Some(Kind::DigitalMiner);
     }
     if let Some((recipe, usage)) = machine::machine(id) {
-        return Some(Kind::Machine(recipe, usage));
+        return Some(Kind::Machine(recipe, usage_of(recipe, usage)));
     }
     if let Some((processes, recipe, usage)) = factory::factory(id) {
-        return Some(Kind::Factory(processes, recipe, usage));
+        return Some(Kind::Factory(processes, recipe, usage_of(recipe, usage)));
     }
     if id == HEAT_GENERATOR {
         return Some(Kind::HeatGenerator);
@@ -3688,7 +3688,7 @@ fn tick_crystallizer(entity: &mut ModBlockEntity) -> Option<bool> {
 /// osmium ingot → osmium).
 fn tick_advanced(game: &mut Game<'_>, entity: &mut ModBlockEntity, m: &'static chem::AdvancedMachine) -> Option<bool> {
     let ticks = chem::ADVANCED_TICKS;
-    let capacity = m.usage * u64::from(ticks);
+    let capacity = advanced_usage(m) * u64::from(ticks);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut tank = get_tank(&entity.nbt, "chemical", chem::ADVANCED_TANK);
@@ -3738,7 +3738,7 @@ fn tick_advanced(game: &mut Game<'_>, entity: &mut ModBlockEntity, m: &'static c
             if fits
                 && tank.chemical.as_deref() == Some(r.chemical)
                 && tank.amount >= r.chemical_amount
-                && energy.consume(m.usage)
+                && energy.consume(advanced_usage(m))
             {
                 active = true;
                 tank.extract(r.chemical_amount);
@@ -3947,7 +3947,7 @@ fn tick_painting(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<boo
 /// recipe's output after 200 ticks at 5 FE a tick (`metallurgic_infusing`: iron + 10 carbon → enriched
 /// iron).
 fn tick_infuser(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool> {
-    let capacity = chem::INFUSER_USAGE * u64::from(chem::INFUSER_TICKS);
+    let capacity = usage_of("infusing", chem::INFUSER_USAGE) * u64::from(chem::INFUSER_TICKS);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut tank = get_tank(&entity.nbt, "infuse", chem::INFUSER_TANK);
@@ -3989,7 +3989,7 @@ fn tick_infuser(game: &mut Game<'_>, entity: &mut ModBlockEntity) -> Option<bool
                 None => true,
                 Some(o) => &*o.item == r.output && o.count + r.output_count <= max,
             };
-            if fits && energy.consume(chem::INFUSER_USAGE) {
+            if fits && energy.consume(usage_of("infusing", chem::INFUSER_USAGE)) {
                 active = true;
                 progress += 1;
                 if progress >= chem::INFUSER_TICKS {
@@ -5903,7 +5903,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Washer => Some((machine::STORAGE_MULTIPLIER * nuclear::WASHER_USAGE, u64::MAX)),
         Kind::Crystallizer => Some((machine::STORAGE_MULTIPLIER * nuclear::CRYSTALLIZER_USAGE, u64::MAX)),
         Kind::Separator => Some((machine::STORAGE_MULTIPLIER * chem::SEPARATOR_USAGE, u64::MAX)),
-        Kind::Advanced(m) => Some((m.usage * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
+        Kind::Advanced(m) => Some((advanced_usage(m) * u64::from(chem::ADVANCED_TICKS), u64::MAX)),
         Kind::Nucleosynthesizer => Some((machine::STORAGE_MULTIPLIER * chem::NUCLEOSYNTHESIZER_USAGE, u64::MAX)),
         Kind::Reaction => Some((reaction_capacity(nbt), u64::MAX)),
         Kind::Teleporter => Some((teleporter::STORAGE, u64::MAX)),
@@ -5933,7 +5933,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
             let rate = get_long(nbt, "rate");
             Some(if get_long(nbt, "master") == 1 { (get_long(nbt, "capacity"), rate) } else { (rate, rate) })
         }
-        Kind::Infuser => Some((chem::INFUSER_USAGE * u64::from(chem::INFUSER_TICKS), u64::MAX)),
+        Kind::Infuser => Some((usage_of("infusing", chem::INFUSER_USAGE) * u64::from(chem::INFUSER_TICKS), u64::MAX)),
         Kind::Painting => Some((chem::PAINTING_USAGE * u64::from(chem::PAINTING_TICKS), u64::MAX)),
         // An SPS port takes energy in input mode (`TileEntitySPSPort`).
         Kind::SpsPort if get_long(nbt, "output") == 0 => Some((sps::PORT_STORAGE, u64::MAX)),
@@ -6109,6 +6109,7 @@ fn sync_gear_config(game: &Game<'_>) {
     let Some(file) = game.native_world_dir().map(|d| d.join("serverconfig").join("mekanism-gear.toml")) else {
         return;
     };
+    sync_usage_config(&file.with_file_name("mekanism-usage.toml"));
     if GEAR_CONFIG.read().is_ok_and(|g| g.as_ref().is_some_and(|(f, _)| *f == file)) {
         return;
     }
@@ -6123,6 +6124,97 @@ fn sync_gear_config(game: &Game<'_>) {
     if let Ok(mut g) = GEAR_CONFIG.write() {
         *g = Some((file, config));
     }
+}
+
+/// `UsageConfig`, read from the world's `serverconfig/mekanism-usage.toml` (written with the defaults when missing).
+static USAGE_CONFIG: std::sync::RwLock<Option<(std::path::PathBuf, mekanism_core::config::UsageConfig)>> = std::sync::RwLock::new(None);
+
+/// A machine's FE a tick: the config's value for the recipe kind's machine, else `default`.
+fn usage_of(recipe: &str, default: u64) -> u64 {
+    let Some(key) = mekanism_core::config::usage_key(recipe) else {
+        return default;
+    };
+    USAGE_CONFIG.read().ok().and_then(|g| g.as_ref().map(|(_, c)| c.get(key, default))).unwrap_or(default)
+}
+
+fn advanced_usage(m: &chem::AdvancedMachine) -> u64 {
+    let recipe = match m.block {
+        "mekanism:purification_chamber" => "purifying",
+        "mekanism:osmium_compressor" => "compressing",
+        _ => "injecting",
+    };
+    usage_of(recipe, m.usage)
+}
+
+fn sync_usage_config(file: &std::path::Path) {
+    if USAGE_CONFIG.read().is_ok_and(|g| g.as_ref().is_some_and(|(f, _)| f == file)) {
+        return;
+    }
+    let config = match std::fs::read_to_string(file) {
+        Ok(text) => mekanism_core::config::UsageConfig::parse(&text),
+        Err(_) => {
+            let config = mekanism_core::config::UsageConfig::default();
+            let _ = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(file, config.to_toml()));
+            config
+        }
+    };
+    if let Ok(mut g) = USAGE_CONFIG.write() {
+        *g = Some((file.to_path_buf(), config));
+    }
+}
+
+/// The items each recipe kind takes as input, worked out once from the recipes and tags of the world
+/// (`InputRecipeCache`: a machine's input slot only takes an item that starts a recipe).
+static INPUT_SETS: std::sync::OnceLock<std::collections::HashMap<&'static str, std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+
+fn sync_input_sets(game: &Game<'_>) {
+    INPUT_SETS.get_or_init(|| {
+        let items = world_items!(game);
+        let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
+        let mut sets: std::collections::HashMap<&'static str, std::collections::HashSet<String>> = std::collections::HashMap::new();
+        for id in items.items.keys() {
+            let id: &str = id;
+            let mut add = |kind: &'static str, yes: bool| {
+                if yes {
+                    sets.entry(kind).or_default().insert(id.to_owned());
+                }
+            };
+            for kind in ["enriching", "crushing"] {
+                add(kind, mekanism_core::recipes::find(mekanism_core::recipes::table(kind), id, 64, &in_tag).is_some());
+            }
+            add("sawing", mekanism_core::recipes::find_sawing(id, 64, &in_tag).is_some());
+            add("smelting", world_recipes!(game).cook("minecraft:smelting", &stack_of(id, 1)).is_some());
+            for m in chem::ADVANCED_MACHINES {
+                let kind = match m.block {
+                    "mekanism:purification_chamber" => "purifying",
+                    "mekanism:osmium_compressor" => "compressing",
+                    _ => "injecting",
+                };
+                add(kind, m.table.iter().any(|r| r.input.matches(id, &in_tag)));
+            }
+        }
+        sets
+    });
+}
+
+/// Whether `stack` starts a `kind` recipe; before the sets are known, anything goes.
+fn starts_recipe(kind: &str, stack: &ItemStack) -> bool {
+    INPUT_SETS.get().is_none_or(|sets| sets.get(kind).is_some_and(|s| s.contains(&*stack.item)))
+}
+
+/// A slot rule per recipe kind (`SlotRule::Check` takes a plain function).
+fn input_rule(kind: &str) -> Option<horizon_client::lan::menu::SlotRule> {
+    use horizon_client::lan::menu::SlotRule;
+    Some(match kind {
+        "enriching" => SlotRule::Check(|s| starts_recipe("enriching", s)),
+        "crushing" => SlotRule::Check(|s| starts_recipe("crushing", s)),
+        "smelting" => SlotRule::Check(|s| starts_recipe("smelting", s)),
+        "sawing" => SlotRule::Check(|s| starts_recipe("sawing", s)),
+        "purifying" => SlotRule::Check(|s| starts_recipe("purifying", s)),
+        "compressing" => SlotRule::Check(|s| starts_recipe("compressing", s)),
+        "injecting" => SlotRule::Check(|s| starts_recipe("injecting", s)),
+        _ => return None,
+    })
 }
 
 /// A disabled mode reads back as normal (`DisassemblerMode.CODEC`).
@@ -9752,9 +9844,9 @@ fn base_usage(k: Kind) -> Option<u64> {
         Kind::Nucleosynthesizer => chem::NUCLEOSYNTHESIZER_USAGE,
         Kind::ChemicalInfuser => chem::CHEMICAL_INFUSER_USAGE,
         Kind::Rotary => chem::ROTARY_USAGE,
-        Kind::Infuser => chem::INFUSER_USAGE,
+        Kind::Infuser => usage_of("infusing", chem::INFUSER_USAGE),
         Kind::Painting => chem::PAINTING_USAGE,
-        Kind::Advanced(m) => m.usage,
+        Kind::Advanced(m) => advanced_usage(m),
         Kind::Pump => isotopes::PUMP_USAGE,
         Kind::Plenisher => plenisher::PLENISHER_USAGE,
         Kind::ModificationStation => modules::STATION_USAGE,
@@ -10532,6 +10624,13 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
             }
         }
         rules[FACTORY_ENERGY] = convert();
+        if let Some(Kind::Factory(n, recipe, _)) = kind(block)
+            && let Some(rule) = input_rule(recipe)
+        {
+            for slot in rules.iter_mut().take(n) {
+                *slot = rule.clone();
+            }
+        }
     } else if kind(block) == Some(Kind::Teleporter) {
         *rules = vec![convert(), SlotRule::Any, SlotRule::Any];
     } else if let Some(l) = layout(block) {
@@ -10549,6 +10648,25 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
             .collect();
         for &i in chemical_layout_slots(block) {
             rules[i] = SlotRule::Items(chemical_item_ids());
+        }
+        // The input slot only takes an item that starts a recipe (`InputInventorySlot.at(containsRecipe)`).
+        match kind(block) {
+            Some(Kind::Machine(recipe, _)) if recipe != "combining" => {
+                if let (Some(rule), Some(slot)) = (input_rule(recipe), rules.first_mut()) {
+                    *slot = rule;
+                }
+            }
+            Some(Kind::Advanced(m)) => {
+                let recipe = match m.block {
+                    "mekanism:purification_chamber" => "purifying",
+                    "mekanism:osmium_compressor" => "compressing",
+                    _ => "injecting",
+                };
+                if let (Some(rule), Some(slot)) = (input_rule(recipe), rules.first_mut()) {
+                    *slot = rule;
+                }
+            }
+            _ => {}
         }
         // The dynamic tank's output slot only gives (`OutputInventorySlot`).
         if kind(block) == Some(Kind::DynamicValve) {
@@ -24898,6 +25016,7 @@ fn rad_client_payload(data: &[u8]) {
 /// The server's tick: sources decay (a 1 in 20 chance a tick), then each player is exposed, dosed, hurt and told.
 fn radiation_server_tick(game: &mut Game<'_>) {
     sync_gear_config(game);
+    sync_input_sets(game);
     // The world's folder keeps the sources and the doses (`RadiationLevelData`, the radiation attachment).
     let file = game.native_world_dir().map(|d| d.join("mekanism").join("radiation.txt"));
     if file.is_some()
