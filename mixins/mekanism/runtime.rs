@@ -6793,6 +6793,62 @@ pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
     });
 }
 
+/// The stored chemicals and fluids of a tank item (`MekanismDataComponents` tooltip appenders for `ATTACHED_CHEMICALS` and
+/// `ATTACHED_FLUIDS`, `ResourceContainerType.getStoredResourceTooltip`): `GENERIC_STORED_MB` "<name>: <amount> mB", the name in
+/// the type's colour (orange chemicals, magenta fluids) and the amount grey. A Gauge Dropper prefixes "Chemical: " or "Liquid: "
+/// and reads "Empty" in dark red with nothing in it; an empty Canteen shows its paste at 0 mB.
+fn stored_tooltip(stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    use horizon_client::text::Text;
+    let white = horizon_client::hud::rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    let rgb = |c: u32| horizon_client::hud::rgba((c >> 16) as u8, (c >> 8) as u8, c as u8, 0xFF);
+    let (orange, pink, grey) = (rgb(0xFFA160), rgb(0xD55ECB), rgb(0xCFCFCF));
+    let dropper = &*stack.item == GAUGE_DROPPER;
+    let pretty = |id: &str| -> String {
+        id.rsplit(':')
+            .next()
+            .unwrap_or(id)
+            .split('_')
+            .map(|w| w.chars().next().map(|c| c.to_uppercase().collect::<String>() + &w[c.len_utf8()..]).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let grouped = |n: u64| -> String {
+        let digits = n.to_string();
+        let mut out = String::new();
+        for (i, c) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        out
+    };
+    let canteen = &*stack.item == CANTEEN;
+    let mut any = false;
+    for (key, color, prefix) in [(CHEMICAL_KEY, if canteen { pink } else { orange }, "Chemical: "), (FLUID_KEY, pink, "Liquid: ")] {
+        let Some(tank) = item_tank(stack, key, u64::MAX) else {
+            continue;
+        };
+        let Some(id) = tank.chemical.as_deref() else {
+            continue;
+        };
+        any = true;
+        let mut text = Text::colored(pretty(id), color).append(Text::literal(": ")).append(Text::colored(grouped(tank.amount), grey)).append(Text::literal(" mB"));
+        if dropper {
+            text = Text::literal(prefix).append(text);
+        }
+        lines.push((text, white));
+    }
+    if !any {
+        if canteen {
+            let text = Text::colored("Nutritional Paste", pink).append(Text::literal(": ")).append(Text::colored("0", grey)).append(Text::literal(" mB"));
+            lines.push((text, white));
+        } else if dropper {
+            lines.push((Text::colored("Empty", rgb(0xC9071F)), white));
+        }
+    }
+}
+
 /// "Stored Energy: 1.2 MFE" under a Mekanism item that holds energy.
 pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
     if !game.native_on(MOD_ID) || !stack.item.starts_with("mekanism") {
@@ -6811,30 +6867,7 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
         let line = format!("Mode: {} (efficiency {})", mode.label(), mode.efficiency());
         lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
     }
-    for key in [FLUID_KEY, CHEMICAL_KEY] {
-        if let Some(tank) = item_tank(stack, key, u64::MAX)
-            && let Some(id) = tank.chemical.as_deref()
-        {
-            // `MekanismLang.STORED`: "Stored: <Chemical Name> - <amount> mB".
-            let name: Vec<String> = id
-                .rsplit(':')
-                .next()
-                .unwrap_or(id)
-                .split('_')
-                .map(|w| w.chars().next().map(|c| c.to_uppercase().collect::<String>() + &w[c.len_utf8()..]).unwrap_or_default())
-                .collect();
-            let digits = tank.amount.to_string();
-            let mut grouped = String::new();
-            for (i, c) in digits.chars().enumerate() {
-                if i > 0 && (digits.len() - i) % 3 == 0 {
-                    grouped.push(',');
-                }
-                grouped.push(c);
-            }
-            let line = format!("Stored: {} - {grouped} mB", name.join(" "));
-            lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
-        }
-    }
+    stored_tooltip(stack, lines);
     // `FormulaComponent.addToTooltip`: the distinct ingredients in order of first use, with how many times each is used.
     if &*stack.item == fa::FORMULA_ITEM
         && let Some(text) = custom_data(stack).and_then(|c| get_string(c, "formula"))
