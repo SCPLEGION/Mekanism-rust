@@ -3246,7 +3246,15 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
 
 /// The Nutritional Liquifier: food becomes nutritional paste (50 mB a point of nutrition) over 100 ticks at
 /// 8 FE a tick. Foods with a use remainder (a stew's bowl) leave it in the output slot.
+/// The items with a nutrition above zero, worked out once for the slot rules (which see no game).
+static LIQUIFIER_FOODS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
 fn tick_liquifier(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    LIQUIFIER_FOODS.get_or_init(|| {
+        let mut foods: Vec<String> = world_items!(game).items.iter().filter(|(_, i)| i.food.is_some_and(|(n, _)| n > 0)).map(|(id, _)| id.to_string()).collect();
+        foods.sort();
+        foods
+    });
     let capacity = chem::LIQUIFIER_USAGE * u64::from(chem::LIQUIFIER_TICKS);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
@@ -6311,6 +6319,25 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
         {
             let line = format!("Stored: {} mB {id}", tank.amount);
             lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+        }
+    }
+    // `FormulaComponent.addToTooltip`: the distinct ingredients in order of first use, with how many times each is used.
+    if &*stack.item == fa::FORMULA_ITEM
+        && let Some(text) = custom_data(stack).and_then(|c| get_string(c, "formula"))
+    {
+        let mut counted: Vec<(String, u32)> = Vec::new();
+        for id in fa::decode(&text).into_iter().flatten() {
+            match counted.iter_mut().find(|(i, _)| *i == id) {
+                Some((_, n)) => *n += 1,
+                None => counted.push((id, 1)),
+            }
+        }
+        if !counted.is_empty() {
+            let gray = horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF);
+            lines.push((horizon_client::text::Text::literal("Ingredients:".to_owned()), gray));
+            for (id, n) in counted {
+                lines.push((horizon_client::text::Text::literal(format!("{}: {n}", module_name(&id))), gray));
+            }
         }
     }
     // `REACTION_STARTER`'s tooltip, after the stored chemical.
@@ -10027,6 +10054,12 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
             && let Some(items) = OD_INPUT.get()
         {
             rules[0] = SlotRule::Items(items.clone());
+        }
+        // `NutritionalLiquifier`'s input slot takes food that heals (known once one has ticked).
+        if kind(block) == Some(Kind::Liquifier)
+            && let Some(foods) = LIQUIFIER_FOODS.get()
+        {
+            rules[0] = SlotRule::Items(foods.clone());
         }
         if kind(block) == Some(Kind::Assemblicator) {
             rules[fa::FORMULA_SLOT] = SlotRule::Items(vec![fa::FORMULA_ITEM.to_owned()]);
