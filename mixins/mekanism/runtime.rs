@@ -4228,7 +4228,7 @@ fn drain_tank_into_bucket(game: &Game<'_>, entity: &mut ModBlockEntity, from: us
         if tank.chemical.as_deref() != Some(chem::NUTRITIONAL_PASTE) {
             return false;
         }
-        let moved = tank.amount.min(suit_paste_capacity().saturating_sub(suit_paste(&bucket)));
+        let moved = tank.amount.min(suit_paste_capacity().saturating_sub(suit_paste(&bucket))).min(mekanism_core::config::gear_int("mekasuit.nutritionalTransferRate", 256).max(1));
         if moved == 0 {
             return false;
         }
@@ -4245,7 +4245,7 @@ fn drain_tank_into_bucket(game: &Game<'_>, entity: &mut ModBlockEntity, from: us
             return false;
         }
         let held = jetpack_fuel(&bucket);
-        let moved = tank.amount.min(jetpack_capacity(&bucket).saturating_sub(held));
+        let moved = tank.amount.min(jetpack_capacity(&bucket).saturating_sub(held)).min(mekanism_core::config::gear_int("canteen.transferRate", 128).max(1));
         if moved == 0 {
             return false;
         }
@@ -4288,7 +4288,18 @@ fn chemical_item_capacity(item: &str) -> Option<u64> {
 
 /// What a chemical item takes or gives in one operation (the hohlraum's `fillRate`), and what it holds at all.
 fn chemical_item_rate(item: &str) -> u64 {
-    if item == fusion::HOHLRAUM { fusion::HOHLRAUM_FILL_RATE } else { u64::MAX }
+    let rate = |key: &str| mekanism_core::config::gear_int(key, 16).max(1);
+    if item == fusion::HOHLRAUM {
+        fusion::HOHLRAUM_FILL_RATE
+    } else if item == flamethrower::ITEM {
+        rate("flamethrower.fillRate")
+    } else if item == SCUBA_TANK {
+        rate("scuba_tank.fillRate")
+    } else if JETPACKS.contains(&item) {
+        rate("jetpack.fillRate")
+    } else {
+        u64::MAX
+    }
 }
 
 fn chemical_item_accepts(item: &str, chemical: &str) -> bool {
@@ -26309,11 +26320,11 @@ fn flame_hits_entity(game: &mut Game<'_>, id: u32, kind: &str, mode: flamethrowe
                     item.ticks = 0;
                     let at = [item.position.x.floor() as i32, item.position.y.floor() as i32, item.position.z.floor() as i32];
                     flame_smoke(game, at);
-                } else if flamethrower::DESTROY_ITEMS {
+                } else if mekanism_core::config::gear_flag("flamethrower.destroyItems", flamethrower::DESTROY_ITEMS) {
                     game.dropped.remove(at);
                 }
             }
-        } else if flamethrower::DESTROY_ITEMS {
+        } else if mekanism_core::config::gear_flag("flamethrower.destroyItems", flamethrower::DESTROY_ITEMS) {
             game.dropped.remove(at);
         }
         return;
