@@ -16096,6 +16096,10 @@ fn module_type(stack: &ItemStack) -> Option<String> {
 }
 
 /// An item's energy limits; the Meka-Tool's and the MekaSuit's grow with their energy units.
+fn seismic_reader_usage() -> u64 {
+    mekanism_core::config::gear_int("seismic_reader.energyUsage", seismic::READER_USAGE)
+}
+
 fn item_energy_of(stack: &ItemStack) -> Option<gear::ItemEnergy> {
     let mut e = gear::item_energy(&stack.item)?;
     if modules::is_container(&stack.item) {
@@ -16128,7 +16132,7 @@ fn meka_tool_use(game: &mut Game<'_>, claimed: &mut bool) {
     let Some((origin, dir)) = game.aim() else {
         return;
     };
-    let Some(hit) = game.clip_ray(origin, dir, modules::TOOL_TELEPORT_REACH) else {
+    let Some(hit) = game.clip_ray(origin, dir, mekanism_core::config::gear_int("mekatool.maxTeleportReach", modules::TOOL_TELEPORT_REACH as u64) as f64) else {
         return;
     };
     let p = hit.pos;
@@ -16367,7 +16371,7 @@ fn mekasuit_distribute(game: &mut Game<'_>) {
     let Some(body) = game.armor[1].as_ref().filter(|s| &*s.item == modules::BODYARMOR) else {
         return;
     };
-    let mut available = stored_energy(body).min(modules::INVENTORY_CHARGE_RATE * 20);
+    let mut available = stored_energy(body).min(mekanism_core::config::gear_int("mekasuit.inventoryChargeRate", modules::INVENTORY_CHARGE_RATE) * 20);
     let mut given = 0;
     let selected = game.selected;
     let order = std::iter::once(selected).chain((0..game.inventory.len().min(36)).filter(|&i| i != selected));
@@ -16418,7 +16422,7 @@ fn mekasuit_solar(game: &mut Game<'_>) {
     let Some(at) = game.player.as_ref().map(|p| [p.position.x, p.position.y + 1.62 + 0.2, p.position.z].map(|v| v.floor() as i32)) else {
         return;
     };
-    let made = sun_production(game, at, modules::SOLAR_RATE * u64::from(units)) * 20;
+    let made = sun_production(game, at, mekanism_core::config::gear_int("mekasuit.solarRechargingRate", modules::SOLAR_RATE) * u64::from(units)) * 20;
     if made > 0
         && let Some(helmet) = game.armor[0].as_mut()
     {
@@ -16874,11 +16878,11 @@ fn seismic_reader_use(game: &mut Game<'_>, claimed: &mut bool) {
             return;
         };
         let stored = stored_energy(held);
-        if stored < seismic::READER_USAGE {
+        if stored < seismic_reader_usage() {
             tell(game, "Seismic Reader: needs energy".to_owned());
             return;
         }
-        set_energy(held, stored - seismic::READER_USAGE);
+        set_energy(held, stored - seismic_reader_usage());
     }
     let bottom = game.world.bottom_y();
     let column: Vec<(i32, String)> = (bottom..at[1])

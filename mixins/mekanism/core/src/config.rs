@@ -17,6 +17,53 @@ pub struct GearConfig {
     pub disassembler_mining_count: usize,
     /// Each energy item's (capacity, charge rate) by its config section (`maxEnergy`/`baseEnergyCapacity`, `chargeRate`).
     pub energy: std::collections::BTreeMap<&'static str, (u64, u64)>,
+    /// The other whole-number keys by `section.key` (`GEAR_INTS`).
+    pub ints: std::collections::BTreeMap<String, u64>,
+}
+
+/// The other whole-number gear keys: (section, key, default), `defineInRange(key, default, 0, Integer.MAX_VALUE)`
+/// unless the range says otherwise. The Meka-Tool's and MekaSuit's usages sit in their `energy_usage` section.
+pub const GEAR_INTS: [(&str, &str, u64); 27] = [
+    ("atomic_disassembler", "energyUsageWeapon", 2_000),
+    ("electric_bow", "energyUsage", 120),
+    ("electric_bow", "energyUsageFlame", 1_200),
+    ("free_runner", "fallEnergyCost", 50),
+    ("seismic_reader", "energyUsage", 250),
+    ("mekatool", "maxTeleportReach", 100),
+    ("mekatool.energy_usage", "base", 10),
+    ("mekatool.energy_usage", "silk", 100),
+    ("mekatool.energy_usage", "weapon", 2_000),
+    ("mekatool.energy_usage", "hoe", 10),
+    ("mekatool.energy_usage", "shovel", 10),
+    ("mekatool.energy_usage", "axe", 10),
+    ("mekatool.energy_usage", "shearEntity", 10),
+    ("mekatool.energy_usage", "shearTrim", 10),
+    ("mekatool.energy_usage", "teleport", 1_000),
+    ("mekasuit", "inventoryChargeRate", 10_000),
+    ("mekasuit", "solarRechargingRate", 500),
+    ("mekasuit.energy_usage", "damage", 100_000),
+    ("mekasuit.energy_usage", "magicReduce", 1_000),
+    ("mekasuit.energy_usage", "fall", 50),
+    ("mekasuit.energy_usage", "jump", 1_000),
+    ("mekasuit.energy_usage", "elytra", 32_000),
+    ("mekasuit.energy_usage", "energyUsagePotionTick", 40_000),
+    ("mekasuit.energy_usage", "sprintBoost", 100),
+    ("mekasuit.energy_usage", "visionEnhancement", 500),
+    ("mekasuit.energy_usage", "itemAttraction", 250),
+    ("mekasuit.energy_usage", "hydrostaticRepulsion", 500),
+];
+
+fn int_key(section: &str, key: &str) -> String {
+    format!("{section}.{key}")
+}
+
+/// A whole-number gear key of the active config (`"mekatool.energy_usage.base"`), else `default`.
+pub fn gear_int(full_key: &str, default: u64) -> u64 {
+    ACTIVE
+        .read()
+        .ok()
+        .and_then(|a| a.as_ref().and_then(|c| c.ints.get(full_key).copied()))
+        .unwrap_or(default)
 }
 
 /// The gear sections that hold an item's energy: (section, key of its capacity, capacity, charge rate), all
@@ -71,6 +118,7 @@ impl Default for GearConfig {
             disassembler_vein_mining: false,
             disassembler_mining_count: 128,
             energy: ENERGY_SECTIONS.iter().map(|(s, _, cap, rate)| (*s, (*cap, *rate))).collect(),
+            ints: GEAR_INTS.iter().map(|(s, k, d)| (int_key(s, k), *d)).collect(),
         }
     }
 }
@@ -101,6 +149,12 @@ impl GearConfig {
                     } else if key == "chargeRate" && n <= i32::MAX as u64 {
                         e.1 = n;
                     }
+                }
+            }
+            if let Some(n) = value.replace('_', "").parse::<u64>().ok().filter(|n| *n <= i32::MAX as u64) {
+                let full = int_key(&section, key);
+                if let Some(v) = config.ints.get_mut(full.as_str()) {
+                    *v = n;
                 }
             }
             if section != SECTION {
@@ -153,6 +207,14 @@ impl GearConfig {
             self.energy[SECTION].0,
             self.energy[SECTION].1
         );
+        let mut last = "";
+        for (sec, key, _) in GEAR_INTS {
+            if sec != last {
+                out.push_str(&format!("[{sec}]\n"));
+                last = sec;
+            }
+            out.push_str(&format!("{key} = {}\n", self.ints[int_key(sec, key).as_str()]));
+        }
         for (name, cap_key, _, _) in ENERGY_SECTIONS {
             if name == SECTION {
                 continue;
@@ -296,6 +358,15 @@ mod tests {
         assert!(!d.disassembler_vein_mining);
         assert_eq!((d.disassembler_energy_usage, d.disassembler_mining_count), (10, 128));
         assert_eq!(GearConfig::parse(&d.to_toml()), d);
+    }
+
+    #[test]
+    fn gear_ints_default_parse_and_round_trip() {
+        let d = GearConfig::default();
+        assert_eq!(d.ints["mekatool.energy_usage.teleport"], 1_000);
+        let c = GearConfig::parse("[mekatool.energy_usage]\nsilk = 7\n[seismic_reader]\nenergyUsage = 9\n");
+        assert_eq!((c.ints["mekatool.energy_usage.silk"], c.ints["seismic_reader.energyUsage"]), (7, 9));
+        assert_eq!(GearConfig::parse(&c.to_toml()), c);
     }
 
     #[test]

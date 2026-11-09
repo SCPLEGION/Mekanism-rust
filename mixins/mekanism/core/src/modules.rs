@@ -137,14 +137,19 @@ pub fn tool_efficiency(installed: &Installed) -> u64 {
     }
 }
 
+/// `energy_usage.base` / `.silk` of the Meka-Tool, from the config.
+fn tool_usage(silk: bool) -> u64 {
+    if silk {
+        crate::config::gear_int("mekatool.energy_usage.silk", TOOL_ENERGY_USAGE_SILK)
+    } else {
+        crate::config::gear_int("mekatool.energy_usage.base", TOOL_ENERGY_USAGE)
+    }
+}
+
 /// `ItemMekaTool.getDestroyEnergy`: 10 FE (100 with silk touch) times the efficiency, half for blocks
 /// that break at once.
 pub fn tool_destroy_energy(efficiency: u64, hardness: f32, silk: bool) -> u64 {
-    let usage = if silk {
-        TOOL_ENERGY_USAGE_SILK
-    } else {
-        TOOL_ENERGY_USAGE
-    };
+    let usage = tool_usage(silk);
     halved(usage * efficiency, hardness)
 }
 
@@ -160,11 +165,7 @@ fn halved(base: u64, hardness: f32) -> u64 {
 /// multiplier, on the energy without the efficiency's share): half the base energy times the
 /// distance to the power 1.5 for ores and 2 for anything else.
 pub fn area_energy(silk: bool, hardness: f32, distance: u32, ore: bool) -> u64 {
-    let usage = if silk {
-        TOOL_ENERGY_USAGE_SILK
-    } else {
-        TOOL_ENERGY_USAGE
-    };
+    let usage = tool_usage(silk);
     let multiplier = 0.5 * f64::from(distance).powf(if ore { 1.5 } else { 2.0 });
     (halved(usage, hardness) as f64 * multiplier).ceil() as u64
 }
@@ -248,7 +249,7 @@ pub fn tool_destroy_speed(efficiency: u64, stored: u64, hardness: f32, silk: boo
 
 /// `ItemMekaTool.use` with a Teleportation Unit: 1,000 FE for each 10 blocks² of distance.
 pub fn teleport_energy(distance_sq: f64) -> u64 {
-    (TOOL_TELEPORT_ENERGY as f64 * (distance_sq / 10.0)).ceil() as u64
+    (crate::config::gear_int("mekatool.energy_usage.teleport", TOOL_TELEPORT_ENERGY) as f64 * (distance_sq / 10.0)).ceil() as u64
 }
 
 /// `GearConfig.mekaToolEnergyUsageWeapon`: the energy a hit costs for each 4 of extra damage.
@@ -271,7 +272,7 @@ pub fn attack(bonus: f32, stored: u64) -> (f32, u64) {
     if bonus <= 0.0 {
         return (0.0, 0);
     }
-    let cost = (TOOL_WEAPON_ENERGY * f64::from(bonus) / 4.0) as u64;
+    let cost = (crate::config::gear_int("mekatool.energy_usage.weapon", TOOL_WEAPON_ENERGY as u64) as f64 * f64::from(bonus) / 4.0) as u64;
     if stored >= cost {
         (bonus, cost)
     } else {
@@ -304,7 +305,7 @@ pub fn sprint_boost(installed: &Installed) -> f32 {
 
 /// The energy a tick of sprint boost costs (`canFunction`: 100 FE for each 0.1 of boost).
 pub fn sprint_energy(boost: f32) -> u64 {
-    (SUIT_SPRINT_ENERGY * f64::from(boost) / 0.1).round() as u64
+    (crate::config::gear_int("mekasuit.energy_usage.sprintBoost", SUIT_SPRINT_ENERGY as u64) as f64 * f64::from(boost) / 0.1).round() as u64
 }
 
 /// `ModuleLocomotiveBoostingUnit.tick`: `moveRelative(boost, (0, 0, 1))` toward the player's yaw, a fifth
@@ -380,6 +381,10 @@ pub fn split_evenly(total: u64, capacities: &[u64]) -> Vec<u64> {
 /// `GearConfig.mekaSuitEnergyUsageDamage`: the energy each point of damage a MekaSuit piece takes costs.
 pub const SUIT_DAMAGE_ENERGY: f32 = 100_000.0;
 
+fn suit_damage_energy() -> f32 {
+    crate::config::gear_int("mekasuit.energy_usage.damage", SUIT_DAMAGE_ENERGY as u64) as f32
+}
+
 /// `ItemMekaSuitArmor`'s absorption of each piece (helmet, body armor, pants, boots): a whole suit
 /// takes every hit that armor can stop.
 pub const SUIT_ABSORPTION: [f32; 4] = [0.15, 0.4, 0.3, 0.15];
@@ -389,7 +394,7 @@ pub fn suit_share(stored: [Option<u64>; 4]) -> f32 {
     stored
         .iter()
         .zip(SUIT_ABSORPTION)
-        .filter(|(e, _)| e.is_some_and(|e| e as f32 >= SUIT_DAMAGE_ENERGY))
+        .filter(|(e, _)| e.is_some_and(|e| e as f32 >= suit_damage_energy()))
         .map(|(_, r)| r)
         .sum()
 }
@@ -402,8 +407,8 @@ pub fn suit_costs(absorbed: f32, stored: [Option<u64>; 4]) -> [u64; 4] {
         return out;
     }
     for (i, e) in stored.iter().enumerate() {
-        if let Some(e) = e.filter(|&e| e as f32 >= SUIT_DAMAGE_ENERGY) {
-            let cost = absorbed * SUIT_ABSORPTION[i] / share * SUIT_DAMAGE_ENERGY;
+        if let Some(e) = e.filter(|&e| e as f32 >= suit_damage_energy()) {
+            let cost = absorbed * SUIT_ABSORPTION[i] / share * suit_damage_energy();
             out[i] = (cost.round() as u64).min(e);
         }
     }
