@@ -4209,6 +4209,22 @@ fn drain_tank_into_bucket(game: &Game<'_>, entity: &mut ModBlockEntity, from: us
         tank.extract(moved);
         return true;
     }
+    // The Canteen takes the paste too (`FluidInventorySlot.drainTank` into any fluid item).
+    if &*bucket.item == CANTEEN {
+        if tank.chemical.as_deref() != Some(chem::NUTRITIONAL_PASTE) {
+            return false;
+        }
+        let held = jetpack_fuel(&bucket);
+        let moved = tank.amount.min(jetpack_capacity(&bucket).saturating_sub(held));
+        if moved == 0 {
+            return false;
+        }
+        let mut canteen = bucket;
+        set_jetpack_fuel(&mut canteen, held + moved);
+        entity.items[from] = Some(canteen);
+        tank.extract(moved);
+        return true;
+    }
     if &*bucket.item != "minecraft:bucket" || tank.amount < 1_000 {
         return false;
     }
@@ -6380,6 +6396,10 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
         free_runners_use(game, claimed);
         return;
     }
+    if !*claimed && &*stack.item == CANTEEN && game.native_on(MOD_ID) {
+        canteen_use(game, claimed);
+        return;
+    }
     if !*claimed && &*stack.item == teleporter::PORTABLE {
         portable_teleporter_use(game, claimed);
         return;
@@ -6873,12 +6893,20 @@ fn is_jetpack(stack: &ItemStack) -> bool {
 
 /// The chemical an item with a chemical tank holds: a scuba tank oxygen, a jetpack or flamethrower hydrogen.
 fn item_chemical(stack: &ItemStack) -> &'static str {
-    if &*stack.item == SCUBA_TANK { "mekanism:oxygen" } else { "mekanism:hydrogen" }
+    if &*stack.item == CANTEEN {
+        chem::NUTRITIONAL_PASTE
+    } else if &*stack.item == SCUBA_TANK {
+        "mekanism:oxygen"
+    } else {
+        "mekanism:hydrogen"
+    }
 }
 
 fn jetpack_capacity(stack: &ItemStack) -> u64 {
     use mekanism_core::config::gear_int;
-    if &*stack.item == SCUBA_TANK {
+    if &*stack.item == CANTEEN {
+        gear_int("canteen.maxStorage", CANTEEN_CAPACITY)
+    } else if &*stack.item == SCUBA_TANK {
         gear_int("scuba_tank.capacity", SCUBA_CAPACITY)
     } else if &*stack.item == flamethrower::ITEM {
         gear_int("flamethrower.capacity", flamethrower::CAPACITY)
@@ -7164,7 +7192,7 @@ pub(super) fn item_bars(game: &Game<'_>, stack: &ItemStack, bar: &mut Option<(i3
     let width = |amount: u64, capacity: u64| ((13.0 * amount as f64 / capacity.max(1) as f64).round() as i32).clamp(0, 13);
     let color_of = |chemical: &str| CHEMICALS.iter().find(|c| c.0 == chemical).map_or(0xAAAAAA, |c| c.2);
     let energy = item_energy_of(stack).map(|e| (stored_energy(stack), e.capacity));
-    let tank_item = JETPACKS.contains(&&*stack.item) || &*stack.item == SCUBA_TANK || &*stack.item == flamethrower::ITEM;
+    let tank_item = JETPACKS.contains(&&*stack.item) || &*stack.item == SCUBA_TANK || &*stack.item == flamethrower::ITEM || &*stack.item == CANTEEN;
     let suit_tank = &*stack.item == modules::BODYARMOR && modules_of(stack).contains_key("mekanism:jetpack_unit");
     if tank_item {
         let fuel = jetpack_fuel(stack);
@@ -25024,7 +25052,11 @@ fn flamethrower_use(game: &mut Game<'_>, claimed: &mut bool) {
 
 /// Each tick the use key is held (`ItemFlamethrower.onUseTick`): a mB of hydrogen makes a flame; with none the
 /// use ends.
-pub(super) fn using_tick(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut bool, keep: &mut bool) {
+pub(super) fn using_tick(game: &mut Game<'_>, stack: &ItemStack, ticks: u32, claimed: &mut bool, keep: &mut bool) {
+    if &*stack.item == CANTEEN && game.native_on(MOD_ID) {
+        canteen_tick(game, ticks, claimed, keep);
+        return;
+    }
     if &*stack.item != flamethrower::ITEM || !game.native_on(MOD_ID) {
         return;
     }
@@ -26413,5 +26445,56 @@ fn inhalation_purification(g: &mut Game<'_>) {
         for _ in 0..9 {
             g.native_speed_up_effect(index);
         }
+    }
+}
+
+// --- Canteen --------------------------------------------------------------------------------------------
+
+const CANTEEN: &str = "mekanism:canteen";
+/// `GearConfig.canteenMaxStorage`: 64 buckets.
+const CANTEEN_CAPACITY: u64 = 64_000;
+/// `getUseDuration`: `Consumable.DEFAULT_CONSUME_SECONDS` (1.6 s) in ticks.
+const CANTEEN_TICKS: u32 = 32;
+
+fn canteen_hungry(g: &Game<'_>) -> bool {
+    g.player.as_ref().is_some_and(|p| p.health.food.food < 20)
+}
+
+/// `ItemCanteen.use`: with food to fill and at least a point's worth of paste (`nutritionalPasteMBPerFood`), the player
+/// starts drinking.
+fn canteen_use(game: &mut Game<'_>, claimed: &mut bool) {
+    let Some(held) = game.held_mut().as_ref().filter(|s| &*s.item == CANTEEN).cloned() else {
+        return;
+    };
+    if canteen_hungry(game) && jetpack_fuel(&held) >= paste_per_food() {
+        game.native_start_using();
+        *claimed = true;
+    }
+}
+
+/// `ItemCanteen.finishUsingItem`: after 32 ticks, as many points of food as the missing ones and the paste allow are
+/// eaten for `paste_per_food` mB each, with the paste's saturation.
+fn canteen_tick(game: &mut Game<'_>, ticks: u32, claimed: &mut bool, keep: &mut bool) {
+    *claimed = true;
+    let Some(held) = game.held_mut().as_ref().filter(|s| &*s.item == CANTEEN).cloned() else {
+        return;
+    };
+    if ticks + 1 < CANTEEN_TICKS {
+        *keep = true;
+        return;
+    }
+    let Some(missing) = game.player.as_ref().map(|p| 20 - p.health.food.food).filter(|m| *m > 0) else {
+        return;
+    };
+    let food = (jetpack_fuel(&held) / paste_per_food()).min(missing as u64);
+    if food == 0 {
+        return;
+    }
+    if let Some(canteen) = game.held_mut().as_mut() {
+        let paste = jetpack_fuel(canteen);
+        set_jetpack_fuel(canteen, paste - food * paste_per_food());
+    }
+    if let Some(p) = game.player.as_mut() {
+        p.health.food.eat(food as i32, paste_saturation());
     }
 }
