@@ -1,5 +1,5 @@
 //! Side configuration, simplified: each face of a machine is left as the machine makes it, turned off,
-//! or limited to taking in or giving out, for each transmission type (items, chemicals, energy), as
+//! or limited to taking in or giving out, for each transmission type (items, fluids, chemicals, energy, heat), as
 //! Mekanism's `TileComponentConfig` keeps a mode per face and type. There is no screen: the Configurator
 //! cycles a face of the type it is set to.
 
@@ -10,16 +10,21 @@ pub enum Transmission {
     Item,
     Chemical,
     Energy,
+    Fluid,
+    Heat,
 }
 
 impl Transmission {
-    pub const ALL: [Transmission; 3] = [Self::Item, Self::Chemical, Self::Energy];
+    /// (Declared after the first three so their saved bits and keys keep their places.)
+    pub const ALL: [Transmission; 5] = [Self::Item, Self::Chemical, Self::Energy, Self::Fluid, Self::Heat];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Item => "items",
             Self::Chemical => "chemicals",
             Self::Energy => "energy",
+            Self::Fluid => "fluids",
+            Self::Heat => "heat",
         }
     }
 
@@ -34,6 +39,8 @@ impl Transmission {
             Self::Item => "sides_item",
             Self::Chemical => "sides_chemical",
             Self::Energy => "sides",
+            Self::Fluid => "sides_fluid",
+            Self::Heat => "sides_heat",
         }
     }
 
@@ -44,7 +51,7 @@ impl Transmission {
 }
 
 /// The Configurator's modes (`ItemConfigurator.ConfiguratorMode`): configure a type, empty a machine, rotate it or
-/// wrench it. (Fluids and heat have no configuration here, so no mode of their own.)
+/// wrench it, in the original's order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfMode {
     Configure(Transmission),
@@ -54,10 +61,12 @@ pub enum ConfMode {
 }
 
 impl ConfMode {
-    pub const ALL: [ConfMode; 6] = [
+    pub const ALL: [ConfMode; 8] = [
         Self::Configure(Transmission::Item),
+        Self::Configure(Transmission::Fluid),
         Self::Configure(Transmission::Chemical),
         Self::Configure(Transmission::Energy),
+        Self::Configure(Transmission::Heat),
         Self::Empty,
         Self::Rotate,
         Self::Wrench,
@@ -92,6 +101,8 @@ impl ConfMode {
             Self::Configure(Transmission::Item) => "Configurate (Items)",
             Self::Configure(Transmission::Chemical) => "Configurate (Chemicals)",
             Self::Configure(Transmission::Energy) => "Configurate (Energy)",
+            Self::Configure(Transmission::Fluid) => "Configurate (Fluids)",
+            Self::Configure(Transmission::Heat) => "Configurate (Heat)",
             Self::Empty => "Empty",
             Self::Rotate => "Rotate",
             Self::Wrench => "Wrench",
@@ -256,8 +267,8 @@ mod tests {
     fn transmission_types_cycle_and_keep_their_own_keys() {
         use Transmission::*;
         assert_eq!(
-            [Item.next(), Chemical.next(), Energy.next()],
-            [Chemical, Energy, Item]
+            [Item.next(), Chemical.next(), Energy.next(), Fluid.next(), Heat.next()],
+            [Chemical, Energy, Fluid, Heat, Item]
         );
         assert_eq!(Transmission::from_name("chemicals"), Some(Chemical));
         assert_eq!(Energy.key(), "sides");
