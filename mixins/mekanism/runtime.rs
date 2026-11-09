@@ -4619,7 +4619,13 @@ fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
             active = true;
             delay = delay.saturating_sub(1);
             if delay == 0 {
-                mine_next(game, pos, entity, &mut found);
+                // A block that is no longer a target is dropped from the list and the next one tried at once.
+                loop {
+                    miner_pick_target(pos, entity, &region, &mut found);
+                    if !mine_next(game, pos, entity, &mut found) {
+                        break;
+                    }
+                }
                 entity.nbt.insert("found".into(), Tag::IntArray(found.clone()));
                 delay = delay_length;
             }
@@ -4659,11 +4665,33 @@ fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
     Some(active)
 }
 
+/// `tryMineBlock` goes chunk by chunk (`oresToMine` is a map of chunk to bitset, `targetChunk` the one being worked
+/// on) and takes the highest index of a chunk first: the last of `found` becomes the highest one in the chunk
+/// being mined, and a new chunk is chosen only when that one is out.
+fn miner_pick_target(pos: [i32; 3], entity: &mut ModBlockEntity, region: &miner::Region, found: &mut Vec<i32>) {
+    let chunk_of = |index: i32| {
+        let at = region.position(pos, index as u32);
+        (at[0] >> 4, at[2] >> 4)
+    };
+    let target = match entity.nbt.get(&JavaString::from("tchunk")) {
+        Some(Tag::IntArray(v)) if v.len() == 2 => Some((v[0], v[1])),
+        _ => None,
+    };
+    let best = |chunk: (i32, i32)| found.iter().enumerate().filter(|(_, i)| chunk_of(**i) == chunk).max_by_key(|(_, i)| **i).map(|(n, _)| n);
+    let n = target.and_then(best).or_else(|| found.last().and_then(|&i| best(chunk_of(i))));
+    if let Some(n) = n {
+        let index = found.remove(n);
+        let chunk = chunk_of(index);
+        found.push(index);
+        entity.nbt.insert("tchunk".into(), Tag::IntArray(vec![chunk.0, chunk.1]));
+    }
+}
+
 /// Mines the highest block the search found, if its drops fit in the miner's slots and its replacement
 /// (`setReplace`) can be had; otherwise it waits (and the missing block shows on the screen).
-fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, found: &mut Vec<i32>) {
+fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, found: &mut Vec<i32>) -> bool {
     let Some(&index) = found.last() else {
-        return;
+        return false;
     };
     let region = miner_region(&entity.nbt);
     let at = region.position(pos, index as u32);
@@ -4677,7 +4705,7 @@ fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fo
     // The block changed since the search saw it: it is no longer a target.
     if miner_skips(&facts.name, facts.hardness) || inverse == matched.is_some() {
         found.pop();
-        return;
+        return true;
     }
     let (target, requires) = match matched {
         Some(f) => (f.replace.clone(), f.requires_replacement),
@@ -4698,7 +4726,7 @@ fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fo
     for stack in drops.into_iter().filter(|s| s.count > 0 && &*s.item != "minecraft:air") {
         // Nothing fits: it waits for room (`tryInsert` fails) and the block stays.
         if miner_insert(game, &mut slots, stack).is_some() {
-            return;
+            return false;
         }
     }
     // The replacement comes from the miner's own slots first, then the inventory on top with Auto-pull.
@@ -4719,7 +4747,7 @@ fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fo
     }
     if !target.is_empty() && !replacement && requires {
         entity.nbt.insert("missing".into(), Tag::String(target.as_str().into()));
-        return;
+        return false;
     }
     entity.nbt.remove(&JavaString::from("missing"));
     entity.items = slots;
@@ -4729,6 +4757,7 @@ fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fo
     if replacement && let Some(new) = game.pack.assets.registry.default_state(&target) {
         game.with_level(|b, level, ticks| b.set_block(level, ticks, block, new, 3));
     }
+    false
 }
 
 /// What the miner's screens read: its settings and filters, and the block it misses, in the `client`
@@ -15334,13 +15363,22 @@ fn teleport_target(game: &mut Game<'_>, frequency: &str, from: [f64; 3], not: Op
     })
 }
 
-/// `PacketPortalFX`: fifty portal particles in each of the two blocks `base` and `base + dir`.
+/// `PacketPortalFX`: fifty portal particles scattered uniformly in each of the two blocks `base` and `base + dir`.
 fn portal_fx(game: &mut Game<'_>, base: [i32; 3], dir: [i32; 3]) {
     let options = horizon_client::particles::ParticleOptions::simple(horizon_client::particles::ParticleType::Portal);
     let dimension = game.native_player().map_or("minecraft:overworld", |p| p.dimension);
+    let mut seed = (game.ticks as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ((base[0] as u64) << 40) ^ ((base[2] as u64) << 8) ^ 0x2545_F491_4F6C_DD1D;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
     for pos in [base, [base[0] + dir[0], base[1] + dir[1], base[2] + dir[2]]] {
-        // The original scatters them uniformly over the block; the server's spread is a normal distribution of the same width.
-        game.lan_send_particles(dimension, &options, None, [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5], [0.3, 0.3, 0.3], 0.0, 50);
+        for _ in 0..50 {
+            let at = [f64::from(pos[0]) + next(), f64::from(pos[1]) + next(), f64::from(pos[2]) + next()];
+            game.lan_send_particles(dimension, &options, None, at, [0.0; 3], 0.0, 0);
+        }
     }
 }
 
