@@ -6464,6 +6464,10 @@ fn player_sounds(game: &mut Game<'_>) {
     };
     let at = [p.position.x, p.position.y + 0.9, p.position.z];
     let grounded = p.ground.on_ground || game.sleeping.is_some() || p.flying;
+    // `GravitationalModulationSound`: while flying on the unit.
+    if p.flying && !p.spectator && !game.creative && gravitational_ready(game) {
+        game.native_loop_sound("mekanism:gravitational", "mekanism:item.gravitational_modulation_unit", Some(at), 1.0, 1.0);
+    }
     if scuba_on(game) {
         game.native_loop_sound("mekanism:scuba_mask", "mekanism:item.scuba_mask", Some(at), 1.0, 1.0);
     }
@@ -24401,6 +24405,7 @@ fn radiation_server_tick(game: &mut Game<'_>) {
             magnetic_attraction(g);
             nutritional_injection(g);
             vision_enhancement_upkeep(g);
+            gravitational_upkeep(g);
             // Told again when the digits of the level or of the dose would change (the dose is an attachment in Java).
             let (previous_level, previous_dose) = RAD_SENT.with_borrow(|s| s.get(&uuid).copied()).unwrap_or((None, None));
             let (new_level, new_dose) = (radiation::Previous::compare(previous_level, level), radiation::Previous::compare(previous_dose, dose));
@@ -24508,6 +24513,38 @@ pub(super) fn worn_tint(_game: &Game<'_>, stack: &ItemStack, tint: &mut Option<u
     };
     if color != COLOR_MODULATION_DEFAULT && color >> 24 != 0 {
         *tint = Some(color);
+    }
+}
+
+/// `GearConfig.mekaSuitEnergyUsageGravitationalModulation`.
+const GRAVITATIONAL_ENERGY: u64 = 1_000;
+
+/// The body armor with its Gravitational Modulating Unit on and enough energy for a tick of flight
+/// (`CommonPlayerTickHandler.isGravitationalModulationOn` without the flying check).
+fn gravitational_ready(game: &Game<'_>) -> bool {
+    game.native_on(MOD_ID)
+        && game.armor[1].as_ref().is_some_and(|s| {
+            &*s.item == modules::BODYARMOR && module_on(s, "mekanism:gravitational_modulating_unit") && stored_energy(s) >= GRAVITATIONAL_ENERGY
+        })
+}
+
+/// `ModuleGravitationalModulatingUnit.adjustAttributes`: the creative flight attribute while the unit has the energy.
+pub(super) fn may_fly(game: &Game<'_>, may_fly: &mut bool) {
+    if gravitational_ready(game) {
+        *may_fly = true;
+    }
+}
+
+/// `ModuleGravitationalModulatingUnit.tickServer`: a flying survival player pays the energy of a tick.
+fn gravitational_upkeep(g: &mut Game<'_>) {
+    if g.creative || !g.player.as_ref().is_some_and(|p| p.flying && !p.spectator) {
+        return;
+    }
+    if let Some(chest) = g.armor[1].as_mut().filter(|s| &*s.item == modules::BODYARMOR && module_on(s, "mekanism:gravitational_modulating_unit")) {
+        let stored = stored_energy(chest);
+        if stored >= GRAVITATIONAL_ENERGY {
+            set_energy(chest, stored - GRAVITATIONAL_ENERGY);
+        }
     }
 }
 
