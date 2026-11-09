@@ -102,25 +102,27 @@ pub fn discharge(item: ItemEnergy, stored: u64, target: &mut EnergyContainer) ->
     stored - (offered - left)
 }
 
-/// `ItemAtomicDisassembler.DisassemblerMode` with `GearConfig`'s defaults: vein mining is off, so the
-/// mode key cycles normal, slow, fast and off.
+/// `ItemAtomicDisassembler.DisassemblerMode`: normal, slow, fast, vein and off. (Vein is switched on
+/// here whatever `GearConfig` says; there is no config file yet.)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DisassemblerMode {
     #[default]
     Normal,
     Slow,
     Fast,
+    Vein,
     Off,
 }
 
 impl DisassemblerMode {
-    pub const ALL: [DisassemblerMode; 4] = [Self::Normal, Self::Slow, Self::Fast, Self::Off];
+    pub const ALL: [DisassemblerMode; 5] = [Self::Normal, Self::Slow, Self::Fast, Self::Vein, Self::Off];
 
     pub fn efficiency(self) -> u64 {
         match self {
             Self::Normal => 20,
             Self::Slow => 8,
             Self::Fast => 128,
+            Self::Vein => 20,
             Self::Off => 0,
         }
     }
@@ -131,6 +133,7 @@ impl DisassemblerMode {
             Self::Normal => "normal",
             Self::Slow => "slow",
             Self::Fast => "fast",
+            Self::Vein => "vein",
             Self::Off => "off",
         }
     }
@@ -140,6 +143,7 @@ impl DisassemblerMode {
             Self::Normal => "Normal",
             Self::Slow => "Slow",
             Self::Fast => "Fast",
+            Self::Vein => "Vein",
             Self::Off => "Off",
         }
     }
@@ -239,7 +243,7 @@ mod tests {
         use DisassemblerMode::*;
         assert_eq!(
             [Normal.next(), Slow.next(), Fast.next(), Off.next()],
-            [Slow, Fast, Off, Normal]
+            [Slow, Fast, Vein, Normal]
         );
         assert_eq!(destroy_energy(Fast, 2.0), 1_280);
         assert_eq!(destroy_speed(Fast, 2_000, 2.0), 128.0);

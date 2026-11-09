@@ -6095,7 +6095,9 @@ pub(super) fn spend_disassembler_energy(game: &mut Game<'_>, pos: [i32; 3]) {
     }
     let state = game.world.block(pos[0], pos[1], pos[2]);
     let hardness = game.res.facts().get(state).hardness;
-    if let Some(stack) = game.held_mut().as_mut().filter(|s| &*s.item == DISASSEMBLER) {
+    if !AREA_MINING.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(stack) = game.held_mut().as_mut().filter(|s| &*s.item == DISASSEMBLER)
+    {
         let stored = stored_energy(stack);
         let cost = gear::destroy_energy(disassembler_mode(stack), hardness);
         set_energy(stack, stored.saturating_sub(cost));
@@ -6110,6 +6112,55 @@ pub(super) fn spend_disassembler_energy(game: &mut Game<'_>, pos: [i32; 3]) {
         let cost = modules::tool_destroy_energy(modules::tool_efficiency(&installed), hardness, silk);
         set_energy(stack, stored.saturating_sub(cost));
     }
+}
+
+/// `ItemAtomicDisassembler.mineBlock` in vein mode: breaking an ore takes the connected blocks of the
+/// same ore (26 neighbours, up to `GearConfig.disassemblerMiningCount`), each paying its own destroy
+/// energy; the work stops when the disassembler runs out.
+pub(super) fn disassembler_vein(game: &mut Game<'_>, pos: [i32; 3]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !game.native_on(MOD_ID) || game.creative || AREA_MINING.load(Relaxed) {
+        return;
+    }
+    if !game.held().is_some_and(|s| &*s.item == DISASSEMBLER && disassembler_mode(s) == gear::DisassemblerMode::Vein) {
+        return;
+    }
+    let name = block_name(game, pos).to_owned();
+    if !world_items!(game).block_in_tag(mekanism_core::miner::ORE_TAG, &name) {
+        return;
+    }
+    let mut seen: std::collections::HashSet<[i32; 3]> = std::collections::HashSet::from([pos]);
+    let mut found: Vec<[i32; 3]> = Vec::new();
+    let mut frontier = std::collections::VecDeque::from([pos]);
+    while let Some(at) = frontier.pop_front() {
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let next = [at[0] + dx, at[1] + dy, at[2] + dz];
+                    if found.len() < modules::VEIN_COUNT && !seen.contains(&next) && block_name(game, next) == name {
+                        seen.insert(next);
+                        found.push(next);
+                        frontier.push_back(next);
+                    }
+                }
+            }
+        }
+    }
+    AREA_MINING.store(true, Relaxed);
+    for at in found {
+        let hardness = game.res.facts().get(game.world.block(at[0], at[1], at[2])).hardness;
+        let Some(tool) = game.held_mut().as_mut().filter(|s| &*s.item == DISASSEMBLER) else {
+            break;
+        };
+        let stored = stored_energy(tool);
+        let cost = gear::destroy_energy(gear::DisassemblerMode::Vein, hardness);
+        if stored < cost {
+            break;
+        }
+        set_energy(tool, stored - cost);
+        let _ = game.break_block_as_player(at);
+    }
+    AREA_MINING.store(false, Relaxed);
 }
 
 /// The tank a block keeps in its item when broken (Mekanism's loot copies its fluid or chemical

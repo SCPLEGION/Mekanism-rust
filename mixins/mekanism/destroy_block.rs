@@ -9,6 +9,7 @@ fn on_destroy_block(game: &mut crate::game::Game<'_>, pos: [i32; 3], canceled: &
         crate::game::mekanism::before_break(game, pos);
         crate::game::mekanism::spend_disassembler_energy(game, pos);
         crate::game::mekanism::meka_tool_area(game, pos);
+        crate::game::mekanism::disassembler_vein(game, pos);
     }
     if !*canceled && crate::game::mekanism::break_keeping_energy(game, pos) {
         *canceled = true;

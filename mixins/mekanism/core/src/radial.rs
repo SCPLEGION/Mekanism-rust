@@ -74,11 +74,12 @@ const CONFIGURATOR_MODES: [Slice; 6] = [
 pub const DISASSEMBLER: &str = "mekanism:atomic_disassembler";
 
 /// `DisassemblerMode` as radial slices (`value` is the index in `gear::DisassemblerMode::ALL`).
-const DISASSEMBLER_MODES: [Slice; 4] = [
+const DISASSEMBLER_MODES: [Slice; 5] = [
     s("Normal", "speed_normal", GREEN, 0),
     s("Slow", "speed_slow", PINK, 1),
     s("Fast", "speed_extreme", RED, 2),
-    s("Off", "speed_off", WHITE, 3),
+    s("Vein", "vein_normal", AQUA, 3),
+    s("Off", "speed_off", WHITE, 4),
 ];
 
 /// The slices a module offers at the root (`addRadialModes`), if it handles the radial.
