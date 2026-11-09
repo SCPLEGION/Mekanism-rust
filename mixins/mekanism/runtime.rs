@@ -24099,6 +24099,31 @@ pub(super) fn fog(game: &Game<'_>, fog_type: u8, fog: &mut horizon_client::fog::
     fog.environmental_end = far * (installed as f32).powf(1.25) / maximum as f32;
 }
 
+/// `ModuleColorModulationUnit.COLOR`'s default (`ModuleColorConfig.argb`): white, opaque.
+const COLOR_MODULATION_DEFAULT: u32 = 0xFFFF_FFFF;
+
+/// `MekaSuitArmor.getColor` and `ColorModulationTint`: the Color Modulation Unit's colour (the `color` setting, ARGB) of an
+/// installed unit; a stack without one stays white.
+pub(super) fn worn_tint(_game: &Game<'_>, stack: &ItemStack, tint: &mut Option<u32>) {
+    const UNIT: &str = "mekanism:color_modulation_unit";
+    if installed_modules(stack).get(UNIT).copied().unwrap_or(0) == 0 {
+        return;
+    }
+    let color = match custom_data(stack).and_then(|c| c.get(&JavaString::from(MODULE_CONFIG_KEY))) {
+        Some(Tag::Compound(all)) => match all.get(&JavaString::from(UNIT)) {
+            Some(Tag::Compound(m)) => match m.get(&JavaString::from("color")) {
+                Some(Tag::Int(v)) => *v as u32,
+                _ => COLOR_MODULATION_DEFAULT,
+            },
+            _ => COLOR_MODULATION_DEFAULT,
+        },
+        _ => COLOR_MODULATION_DEFAULT,
+    };
+    if color != COLOR_MODULATION_DEFAULT && color >> 24 != 0 {
+        *tint = Some(color);
+    }
+}
+
 /// `GearConfig.mekaSuitEnergyUsageVisionEnhancement`.
 const VISION_ENERGY: u64 = 500;
 

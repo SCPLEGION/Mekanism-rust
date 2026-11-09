@@ -693,3 +693,15 @@ bindings = [
   { name = "fog_type", ty = "u8", value = "fog_type" },
   { name = "fog", ty = "&mut horizon_client::fog::FogData", value = "&mut *fog" },
 ]
+
+[[injection]]
+id = "worn-tint"
+hook = "worn_tint"
+hook_version = 1
+kind = "HEAD"
+helper = "worn_tint.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+  { name = "tint", ty = "&mut Option<u32>", value = "&mut *tint" },
+]
