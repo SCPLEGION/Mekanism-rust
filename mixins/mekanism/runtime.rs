@@ -25115,7 +25115,8 @@ fn robit_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         format!("Owner: {}", view.owner),
     ];
     for (i, line) in lines.iter().enumerate() {
-        game.native_text_scaled(batch, line, [o[0] + 30.0, o[1] + 19.0 + 8.5 * i as f32], 0x3CFD_3C, 0.8);
+        // `clearFormat().clearSpacing().clearScale().padding(2)`: full size, nine pixels a line, two pixels in.
+        game.native_text(batch, line, [o[0] + 29.0, o[1] + 18.0 + 9.0 * i as f32], 0x3CFD_3C, false);
     }
     let fraction = (view.energy as f32 / robit::MAX_ENERGY as f32).clamp(0.0, 1.0);
     nine_slice_tinted(game, batch, "bar/base", [5.0, 5.0], 1.0, [o[0] + 27.0, o[1] + 74.0, 120.0, 6.0], 0xFFFF_FFFF);
