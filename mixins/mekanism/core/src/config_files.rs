@@ -296,6 +296,37 @@ pub fn all() -> [Spec; 4] {
     [storage(), tiers(), general(), world()]
 }
 
+/// The configs of the world that is open, which the tiers and buffers read (`set_active`).
+static ACTIVE: std::sync::RwLock<Vec<Config>> = std::sync::RwLock::new(Vec::new());
+
+/// Makes `configs` the ones the rest of the port reads.
+pub fn set_active(configs: Vec<Config>) {
+    if let Ok(mut active) = ACTIVE.write() {
+        *active = configs;
+    }
+}
+
+fn active_value(file: &str, section: &str, key: &str) -> Option<Value> {
+    let active = ACTIVE.read().ok()?;
+    active.iter().find(|c| c.spec.name == file)?.get(section, key).cloned()
+}
+
+/// An integer of the open world's config, else `default`.
+pub fn active_int(file: &str, section: &str, key: &str, default: u64) -> u64 {
+    match active_value(file, section, key) {
+        Some(Value::Int(v)) => v.max(0) as u64,
+        _ => default,
+    }
+}
+
+/// A decimal of the open world's config, else `default`.
+pub fn active_double(file: &str, section: &str, key: &str, default: f64) -> f64 {
+    match active_value(file, section, key) {
+        Some(Value::Double(v)) => v,
+        _ => default,
+    }
+}
+
 /// A config file's values.
 #[derive(Clone, Debug)]
 pub struct Config {

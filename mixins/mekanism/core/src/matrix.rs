@@ -6,34 +6,28 @@ pub const MAX_SIZE: i32 = 18;
 
 /// `InductionCellTier`: FE a cell stores.
 pub fn cell(block: &str) -> Option<u64> {
-    Some(
-        match block
-            .strip_prefix("mekanism:")?
-            .strip_suffix("_induction_cell")?
-        {
-            "basic" => 8_000_000_000,
-            "advanced" => 64_000_000_000,
-            "elite" => 512_000_000_000,
-            "ultimate" => 4_000_000_000_000,
-            _ => return None,
-        },
-    )
+    let tier = block.strip_prefix("mekanism:")?.strip_suffix("_induction_cell")?;
+    let default = match tier {
+        "basic" => 8_000_000_000,
+        "advanced" => 64_000_000_000,
+        "elite" => 512_000_000_000,
+        "ultimate" => 4_000_000_000_000,
+        _ => return None,
+    };
+    Some(crate::config_files::active_int("tiers", "induction", &format!("{tier}Capacity"), default))
 }
 
 /// `InductionProviderTier`: FE a tick a provider adds to the matrix's transfer rate.
 pub fn provider(block: &str) -> Option<u64> {
-    Some(
-        match block
-            .strip_prefix("mekanism:")?
-            .strip_suffix("_induction_provider")?
-        {
-            "basic" => 256_000,
-            "advanced" => 2_048_000,
-            "elite" => 16_384_000,
-            "ultimate" => 131_072_000,
-            _ => return None,
-        },
-    )
+    let tier = block.strip_prefix("mekanism:")?.strip_suffix("_induction_provider")?;
+    let default = match tier {
+        "basic" => 256_000,
+        "advanced" => 2_048_000,
+        "elite" => 16_384_000,
+        "ultimate" => 131_072_000,
+        _ => return None,
+    };
+    Some(crate::config_files::active_int("tiers", "induction", &format!("{tier}Output"), default))
 }
 
 pub fn is_frame(block: &str) -> bool {
