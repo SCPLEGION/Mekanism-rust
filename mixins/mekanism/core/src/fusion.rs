@@ -26,7 +26,7 @@ pub const MAX_INJECTION: u64 = 98;
 pub const BURN_TEMPERATURE: f64 = 100_000_000.0;
 const PLASMA_HEAT_CAPACITY: f64 = 100.0;
 const PLASMA_CASE_CONDUCTIVITY: f64 = 0.2;
-/// `HeatAPI.AMBIENT_TEMP`, as biomes do not change it here.
+/// `HeatAPI.AMBIENT_TEMP`, the default of a reactor in a plains biome.
 pub const AMBIENT: f64 = 300.0;
 /// `GeneratorsConfig`: `fuelEnergy`, `thermocoupleEfficiency`, `casingThermalConductivity`,
 /// `waterHeatingRatio`, `fuelCapacity`, `energyCapacity`, `waterPerInjection`, `steamPerInjection`.
@@ -91,14 +91,24 @@ pub struct Plasma {
     pub plasma: f64,
     pub case: f64,
     pub burning: bool,
+    /// `biomeAmbientTemp`: what the casing relaxes toward.
+    pub ambient: f64,
 }
 
 impl Default for Plasma {
     fn default() -> Self {
+        Self::at_ambient(AMBIENT)
+    }
+}
+
+impl Plasma {
+    /// A cold reactor in a biome of ambient temperature `ambient`.
+    pub fn at_ambient(ambient: f64) -> Self {
         Self {
-            plasma: AMBIENT,
-            case: AMBIENT,
+            plasma: ambient,
+            case: ambient,
             burning: false,
+            ambient,
         }
     }
 }
@@ -114,22 +124,40 @@ pub struct Tanks {
 }
 
 /// What one tick gave: energy (J), and fuel burned (mB).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Output {
     pub energy: u64,
     pub burned: u64,
+    /// `lastTransferLoss`: the heat the casing gave to water this tick.
+    pub transfer_loss: f64,
+    /// `lastEnvironmentLoss`: the heat the casing gave to the air this tick.
+    pub environment_loss: f64,
 }
 
-/// What the reactor's lasers and hohlraum do to start it, simplified: the plasma is heated to
-/// `getMaxPlasmaTemperature` (air cooled) for the injection rate, hot enough to keep burning while the
-/// casing warms up.
-pub fn ignite(p: &mut Plasma, injection: u64) {
-    let k = CASING_CONDUCTIVITY;
-    let max = injection.max(DEFAULT_INJECTION) as f64 * ENERGY_PER_FUEL / PLASMA_CASE_CONDUCTIVITY
-        * (PLASMA_CASE_CONDUCTIVITY + k)
-        / k;
-    p.plasma = p.plasma.max(max);
-    p.burning = true;
+/// `addTemperatureFromEnergyInput`: laser energy (a Laser Focus Matrix hit by a beam) heats the plasma,
+/// ten times as much while it is not yet burning.
+pub fn add_laser_energy(p: &mut Plasma, energy: u64) {
+    if energy > 0 {
+        let heat = energy as f64 / PLASMA_HEAT_CAPACITY;
+        p.plasma += if p.burning { heat } else { heat * 10.0 };
+    }
+}
+
+/// `GeneratorsItems.HOHLRAUM`: holds up to `hohlraumMaxGas` (10) mB of D-T fuel, filled at `hohlraumFillRate` (1) a
+/// tick; a full one is the reaction starter.
+pub const HOHLRAUM: &str = "mekanismgenerators:hohlraum";
+pub const FUSION_FUEL: &str = "mekanismgenerators:fusion_fuel";
+pub const HOHLRAUM_CAPACITY: u64 = 10;
+pub const HOHLRAUM_FILL_RATE: u64 = 1;
+
+/// `vaporiseHohlraum`: the fuel a full hohlraum gives the fuel tank when `needed` mB fit in it; `None` when the
+/// tank cannot take any of it (the hohlraum stays).
+pub fn vaporise(needed: u64) -> Option<u64> {
+    if needed == 0 {
+        Some(0)
+    } else {
+        Some(needed.min(HOHLRAUM_CAPACITY))
+    }
 }
 
 /// `FusionReactorMultiblockData.tick`: inject and burn while burning and hot enough, then
@@ -161,25 +189,67 @@ pub fn tick(p: &mut Plasma, t: &mut Tanks, injection: u64, steam_capacity: u64) 
     }
     // Plasma to casing.
     let mut case_heat = 0.0;
+    let mut lost_to_water = 0.0;
     let plasma_case = PLASMA_CASE_CONDUCTIVITY * (p.plasma - p.case);
     p.plasma -= plasma_case / PLASMA_HEAT_CAPACITY;
     case_heat += plasma_case;
     // Casing to water.
-    let case_water = WATER_HEATING_RATIO * (p.case - AMBIENT);
+    let case_water = WATER_HEATING_RATIO * (p.case - p.ambient);
     if t.water > 0 && case_water > 0.0 {
         let boil = ((STEAM_EFFICIENCY * case_water / WATER_ENTHALPY) as u64)
             .min(steam_capacity.saturating_sub(t.steam))
             .min(t.water);
         t.water -= boil;
         t.steam += boil;
-        case_heat -= boil as f64 * WATER_ENTHALPY / STEAM_EFFICIENCY;
+        lost_to_water = boil as f64 * WATER_ENTHALPY / STEAM_EFFICIENCY;
+        case_heat -= lost_to_water;
     }
     // Casing to air, through the thermocouples.
-    let case_air = CASING_CONDUCTIVITY * (p.case - AMBIENT);
+    let case_air = CASING_CONDUCTIVITY * (p.case - p.ambient);
     case_heat -= case_air;
     let energy = (case_air * THERMOCOUPLE_EFFICIENCY).max(0.0) as u64;
     p.case += case_heat;
-    Output { energy, burned }
+    Output { energy, burned, transfer_loss: lost_to_water, environment_loss: if case_air.abs() > 1e-6 { case_air } else { 0.0 } }
+}
+
+/// `getMinInjectionRate`: the lowest even injection rate that keeps the plasma burning, `active` for water cooling.
+pub fn min_injection(active: bool) -> u64 {
+    let k = if active { WATER_HEATING_RATIO } else { 0.0 };
+    let air = CASING_CONDUCTIVITY;
+    let a_min = BURN_TEMPERATURE * PLASMA_CASE_CONDUCTIVITY * (k + air)
+        / (ENERGY_PER_FUEL * (PLASMA_CASE_CONDUCTIVITY + k + air) - PLASMA_CASE_CONDUCTIVITY * (k + air));
+    2 * (a_min / 2.0).ceil() as u64
+}
+
+/// `getMaxPlasmaTemperature`; `rate` is the larger of the injection rate and the last burn.
+pub fn max_plasma(active: bool, rate: u64) -> f64 {
+    let k = if active { WATER_HEATING_RATIO } else { 0.0 };
+    let air = CASING_CONDUCTIVITY;
+    rate as f64 * ENERGY_PER_FUEL / PLASMA_CASE_CONDUCTIVITY * (PLASMA_CASE_CONDUCTIVITY + k + air) / (k + air)
+}
+
+/// `getMaxCasingTemperature`.
+pub fn max_casing(active: bool, rate: u64) -> f64 {
+    let k = if active { WATER_HEATING_RATIO } else { 0.0 };
+    ENERGY_PER_FUEL * rate as f64 / (k + CASING_CONDUCTIVITY)
+}
+
+/// `getIgnitionTemperature`.
+pub fn ignition(active: bool) -> f64 {
+    let k = if active { WATER_HEATING_RATIO } else { 0.0 };
+    let air = CASING_CONDUCTIVITY;
+    BURN_TEMPERATURE * ENERGY_PER_FUEL * (PLASMA_CASE_CONDUCTIVITY + k + air)
+        / (ENERGY_PER_FUEL * (PLASMA_CASE_CONDUCTIVITY + k + air) - PLASMA_CASE_CONDUCTIVITY * (k + air))
+}
+
+/// `getPassiveGeneration` at a casing temperature.
+pub fn passive_generation(case_temp: f64) -> u64 {
+    (THERMOCOUPLE_EFFICIENCY * CASING_CONDUCTIVITY * case_temp).max(0.0) as u64
+}
+
+/// `getSteamPerTick` at a casing temperature.
+pub fn steam_per_tick(case_temp: f64) -> u64 {
+    (STEAM_EFFICIENCY * WATER_HEATING_RATIO * case_temp / WATER_ENTHALPY).clamp(0.0, f64::from(i32::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -206,7 +276,7 @@ mod tests {
             ..Default::default()
         };
         let out = tick(&mut p, &mut t, 2, steam_capacity(2));
-        assert_eq!(out, Output::default());
+        assert_eq!(out.energy, 0);
         assert_eq!((t.deuterium, p.burning), (100, false));
     }
 
@@ -218,7 +288,9 @@ mod tests {
             tritium: u64::MAX / 4,
             ..Default::default()
         };
-        ignite(&mut p, 2);
+        // A full hohlraum starts it once lasers (here: the creative click) have the plasma over the burn temperature.
+        p.plasma = 10.0 * BURN_TEMPERATURE;
+        p.burning = true;
         let mut out = Output::default();
         for _ in 0..20_000 {
             out = tick(&mut p, &mut t, 2, steam_capacity(2));
@@ -232,11 +304,36 @@ mod tests {
     }
 
     #[test]
+    fn laser_energy_heats_a_cold_plasma_ten_times_as_fast() {
+        let mut p = Plasma::default();
+        add_laser_energy(&mut p, 1_000);
+        assert_eq!(p.plasma, 300.0 + 100.0);
+        p.burning = true;
+        add_laser_energy(&mut p, 1_000);
+        assert_eq!(p.plasma, 300.0 + 100.0 + 10.0);
+        assert_eq!(vaporise(0), Some(0));
+        assert_eq!(vaporise(4), Some(4));
+        assert_eq!(vaporise(1_000), Some(10));
+    }
+
+    #[test]
+    fn the_statistics_follow_mekanisms_formulas() {
+        assert_eq!(min_injection(false), 2);
+        assert_eq!(min_injection(true), 2);
+        assert!((ignition(false) - 100_000_000.0 * 10_000_000.0 * 0.3 / (10_000_000.0 * 0.3 - 0.0)).abs() < 1.0);
+        // Air cooled, two a tick: 2 × 10 MJ / 0.1 = 200 MK at the casing, 1 MJ a tick passive.
+        assert_eq!(max_casing(false, 2), 200_000_000.0);
+        assert_eq!(passive_generation(max_casing(false, 2)), 1_000_000);
+        assert_eq!(steam_per_tick(2e8), 1_200_000);
+    }
+
+    #[test]
     fn water_takes_heat_as_steam() {
         let mut p = Plasma {
             plasma: 3e8,
             case: 2e8,
             burning: true,
+            ambient: AMBIENT,
         };
         let mut t = Tanks {
             deuterium: 1_000,

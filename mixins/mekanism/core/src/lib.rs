@@ -33,6 +33,8 @@ pub mod miner;
 pub mod module_config;
 pub mod modules;
 pub mod radial;
+pub mod robit;
+pub mod slot_click;
 pub mod nuclear;
 pub mod oredictionificator;
 pub mod plenisher;

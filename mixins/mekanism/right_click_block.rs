@@ -24,6 +24,7 @@ fn on_right_click_block(game: &mut crate::game::Game<'_>, pos: [i32; 3], face: [
         || crate::game::mekanism::use_plenisher(game, pos)
         || crate::game::mekanism::use_sorter(game, pos)
         || crate::game::mekanism::use_entangloporter(game, pos)
+        || crate::game::mekanism::use_robit(game, pos)
     {
         *canceled = true;
     }
