@@ -25462,6 +25462,7 @@ fn radiation_server_tick(game: &mut Game<'_>) {
             }
             magnetic_attraction(g);
             nutritional_injection(g);
+            inhalation_purification(g);
             vision_enhancement_upkeep(g);
             gravitational_upkeep(g);
             // Told again when the digits of the level or of the dose would change (the dose is an attachment in Java).
@@ -26319,5 +26320,42 @@ pub(super) fn farming_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3],
         }
         *claimed = true;
         return;
+    }
+}
+
+/// `ModuleInhalationPurificationUnit.tickServer`: the helmet's enabled unit, with the energy for a whole step
+/// (`energyUsagePotionTick`), counts each timed effect of the kinds the unit is set to handle nine more ticks down for
+/// the same energy again (`speedupEffect`), stopping when the energy runs out. Creative players pay nothing.
+fn inhalation_purification(g: &mut Game<'_>) {
+    const UNIT: &str = "mekanism:inhalation_purification_unit";
+    let Some(helmet) = g.armor[0].as_ref().filter(|s| modules::is_container(&s.item) && module_on(s, UNIT)) else {
+        return;
+    };
+    // beneficial, neutral, harmful; the unit's categories in the order the effects report them.
+    let handles = [
+        module_choice(helmet, UNIT, "purification.beneficial").unwrap_or(0) != 0,
+        module_choice(helmet, UNIT, "purification.neutral").unwrap_or(0) != 0,
+        module_choice(helmet, UNIT, "purification.harmful").unwrap_or(1) != 0,
+    ];
+    let usage = mekanism_core::config::gear_int("mekasuit.energy_usage.energyUsagePotionTick", 40_000);
+    let creative = g.creative;
+    let enough = |g: &Game<'_>| creative || g.armor[0].as_ref().is_some_and(|s| stored_energy(s) >= usage);
+    if !enough(g) {
+        return;
+    }
+    for (index, category) in g.native_timed_effects() {
+        if !handles[category as usize] {
+            continue;
+        }
+        if !enough(g) {
+            break;
+        }
+        if !creative && let Some(helmet) = g.armor[0].as_mut() {
+            let e = stored_energy(helmet);
+            set_energy(helmet, e - usage);
+        }
+        for _ in 0..9 {
+            g.native_speed_up_effect(index);
+        }
     }
 }
