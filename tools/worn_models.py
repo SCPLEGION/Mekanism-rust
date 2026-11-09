@@ -308,3 +308,30 @@ def build_world_model(ns, name, obj_file, texture, out, textures_dirs, report):
     shutil.copyfile(source, sprite)
     report["world_models"] = report.get("world_models", 0) + 1
     return True
+
+
+def build_cube_world_model(ns, name, half, texture_png, out, report):
+    """A part tree for `native_world_models`: a cube of side `2 * half` blocks about its centre, the whole
+    texture on every face (Mekanism's `energy_core` element at 0.4 scale)."""
+    h = half
+    faces = [  # counter-clockwise seen from outside
+        [(-h, -h, h), (h, -h, h), (h, h, h), (-h, h, h)],       # south
+        [(h, -h, -h), (-h, -h, -h), (-h, h, -h), (h, h, -h)],   # north
+        [(h, -h, h), (h, -h, -h), (h, h, -h), (h, h, h)],       # east
+        [(-h, -h, -h), (-h, -h, h), (-h, h, h), (-h, h, -h)],   # west
+        [(-h, h, h), (h, h, h), (h, h, -h), (-h, h, -h)],       # up
+        [(-h, -h, -h), (h, -h, -h), (h, -h, h), (-h, -h, h)],   # down
+    ]
+    uvs = [[0, 1], [1, 1], [1, 0], [0, 0]]
+    polygons, normals = [], []
+    for quad in faces:
+        poly, normal = polygon([list(p) for p in quad], uvs)
+        polygons.append(poly)
+        normals.append(normal)
+    target = out / "assets" / ns / "horizon" / "world_models" / f"{name}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"pose": [0, 0, 0, 0, 0, 0, 1, 1, 1], "polygons": polygons, "normals": normals}))
+    sprite = out / "assets" / ns / "textures/entity/equipment/horizon_models" / f"{name}.png"
+    sprite.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(texture_png, sprite)
+    report["world_models"] = report.get("world_models", 0) + 1

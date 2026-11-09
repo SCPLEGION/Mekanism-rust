@@ -394,6 +394,12 @@ def build_module(ns, out):
         if rotor is not None:
             worn_models.build_world_model(ns, "wind_generator_rotor", rotor, "mekanismgenerators:block/model/wind_generator",
                                           out, search, report)
+    if ns == "mekanism":
+        # The energy cube's core (`RenderEnergyCube`): the 16 px `energy_core` cube at 0.4 scale.
+        core = next((d / ns / "textures/block/energy_core.png" for d in search
+                     if (d / ns / "textures/block/energy_core.png").is_file()), None)
+        if core is not None:
+            worn_models.build_cube_world_model(ns, "energy_core", 0.2, core, out, report)
     worn = set()
     if ns == "mekanism":
         for item in worn_models.WORN:
@@ -549,6 +555,11 @@ def gauge_textures(ns, out):
             continue
         dst.mkdir(parents=True, exist_ok=True)
         (dst / texture.name).write_bytes(first_frame_png(texture.read_bytes(), 16))
+        count += 1
+    portal = out / "assets" / ns / "textures/block/teleporter_portal.png"
+    if portal.is_file():
+        dst.mkdir(parents=True, exist_ok=True)
+        (dst / "teleporter_portal.png").write_bytes(first_frame_png(portal.read_bytes(), 16))
         count += 1
     return count
 

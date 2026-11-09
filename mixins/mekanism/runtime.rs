@@ -618,7 +618,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::Bin(t) => {
-                tick_bin(game, entity, t);
+                tick_bin(game, pos, entity, t);
                 None
             }
             Kind::PersonalStorage => None,
@@ -1206,18 +1206,83 @@ fn wind_rotor_speed(game: &Game<'_>, pos: [i32; 3]) -> f32 {
     SPEED * height / (game.world.top_y() - min) as f32
 }
 
-/// The rotors this client has heard of: the angle they have turned to and the tick it was worked out at.
+// The rotors this client has heard of: the angle they have turned to and the tick it was worked out at.
 thread_local! {
     static ROTORS: std::cell::RefCell<std::collections::HashMap<[i32; 3], (f32, u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// A block entity's client view arrived (`native_client_block_entity_changed`): a wind generator's rotor.
+thread_local! {
+    /// The bins this client has heard of.
+    static BINS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
+    /// The energy cubes this client has heard of.
+    static CORES: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
+    /// The fluid tanks this client has heard of.
+    static TANKS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// A block entity's client view arrived (`native_client_block_entity_changed`): a wind generator's rotor or a
+/// fluid tank's contents are for the world to draw.
 pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
     if id == "mekanismgenerators:wind_generator" {
         ROTORS.with_borrow_mut(|r| {
             r.entry(pos).or_insert((0.0, 0));
         });
+    } else if matches!(kind(id), Some(Kind::FluidTank(_))) {
+        TANKS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    } else if matches!(kind(id), Some(Kind::Bin(_))) {
+        BINS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    } else if matches!(kind(id), Some(Kind::EnergyCube(_))) {
+        CORES.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    } else if id == "mekanism:teleporter" {
+        PORTALS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
     }
+}
+
+/// The fluid in each tank (`RenderFluidTank`): a box of its still texture tinted with its colour from just above
+/// the tank's floor, 0.135 in from the sides, its top by how full the tank is; the down face is not drawn.
+fn tank_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    const MIN_XZ: f64 = 0.135;
+    const MAX_XZ: f64 = 0.865;
+    const MIN_Y: f64 = 0.12375;
+    TANKS.with_borrow_mut(|tanks| {
+        tanks.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::FluidTank(_))) {
+                return false;
+            }
+            let scale = f64::from(get_int(c, "tank_scale"));
+            if scale > 0.0 {
+                let chemical = usize::try_from(get_int(c, "tank_fluid") as i32).ok().and_then(|i| CHEMICALS.get(i));
+                let (sprite, argb) = gauge_texture(chemical);
+                let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
+                let top = MIN_Y + 0.75225 * scale / 200.0;
+                let faces = [argb, argb, argb, 0, argb, argb];
+                boxes.push(super::native_hooks::NativeWorldBox {
+                    min: [x + MIN_XZ, y + MIN_Y, z + MIN_XZ],
+                    max: [x + MAX_XZ, y + top, z + MAX_XZ],
+                    colors: faces,
+                    sprite: Some(sprite),
+                });
+            }
+            true
+        });
+    });
 }
 
 /// The rotors that turn (hook point `native_world_models`, API 43): `RenderWindGenerator` puts the blades 4.5 up,
@@ -1257,10 +1322,156 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
                 pitch: 0.0,
                 roll,
                 light_at: [pos[0], pos[1] + 4, pos[2]],
+                color: 0xFFFF_FFFF,
+                rotation: None,
+                full_bright: false,
             });
             true
         });
     });
+    // `RenderEnergyCube`: the core floats, bobs and turns while the cube holds energy, tinted with the tier's
+    // colour and the fill as alpha.
+    const TIER_RGB: [u32; 5] = [0x5FFFB8, 0xFF806A, 0x4BF8FF, 0xF787FF, 0x585858];
+    let time = game.ticks as f32 + game.clock.fraction() as f32;
+    CORES.with_borrow_mut(|cores| {
+        cores.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if !matches!(kind(id), Some(Kind::EnergyCube(_))) {
+                return false;
+            }
+            let alpha = get_int(c, "core_alpha").min(255);
+            if alpha > 0 {
+                let rgb = TIER_RGB.get(get_int(c, "core_tier") as usize).copied().unwrap_or(0xFFFFFF);
+                let scaled = 4.0 * time;
+                let bob = f64::from((3.0 * time).to_radians().sin() / 7.0 * 0.4);
+                // poseStack: rotate Y by `scaled`, then about (0, 1/√2, 1/√2) by 36 + `scaled`.
+                let axis = glam::Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2);
+                let q = glam::Quat::from_axis_angle(glam::Vec3::Y, scaled.to_radians())
+                    * glam::Quat::from_axis_angle(axis, (36.0 + scaled).to_radians());
+                models.push(super::native_hooks::NativeWorldModel {
+                    model: "mekanism:energy_core".into(),
+                    position: [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5 + bob, f64::from(pos[2]) + 0.5],
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    roll: 0.0,
+                    light_at: *pos,
+                    color: (alpha << 24) | rgb,
+                    rotation: Some(q.to_array()),
+                    full_bright: true,
+                });
+            }
+            true
+        });
+    });
+}
+
+/// What `RenderBin` draws for one bin: its pose is the facing's, the item and the count's text hang from it.
+struct BinFace {
+    item: String,
+    count: String,
+    locked: bool,
+    pos: [i32; 3],
+    cover: [i32; 3],
+    item_pose: glam::DMat4,
+    text_pose: glam::DMat4,
+}
+
+/// The bins with something to show and nothing solid over their front (`RenderBin.extractRenderState`).
+fn bin_faces(game: &Game<'_>) -> Vec<BinFace> {
+    use glam::{DMat4, DVec3};
+    use std::f64::consts::{FRAC_PI_2, PI};
+    let mut faces = Vec::new();
+    BINS.with_borrow_mut(|bins| {
+        bins.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            let Some(Kind::Bin(tier)) = kind(id) else {
+                return false;
+            };
+            let item = get_string(c, "bin_item").unwrap_or_default();
+            let locked = get_int(c, "bin_lock") != 0;
+            if item.is_empty() || (get_int(c, "bin_count") == 0 && !locked) {
+                return true;
+            }
+            let Some(front) = game.native_block_property(*pos, "facing") else {
+                return true;
+            };
+            let Some(d) = direction(&front) else {
+                return true;
+            };
+            let cover = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+            let opposite = horizon_core::geometry::Direction::ALL[face_index([-d[0], -d[1], -d[2]])];
+            if game.native_face_sturdy(cover, opposite) {
+                return true;
+            }
+            let count = if tier == BaseTier::Creative { "Infinite".to_owned() } else { get_int(c, "bin_count").to_string() };
+            let origin = DMat4::from_translation(DVec3::new(f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])));
+            let t = |x: f64, y: f64, z: f64| DMat4::from_translation(DVec3::new(x, y, z));
+            let (ry, rx) = (DMat4::from_rotation_y, DMat4::from_rotation_x);
+            let mut item_pose = origin
+                * match front.as_str() {
+                    "north" => t(0.71, 0.8, -0.0001) * ry(PI),
+                    "south" => t(0.29, 0.8, 1.0001),
+                    "west" => t(-0.0001, 0.8, 0.29) * ry(-FRAC_PI_2),
+                    _ => t(1.0001, 0.8, 0.71) * ry(FRAC_PI_2),
+                };
+            item_pose = item_pose
+                * DMat4::from_scale(DVec3::new(0.025, 0.025, 0.0001))
+                * t(8.0, -8.0, 8.0)
+                * DMat4::from_scale(DVec3::splat(16.0));
+            let text_pose = origin
+                * t(0.0, -0.25, 0.0)
+                * match front.as_str() {
+                    "south" => t(0.0, 1.0, 0.0) * rx(FRAC_PI_2),
+                    "north" => t(1.0, 1.0, 1.0) * ry(PI) * rx(FRAC_PI_2),
+                    "east" => t(0.0, 1.0, 1.0) * ry(FRAC_PI_2) * rx(FRAC_PI_2),
+                    _ => t(1.0, 1.0, 0.0) * ry(-FRAC_PI_2) * rx(FRAC_PI_2),
+                }
+                * t(0.5, 1.0, 0.5)
+                * rx(-FRAC_PI_2);
+            faces.push(BinFace { item, count, locked, pos: *pos, cover, item_pose, text_pose });
+            true
+        });
+    });
+    faces
+}
+
+/// The items on the bins' fronts (hook point `native_world_items`, API 44).
+pub(super) fn world_items(game: &Game<'_>, items: &mut Vec<super::native_hooks::NativeWorldItem>) {
+    for f in bin_faces(game) {
+        items.push(super::native_hooks::NativeWorldItem {
+            item: f.item,
+            matrix: f.item_pose.to_cols_array(),
+            light_at: f.cover,
+            seed: (i64::from(f.pos[0]) * 3129871 ^ i64::from(f.pos[2]) * 116129781 ^ i64::from(f.pos[1])) as i32,
+        });
+    }
+}
+
+/// The counts under them (hook point `native_world_texts`, API 44): `RenderBin` scales the text to fit the
+/// block's width, at most 0.02, and centres it.
+pub(super) fn world_texts(game: &Game<'_>, texts: &mut Vec<super::native_hooks::NativeWorldText>) {
+    for f in bin_faces(game) {
+        let required_width = game.native_text_width(&f.count).max(1.0) as i32;
+        let required_height = 9 + 2;
+        let scale = (0.4 / required_width as f32).min(0.02);
+        let real_height = (1.0 / scale).floor() as i32;
+        let real_width = (1.0 / scale).floor() as i32;
+        let offset_x = (real_width - required_width) / 2;
+        let offset_y = (real_height - required_height) / 2;
+        let s = f64::from(scale);
+        texts.push(super::native_hooks::NativeWorldText {
+            text: f.count,
+            matrix: (f.text_pose * glam::DMat4::from_scale(glam::DVec3::new(s, -s, s))).to_cols_array(),
+            x: (offset_x - real_width / 2) as f32,
+            y: (1 + offset_y - real_height / 2) as f32,
+            color: if f.locked { 0xFF30_FFF9 } else { 0xFFFF_FFFF },
+            light_at: f.cover,
+        });
+    }
 }
 
 // --- Energy cubes -----------------------------------------------------------------------------------
@@ -1281,6 +1492,11 @@ fn tick_cube(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, ti
     }
     put_long(&mut entity.nbt, "energy", energy.stored);
     entity.data = vec![(energy.stored * 1000 / capacity.max(1)) as i32, 1000, 0, 0];
+    // The core, for `RenderEnergyCube`: the tier and how full the cube is (its alpha), as 0..=255.
+    let mut core = Compound::new();
+    put_int(&mut core, "core_alpha", (energy.stored as f64 / capacity.max(1) as f64 * 255.0) as u32);
+    put_int(&mut core, "core_tier", tier as u32);
+    put_client(game, pos, entity, &["core_alpha", "core_tier"], core);
 }
 
 // --- Universal cables -------------------------------------------------------------------------------
@@ -3541,6 +3757,12 @@ fn tick_fluid_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
         push_chemical(game, pos, &mut tank, Some([0, -1, 0]), rate, false);
     }
     put_tank(&mut entity.nbt, "fluid", &tank);
+    // What the tank shows in the world (`RenderFluidTank`): its fluid and how full it is, in 200ths.
+    let scale = if tank.amount == 0 { 0 } else { (tank.amount.saturating_mul(200) / tank.capacity.max(1)).clamp(1, 200) };
+    let mut client = Compound::new();
+    put_int(&mut client, "tank_scale", scale as u32);
+    put_int(&mut client, "tank_fluid", chemical_index(tank.chemical.as_deref()) as u32);
+    put_client(game, pos, entity, &["tank_scale", "tank_fluid"], client);
 }
 
 /// A right click on a fluid tank (`BlockFluidTank.useItemOn`): a full bucket empties into it, an empty
@@ -9533,6 +9755,69 @@ fn tick_teleporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
     }
     let status = teleporter_status(game, pos, entity);
     put_int(&mut entity.nbt, "status", status);
+    // The portal, for `RenderTeleporter`: where the frame is, whether it is turned, and the frequency's colour,
+    // shown while the teleporter is ready (`shouldRender`).
+    let mut portal = Compound::new();
+    if let (Some(d), 0) = (dir, status) {
+        let is_frame = |o: &[i32; 3]| block_name(game, [pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]]) == teleporter::FRAME;
+        let rotated = !teleporter::frame_offsets(d, false).iter().all(is_frame);
+        let direction = DIRECTIONS.iter().position(|(_, v)| *v == d).map_or(0, |i| i + 1);
+        let color = freq::COLORS.get(get_int(&entity.nbt, "freq_color") as usize).map_or(0xFFFF_FF, |c| c.1);
+        put_int(&mut portal, "portal", direction as u32);
+        put_int(&mut portal, "portal_rotated", u32::from(rotated));
+        put_int(&mut portal, "portal_color", color);
+    } else {
+        put_int(&mut portal, "portal", 0);
+    }
+    put_client(game, pos, entity, &["portal", "portal_rotated", "portal_color"], portal);
+}
+
+// The portals this client has heard of, drawn as `RenderTeleporter` does: a translucent sheet of the
+// portal texture tinted with the frequency's colour, between the teleporter's frame.
+thread_local! {
+    static PORTALS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+fn portal_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    PORTALS.with_borrow_mut(|portals| {
+        portals.retain(|pos| {
+            let Some((id, c)) = game.native_client_block_entity(*pos) else {
+                return false;
+            };
+            if id != "mekanism:teleporter" {
+                return false;
+            }
+            let Some((_, d)) = usize::try_from(get_int(c, "portal")).ok().and_then(|i| i.checked_sub(1)).and_then(|i| DIRECTIONS.get(i)) else {
+                return true;
+            };
+            let rotated = get_int(c, "portal_rotated") != 0;
+            let argb = (191u32 << 24) | (get_int(c, "portal_color") & 0xFF_FFFF);
+            // `setBounds`: the sheet is 0.08 thick (0.46..0.54) across one of the two axes the frame spans.
+            let (lo, hi) = if d[0] + d[1] + d[2] > 0 { (1.0, 3.0) } else { (-2.0, 0.0) };
+            let (thin, flat) = (0.46, 0.54);
+            let (min, max): ([f64; 3], [f64; 3]) = match d.iter().position(|v| *v != 0) {
+                Some(0) if rotated => ([lo, thin, 0.0], [hi, flat, 1.0]),
+                Some(0) => ([lo, 0.0, thin], [hi, 1.0, flat]),
+                Some(1) if rotated => ([thin, lo, 0.0], [flat, hi, 1.0]),
+                Some(1) => ([0.0, lo, thin], [1.0, hi, flat]),
+                _ if rotated => ([0.0, thin, lo], [1.0, flat, hi]),
+                _ => ([thin, 0.0, lo], [flat, 1.0, hi]),
+            };
+            let at = |p: [f64; 3], q: [f64; 3]| -> ([f64; 3], [f64; 3]) {
+                (std::array::from_fn(|i| f64::from(pos[i]) + p[i]), std::array::from_fn(|i| f64::from(pos[i]) + q[i]))
+            };
+            let (min, max) = at(min, max);
+            // East, west, up, down, south, north; the horizontal frame shows its top and bottom only.
+            let colors = if d[1] == 0 { [0, 0, argb, argb, 0, 0] } else if rotated { [argb, argb, 0, 0, 0, 0] } else { [0, 0, 0, 0, argb, argb] };
+            boxes.push(super::native_hooks::NativeWorldBox {
+                min,
+                max,
+                colors,
+                sprite: Some(format!("{SPRITES_ROOT}gauge_fluid/teleporter_portal")),
+            });
+            true
+        });
+    });
 }
 
 /// The closest other formed teleporter on `frequency` in this dimension, and where a player arrives:
@@ -10397,7 +10682,7 @@ fn settle_bin(entity: &mut ModBlockEntity, tier: BaseTier) -> Bin {
 
 /// A bin's tick: what hoppers put in the input slot goes in, and the output slot shows a stack of it for
 /// hoppers below to take (`BinInventorySlot` through the item handler).
-fn tick_bin(game: &mut Game<'_>, entity: &mut ModBlockEntity, tier: BaseTier) {
+fn tick_bin(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, tier: BaseTier) {
     let mut b = settle_bin(entity, tier);
     if let Some(s) = entity.items[0].clone().filter(plain) {
         let took = b.insert(tier, &s.item, u64::from(s.count), false) as u32;
@@ -10416,6 +10701,12 @@ fn tick_bin(game: &mut Game<'_>, entity: &mut ModBlockEntity, tier: BaseTier) {
     let ticks = get_int(&entity.nbt, "add_ticks");
     put_int(&mut entity.nbt, "add_ticks", ticks.saturating_sub(1));
     put_bin(&mut entity.nbt, &b);
+    // What `RenderBin` shows on the front: the item (the locked one when empty), how many, and the lock.
+    let mut shown = Compound::new();
+    shown.insert("bin_item".into(), Tag::String(b.item_type().unwrap_or_default().into()));
+    put_int(&mut shown, "bin_count", b.count.min(u64::from(u32::MAX)) as u32);
+    put_int(&mut shown, "bin_lock", u32::from(b.lock.is_some()));
+    put_client(game, pos, entity, &["bin_item", "bin_count", "bin_lock"], shown);
 }
 
 fn bin_line(tier: BaseTier, b: &Bin) -> String {
@@ -13789,8 +14080,10 @@ pub(super) fn world_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::
         let max = [min[0] + d, min[1] + f64::from(r.max_y - r.min_y) - 0.02, min[2] + d];
         // `ARGB.white(alpha)`: east/west 0.78, up/down 0.82, north/south 0.8.
         let (east_west, up_down, north_south) = (0xC7FF_FFFF, 0xD1FF_FFFF, 0xCCFF_FFFF);
-        boxes.push(super::native_hooks::NativeWorldBox { min, max, colors: [east_west, east_west, up_down, up_down, north_south, north_south] });
+        boxes.push(super::native_hooks::NativeWorldBox { min, max, colors: [east_west, east_west, up_down, up_down, north_south, north_south], sprite: None });
     }
+    tank_boxes(game, boxes);
+    portal_boxes(game, boxes);
 }
 
 /// Opens the config screen from the main one, and keeps it open while the screen is.
