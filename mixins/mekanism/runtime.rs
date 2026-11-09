@@ -6090,6 +6090,60 @@ fn sync_usage_config(file: &std::path::Path) {
     }
 }
 
+/// The items each recipe kind takes as input, worked out once from the recipes and tags of the world
+/// (`InputRecipeCache`: a machine's input slot only takes an item that starts a recipe).
+static INPUT_SETS: std::sync::OnceLock<std::collections::HashMap<&'static str, std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+
+fn sync_input_sets(game: &Game<'_>) {
+    INPUT_SETS.get_or_init(|| {
+        let items = world_items!(game);
+        let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
+        let mut sets: std::collections::HashMap<&'static str, std::collections::HashSet<String>> = std::collections::HashMap::new();
+        for id in items.items.keys() {
+            let id: &str = id;
+            let mut add = |kind: &'static str, yes: bool| {
+                if yes {
+                    sets.entry(kind).or_default().insert(id.to_owned());
+                }
+            };
+            for kind in ["enriching", "crushing"] {
+                add(kind, mekanism_core::recipes::find(mekanism_core::recipes::table(kind), id, 64, &in_tag).is_some());
+            }
+            add("sawing", mekanism_core::recipes::find_sawing(id, 64, &in_tag).is_some());
+            add("smelting", world_recipes!(game).cook("minecraft:smelting", &stack_of(id, 1)).is_some());
+            for m in chem::ADVANCED_MACHINES {
+                let kind = match m.block {
+                    "mekanism:purification_chamber" => "purifying",
+                    "mekanism:osmium_compressor" => "compressing",
+                    _ => "injecting",
+                };
+                add(kind, m.table.iter().any(|r| r.input.matches(id, &in_tag)));
+            }
+        }
+        sets
+    });
+}
+
+/// Whether `stack` starts a `kind` recipe; before the sets are known, anything goes.
+fn starts_recipe(kind: &str, stack: &ItemStack) -> bool {
+    INPUT_SETS.get().is_none_or(|sets| sets.get(kind).is_some_and(|s| s.contains(&*stack.item)))
+}
+
+/// A slot rule per recipe kind (`SlotRule::Check` takes a plain function).
+fn input_rule(kind: &str) -> Option<horizon_client::lan::menu::SlotRule> {
+    use horizon_client::lan::menu::SlotRule;
+    Some(match kind {
+        "enriching" => SlotRule::Check(|s| starts_recipe("enriching", s)),
+        "crushing" => SlotRule::Check(|s| starts_recipe("crushing", s)),
+        "smelting" => SlotRule::Check(|s| starts_recipe("smelting", s)),
+        "sawing" => SlotRule::Check(|s| starts_recipe("sawing", s)),
+        "purifying" => SlotRule::Check(|s| starts_recipe("purifying", s)),
+        "compressing" => SlotRule::Check(|s| starts_recipe("compressing", s)),
+        "injecting" => SlotRule::Check(|s| starts_recipe("injecting", s)),
+        _ => return None,
+    })
+}
+
 /// A disabled mode reads back as normal (`DisassemblerMode.CODEC`).
 fn disassembler_mode(stack: &ItemStack) -> gear::DisassemblerMode {
     let mode = stored_disassembler_mode(stack);
@@ -10494,6 +10548,13 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
             }
         }
         rules[FACTORY_ENERGY] = convert();
+        if let Some(Kind::Factory(n, recipe, _)) = kind(block)
+            && let Some(rule) = input_rule(recipe)
+        {
+            for slot in rules.iter_mut().take(n) {
+                *slot = rule.clone();
+            }
+        }
     } else if kind(block) == Some(Kind::Teleporter) {
         *rules = vec![convert(), SlotRule::Any, SlotRule::Any];
     } else if let Some(l) = layout(block) {
@@ -10511,6 +10572,25 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
             .collect();
         for &i in chemical_layout_slots(block) {
             rules[i] = SlotRule::Items(chemical_item_ids());
+        }
+        // The input slot only takes an item that starts a recipe (`InputInventorySlot.at(containsRecipe)`).
+        match kind(block) {
+            Some(Kind::Machine(recipe, _)) if recipe != "combining" => {
+                if let (Some(rule), Some(slot)) = (input_rule(recipe), rules.first_mut()) {
+                    *slot = rule;
+                }
+            }
+            Some(Kind::Advanced(m)) => {
+                let recipe = match m.block {
+                    "mekanism:purification_chamber" => "purifying",
+                    "mekanism:osmium_compressor" => "compressing",
+                    _ => "injecting",
+                };
+                if let (Some(rule), Some(slot)) = (input_rule(recipe), rules.first_mut()) {
+                    *slot = rule;
+                }
+            }
+            _ => {}
         }
         // The dynamic tank's output slot only gives (`OutputInventorySlot`).
         if kind(block) == Some(Kind::DynamicValve) {
@@ -24860,6 +24940,7 @@ fn rad_client_payload(data: &[u8]) {
 /// The server's tick: sources decay (a 1 in 20 chance a tick), then each player is exposed, dosed, hurt and told.
 fn radiation_server_tick(game: &mut Game<'_>) {
     sync_gear_config(game);
+    sync_input_sets(game);
     // The world's folder keeps the sources and the doses (`RadiationLevelData`, the radiation attachment).
     let file = game.native_world_dir().map(|d| d.join("mekanism").join("radiation.txt"));
     if file.is_some()
