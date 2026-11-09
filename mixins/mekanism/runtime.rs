@@ -21389,6 +21389,14 @@ fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         if ui.module.as_ref().is_some_and(|m| !installed.contains_key(m)) {
             ui.module = None;
         }
+        // `GuiScrollBar` of the module list: a thumb in a bordered track once more modules are installed than rows show.
+        if ids.len() > TW_ROWS {
+            let hidden = ids.len() - TW_ROWS;
+            let (bar_x, bar_y, bar_h) = (frame[0] + frame[2] - 7.0, frame[1] + 2.0, frame[3] - 4.0);
+            nine_slice_tinted(game, batch, "scroll/list_border", [6.0, 6.0], 2.0, [bar_x - 1.0, bar_y - 1.0, 6.0, bar_h + 2.0], 0xFFFF_FFFF);
+            let thumb = (ui.scroll as f32 / hidden as f32 * (bar_h - 4.0)).round();
+            sprite(game, batch, "scroll/list_bar", [0.0, 0.0, 4.0, 4.0], [bar_x, bar_y + thumb, 4.0, 4.0]);
+        }
         for (i, id) in ids.iter().skip(ui.scroll).take(TW_ROWS).enumerate() {
             let r = tw_module_row(i, o);
             let base = if ui.module.as_deref() == Some(id.as_str()) {
@@ -21408,6 +21416,13 @@ fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         let n = installed.get(&module).copied().unwrap_or(0);
         let settings = module_config::settings(&module, n);
         ui.setting_scroll = ui.setting_scroll.min(settings.len().saturating_sub(TW_SETTING_ROWS));
+        if settings.len() > TW_SETTING_ROWS {
+            let hidden = settings.len() - TW_SETTING_ROWS;
+            let (bar_x, bar_y, bar_h) = (o[0] + 212.0, o[1] + 39.0, 27.0 * TW_SETTING_ROWS as f32 - 2.0);
+            nine_slice_tinted(game, batch, "scroll/list_border", [6.0, 6.0], 2.0, [bar_x - 1.0, bar_y - 1.0, 6.0, bar_h + 2.0], 0xFFFF_FFFF);
+            let thumb = (ui.setting_scroll as f32 / hidden as f32 * (bar_h - 4.0)).round();
+            sprite(game, batch, "scroll/list_bar", [0.0, 0.0, 4.0, 4.0], [bar_x, bar_y + thumb, 4.0, 4.0]);
+        }
         for (i, s) in settings.iter().skip(ui.setting_scroll).take(TW_SETTING_ROWS).enumerate() {
             let row = tw_setting_row(i, o);
             game.native_text_scaled(batch, s.label, [row[0], row[1] + 1.0], 0x40_4040, 0.75);
