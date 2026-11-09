@@ -21283,6 +21283,17 @@ fn tw_stack_mut<'a>(game: &'a mut Game<'_>, slot: usize) -> Option<&'a mut ItemS
     .filter(|s| modules::is_container(&s.item))
 }
 
+/// The stack in a radial's slot: a module container, or the Atomic Disassembler.
+fn radial_stack<'a>(game: &'a Game<'_>, slot: usize) -> Option<&'a ItemStack> {
+    match slot {
+        0..=3 => game.armor.get(slot)?.as_ref(),
+        4..=12 => game.inventory.get(slot - 4)?.as_ref(),
+        13 => game.offhand.as_ref(),
+        _ => None,
+    }
+    .filter(|s| modules::is_container(&s.item) || &*s.item == DISASSEMBLER)
+}
+
 fn tw_slots(game: &Game<'_>) -> Vec<usize> {
     (0..14).filter(|i| tw_stack(game, *i).is_some_and(|s| !installed_modules(s).is_empty())).collect()
 }
@@ -21461,6 +21472,21 @@ fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         }
     });
     tw_color_draw(game, batch, o);
+    // `GuiModuleScrollList.updateTooltip`: a module in the list tells how many of the most it can take are installed.
+    if TW_COLOR.with_borrow(Option::is_none) {
+        let cursor = game.native_cursor();
+        let line = TW_UI.with_borrow(|ui| {
+            let stack = tw_stack(game, ui.slot?)?;
+            let installed = installed_modules(stack);
+            (0..TW_ROWS).find(|i| inside(cursor, tw_module_row(*i, o))).and_then(|i| {
+                let id = installed.keys().nth(ui.scroll + i)?;
+                Some(format!("\u{a7}7Installed: {}/{}", installed[id], modules::max_installed(&stack.item, id)))
+            })
+        });
+        if let Some(line) = line {
+            horizon_client::ui::tooltip(batch, &game.gui.atlas, &[horizon_client::text::Text::legacy(&line)], (cursor[0], cursor[1]));
+        }
+    }
 }
 
 fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
@@ -21850,6 +21876,21 @@ fn tweaker_payload(game: &mut Game<'_>, data: &[u8]) {
     let (Ok(slot), Ok(value)) = (slot.parse::<usize>(), value.parse::<u32>()) else {
         return;
     };
+    // The Atomic Disassembler's radial sets its mode (`IRadialModeItem.setMode`).
+    if module == radial::DISASSEMBLER {
+        let stack = match slot {
+            0..=3 => game.armor.get_mut(slot).and_then(Option::as_mut),
+            4..=12 => game.inventory.get_mut(slot - 4).and_then(Option::as_mut),
+            13 => game.offhand.as_mut(),
+            _ => None,
+        };
+        if let Some(stack) = stack.filter(|s| &*s.item == DISASSEMBLER)
+            && let Some(mode) = gear::DisassemblerMode::ALL.get(value as usize)
+        {
+            set_disassembler_mode(stack, *mode);
+        }
+        return;
+    }
     let Some(stack) = tw_stack_mut(game, slot) else {
         return;
     };
@@ -21972,6 +22013,9 @@ static RADIAL_KEY_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 
 /// The root slices an item offers: its enabled modules that handle the radial.
 fn radial_roots(stack: &ItemStack) -> Vec<radial::Nested> {
+    if &*stack.item == DISASSEMBLER {
+        return radial::nested(radial::DISASSEMBLER).into_iter().collect();
+    }
     let installed = modules_of(stack);
     installed
         .iter()
@@ -21985,6 +22029,9 @@ fn radial_roots(stack: &ItemStack) -> Vec<radial::Nested> {
 
 /// The current option of a nested module's radial.
 fn radial_current(stack: &ItemStack, module: &str) -> Option<u32> {
+    if module == radial::DISASSEMBLER {
+        return gear::DisassemblerMode::ALL.iter().position(|m| *m == disassembler_mode(stack)).map(|i| i as u32);
+    }
     let n = *modules_of(stack).get(module)?;
     let key = radial::nested(module)?.key;
     let s = module_config::settings(module, n).into_iter().find(|s| s.key == key)?;
@@ -22006,10 +22053,10 @@ fn radial_key(game: &mut Game<'_>) {
         return;
     }
     let hand = 4 + game.selected;
-    let Some(slot) = [hand, 13].into_iter().find(|s| tw_stack(game, *s).is_some_and(|st| !radial_roots(st).is_empty())) else {
+    let Some(slot) = [hand, 13].into_iter().find(|s| radial_stack(game, *s).is_some_and(|st| !radial_roots(st).is_empty())) else {
         return;
     };
-    let roots = tw_stack(game, slot).map(radial_roots).unwrap_or_default();
+    let roots = radial_stack(game, slot).map(radial_roots).unwrap_or_default();
     RADIAL_UI.with_borrow_mut(|ui| {
         *ui = RadialUi { slot, open: true, ..RadialUi::default() };
         if roots.len() == 1 {
@@ -22059,7 +22106,7 @@ fn radial_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
     let centre = [(batch.width / 2.0).floor(), (batch.height / 2.0).floor()];
     let cursor = game.native_cursor();
     RADIAL_UI.with_borrow_mut(|ui| {
-        let Some(stack) = tw_stack(game, ui.slot) else {
+        let Some(stack) = radial_stack(game, ui.slot) else {
             return;
         };
         let slices = radial_slices(stack, ui.module);
@@ -22106,7 +22153,7 @@ fn radial_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
 fn radial_update(game: &mut Game<'_>) {
     let mut send = None;
     RADIAL_UI.with_borrow_mut(|ui| {
-        let Some(stack) = tw_stack(game, ui.slot) else {
+        let Some(stack) = radial_stack(game, ui.slot) else {
             return;
         };
         if let Some(i) = ui.selection {
@@ -22146,7 +22193,7 @@ fn radial_scroll(game: &mut Game<'_>, steps: f32) {
     let shift: i32 = if steps > 0.0 { 1 } else if steps < 0.0 { -1 } else { return };
     let mut send = None;
     RADIAL_UI.with_borrow(|ui| {
-        let (Some(m), Some(stack)) = (ui.module, tw_stack(game, ui.slot)) else {
+        let (Some(m), Some(stack)) = (ui.module, radial_stack(game, ui.slot)) else {
             return;
         };
         let slices = radial_slices(stack, Some(m));
