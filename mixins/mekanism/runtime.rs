@@ -26123,3 +26123,77 @@ pub(super) fn bow_shot(game: &mut Game<'_>, bow: &ItemStack, flame: &mut bool, a
     }
     set_energy(held, stored - need);
 }
+
+// --- Farming Unit ---------------------------------------------------------------------------------------
+
+/// `ModuleFarmingUnit.onItemUse`: the Meka-Tool with the unit strips (axe), flattens (shovel) and tills (hoe) the clicked
+/// block and every block of the same kind around it within the unit's farming radius (axe: the plane of the clicked face;
+/// shovel and hoe: the same level), each costing `energy_usage.axe/shovel/hoe` FE times the transform's durability use
+/// (free in creative). The first of the three that changes the clicked block wins.
+pub(super) fn farming_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3], face: [i32; 3], claimed: &mut bool) {
+    const UNIT: &str = "mekanism:farming_unit";
+    if *claimed || &*stack.item != modules::MEKA_TOOL || !game.native_on(MOD_ID) || !module_on(stack, UNIT) {
+        return;
+    }
+    let installed = installed_modules(stack).get(UNIT).copied().unwrap_or(0);
+    let Some(setting) = module_config::settings(UNIT, installed).into_iter().find(|s| s.key == "farming_radius") else {
+        return;
+    };
+    let diameter = [0i32, 1, 3, 5, 7][(module_setting(stack, UNIT, &setting, installed) as usize).min(4)];
+    if diameter == 0 {
+        return;
+    }
+    let radius = (diameter - 1) / 2;
+    let creative = game.creative;
+    let tools = [("minecraft:axe", "axe"), ("minecraft:shovel", "shovel"), ("minecraft:hoe", "hoe")];
+    for (transformer, key) in tools {
+        let Some((state, damage)) = game.native_block_transform(transformer, pos, face) else {
+            continue;
+        };
+        let usage = if creative { 0 } else { mekanism_core::config::gear_int(&format!("mekatool.energy_usage.{key}"), 10) };
+        let cost = usage * u64::from(damage);
+        let energy = |g: &mut Game<'_>| g.held_mut().as_ref().map_or(0, |s| stored_energy(s));
+        if cost > 0 && energy(game) < cost {
+            continue;
+        }
+        let pay = |g: &mut Game<'_>| {
+            if cost > 0
+                && let Some(held) = g.held_mut().as_mut()
+            {
+                let e = stored_energy(held);
+                set_energy(held, e - cost.min(e));
+            }
+        };
+        pay(game);
+        game.native_apply_block_transform(transformer, pos, face);
+        let axe = key == "axe";
+        let (rx, ry, rz) = if !axe {
+            (radius, 0, radius)
+        } else if face[0] != 0 {
+            (0, radius, radius)
+        } else if face[1] != 0 {
+            (radius, 0, radius)
+        } else {
+            (radius, radius, 0)
+        };
+        for y in pos[1] - ry..=pos[1] + ry {
+            for z in pos[2] - rz..=pos[2] + rz {
+                for x in pos[0] - rx..=pos[0] + rx {
+                    let at = [x, y, z];
+                    if at == pos {
+                        continue;
+                    }
+                    if cost > 0 && energy(game) < cost {
+                        break;
+                    }
+                    if game.native_block_transform(transformer, at, face).is_some_and(|(s, _)| s == state) {
+                        pay(game);
+                        game.native_apply_block_transform(transformer, at, face);
+                    }
+                }
+            }
+        }
+        *claimed = true;
+        return;
+    }
+}
