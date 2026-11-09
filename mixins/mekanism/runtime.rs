@@ -8069,6 +8069,10 @@ pub(super) fn gear_attributes(game: &mut Game<'_>, attributes: &mut Vec<(String,
         let amount = f64::from((0.333_333_34_f32 * count as f32).min(1.0));
         attributes.push(("minecraft:water_movement_efficiency".to_owned(), "mekanism:water_movement".to_owned(), amount, "add_value".to_owned()));
     }
+    // `ModuleHydrostaticRepulsorUnit.adjustAttributes`: the swim boost (`neoforge:swim_speed` +1) with the energy to pay it.
+    if swim_boost_on(legs) && stored_energy(legs) >= hydrostatic_usage() {
+        attributes.push(("neoforge:swim_speed".to_owned(), "mekanism:swim_boost".to_owned(), 1.0, "add_value".to_owned()));
+    }
     // `MotorizedServoUnit.adjustAttributes`: +0.15 sneaking speed for each unit, one at most.
     let servos = installed_modules(legs).get("mekanism:motorized_servo_unit").copied().unwrap_or(0);
     if servos > 0 && module_on(legs, "mekanism:motorized_servo_unit") {
@@ -8077,6 +8081,30 @@ pub(super) fn gear_attributes(game: &mut Game<'_>, attributes: &mut Vec<(String,
     }
     if module_on(legs, "mekanism:gyroscopic_stabilization_unit") {
         attributes.push(("minecraft:submerged_mining_speed".to_owned(), "mekanism:submerged_mining_speed".to_owned(), 1.0, "add_value".to_owned()));
+    }
+}
+
+/// `GearConfig.mekaSuitEnergyUsageHydrostaticRepulsion`: FE a tick of swim boost takes.
+fn hydrostatic_usage() -> u64 {
+    mekanism_core::config::gear_int("mekasuit.energy_usage.hydrostaticRepulsion", 500)
+}
+
+/// `ModuleHydrostaticRepulsorUnit.isSwimBoost`: four units installed (`BOOST_STACKS`) and the module's swim boost setting on.
+fn swim_boost_on(legs: &ItemStack) -> bool {
+    const UNIT: &str = "mekanism:hydrostatic_repulsor_unit";
+    installed_modules(legs).get(UNIT).copied().unwrap_or(0) >= 4 && module_on(legs, UNIT) && module_choice(legs, UNIT, "swim_boost").unwrap_or(1) != 0
+}
+
+/// `ModuleHydrostaticRepulsorUnit.tickServer`: in water, the swim boost takes `hydrostaticRepulsion` FE a tick (a creative
+/// player pays nothing).
+fn hydrostatic_upkeep(g: &mut Game<'_>) {
+    if g.creative || !g.player.as_ref().is_some_and(|p| p.fluids.was_touching_water) {
+        return;
+    }
+    let usage = hydrostatic_usage();
+    if let Some(legs) = g.armor[2].as_mut().filter(|s| modules::is_container(&s.item) && swim_boost_on(s)) {
+        let e = stored_energy(legs);
+        set_energy(legs, e - usage.min(e));
     }
 }
 
@@ -25587,6 +25615,7 @@ fn radiation_server_tick(game: &mut Game<'_>) {
             magnetic_attraction(g);
             nutritional_injection(g);
             inhalation_purification(g);
+            hydrostatic_upkeep(g);
             vision_enhancement_upkeep(g);
             gravitational_upkeep(g);
             // Told again when the digits of the level or of the dose would change (the dose is an attachment in Java).
