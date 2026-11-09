@@ -6024,7 +6024,41 @@ const DISASSEMBLER: &str = "mekanism:atomic_disassembler";
 /// The key in the disassembler's custom data that holds its mode (Mekanism's `disassembler_mode`).
 const MODE_KEY: &str = "mekanism:disassembler_mode";
 
+/// `GearConfig`, read from the world's `serverconfig/mekanism-gear.toml` (written with the defaults when missing).
+static GEAR_CONFIG: std::sync::RwLock<Option<(std::path::PathBuf, mekanism_core::config::GearConfig)>> = std::sync::RwLock::new(None);
+
+fn gear_config() -> mekanism_core::config::GearConfig {
+    GEAR_CONFIG.read().ok().and_then(|g| g.as_ref().map(|(_, c)| c.clone())).unwrap_or_default()
+}
+
+/// Loads the world's gear config the first time a world (or after another opens) is seen.
+fn sync_gear_config(game: &Game<'_>) {
+    let Some(file) = game.native_world_dir().map(|d| d.join("serverconfig").join("mekanism-gear.toml")) else {
+        return;
+    };
+    if GEAR_CONFIG.read().is_ok_and(|g| g.as_ref().is_some_and(|(f, _)| *f == file)) {
+        return;
+    }
+    let config = match std::fs::read_to_string(&file) {
+        Ok(text) => mekanism_core::config::GearConfig::parse(&text),
+        Err(_) => {
+            let config = mekanism_core::config::GearConfig::default();
+            let _ = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&file, config.to_toml()));
+            config
+        }
+    };
+    if let Ok(mut g) = GEAR_CONFIG.write() {
+        *g = Some((file, config));
+    }
+}
+
+/// A disabled mode reads back as normal (`DisassemblerMode.CODEC`).
 fn disassembler_mode(stack: &ItemStack) -> gear::DisassemblerMode {
+    let mode = stored_disassembler_mode(stack);
+    if mode.enabled(&gear_config()) { mode } else { gear::DisassemblerMode::Normal }
+}
+
+fn stored_disassembler_mode(stack: &ItemStack) -> gear::DisassemblerMode {
     let name = custom_data(stack).and_then(|c| match c.get(&JavaString::from(MODE_KEY)) {
         Some(Tag::String(s)) => s.to_string().ok(),
         _ => None,
@@ -6058,7 +6092,7 @@ pub(super) fn destroy_speed(game: &Game<'_>, stack: Option<&ItemStack>, hardness
         return;
     };
     if game.native_on(MOD_ID) {
-        *speed = gear::destroy_speed(disassembler_mode(stack), stored_energy(stack), hardness);
+        *speed = gear::destroy_speed_with(gear_config().disassembler_energy_usage, disassembler_mode(stack), stored_energy(stack), hardness);
     }
 }
 
@@ -6106,7 +6140,7 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
     let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == DISASSEMBLER) else {
         return;
     };
-    let mode = disassembler_mode(held).next();
+    let mode = disassembler_mode(held).next_enabled(&gear_config());
     set_disassembler_mode(held, mode);
     *claimed = true;
     if let Some(player) = game.native_acting_player() {
@@ -6144,7 +6178,7 @@ pub(super) fn spend_disassembler_energy(game: &mut Game<'_>, pos: [i32; 3]) {
         && let Some(stack) = game.held_mut().as_mut().filter(|s| &*s.item == DISASSEMBLER)
     {
         let stored = stored_energy(stack);
-        let cost = gear::destroy_energy(disassembler_mode(stack), hardness);
+        let cost = gear::destroy_energy_with(gear_config().disassembler_energy_usage, disassembler_mode(stack), hardness);
         set_energy(stack, stored.saturating_sub(cost));
     }
     // The blocks a vein or a blast takes pay their own way (`meka_tool_area`).
@@ -6182,7 +6216,7 @@ pub(super) fn disassembler_vein(game: &mut Game<'_>, pos: [i32; 3]) {
             for dy in -1..=1 {
                 for dz in -1..=1 {
                     let next = [at[0] + dx, at[1] + dy, at[2] + dz];
-                    if found.len() < modules::VEIN_COUNT && !seen.contains(&next) && block_name(game, next) == name {
+                    if found.len() < gear_config().disassembler_mining_count && !seen.contains(&next) && block_name(game, next) == name {
                         seen.insert(next);
                         found.push(next);
                         frontier.push_back(next);
@@ -6198,7 +6232,7 @@ pub(super) fn disassembler_vein(game: &mut Game<'_>, pos: [i32; 3]) {
             break;
         };
         let stored = stored_energy(tool);
-        let cost = gear::destroy_energy(gear::DisassemblerMode::Vein, hardness);
+        let cost = gear::destroy_energy_with(gear_config().disassembler_energy_usage, gear::DisassemblerMode::Vein, hardness);
         if stored < cost {
             break;
         }
@@ -22457,7 +22491,15 @@ fn radial_key(game: &mut Game<'_>) {
 /// The slices on screen: the root's, or the open module's options.
 fn radial_slices(stack: &ItemStack, module: Option<&'static str>) -> Vec<radial::Slice> {
     match module {
-        Some(m) => radial::modes(m, modules_of(stack).get(m).copied().unwrap_or(0)),
+        Some(m) => {
+            let mut slices = radial::modes(m, modules_of(stack).get(m).copied().unwrap_or(0));
+            // `IDisableableEnum`: the disassembler's disabled modes get no slice.
+            if m == radial::DISASSEMBLER {
+                let config = gear_config();
+                slices.retain(|s| gear::DisassemblerMode::ALL.get(s.value as usize).is_some_and(|mode| mode.enabled(&config)));
+            }
+            slices
+        }
         None => radial_roots(stack).into_iter().map(|r| r.slice).collect(),
     }
 }
@@ -24779,6 +24821,7 @@ fn rad_client_payload(data: &[u8]) {
 
 /// The server's tick: sources decay (a 1 in 20 chance a tick), then each player is exposed, dosed, hurt and told.
 fn radiation_server_tick(game: &mut Game<'_>) {
+    sync_gear_config(game);
     // The world's folder keeps the sources and the doses (`RadiationLevelData`, the radiation attachment).
     let file = game.native_world_dir().map(|d| d.join("mekanism").join("radiation.txt"));
     if file.is_some()
@@ -24964,7 +25007,7 @@ pub(super) fn acts_as_shears(_game: &Game<'_>, stack: &ItemStack, shears: &mut b
     if &*stack.item != modules::MEKA_TOOL || !module_on(stack, "mekanism:shearing_unit") {
         return;
     }
-    *shears = stored_energy(stack) >= gear::destroy_energy(disassembler_mode(stack), 0.0);
+    *shears = stored_energy(stack) >= gear::destroy_energy_with(gear_config().disassembler_energy_usage, disassembler_mode(stack), 0.0);
 }
 
 /// `ModuleColorModulationUnit.COLOR`'s default (`ModuleColorConfig.argb`): white, opaque.
