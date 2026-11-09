@@ -230,7 +230,7 @@ const ANCHORS: &[&str] = &["ABSOLUTE", "ABOVE_BOTTOM", "BELOW_TOP"];
 /// An ore vein of `OreType`: name, per chunk, discard chance, size, shape, minimum anchor, maximum anchor, plateau.
 type Vein = (&'static str, i64, f64, i64, &'static str, (&'static str, i64), (&'static str, i64), i64);
 
-const ORES: [(&str, &[Vein]); 5] = [
+pub(crate) const ORES: [(&str, &[Vein]); 5] = [
     (
         "tin",
         &[
@@ -359,6 +359,14 @@ impl Config {
         match self.get(section, key) {
             Some(Value::Double(v)) => *v,
             _ => 0.0,
+        }
+    }
+
+    /// An enum's constant name.
+    pub fn string(&self, section: &str, key: &str) -> String {
+        match self.get(section, key) {
+            Some(Value::Enum(v)) => v.clone(),
+            _ => String::new(),
         }
     }
 

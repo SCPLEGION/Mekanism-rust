@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "38ea6e1e8f1fff3b1db386a409cb5226faa50783"
+horizon_revision = "e7e0149480274973eec8c02c64010a506f0e4b62"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -762,4 +762,15 @@ bindings = [
   { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
   { name = "bar", ty = "&mut Option<(i32, u32)>", value = "&mut *bar" },
   { name = "extra", ty = "&mut Vec<(i32, i32, u32)>", value = "&mut *extra" },
+]
+
+[[injection]]
+id = "worldgen-entries"
+hook = "worldgen_entries"
+hook_version = 1
+kind = "HEAD"
+helper = "worldgen_entries.rs"
+bindings = [
+  { name = "world_root", ty = "&std::path::Path", value = "world_root" },
+  { name = "entries", ty = "&mut Vec<(String, String, String)>", value = "&mut *entries" },
 ]

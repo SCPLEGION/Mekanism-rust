@@ -357,6 +357,22 @@ def vanilla_ore(name, feature):
     return configured, placed
 
 
+def vanilla_salt():
+    """`mekanism:disk` -> `minecraft:disk` with SaltConfig's defaults (radius 2 to 3, half height 1, 2 per chunk)."""
+    feature = {"type": "minecraft:disk", "config": {
+        "state_provider": {"type": "minecraft:simple_state_provider", "state": {"Name": "mekanism:block_salt"}},
+        "target": {"predicate_type": "minecraft:matching_blocks", "blocks": ["minecraft:dirt", "minecraft:clay"]},
+        "radius": {"type": "minecraft:uniform", "min_inclusive": 2, "max_inclusive": 3},
+        "half_height": 1}}
+    placed = {"feature": "mekanism:salt", "placement": [
+        {"type": "minecraft:count", "count": 2},
+        {"type": "minecraft:in_square"},
+        {"type": "minecraft:heightmap", "heightmap": "OCEAN_FLOOR_WG"},
+        {"type": "minecraft:block_predicate_filter", "predicate": {"type": "minecraft:matching_fluids", "fluids": "minecraft:water"}},
+        {"type": "minecraft:biome"}]}
+    return feature, placed
+
+
 def copy_tree(src, dst, report, key):
     if not src.is_dir():
         return
@@ -425,10 +441,16 @@ def build_module(ns, out):
         path.write_text(json.dumps(configured, indent=2) + "\n")
         (placed_dir / path.name).write_text(json.dumps(placed, indent=2) + "\n")
         report["ores"] = report.get("ores", 0) + 1
-    # The salt disk uses Mekanism's own feature and height types; it waits for a native feature.
-    for folder in (features, placed_dir):
-        for path in folder.glob("salt*.json") if folder.is_dir() else []:
+    # The salt disk: vanilla's disk feature with the default radius, depth and count. The native mod overrides it
+    # with the world config (`mixins/mekanism/core/src/worldgen.rs`).
+    if features.is_dir():
+        placed_dir.mkdir(parents=True, exist_ok=True)
+        salt_feature, salt_placed = vanilla_salt()
+        (features / "salt.json").write_text(json.dumps(salt_feature, indent=2) + "\n")
+        (placed_dir / "salt.json").write_text(json.dumps(salt_placed, indent=2) + "\n")
+        for path in placed_dir.glob("salt_retrogen.json"):
             path.unlink()
+        report["salt"] = 1
 
     # Items told apart by a Mekanism data component (upgrades, modules): Horizon has no mod components, so
     # the type goes in vanilla's custom_data, the model is chosen by custom_model_data, and the name is

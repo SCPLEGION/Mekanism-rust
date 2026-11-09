@@ -6135,6 +6135,20 @@ fn sync_gear_config(game: &Game<'_>) {
 /// (each written with the defaults when missing).
 static WORLD_CONFIGS: std::sync::RwLock<Option<(std::path::PathBuf, Vec<mekanism_core::config_files::Config>)>> = std::sync::RwLock::new(None);
 
+/// The worldgen files of the world's `mekanism-world.toml` (written with the defaults when missing): ore veins and the salt disk
+/// (`native_worldgen_entries`, run before the generator loads).
+pub fn worldgen_entries(world_root: &std::path::Path, entries: &mut Vec<(String, String, String)>) {
+    sync_world_configs(&world_root.join("serverconfig"));
+    let Ok(guard) = WORLD_CONFIGS.read() else {
+        return;
+    };
+    if let Some((_, configs)) = guard.as_ref()
+        && let Some(world) = configs.iter().find(|c| c.file_name() == "mekanism-world.toml")
+    {
+        entries.extend(mekanism_core::worldgen::entries(world));
+    }
+}
+
 /// A value of one of those files: `file` is its name (`machine-storage`, `tiers`, `general`, `world`).
 #[allow(dead_code)]
 fn config_value(file: &str, section: &str, key: &str) -> Option<mekanism_core::config_files::Value> {
