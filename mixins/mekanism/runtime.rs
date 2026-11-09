@@ -448,6 +448,17 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         });
         return;
     }
+    // `TileEntityChemicalTank`: the drain slot (a tank item takes the chemical) and the fill slot (it gives it).
+    if matches!(kind(block), Some(Kind::ChemicalTank(_))) {
+        *container = Some(ModContainer {
+            slots: 5,
+            faces: std::array::from_fn(|_| vec![0, 1]),
+            inputs: vec![1],
+            outputs: vec![0],
+            menu: Some("minecraft:hopper".into()),
+        });
+        return;
+    }
     // The module slot, the item to fit it into and the energy slot.
     if kind(block) == Some(Kind::ModificationStation) {
         *container = Some(ModContainer {
@@ -532,8 +543,7 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
         Some(Kind::InductionPort) => (vec![0, 1], vec![]),
         // Tanks, the multiblocks' ports and the machines below open a screen with no slots of their own.
         Some(
-            Kind::ChemicalTank(_)
-            | Kind::FissionPort
+            Kind::FissionPort
             | Kind::TurbineValve
             | Kind::FusionPort
             | Kind::BoilerValve
@@ -5516,6 +5526,10 @@ fn tick_chemical_tank(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     let mut tank = get_tank(&entity.nbt, "chemical", capacity);
     let dumping = get_int(&entity.nbt, "dump") % 3;
     let creative = tier == BaseTier::Creative;
+    // `drainTankIntoSlot`, `fillTankFromSlot`.
+    drain_tank_into_item(entity, 0, &mut tank);
+    fill_tank_from_item(entity, 1, &mut tank, |_| true);
+    put_tank(&mut entity.nbt, "chemical", &tank);
     // `ChemicalUtils.dump(tank, mode, capacity / 400, transfer rate)`: dumping removes a share, dumping excess
     // what is over 85% of the tank.
     if dumping != 0 && !creative && tank.amount > 0 {
@@ -9758,7 +9772,8 @@ fn layout(block: &str) -> Option<Layout> {
         },
         // A tank's one big gauge.
         Kind::ChemicalTank(t) => Layout {
-            slots: [None; 3],
+            // `drainSlot` (16, 16) and `fillSlot` (16, 48).
+            slots: [Some(([16.0, 16.0], "slot/output")), Some(([16.0, 48.0], "slot/normal")), None],
             // `GuiChemicalBar`: a horizontal bar of 116 x 10 (drawn by `draw_tank_screen`).
             gauges: vec![gauge("chemical", chem::chemical_tank(t).0, 42.0, 16.0, [116.0, 10.0])],
             power: None,
@@ -13967,6 +13982,11 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
             sprite(game, batch, "slot/overlay/minus", [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
         }
         // `SlotOverlay.PLUS` on the matrix's charge slot, `MINUS` on its discharge slot.
+        // `SlotOverlay.PLUS` on the tank's drain slot, `MINUS` on its fill slot.
+        if i < 2 && matches!(kind(block), Some(Kind::ChemicalTank(_))) {
+            let overlay = if i == 0 { "slot/overlay/plus" } else { "slot/overlay/minus" };
+            sprite(game, batch, overlay, [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
+        }
         if i < 2 && kind(block) == Some(Kind::InductionPort) {
             let overlay = if i == 0 { "slot/overlay/plus" } else { "slot/overlay/minus" };
             sprite(game, batch, overlay, [0.0, 0.0, 18.0, 18.0], [ox + at[0] - 1.0, oy + at[1] - 1.0, 18.0, 18.0]);
