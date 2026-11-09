@@ -27487,6 +27487,15 @@ fn dropper_key(chemical: &str) -> &'static str {
     if chemical.starts_with("minecraft:") || chemical == "mekanism:heavy_water" { FLUID_KEY } else { CHEMICAL_KEY }
 }
 
+/// Whether gauge `key` of a multiblock's screen is a tank (the packed statistics and the fusion temperatures and combined
+/// fuel are not).
+fn dropper_gauge_is_tank(block: &str, key: &str) -> bool {
+    if key.starts_with("stats_") {
+        return false;
+    }
+    !(kind(block) == Some(Kind::FusionPort) && matches!(key, "plasma" | "case" | "fuel"))
+}
+
 /// `GuiTankGauge.onClick`: with a Gauge Dropper on the cursor, a left click on a gauge fills the dropper from the tank
 /// (shift: dumps the tank), a right click drains the dropper into it.
 fn dropper_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool, button: &mut Option<i32>) -> bool {
@@ -27497,7 +27506,7 @@ fn dropper_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool, button
         return false;
     };
     for (i, g) in l.gauges.iter().enumerate() {
-        if inside(at, [g.at[0], g.at[1], g.size[0], g.size[1]]) {
+        if dropper_gauge_is_tank(block, g.key) && inside(at, [g.at[0], g.at[1], g.size[0], g.size[1]]) {
             let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);
             let action = if right { 1 } else if shift { 2 } else { 0 };
             *button = Some(BUTTON_DROPPER + 4 * i as i32 + action);
@@ -27520,7 +27529,39 @@ fn dropper_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     let Some(g) = layout(&entity.id).and_then(|l| l.gauges.get(i).copied()) else {
         return true;
     };
-    let mut tank = get_tank(&entity.nbt, g.key, g.capacity);
+    // A multiblock's gauges show the tanks of its master port, whose capacities follow the size of the structure.
+    let multi = matches!(
+        kind(&entity.id),
+        Some(Kind::DynamicValve | Kind::BoilerValve | Kind::TurbineValve | Kind::FissionPort | Kind::FusionPort | Kind::SpsPort)
+    );
+    if multi && !dropper_gauge_is_tank(&entity.id, g.key) {
+        return true;
+    }
+    let remote = if multi { multiblock_master(entity, pos).flatten().filter(|m| *m != pos) } else { None };
+    let capacity_of = |e: &ModBlockEntity| match kind(&e.id) {
+        Some(Kind::DynamicValve) => dynamic_tank::capacity(get_long(&e.nbt, "volume")),
+        _ if g.capacity == 0 => multiblock_capacity(e, g.key),
+        _ => g.capacity,
+    };
+    let mut tank = match remote {
+        Some(m) => {
+            let Some(tank) = game.native_with_mod_block_entity(m, |e| get_tank(&e.nbt, g.key, capacity_of(e))) else {
+                return true;
+            };
+            tank
+        }
+        None => {
+            let capacity = if multi {
+                capacity_of(entity)
+            } else if g.key == "water" && kind(&entity.id) == Some(Kind::Evaporation) {
+                // The Thermal Evaporation Plant's input tank grows with its height.
+                evap::input_capacity(get_int(&entity.nbt, "height"))
+            } else {
+                g.capacity
+            };
+            get_tank(&entity.nbt, g.key, capacity)
+        }
+    };
     let rate = mekanism_core::config::gear_int("gauge_dropper.transferRate", 250).max(1);
     let load = |key: &str| item_tank(&carried, key, dropper_capacity()).unwrap_or_else(|| ChemicalTank::new(dropper_capacity()));
     // Which of the dropper's two tanks takes part: the one that fits the gauge's chemical, else the one holding something.
@@ -27555,7 +27596,12 @@ fn dropper_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
             dropper.extract(moved);
         }
     }
-    put_tank(&mut entity.nbt, g.key, &tank);
+    match remote {
+        Some(m) => {
+            game.native_with_mod_block_entity(m, |e| put_tank(&mut e.nbt, g.key, &tank));
+        }
+        None => put_tank(&mut entity.nbt, g.key, &tank),
+    }
     put_item_tank_key(&mut carried, key, &dropper);
     game.carried = Some(carried);
     true
