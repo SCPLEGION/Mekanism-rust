@@ -621,7 +621,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     TICKING.set(Some((pos, ticking)));
     let facing = game.native_block_property(pos, "facing").and_then(|f| direction(&f)).map_or(2, face_index);
     // A machine its redstone control holds back does nothing this tick and goes dark.
-    let allowed = tabs(&entity.id) & TAB_REDSTONE == 0 || redstone_allows(game, pos, entity);
+    // (The Assemblicator reads its own redstone: a pulse is stored in `pulseOperations`, and its buttons always work.)
+    let allowed = tabs(&entity.id) & TAB_REDSTONE == 0 || k == Kind::Assemblicator || redstone_allows(game, pos, entity);
     discharge_energy_slot(entity);
     let active = if !allowed {
         Some(false)
@@ -3246,7 +3247,15 @@ fn tick_oxidizer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
 
 /// The Nutritional Liquifier: food becomes nutritional paste (50 mB a point of nutrition) over 100 ticks at
 /// 8 FE a tick. Foods with a use remainder (a stew's bowl) leave it in the output slot.
+/// The items with a nutrition above zero, worked out once for the slot rules (which see no game).
+static LIQUIFIER_FOODS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
 fn tick_liquifier(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
+    LIQUIFIER_FOODS.get_or_init(|| {
+        let mut foods: Vec<String> = world_items!(game).items.iter().filter(|(_, i)| i.food.is_some_and(|(n, _)| n > 0)).map(|(id, _)| id.to_string()).collect();
+        foods.sort();
+        foods
+    });
     let capacity = chem::LIQUIFIER_USAGE * u64::from(chem::LIQUIFIER_TICKS);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
@@ -6311,6 +6320,25 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
         {
             let line = format!("Stored: {} mB {id}", tank.amount);
             lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+        }
+    }
+    // `FormulaComponent.addToTooltip`: the distinct ingredients in order of first use, with how many times each is used.
+    if &*stack.item == fa::FORMULA_ITEM
+        && let Some(text) = custom_data(stack).and_then(|c| get_string(c, "formula"))
+    {
+        let mut counted: Vec<(String, u32)> = Vec::new();
+        for id in fa::decode(&text).into_iter().flatten() {
+            match counted.iter_mut().find(|(i, _)| *i == id) {
+                Some((_, n)) => *n += 1,
+                None => counted.push((id, 1)),
+            }
+        }
+        if !counted.is_empty() {
+            let gray = horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF);
+            lines.push((horizon_client::text::Text::literal("Ingredients:".to_owned()), gray));
+            for (id, n) in counted {
+                lines.push((horizon_client::text::Text::literal(format!("{}: {n}", module_name(&id))), gray));
+            }
         }
     }
     // `REACTION_STARTER`'s tooltip, after the stored chemical.
@@ -9994,6 +10022,12 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
         if kind(block) == Some(Kind::DynamicValve) {
             rules[1] = SlotRule::Refuse;
         }
+        // The desk's slots (`SecurityInventorySlot`): the lock slot takes what can carry security, the unlock slot
+        // what already does.
+        if kind(block) == Some(Kind::SecurityDesk) {
+            rules[0] = SlotRule::Check(|s| item_security(s).is_some());
+            rules[1] = SlotRule::Check(|s| is_secure_item(&s.item));
+        }
         // `EnergyInventorySlot.drain` takes what can be charged, `fillOrConvert` what holds energy or turns into it.
         if kind(block) == Some(Kind::InductionPort) {
             rules[0] = energy();
@@ -10021,6 +10055,12 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
             && let Some(items) = OD_INPUT.get()
         {
             rules[0] = SlotRule::Items(items.clone());
+        }
+        // `NutritionalLiquifier`'s input slot takes food that heals (known once one has ticked).
+        if kind(block) == Some(Kind::Liquifier)
+            && let Some(foods) = LIQUIFIER_FOODS.get()
+        {
+            rules[0] = SlotRule::Items(foods.clone());
         }
         if kind(block) == Some(Kind::Assemblicator) {
             rules[fa::FORMULA_SLOT] = SlotRule::Items(vec![fa::FORMULA_ITEM.to_owned()]);
@@ -19910,6 +19950,15 @@ fn tick_assemblicator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let formula = asm_formula(game, entity);
+    // `canFunction`, and in pulse mode the pulses saved up (`pulseOperations`): each completed craft spends one.
+    let can_function = redstone_allows(game, pos, entity);
+    let pulse_mode = RedstoneControl::from_ordinal(get_int(&entity.nbt, "control")) == RedstoneControl::Pulse;
+    let mut pulses = get_int(&entity.nbt, "pulses");
+    if !pulse_mode {
+        pulses = 0;
+    } else if can_function {
+        pulses += 1;
+    }
     let mut auto = get_int(&entity.nbt, "auto") == 1;
     let mut stock = get_int(&entity.nbt, "stock") == 1;
     let mut progress = get_int(&entity.nbt, "progress");
@@ -19974,7 +20023,7 @@ fn tick_assemblicator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     }
     let mut used = false;
     let mut warn = 0;
-    if auto && let Some(f) = &formula {
+    if auto && let Some(f) = &formula && ((pulse_mode && pulses > 0) || can_function) {
         let mut can = true;
         if asm_craft(game, entity, Some(f)).is_none() {
             can = asm_move_to_grid(game, entity, f);
@@ -19983,6 +20032,7 @@ fn tick_assemblicator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
             if progress >= ticks_required {
                 if asm_single_craft(game, entity, Some(f)) {
                     progress = 0;
+                    pulses = pulses.saturating_sub(1);
                 }
             } else if energy.consume(per_tick) {
                 used = true;
@@ -20015,6 +20065,7 @@ fn tick_assemblicator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
     put_int(&mut entity.nbt, "progress", progress);
     put_int(&mut entity.nbt, "auto", u32::from(auto));
     put_int(&mut entity.nbt, "stock", u32::from(stock));
+    put_int(&mut entity.nbt, "pulses", pulses);
     put_int(&mut entity.nbt, "warn", warn);
     let mut client = Compound::new();
     for (k, v) in [("asm_auto", auto), ("asm_recipe", craft.is_some()), ("asm_valid", formula.is_some()), ("asm_stock", stock), ("asm_used", used), ("asm_encode", encodable)] {
@@ -20852,7 +20903,12 @@ const STN_CHANNEL: &str = "mekanism:modification_station";
 const STN_LIST: [f32; 4] = [28.0, 20.0, 120.0, 74.0];
 const STN_ROWS: usize = 6;
 const STN_REMOVE: [f32; 4] = [28.0, 96.0, 120.0, 17.0];
-const STN_KEYS: [&str; 2] = ["stn_item", "stn_mods"];
+const STN_KEYS: [&str; 3] = ["stn_item", "stn_mods", "stn_off"];
+/// The modules with an `ExclusiveFlag` (`ModuleData.isExclusive(ANY)`): their names are drawn in blue.
+const EXCLUSIVE_MODULES: [&str; 7] = [
+    "mekanism:farming_unit", "mekanism:shearing_unit", "mekanism:silk_touch_unit", "mekanism:fortune_unit",
+    "mekanism:teleportation_unit", "mekanism:jetpack_unit", "mekanism:gravitational_modulating_unit",
+];
 
 thread_local! {
     static STN_UI: std::cell::RefCell<StnUi> = std::cell::RefCell::new(StnUi::default());
@@ -20939,6 +20995,8 @@ fn tick_station(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity)
         client.insert("stn_item".into(), Tag::String(held.item.as_ref().into()));
         let listed: Vec<String> = installed_modules(held).into_iter().map(|(id, n)| format!("{id}={n}")).collect();
         client.insert("stn_mods".into(), Tag::String(listed.join(";").as_str().into()));
+        let off: Vec<String> = installed_modules(held).into_keys().filter(|id| !module_on(held, id)).collect();
+        client.insert("stn_off".into(), Tag::String(off.join(";").as_str().into()));
     }
     put_client(game, pos, entity, &STN_KEYS, client);
     Some(active)
@@ -21008,6 +21066,12 @@ fn draw_station(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, heig
     let cursor = game.native_cursor();
     let mouse = [cursor[0] - ox, cursor[1] - oy];
     let (item, installed) = stn_view(game).unwrap_or_default();
+    let disabled: Vec<String> = game
+        .container
+        .and_then(|(x, y, z)| game.native_client_block_entity([x, y, z]))
+        .and_then(|(_, c)| get_string(c, "stn_off"))
+        .map(|t| t.split(';').map(str::to_owned).collect())
+        .unwrap_or_default();
     let types = stn_types(&item);
     let title = game.native_screen_title().unwrap_or_default();
     centred(game, batch, &title, ox + 24.0, 152.0, oy + 4.0, 0x40_4040);
@@ -21042,7 +21106,15 @@ fn draw_station(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, heig
             sprite(game, batch, slot, [0.0, 0.0, 10.0, 10.0], [ox + row[0] + 1.0, oy + row[1] + 1.0, 10.0, 10.0]);
             game.native_item(batch, modules::MODULE_ITEM, [ox + row[0] + 2.0, oy + row[1] + 2.0], 8.0);
             if installed.contains_key(*id) {
-                game.native_text_scaled(batch, &module_name(id), [ox + lx + 13.0, oy + ly + 3.0 + 12.0 * i as f32], 0x40_4040, 0.7);
+                // `GuiModuleScrollList.drawName`: exclusive modules are blue, disabled ones darker (red when not exclusive).
+                let (exclusive, enabled) = (EXCLUSIVE_MODULES.contains(id), !disabled.iter().any(|d| d == id));
+                let color = match (exclusive, enabled) {
+                    (true, true) => 0x63_5BD4,
+                    (true, false) => 0x2E_2A69,
+                    (false, true) => 0x40_4040,
+                    (false, false) => 0x5E_1D1D,
+                };
+                game.native_text_scaled(batch, &module_name(id), [ox + lx + 13.0, oy + ly + 3.0 + 12.0 * i as f32], color, 0.7);
             }
         }
         let can = ui.selected.as_deref().is_some_and(|s| installed.contains_key(s));
