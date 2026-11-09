@@ -7086,6 +7086,82 @@ pub(super) fn item_bars(game: &Game<'_>, stack: &ItemStack, bar: &mut Option<(i3
     }
 }
 
+const MODE_SWITCH_TIMER: u32 = 100;
+
+thread_local! {
+    /// `MekanismStatusOverlay.modeSwitchTimer`, and the held item's mode text last seen with its slot.
+    static MODE_TIMER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static MODE_SEEN: std::cell::RefCell<Option<(usize, Vec<(String, u32)>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `IModeItem.getScrollTextComponent`: what a held mode item says about its mode.
+fn scroll_text(stack: &ItemStack) -> Option<Vec<(String, u32)>> {
+    let item: &str = &stack.item;
+    if item == DISASSEMBLER {
+        let mode = disassembler_mode(stack);
+        return Some(vec![(mode.label().to_owned(), 0x559EFF), (" (".into(), 0xFFFFFF), (mode.efficiency().to_string(), 0x55FFFF), (")".into(), 0xFFFFFF)]);
+    }
+    if item == CONFIGURATOR {
+        return Some(vec![(configurator_conf(stack).label().to_owned(), 0xD55ECB)]);
+    }
+    if item == flamethrower::ITEM {
+        return Some(vec![(flamethrower_mode(stack).label().to_owned(), 0xFFFFFF)]);
+    }
+    if modules::is_container(item) {
+        let (id, n) = mode_module(stack)?;
+        let settings = module_config::settings(&id, n);
+        let setting = settings.iter().find(|s| s.key != "enabled" && matches!(s.kind, module_config::Kind::Enum { .. })).or_else(|| settings.iter().find(|s| s.key == "enabled"))?;
+        let value = module_config::value_text(setting.kind, module_setting(stack, &id, setting, n));
+        return Some(vec![(format!("{}: {value}", module_name(&id)), 0xFFFFFF)]);
+    }
+    None
+}
+
+/// Each tick on the window: a change in the held mode item's mode (`MekanismStatusOverlay.setTimer`) starts the timer.
+fn mode_status_tick(game: &Game<'_>) {
+    let held = game.inventory.get(game.selected).cloned().flatten();
+    let text = held.as_ref().and_then(scroll_text);
+    MODE_SEEN.with_borrow_mut(|seen| {
+        match (&*seen, &text) {
+            (Some((slot, old)), Some(new)) if *slot == game.selected && old != new => MODE_TIMER.set(MODE_SWITCH_TIMER),
+            _ => {}
+        }
+        *seen = text.map(|t| (game.selected, t));
+    });
+    let timer = MODE_TIMER.get();
+    if timer > 1 {
+        MODE_TIMER.set(timer - 1);
+    }
+}
+
+/// `MekanismStatusOverlay`: for five seconds after a mode change the held item's mode text shows above the hotbar,
+/// fading out.
+fn mode_status_overlay(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    let timer = MODE_TIMER.get();
+    if timer <= 1 {
+        return;
+    }
+    let Some(parts) = MODE_SEEN.with_borrow(|seen| seen.as_ref().map(|(_, t)| t.clone())) else {
+        return;
+    };
+    let alpha = timer as f32 / MODE_SWITCH_TIMER as f32;
+    let width: f32 = parts.iter().map(|(t, _)| game.native_text_width(t)).sum();
+    let shift = if game.creative { 59.0 - 14.0 } else { 59.0 } + 13.0;
+    let (x, y) = ((batch.width - width) / 2.0, batch.height - shift);
+    let backdrop = (alpha * 0.25 * 255.0) as u32;
+    game.native_fill(batch, [x - 2.0, y - 2.0, width + 4.0, 12.0], backdrop << 24);
+    let start = batch.vertices.len();
+    let mut at = x;
+    for (text, rgb) in &parts {
+        game.native_text(batch, text, [at, y], *rgb, true);
+        at += game.native_text_width(text);
+    }
+    for v in &mut batch.vertices[start..] {
+        let a = ((v.color >> 24) as f32 * alpha) as u32;
+        v.color = (v.color & 0x00FF_FFFF) | (a << 24);
+    }
+}
+
 /// `MekaSuitEnergyLevel`: above the armour row, a bar of the energy the worn suit pieces hold together
 /// (`hudRenderMekaSuitEnergyBar`). One row of hearts is assumed for the height.
 fn suit_energy_level(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
@@ -7117,6 +7193,7 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch
     }
     radiation_overlay(game, batch);
     suit_energy_level(game, batch);
+    mode_status_overlay(game, batch);
     // `MekanismConfig.client.enableHUD`, flipped by the HUD key.
     if game.native_setting(MOD_ID, "enable_hud").as_deref() == Some("false") {
         return;
@@ -7346,6 +7423,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     }
     register_game_events();
     CLIENT_TICK.set(game.ticks as u64);
+    mode_status_tick(game);
     mode_keys(game);
     remote_player_sounds(game);
     loop_sounds(game);
