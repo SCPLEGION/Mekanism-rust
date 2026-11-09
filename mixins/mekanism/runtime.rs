@@ -25632,11 +25632,29 @@ pub(super) fn fog(game: &Game<'_>, fog_type: u8, fog: &mut horizon_client::fog::
     fog.environmental_end = far * (installed as f32).powf(1.25) / maximum as f32;
 }
 
-/// `GearConfig.mekaToolEnergyUsageShearEntity` (the trim of a block costs the same): FE a shearing takes.
+/// `GearConfig.mekaToolEnergyUsageShearEntity`: FE a shearing of a mob takes.
 const SHEAR_ENERGY: u64 = 10;
 
 fn shear_energy() -> u64 {
     mekanism_core::config::gear_int("mekatool.energy_usage.shearEntity", SHEAR_ENERGY)
+}
+
+/// `GearConfig.mekaToolEnergyUsageShearTrim`: FE a shearing of a block (a hive, a pumpkin) takes.
+fn shear_trim_energy() -> u64 {
+    mekanism_core::config::gear_int("mekatool.energy_usage.shearTrim", SHEAR_ENERGY)
+}
+
+/// `ModuleShearingUnit.onItemUse`: shearing a block takes `shearTrim`.
+pub(super) fn shears_trim(game: &mut Game<'_>, stack: &ItemStack) {
+    if &*stack.item != modules::MEKA_TOOL || !game.native_on(MOD_ID) {
+        return;
+    }
+    if let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == modules::MEKA_TOOL) {
+        let stored = stored_energy(held);
+        if stored >= shear_trim_energy() {
+            set_energy(held, stored - shear_trim_energy());
+        }
+    }
 }
 
 /// `ModuleShearingUnit.onInteract` / `onItemUse`: shearing takes `useAllEnergy` of the Meka-Tool's energy.

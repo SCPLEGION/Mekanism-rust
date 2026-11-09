@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "f059e437d78cf018498c436f5e0ec731d8ae7353"
+horizon_revision = "34d8aedf051c8e98e3933f0fd38eed4701c1f715"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -776,6 +776,17 @@ hook = "shears_used"
 hook_version = 1
 kind = "HEAD"
 helper = "shears_used.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+]
+
+[[injection]]
+id = "shears-trim"
+hook = "shears_trim"
+hook_version = 1
+kind = "HEAD"
+helper = "shears_trim.rs"
 bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
