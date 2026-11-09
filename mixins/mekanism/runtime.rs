@@ -6675,6 +6675,10 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch
         return;
     }
     radiation_overlay(game, batch);
+    // `MekanismConfig.client.enableHUD`, flipped by the HUD key.
+    if game.native_setting(MOD_ID, "enable_hud").as_deref() == Some("false") {
+        return;
+    }
     let (width, height) = (batch.width, batch.height);
     let gray = 0xCFCFCF;
     let dark = 0x7A7A7A;
@@ -6898,6 +6902,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
         return;
     }
     register_game_events();
+    mode_keys(game);
     loop_sounds(game);
     player_sounds(game);
     gravitational_client(game);
@@ -7012,6 +7017,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     }
     if channel == ROBIT_CHANNEL && game.native_on(MOD_ID) {
         robit_op_payload(game, data);
+        return;
+    }
+    if channel == MODE_SLOT_CHANNEL && game.native_on(MOD_ID) {
+        suit_mode_change(game, data);
         return;
     }
     if channel == BOOST_CHANNEL && game.native_on(MOD_ID) {
@@ -24799,7 +24808,12 @@ fn gravitational_boost_paid(game: &mut Game<'_>) {
 }
 
 /// Mekanism's keys (`MekanismKeyHandler`): name, label and default; Options > Mods lets the player rebind them.
-const KEYS: [[&str; 3]; 4] = [
+const KEYS: [[&str; 3]; 9] = [
+    ["head_mode", "Head Mode Change", "key.keyboard.v"],
+    ["chest_mode", "Chest Mode Change", "key.keyboard.g"],
+    ["legs_mode", "Legs Mode Change", "key.keyboard.j"],
+    ["feet_mode", "Feet Mode Change", "key.keyboard.b"],
+    ["hud", "Toggle HUD", "key.keyboard.h"],
     ["mode", "Mode Change (hold, then the wheel)", "key.keyboard.m"],
     ["module_tweaker", "Module Tweaker", "key.keyboard.backslash"],
     ["radial", "Radial Selector", "key.keyboard.n"],
@@ -24822,6 +24836,97 @@ pub(super) fn list_mod(_game: &mut Game<'_>, mods: &mut Vec<super::native_hooks:
         description: "Mekanism ported to Rust: machines, generators, the MekaSuit and more.".to_owned(),
         keys: KEYS.iter().map(|k| k.map(str::to_owned)).collect(),
     });
+}
+
+/// The module a worn piece's mode key changes (`IModuleContainerItem.changeMode`): the first installed one that handles the
+/// mode key. One with a mode setting (an enum) needs to be on; one without only toggles on and off.
+fn mode_module(stack: &ItemStack) -> Option<(String, u32)> {
+    for (id, n) in installed_modules(stack) {
+        let settings = module_config::settings(&id, n);
+        let Some(handles) = settings.iter().find(|s| s.key == "handle_mode_change") else {
+            continue;
+        };
+        if module_setting(stack, &id, handles, n) == 0 {
+            continue;
+        }
+        let enabled = settings.iter().find(|s| s.key == "enabled").is_none_or(|e| module_setting(stack, &id, e, n) != 0);
+        let has_mode = settings.iter().any(|s| s.key != "enabled" && matches!(s.kind, module_config::Kind::Enum { .. }));
+        if enabled || !has_mode {
+            return Some((id, n));
+        }
+    }
+    None
+}
+
+const MODE_SLOT_CHANNEL: &str = "mekanism:suit_mode";
+
+thread_local! {
+    static MODE_KEYS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static HUD_KEY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `MekanismKeyHandler`'s head, chest, legs and feet keys (`handlePotentialModeItem`): a press asks the server to change the
+/// mode of the worn piece, with the hydraulic sound, and the HUD key flips `enableHUD`.
+fn mode_keys(game: &mut Game<'_>) {
+    if game.native_ui_open().is_some() {
+        return;
+    }
+    let mut now = 0u8;
+    for (i, name) in ["head_mode", "chest_mode", "legs_mode", "feet_mode"].into_iter().enumerate() {
+        if key_down(game, name) {
+            now |= 1 << i;
+        }
+    }
+    let pressed = now & !MODE_KEYS.replace(now);
+    for slot in 0..4u8 {
+        if pressed & (1 << slot) != 0 && game.armor[slot as usize].as_ref().is_some_and(|s| mode_module(s).is_some()) {
+            let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+            game.native_send_to_server(MODE_SLOT_CHANNEL, &[slot, u8::from(shift)]);
+            game.audio.play_unshared("mekanism:item.hydraulic", None, 1.0, 1.0);
+        }
+    }
+    let hud = key_down(game, "hud");
+    if hud && !HUD_KEY.replace(hud) {
+        let on = game.native_setting(MOD_ID, "enable_hud").as_deref() != Some("false");
+        game.native_set_setting(MOD_ID, "enable_hud", if on { "false" } else { "true" });
+    } else if !hud {
+        HUD_KEY.set(false);
+    }
+}
+
+/// Server side, the player swapped in: the worn piece's mode changes by one step (the sneaking player steps back) and the
+/// action bar tells the new one.
+fn suit_mode_change(game: &mut Game<'_>, data: &[u8]) {
+    let (Some(&slot), Some(&back)) = (data.first(), data.get(1)) else {
+        return;
+    };
+    let Some(stack) = game.armor.get_mut(slot as usize).and_then(Option::as_mut).filter(|s| modules::is_container(&s.item)) else {
+        return;
+    };
+    let Some((id, n)) = mode_module(stack) else {
+        return;
+    };
+    let settings = module_config::settings(&id, n);
+    let (setting, text) = match settings.iter().find(|s| s.key != "enabled" && matches!(s.kind, module_config::Kind::Enum { .. })) {
+        Some(s) => {
+            let count = module_config::choices(s.kind, n).max(1) as u32;
+            let now = module_setting(stack, &id, s, n);
+            let next = if back != 0 { (now + count - 1) % count } else { (now + 1) % count };
+            (s, (next, module_config::value_text(s.kind, next)))
+        }
+        None => {
+            let Some(s) = settings.iter().find(|s| s.key == "enabled") else {
+                return;
+            };
+            let next = u32::from(module_setting(stack, &id, s, n) == 0);
+            (s, (next, module_config::value_text(s.kind, next)))
+        }
+    };
+    tw_set(stack, &id, setting, n, text.0);
+    let line = format!("{}: {}", id.trim_start_matches("mekanism:").replace('_', " "), text.1);
+    if let Some(player) = game.native_acting_player() {
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
+    }
 }
 
 /// `GearConfig.mekaSuitEnergyUsageGravitationalModulation`.
