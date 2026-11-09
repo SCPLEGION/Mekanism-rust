@@ -3013,7 +3013,7 @@ fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, 
 thread_local! {
     /// The block entity being ticked and its side configuration. `push_energy` and `push_chemical` are
     /// called with the ticking block's containers taken out of its NBT, so they read its sides here.
-    static TICKING: std::cell::Cell<Option<([i32; 3], [Sides; 3])>> = const { std::cell::Cell::new(None) };
+    static TICKING: std::cell::Cell<Option<([i32; 3], [Sides; 5])>> = const { std::cell::Cell::new(None) };
 }
 
 /// The faces' modes for one transmission type.
@@ -3057,6 +3057,19 @@ fn gives_out(pos: [i32; 3], d: [i32; 3], t: Transmission) -> bool {
         Some((at, sides)) if at == pos => sides[t as usize].get(face_index(d)).gives_out(),
         _ => true,
     }
+}
+
+/// Whether the block at `pos`, ticking now, takes in `t` through its face `d`, by its side configuration.
+fn takes_in_ticking(pos: [i32; 3], d: [i32; 3], t: Transmission) -> bool {
+    match TICKING.get() {
+        Some((at, sides)) if at == pos => sides[t as usize].get(face_index(d)).takes_in(),
+        _ => true,
+    }
+}
+
+/// The type a chemical tank's content travels as: a fluid or a chemical.
+fn tank_transmission(content: &str) -> Transmission {
+    if FLUIDS.contains(&content) { Transmission::Fluid } else { Transmission::Chemical }
 }
 
 /// Whether a receiver takes in `t` through its face `back` (the one facing the giver).
@@ -3126,6 +3139,10 @@ pub(super) fn configure_side(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3])
     }
     let mode = game.native_with_mod_block_entity(pos, |m| {
         kind(&m.id)?;
+        // A block only has the types its side configuration lists (`TileComponentConfig.getConfig`).
+        if !transmissions(&m.id).contains(&t) {
+            return None;
+        }
         let mut sides = sides_of(&m.nbt, t);
         let mode = sides.cycle(face_index(face));
         put_long(&mut m.nbt, t.key(), u64::from(sides.0));
@@ -3190,19 +3207,20 @@ fn push_chemical(
 ) {
     let mut budget = rate;
     for (_, d) in DIRECTIONS {
-        if only.is_some_and(|o| o != d) || !gives_out(pos, d, Transmission::Chemical) {
-            continue;
-        }
         let Some(chemical) = from.chemical.clone() else {
             return;
         };
+        let kind_of = tank_transmission(&chemical);
+        if only.is_some_and(|o| o != d) || !gives_out(pos, d, kind_of) {
+            continue;
+        }
         let offer = from.amount.min(budget);
         if offer == 0 {
             return;
         }
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
         let taken = game.native_with_mod_block_entity(at, |m| {
-            if !takes_in(&m.nbt, [-d[0], -d[1], -d[2]], Transmission::Chemical) {
+            if !takes_in(&m.nbt, [-d[0], -d[1], -d[2]], kind_of) {
                 return 0;
             }
             let Some((key, capacity)) = chemical_receiver(&m.id, &m.nbt, &chemical, from_tube, d) else {
@@ -5488,6 +5506,9 @@ fn pull_from_carriers(game: &mut Game<'_>, pos: [i32; 3], into: &mut ChemicalTan
         let room = into.capacity - into.amount;
         if room == 0 || !into.accepts(fluid) {
             return gained;
+        }
+        if !takes_in_ticking(pos, d, if is_fluid { Transmission::Fluid } else { Transmission::Chemical }) {
+            continue;
         }
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
         let taken = game.native_with_mod_block_entity(at, |m| {
@@ -9327,7 +9348,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
             for t in Transmission::ALL {
                 entity.data.push(sides_of(&entity.nbt, t).relative(facing) as i32);
             }
-            entity.data.push((get_int(&entity.nbt, "no_eject") & 7) as i32);
+            entity.data.push((get_int(&entity.nbt, "no_eject") & 31) as i32);
         }
         // Then a factory's progress on each process, as the height of its arrow (0 to 20).
         if let Some(Kind::Factory(n, _, usage)) = kind(&entity.id) {
@@ -9784,6 +9805,12 @@ fn transmissions(block: &str) -> &'static [Transmission] {
     match kind(block) {
         Some(Kind::Machine(..) | Kind::Factory(..) | Kind::EnergyCube(_) | Kind::ModificationStation) => &[Transmission::Item, Transmission::Energy],
         Some(Kind::ChemicalTank(_)) => &[Transmission::Item, Transmission::Chemical],
+        // The orders of `MekanismBlockTypes.withSideConfig`.
+        Some(Kind::Reaction) => &[Transmission::Item, Transmission::Chemical, Transmission::Fluid, Transmission::Energy],
+        Some(Kind::Washer | Kind::Rotary) => &[Transmission::Chemical, Transmission::Fluid, Transmission::Item, Transmission::Energy],
+        Some(Kind::Separator) => &[Transmission::Fluid, Transmission::Chemical, Transmission::Item, Transmission::Energy],
+        Some(Kind::Liquifier) => &[Transmission::Item, Transmission::Fluid, Transmission::Energy],
+        Some(Kind::Entangloporter) => &[Transmission::Item, Transmission::Fluid, Transmission::Chemical, Transmission::Energy, Transmission::Heat],
         _ => &[Transmission::Item, Transmission::Chemical, Transmission::Energy],
     }
 }
@@ -9794,6 +9821,8 @@ fn transmission_look(t: Transmission) -> (&'static str, &'static str, u32) {
         Transmission::Item => ("Items", "transmission/items", 0xFFCF_CFCF),
         Transmission::Chemical => ("Chemicals", "transmission/chemicals", 0xFFFF_DD4F),
         Transmission::Energy => ("Energy", "transmission/energy", 0xFF59_C15F),
+        Transmission::Fluid => ("Fluids", "transmission/fluids", 0xFF36_6BD0),
+        Transmission::Heat => ("Heat", "transmission/heat", 0xFFFF_A160),
     }
 }
 
@@ -9813,10 +9842,10 @@ const WINDOW_SCREEN: [f32; 4] = [38.0, 25.0, 80.0, 12.0];
 const SIDE_BUTTONS: [[f32; 2]; 6] = [[67.0, 69.0], [44.0, 69.0], [90.0, 69.0], [44.0, 92.0], [67.0, 46.0], [67.0, 92.0]];
 
 /// The menu buttons the window sends: a face (200 + 16 × type + 2 × side, + 1 for a right click),
-/// auto-eject (260 + type), and the clear button (270 + 2 × type, + 1 for a right click).
+/// auto-eject (280 + type), and the clear button (285 + 2 × type, + 1 for a right click).
 const BUTTON_SIDE: i32 = 200;
-const BUTTON_EJECT: i32 = 260;
-const BUTTON_CLEAR: i32 = 270;
+const BUTTON_EJECT: i32 = 280;
+const BUTTON_CLEAR: i32 = 285;
 
 /// A rectangle of the window in the screen's coordinates.
 fn in_window(r: [f32; 4]) -> [f32; 4] {
@@ -9828,7 +9857,7 @@ fn window_type_tabs(block: &str, shown: usize) -> Vec<(usize, [f32; 4])> {
     transmissions(block)
         .iter()
         .enumerate()
-        .filter(|(i, _)| *i != shown && *i < 4)
+        .filter(|(i, _)| *i != shown && *i < 5)
         .map(|(i, _)| (i, in_window([-26.0, 2.0 + 28.0 * i as f32, 26.0, 26.0])))
         .collect()
 }
@@ -9838,7 +9867,7 @@ fn window_type_tabs(block: &str, shown: usize) -> Vec<(usize, [f32; 4])> {
 fn window_sides(l: &Layout, data: &[i32], t: Transmission) -> (u32, bool) {
     let at = redstone_slot(l) + 1;
     let packed = data.get(at + t as usize).copied().unwrap_or(0).max(0) as u32;
-    let no_eject = data.get(at + 3).copied().unwrap_or(0).max(0) as u32 & (1 << t as u32) != 0;
+    let no_eject = data.get(at + Transmission::ALL.len()).copied().unwrap_or(0).max(0) as u32 & (1 << t as u32) != 0;
     (packed, no_eject)
 }
 
@@ -10486,7 +10515,7 @@ fn window_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<Strin
 /// previous mode (`PacketSideData`), a type's auto-eject (`PacketEjectConfiguration`), or every face
 /// of a type at once (`PacketBatchConfiguration`). False for any other button.
 fn window_button(game: &Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id: i32) -> bool {
-    if tabs(&entity.id) & TAB_SIDES == 0 || !(BUTTON_SIDE..BUTTON_CLEAR + 6).contains(&id) {
+    if tabs(&entity.id) & TAB_SIDES == 0 || !(BUTTON_SIDE..BUTTON_CLEAR + 10).contains(&id) {
         return false;
     }
     let facing = game.native_block_property(pos, "facing").and_then(|f| direction(&f)).map_or(2, face_index);
@@ -18843,7 +18872,7 @@ fn miner_cfg_escape(consumed: &mut bool) {
 
 /// Where the ejector's data starts after the screen's redstone slot (after the factory's progress and
 /// sorting slots).
-const EJECTOR_AT: usize = 5 + 10;
+const EJECTOR_AT: usize = 7 + 10;
 const TRANSPORTER_WINDOW: [f32; 4] = [10.0, 15.0, 156.0, 119.0];
 const TRANSPORTER_SCREEN: [f32; 4] = [38.0, 15.0, 80.0, 12.0];
 const TRANSPORTER_STRICT: [f32; 4] = [136.0, 6.0, 14.0, 14.0];

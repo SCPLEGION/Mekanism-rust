@@ -61,13 +61,15 @@ pub const VEIN_MINING: &str = "mekanism:vein_mining_unit";
 /// The Configurator's radial (`IRadialModeItem`): `ConfMode`'s modes, `value` the index in `ConfMode::ALL`.
 pub const CONFIGURATOR: &str = "mekanism:configurator";
 
-const CONFIGURATOR_MODES: [Slice; 6] = [
+const CONFIGURATOR_MODES: [Slice; 8] = [
     s("Configurate (Items)", "transmission/items", GREEN, 0),
-    s("Configurate (Chemicals)", "transmission/chemicals", GREEN, 1),
-    s("Configurate (Energy)", "transmission/energy", GREEN, 2),
-    s("Empty", "empty", DARK_RED, 3),
-    s("Rotate", "rotate", YELLOW, 4),
-    s("Wrench", "wrench", PINK, 5),
+    s("Configurate (Fluids)", "transmission/fluids", GREEN, 1),
+    s("Configurate (Chemicals)", "transmission/chemicals", GREEN, 2),
+    s("Configurate (Energy)", "transmission/energy", GREEN, 3),
+    s("Configurate (Heat)", "transmission/heat", GREEN, 4),
+    s("Empty", "empty", DARK_RED, 5),
+    s("Rotate", "rotate", YELLOW, 6),
+    s("Wrench", "wrench", PINK, 7),
 ];
 
 /// The Atomic Disassembler's own radial (`IRadialModeItem`): its modes, standing in for a module of the same id.
