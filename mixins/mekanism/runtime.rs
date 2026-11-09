@@ -4037,20 +4037,40 @@ fn tick_separator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     drain_tank_into_item(entity, 4, &mut right);
     let warn = if fluid.amount > 0 && (left.amount >= left.capacity || right.amount >= right.capacity) { 4 } else { 0 };
     put_int(&mut entity.nbt, "warn", warn);
-    let active = chem::separate(&mut fluid, &mut left, &mut right, &mut energy);
-    push_chemical(game, pos, &mut left, None, u64::MAX, false);
-    push_chemical(game, pos, &mut right, None, u64::MAX, false);
+    let (mode_left, mode_right) = (get_int(&entity.nbt, "dump_left") % 3, get_int(&entity.nbt, "dump_right") % 3);
+    // `canFunction`: not while both tanks dump their excess and both are at the level they keep.
+    let keep = config_double("general", "auto_eject", "dumpExcessKeepRatio", 0.85).clamp(0.001, 1.0);
+    let at_target = |t: &ChemicalTank| t.amount >= (t.capacity as f64 * keep) as u64;
+    let can_function = mode_left != 1 || mode_right != 1 || !at_target(&left) || !at_target(&right);
+    let active = can_function && chem::separate(&mut fluid, &mut left, &mut right, &mut energy);
+    // `handleTank`: `ChemicalUtils.dump` at 8 mB a tick per speed upgrade doubling, or the excess over the kept level.
+    let dump_rate = 8u64 << upgrades(&entity.nbt).get(Upgrade::Speed).min(20);
+    let eject = config_int("general", "auto_eject", "chemical", 1_024).max(1) as u64;
+    for (tank, mode) in [(&mut left, mode_left), (&mut right, mode_right)] {
+        if mode == 0 || tank.amount == 0 {
+            continue;
+        }
+        let to_dump = if mode == 2 {
+            dump_rate
+        } else {
+            let target = (tank.capacity as f64 * keep) as u64;
+            if target < tank.amount { (tank.amount - target).min(eject) } else { 0 }
+        };
+        tank.extract(to_dump);
+    }
+    // `setCanTankEject`: a tank that dumps does not eject.
+    if mode_left != 2 {
+        push_chemical(game, pos, &mut left, None, u64::MAX, false);
+    }
+    if mode_right != 2 {
+        push_chemical(game, pos, &mut right, None, u64::MAX, false);
+    }
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_tank(&mut entity.nbt, "fluid", &fluid);
     put_tank(&mut entity.nbt, "left", &left);
     put_tank(&mut entity.nbt, "right", &right);
-    // The flame shows the fluid, the arrow the left gas tank.
-    entity.data = vec![
-        (fluid.amount * 1000 / chem::SEPARATOR_FLUID) as i32,
-        1000,
-        (left.amount * 1000 / chem::SEPARATOR_GAS) as i32,
-        1000,
-    ];
+    // The two dump modes, then the arrow (full while it works).
+    entity.data = vec![mode_left as i32, mode_right as i32, if active { 1000 } else { 0 }, 1000];
     Some(active)
 }
 
@@ -9533,7 +9553,8 @@ fn layout(block: &str) -> Option<Layout> {
                 gauge("right", chem::SEPARATOR_GAS, 100.0, 18.0, SMALL),
             ],
             power: Some(PowerBar::Vertical([164.0, 15.0])),
-            progress: None,
+            // `GuiProgress(tile::getActive, ProgressType.BI, 80, 30)`.
+            progress: Some(([80.0, 30.0], "progress/bidirectional", [16.0, 6.0])),
         },
         // TileEntityEnergyCube: an item there charges from the cube on the right (our slot 0) and
         // gives the cube its energy on the left (our slot 1).
@@ -9754,10 +9775,11 @@ fn layout(block: &str) -> Option<Layout> {
             power: None,
             progress: None,
         },
+        // GuiSeismicVibrator: the vertical power bar (164, 15) and the energy slot (143, 35).
         Kind::Vibrator => Layout {
             slots: [Some(([143.0, 35.0], "slot/power")), None, None],
             gauges: vec![],
-            power: Some(PowerBar::Gauge([55.0, 18.0])),
+            power: Some(PowerBar::Vertical([164.0, 15.0])),
             progress: None,
         },
         // `GuiInductionMatrix`: the medium energy gauge, and the two slots in the element holder (the stats
@@ -12053,6 +12075,8 @@ fn buttons(block: &str) -> &'static [([f32; 4], &'static str)] {
         // `GuiGasMode`: the steam dump mode, a 10 px image button.
         Some(Kind::TurbineValve) => &[([173.0, 72.0, 10.0, 10.0], "")],
         Some(Kind::ChemicalTank(_)) => &[([159.0, 72.0, 10.0, 10.0], "")],
+        // `GuiGasMode` x 2: the left tank's dump mode and the right's.
+        Some(Kind::Separator) => &[([7.0, 72.0, 10.0, 10.0], ""), ([159.0, 72.0, 10.0, 10.0], "")],
         // `GuiDumpButton`: empties the infusion tank.
         Some(Kind::Infuser) => &[([16.0, 59.0, 21.0, 10.0], "")],
         // The chemical factories' dump button (at 182 in the ultimate one).
@@ -12225,6 +12249,13 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
     // The security tab (`GuiInteraction.NEXT_SECURITY_MODE` / `PREVIOUS_SECURITY_MODE`).
     if matches!(id, BUTTON_SECURITY_NEXT | BUTTON_SECURITY_PREVIOUS) && tabs(&entity.id) & TAB_SECURITY != 0 {
         sec_step(game, entity, id == BUTTON_SECURITY_NEXT);
+        return;
+    }
+    // `TileEntityElectrolyticSeparator.nextMode(tank)`.
+    if matches!(id, 0 | 1) && kind(&entity.id) == Some(Kind::Separator) {
+        let key = if id == 0 { "dump_left" } else { "dump_right" };
+        let next = (get_int(&entity.nbt, key) + 1) % 3;
+        put_int(&mut entity.nbt, key, next);
         return;
     }
     // `GasMode.getNext` on the chemical tank's button.
@@ -12593,6 +12624,8 @@ fn extras(block: &str) -> Extras {
         // `GuiTexturedElement.downArrow(imageWidth + 8, 91)` between the washer's two fluid slots.
         Some(Kind::Washer) => Extras { active_progress: vec![large(64.0, 39.0)], arrows: vec![[184.0, 91.0]], ..none },
         Some(Kind::Heater) => Extras { screen: Some([48.0, 23.0, 80.0, 42.0]), ..none },
+        // `GuiSeismicVibrator`: the screen with "Vibrating" or "Idle" and the chunk it stands in.
+        Some(Kind::Vibrator) => Extras { screen: Some([16.0, 23.0, 112.0, 40.0]), ..none },
         // `GuiDynamicTank`: the screen, and the arrow from the container slot to the output.
         Some(Kind::DynamicValve) => Extras { screen: Some([49.0, 21.0, 84.0, 46.0]), arrows: vec![[150.0, 39.0]], ..none },
         // `GuiInductionMatrix`: the same screen, no arrow.
@@ -13617,6 +13650,15 @@ fn draw_extras(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block
     }
     if let Some([x, y, w, h]) = e.screen {
         nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [ox + x, oy + y, w, h], 0xFFFF_FFFF);
+        if kind(block) == Some(Kind::Vibrator) {
+            // `GuiInnerScreen.defaultFormat`: 5 px in, 0.8 scale, 2 px between the lines, centred upright.
+            let (cx, cz) = game.container.map_or((0, 0), |(px, _, pz)| (px.div_euclid(16), pz.div_euclid(16)));
+            let lines = [if lit { "Vibrating".to_owned() } else { "Idle".to_owned() }, format!("Chunk: {cx}, {cz}")];
+            let top = ((h - (9.0 * 2.0 + 2.0)) / 2.0).floor();
+            for (i, line) in lines.iter().enumerate() {
+                game.native_text_scaled(batch, line, [ox + x + 5.0, oy + y + top + 11.0 * i as f32], 0x3C_FE9A, 0.8);
+            }
+        }
         for (i, line) in screen_lines(block, data).iter().enumerate() {
             // `GuiInnerScreen`'s default format is centred lines at 0.8 scale with 2 px of spacing;
             // the evaporation screen clears the spacing. The others here keep their own plain style.
@@ -14073,6 +14115,19 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     let text_x = if l.gauges.len() > 2 { 50.0 } else { 30.0 };
     for (i, line) in multiblock_lines(block, data).iter().enumerate() {
         game.native_text(batch, line, [ox + text_x, oy + 16.0 + 10.0 * i as f32], 0x40_4040, false);
+    }
+    if kind(block) == Some(Kind::Separator) {
+        // `GuiGasMode`: the icon, and the mode's name beside it (right of the left button, left of the right one).
+        for (i, x) in [7.0_f32, 159.0].into_iter().enumerate() {
+            let (sprite_name, text) = match data.get(i).copied().unwrap_or(0) {
+                1 => ("chemical_mode/dump_excess", "Dumping Excess"),
+                2 => ("chemical_mode/dump", "Dumping"),
+                _ => ("chemical_mode/idle", "Idle"),
+            };
+            sprite(game, batch, sprite_name, [0.0, 0.0, 10.0, 10.0], [ox + x, oy + 72.0, 10.0, 10.0]);
+            let text_x = if i == 0 { x + 12.0 } else { x - 2.0 - game.native_text_width(text) };
+            game.native_text(batch, text, [ox + text_x, oy + 73.0], 0x40_4040, false);
+        }
     }
     if kind(block) == Some(Kind::TurbineValve) && data.first().copied().unwrap_or(0) > 0 {
         let mode = data.get(3).copied().unwrap_or(0);
