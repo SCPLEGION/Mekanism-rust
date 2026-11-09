@@ -9,11 +9,31 @@ pub const BASELINE: f64 = 0.000_000_100;
 pub const MIN_MAGNITUDE: f64 = 0.000_010;
 /// `GeneralConfig.radiationSourceDecayRate` and `radiationTargetDecayRate`.
 pub const SOURCE_DECAY_RATE: f64 = 0.9995;
+
+/// `sourceDecayRate` of the open world's config (`SOURCE_DECAY_RATE` is its default).
+pub fn source_decay_rate() -> f64 {
+    crate::config_files::active_double("general", "radiation", "sourceDecayRate", SOURCE_DECAY_RATE)
+}
 pub const TARGET_DECAY_RATE: f64 = 0.9995;
+
+/// `targetDecayRate` of the open world's config (`TARGET_DECAY_RATE` is its default).
+pub fn target_decay_rate() -> f64 {
+    crate::config_files::active_double("general", "radiation", "targetDecayRate", TARGET_DECAY_RATE)
+}
 /// `GeneralConfig.radiationNegativeEffectsMinSeverity`.
 pub const NEGATIVE_EFFECTS_MIN_SEVERITY: f64 = 0.1;
+
+/// `negativeEffectsMinSeverity` of the open world's config (`NEGATIVE_EFFECTS_MIN_SEVERITY` is its default).
+pub fn negative_effects_min_severity() -> f64 {
+    crate::config_files::active_double("general", "radiation", "negativeEffectsMinSeverity", NEGATIVE_EFFECTS_MIN_SEVERITY)
+}
 /// `GeneralConfig.radiationChunkCheckRadius`, in blocks (a source is looked for within 5 chunks).
 pub const MAX_BLOCK_RANGE: i32 = 5 * 16;
+
+/// `chunkCheckRadius` of the open world's config, in blocks.
+pub fn max_block_range() -> i32 {
+    crate::config_files::active_int("general", "radiation", "chunkCheckRadius", 5).clamp(1, 100) as i32 * 16
+}
 
 /// `RadiationScale`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -179,7 +199,7 @@ impl Sources {
         let mut level = BASELINE;
         let mut max = BASELINE;
         for (at, magnitude) in &self.map {
-            if (0..3).any(|i| (at[i] - pos[i]).abs() > MAX_BLOCK_RANGE) {
+            if (0..3).any(|i| (at[i] - pos[i]).abs() > max_block_range()) {
                 continue;
             }
             let d: i64 = (0..3).map(|i| i64::from(at[i] - pos[i]).pow(2)).sum();
@@ -192,7 +212,7 @@ impl Sources {
     /// `decay`: every source loses a little; the ones below the minimum go. True when any source changed.
     pub fn decay(&mut self) -> bool {
         for magnitude in self.map.values_mut() {
-            *magnitude *= SOURCE_DECAY_RATE;
+            *magnitude *= source_decay_rate();
         }
         self.map.retain(|_, m| *m >= MIN_MAGNITUDE);
         !self.map.is_empty()
@@ -300,8 +320,8 @@ mod tests {
 
     #[test]
     fn decay_time_counts_seconds_in_ticks() {
-        assert_eq!(decay_ticks(MIN_MAGNITUDE, SOURCE_DECAY_RATE), 0);
-        assert!(decay_ticks(1.0, SOURCE_DECAY_RATE) > 20 * 10_000);
+        assert_eq!(decay_ticks(MIN_MAGNITUDE, source_decay_rate()), 0);
+        assert!(decay_ticks(1.0, source_decay_rate()) > 20 * 10_000);
     }
 
     #[test]

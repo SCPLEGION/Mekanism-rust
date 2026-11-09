@@ -3424,7 +3424,7 @@ fn tick_liquifier(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     let recipe = entity.items.first().cloned().flatten().and_then(|stack| {
         let info = items.get(&stack.item)?;
         let nutrition = info.food.map(|(n, _)| n).filter(|n| *n > 0)?;
-        Some((stack, u64::from(nutrition) * chem::PASTE_PER_NUTRITION, info.use_remainder.clone()))
+        Some((stack, u64::from(nutrition) * chem::paste_per_nutrition(), info.use_remainder.clone()))
     });
     let out = entity.items.get(2).cloned().flatten();
     let fits = |paste: u64, remainder: &Option<String>| {
@@ -5937,7 +5937,7 @@ fn receiver(id: &str, nbt: &Compound, facing_away: bool, from_cable: bool) -> Op
         Kind::Infuser => Some((usage_of("infusing", chem::INFUSER_USAGE) * u64::from(chem::INFUSER_TICKS), u64::MAX)),
         Kind::Painting => Some((usage_const("paintingMachine", chem::PAINTING_USAGE) * u64::from(chem::PAINTING_TICKS), u64::MAX)),
         // An SPS port takes energy in input mode (`TileEntitySPSPort`).
-        Kind::SpsPort if get_long(nbt, "output") == 0 => Some((sps::PORT_STORAGE, u64::MAX)),
+        Kind::SpsPort if get_long(nbt, "output") == 0 => Some((sps::port_storage(), u64::MAX)),
         Kind::DigitalMiner => {
             Some((mekanism_core::miner::STORAGE.max(miner_usage(nbt)), u64::MAX))
         }
@@ -7463,11 +7463,11 @@ fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
             if calm { REGULAR } else if magnitude < 0.1 { 0xFFDD4F } else { 0xFF383C }
         };
         if on("mekanism:geiger_unit") {
-            let text = decay_text(radiation::display(level, "Sv", 2), level > radiation::BASELINE, max, radiation::SOURCE_DECAY_RATE);
+            let text = decay_text(radiation::display(level, "Sv", 2), level > radiation::BASELINE, max, radiation::source_decay_rate());
             elements.push(("geiger_counter", text, tone(true, level)));
         }
         if on("mekanism:dosimeter_unit") {
-            let text = decay_text(radiation::display(dose, "Sv", 2), dose > radiation::MIN_MAGNITUDE, dose, radiation::TARGET_DECAY_RATE);
+            let text = decay_text(radiation::display(dose, "Sv", 2), dose > radiation::MIN_MAGNITUDE, dose, radiation::target_decay_rate());
             elements.push(("dosimeter", text, tone(false, dose)));
         }
     }
@@ -9683,8 +9683,8 @@ fn layout(block: &str) -> Option<Layout> {
         Kind::SpsPort => Layout {
             slots: [None; 3],
             gauges: vec![
-                gauge("input", sps::INPUT_CAPACITY, 7.0, 17.0, STANDARD),
-                gauge("output", sps::OUTPUT_CAPACITY, 151.0, 17.0, STANDARD),
+                gauge("input", sps::input_capacity(), 7.0, 17.0, STANDARD),
+                gauge("output", sps::output_capacity(), 151.0, 17.0, STANDARD),
                 // `lastProcessed` in thousandths of a mB (never drawn).
                 gauge("stats_a", 1 << 58, 0.0, 0.0, SMALL),
             ],
@@ -11348,7 +11348,7 @@ fn wrap(game: &Game<'_>, text: &str, width: f32, scale: f32) -> Vec<String> {
 /// power of installed / max, to two places.
 fn upgrade_effect(u: Upgrade, installed: u32) -> Option<String> {
     (u.max() > 1).then(|| {
-        let effect = mekanism_core::upgrades::MAX_UPGRADE_MULTIPLIER.powf(f64::from(installed) / f64::from(u.max()));
+        let effect = mekanism_core::upgrades::max_upgrade_multiplier().powf(f64::from(installed) / f64::from(u.max()));
         format!("Effect: {}x", (effect * 100.0).round() / 100.0)
     })
 }
@@ -14900,8 +14900,8 @@ fn find_sps(game: &Game<'_>, start: [i32; 3]) -> Option<(Vec<[i32; 3]>, Vec<[i32
 
 fn sps_of(nbt: &Compound) -> sps::Sps {
     sps::Sps {
-        input: get_tank(nbt, "input", sps::INPUT_CAPACITY).amount,
-        output: get_tank(nbt, "output", sps::OUTPUT_CAPACITY).amount,
+        input: get_tank(nbt, "input", sps::input_capacity()).amount,
+        output: get_tank(nbt, "output", sps::output_capacity()).amount,
         progress: get_double(nbt, "progress").unwrap_or(0.0),
         input_processed: get_long(nbt, "input_processed"),
     }
@@ -14933,8 +14933,8 @@ fn tick_sps_port(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     }
     let ports = positions(&entity.nbt, "ports");
     let coiled = positions(&entity.nbt, "coiled");
-    let mut input = get_tank(&entity.nbt, "input", sps::INPUT_CAPACITY);
-    let mut output = get_tank(&entity.nbt, "output", sps::OUTPUT_CAPACITY);
+    let mut input = get_tank(&entity.nbt, "input", sps::input_capacity());
+    let mut output = get_tank(&entity.nbt, "output", sps::output_capacity());
     let output_mode = |game: &mut Game<'_>, entity: &ModBlockEntity, p: [i32; 3]| {
         if p == pos {
             get_long(&entity.nbt, "output") == 1
@@ -15282,7 +15282,7 @@ fn tick_heater(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
     let active = energy.consume(usage);
     let mut heat = heater_heat(game, pos, &entity.nbt);
     if active {
-        heat.handle_heat(usage as f64 * boiler::HEATER_EFFICIENCY);
+        heat.handle_heat(usage as f64 * boiler::heater_efficiency());
     }
     put_long(&mut entity.nbt, "energy", energy.stored);
     simulate_heater(game, pos, entity, heat);
@@ -16748,7 +16748,7 @@ fn laser_hit_players(game: &mut Game<'_>, min: [f64; 3], max: [f64; 3], energy: 
                 let Ok(blocked) = blocking.rules.resolve(&mut LaserMatch, full, blocking.angle);
                 if blocked > 0.0 {
                     g.after_block(horizon_client::health::BlockOutcome { hurt: true, blocked, sound: false, knockback: false }, full, None, true);
-                    remaining -= ((laser::ENERGY_PER_DAMAGE as f64 * f64::from(blocked)) as u64).min(remaining);
+                    remaining -= ((laser::energy_per_damage() as f64 * f64::from(blocked)) as u64).min(remaining);
                     if remaining == 0 {
                         result = 0;
                         return;
@@ -16993,7 +16993,7 @@ fn tick_fuelwood_heater(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBloc
     let mut heat = heater_heat(game, pos, &entity.nbt);
     if active {
         burn -= 1;
-        heat.handle_heat(boiler::HEAT_PER_FUEL_TICK);
+        heat.handle_heat(boiler::heat_per_fuel_tick());
     }
     put_int(&mut entity.nbt, "burn_time", burn);
     simulate_heater(game, pos, entity, heat);
@@ -25362,13 +25362,13 @@ fn radiation_server_tick(game: &mut Game<'_>) {
                         dose = (dose + gained).max(radiation::BASELINE);
                     }
                 }
-                dose = (dose * radiation::TARGET_DECAY_RATE).max(radiation::BASELINE);
+                dose = (dose * radiation::target_decay_rate()).max(radiation::BASELINE);
                 RAD_DOSE.with_borrow_mut(|d| d.insert(uuid, dose));
             }
             // `RadiationEntity.update`: a dose that shows hurts now and then and tires the player.
             let severity = radiation::scaled_dose_severity(dose);
             if playing && severity > radiation::BASELINE {
-                let min = radiation::NEGATIVE_EFFECTS_MIN_SEVERITY;
+                let min = radiation::negative_effects_min_severity();
                 let chance = min + rad_float() * (1.0 - min);
                 if severity > chance {
                     let strength = (dose.ln_1p() as f32).max(1.0);
@@ -25407,8 +25407,14 @@ fn suit_paste_capacity() -> u64 {
     mekanism_core::config::gear_int("mekasuit.nutritionalMaxStorage", SUIT_PASTE_CAPACITY)
 }
 /// `GeneralConfig.nutritionalPasteMBPerFood` and `saturation`.
-const PASTE_PER_FOOD: u64 = 50;
-const PASTE_SATURATION: f32 = 0.8;
+fn paste_per_food() -> u64 {
+    config_int("general", "nutritional_paste", "mbPerFood", 50).max(1) as u64
+}
+
+fn paste_saturation() -> f32 {
+    config_double("general", "nutritional_paste", "saturation", 0.8) as f32
+}
+
 /// `GearConfig.mekaSuitEnergyUsageNutritionalInjection`.
 const NUTRITION_ENERGY: u64 = 20_000;
 
@@ -25772,18 +25778,18 @@ fn nutritional_injection(g: &mut Game<'_>) {
     let Some(piece) = g.armor[1].as_mut().filter(|s| &*s.item == modules::BODYARMOR && module_on(s, NUTRITION_UNIT)) else {
         return;
     };
-    let by_paste = suit_paste(piece) / PASTE_PER_FOOD;
+    let by_paste = suit_paste(piece) / paste_per_food();
     let by_energy = stored_energy(piece) / NUTRITION_ENERGY;
     let food = by_paste.min(by_energy).min(missing as u64);
     if food == 0 {
         return;
     }
     let held = suit_paste(piece);
-    set_suit_paste(piece, held - food * PASTE_PER_FOOD);
+    set_suit_paste(piece, held - food * paste_per_food());
     let stored = stored_energy(piece);
     set_energy(piece, stored - food * NUTRITION_ENERGY);
     if let Some(p) = g.player.as_mut() {
-        p.health.food.eat(food as i32, PASTE_SATURATION);
+        p.health.food.eat(food as i32, paste_saturation());
     }
 }
 
@@ -25936,7 +25942,7 @@ fn geiger_counter_use(game: &mut Game<'_>, claimed: &mut bool) {
     let Some((level, max, _)) = rad_player(game) else {
         return;
     };
-    let decay = (level > radiation::BASELINE).then(|| radiation::decay_ticks(max, radiation::SOURCE_DECAY_RATE));
+    let decay = (level > radiation::BASELINE).then(|| radiation::decay_ticks(max, radiation::source_decay_rate()));
     rad_say(game, "Radiation Exposure", level, "Sv/h", decay);
 }
 
@@ -25949,7 +25955,7 @@ fn dosimeter_use(game: &mut Game<'_>, claimed: &mut bool) {
     let Some((_, _, dose)) = rad_player(game) else {
         return;
     };
-    let decay = (dose > radiation::MIN_MAGNITUDE).then(|| radiation::decay_ticks(dose, radiation::TARGET_DECAY_RATE));
+    let decay = (dose > radiation::MIN_MAGNITUDE).then(|| radiation::decay_ticks(dose, radiation::target_decay_rate()));
     rad_say(game, "Radiation Exposure", dose, "Sv", decay);
 }
 

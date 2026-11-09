@@ -4,6 +4,11 @@
 /// `GeneralConfig.maxUpgradeMultiplier`'s default: a full set of one upgrade multiplies by this.
 pub const MAX_UPGRADE_MULTIPLIER: f64 = 10.0;
 
+/// `maxUpgradeMultiplier` of the open world's config (`MAX_UPGRADE_MULTIPLIER` is its default).
+pub fn max_upgrade_multiplier() -> f64 {
+    crate::config_files::active_int("general", "", "maxUpgradeMultiplier", MAX_UPGRADE_MULTIPLIER as u64) as f64
+}
+
 /// The upgrades this port installs, with their `max` from `data/mekanism/mekanism/upgrade/*.json`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Upgrade {
@@ -82,19 +87,19 @@ impl Upgrades {
 
     /// `UpgradeUtils.getTicks`: at least one tick.
     pub fn ticks(&self, base: u32) -> u32 {
-        let t = f64::from(base) * MAX_UPGRADE_MULTIPLIER.powf(-self.fraction(Upgrade::Speed));
+        let t = f64::from(base) * max_upgrade_multiplier().powf(-self.fraction(Upgrade::Speed));
         clamp_to_int(t).max(1) as u32
     }
 
     /// `UpgradeUtils.getEnergyPerTick`.
     pub fn energy_per_tick(&self, base: u64) -> u64 {
         let exp = 2.0 * self.fraction(Upgrade::Speed) - self.fraction(Upgrade::Energy);
-        (base as f64 * MAX_UPGRADE_MULTIPLIER.powf(exp)).ceil() as u64
+        (base as f64 * max_upgrade_multiplier().powf(exp)).ceil() as u64
     }
 
     /// `UpgradeUtils.getMaxEnergy`.
     pub fn max_energy(&self, base: u64) -> u64 {
-        let e = base as f64 * MAX_UPGRADE_MULTIPLIER.powf(self.fraction(Upgrade::Energy));
+        let e = base as f64 * max_upgrade_multiplier().powf(self.fraction(Upgrade::Energy));
         if e >= i64::MAX as f64 {
             i64::MAX as u64
         } else {

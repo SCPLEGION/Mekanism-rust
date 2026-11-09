@@ -215,6 +215,11 @@ pub const LIQUIFIER_USAGE: u64 = 8;
 pub const LIQUIFIER_TICKS: u32 = 100;
 pub const LIQUIFIER_TANK: u64 = 10_000;
 pub const PASTE_PER_NUTRITION: u64 = 50;
+
+/// `mbPerFood` of the open world's config (`PASTE_PER_NUTRITION` is its default).
+pub fn paste_per_nutrition() -> u64 {
+    crate::config_files::active_int("general", "nutritional_paste", "mbPerFood", PASTE_PER_NUTRITION)
+}
 pub const NUTRITIONAL_PASTE: &str = "mekanism:nutritional_paste";
 
 /// An advanced electric machine (`TileEntityAdvancedElectricMachine`): an item and a chemical used each

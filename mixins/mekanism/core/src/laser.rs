@@ -21,18 +21,23 @@ pub const TRACTOR_SLOTS: usize = 27;
 
 /// `general.laser.energyPerDamage`: FE a point of damage to an entity in the beam takes.
 pub const ENERGY_PER_DAMAGE: u64 = 2_500;
+
+/// `energyPerDamage` of the open world's config (`ENERGY_PER_DAMAGE` is its default).
+pub fn energy_per_damage() -> u64 {
+    crate::config_files::active_int("general", "laser", "energyPerDamage", ENERGY_PER_DAMAGE)
+}
 /// Half the beam's width, as its box reaches around the beam's line.
 pub const BEAM_HALF_WIDTH: f64 = 0.25;
 
 /// The damage `energy` does to an entity in the beam, and the ticks it burns for (`fireLaser`).
 pub fn damage(energy: u64) -> (f32, i32) {
-    let value = energy as f64 / ENERGY_PER_DAMAGE as f64;
+    let value = energy as f64 / energy_per_damage() as f64;
     (value as f32, value.min(f64::from(i32::MAX)) as i32)
 }
 
 /// The energy a hit used, from the health the entity lost.
 pub fn spent(lost: f32, energy: u64) -> u64 {
-    ((f64::from(lost) * ENERGY_PER_DAMAGE as f64) as u64).min(energy)
+    ((f64::from(lost) * energy_per_damage() as f64) as u64).min(energy)
 }
 
 /// The beam's box from the laser at `pos` facing `d`, `length` blocks long from the laser's face.
