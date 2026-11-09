@@ -230,6 +230,9 @@ def shape_declaration(ns, name, declaration, report):
             # A template without a facing: the shape of the model the blockstate shows.
             declaration["shape"] = shape["facing"]["north"]
         report["shapes"] = report.get("shapes", 0) + 1
+    if name == "laser_amplifier":
+        # Its redstone output is graded (0 to 15): the bundle sets it with native_set_block_signal.
+        declaration.setdefault("properties", {})["signal_source"] = True
     if see_through(name):
         declaration.setdefault("properties", {})["occludes"] = False
         report["see_through"] = report.get("see_through", 0) + 1
