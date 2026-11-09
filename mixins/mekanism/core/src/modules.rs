@@ -126,18 +126,23 @@ pub fn energy_from(installed: &Installed, capacity: u64, rate: u64) -> (u64, u64
 }
 
 /// `ExcavationMode` efficiencies: off, slow, normal, fast, super fast, extreme.
-pub const EXCAVATION_EFFICIENCY: [u64; 6] = [0, 4, 16, 32, 64, 128];
+pub const EXCAVATION_EFFICIENCY: [f32; 6] = [0.0, 4.0, 16.0, 32.0, 64.0, 128.0];
+
+/// `GearConfig.mekaToolBaseEfficiency`.
+pub fn base_efficiency() -> f32 {
+    crate::config::gear_double("mekatool.baseEfficiency", f64::from(TOOL_BASE_EFFICIENCY as u32)) as f32
+}
 
 /// The Meka-Tool's efficiency (`ModuleExcavationEscalationUnit.getEfficiency`): the base efficiency without an enabled
 /// Excavation Escalation Unit, and with one the efficiency of the mode chosen in its settings (`mode`, normal by default),
 /// which can reach as far as the installed units allow (`installed + 1`).
-pub fn tool_efficiency(installed: &Installed, mode: Option<usize>) -> u64 {
+pub fn tool_efficiency(installed: &Installed, mode: Option<usize>) -> f32 {
     match installed
         .get("mekanism:excavation_escalation_unit")
         .copied()
         .unwrap_or(0)
     {
-        0 => TOOL_BASE_EFFICIENCY,
+        0 => base_efficiency(),
         n => EXCAVATION_EFFICIENCY[mode.unwrap_or(2).min(n as usize + 1).min(5)],
     }
 }
@@ -153,9 +158,9 @@ fn tool_usage(silk: bool) -> u64 {
 
 /// `ItemMekaTool.getDestroyEnergy`: 10 FE (100 with silk touch) times the efficiency, half for blocks
 /// that break at once.
-pub fn tool_destroy_energy(efficiency: u64, hardness: f32, silk: bool) -> u64 {
+pub fn tool_destroy_energy(efficiency: f32, hardness: f32, silk: bool) -> u64 {
     let usage = tool_usage(silk);
-    halved(usage * efficiency, hardness)
+    halved((usage as f32 * efficiency) as u64, hardness)
 }
 
 fn halved(base: u64, hardness: f32) -> u64 {
@@ -244,12 +249,12 @@ pub const MODULE_ENCHANTMENTS: [&str; 4] = [
 
 /// `ItemMekaTool.getDestroySpeed`: the efficiency while the energy is there, the base efficiency scaled
 /// by how much of it there is otherwise.
-pub fn tool_destroy_speed(efficiency: u64, stored: u64, hardness: f32, silk: bool) -> f32 {
+pub fn tool_destroy_speed(efficiency: f32, stored: u64, hardness: f32, silk: bool) -> f32 {
     let required = tool_destroy_energy(efficiency, hardness, silk);
     if stored < required {
-        return TOOL_BASE_EFFICIENCY as f32 * (stored as f32 / required as f32);
+        return base_efficiency() * (stored as f32 / required as f32);
     }
-    efficiency as f32
+    efficiency
 }
 
 /// `ItemMekaTool.use` with a Teleportation Unit: 1,000 FE for each 10 blocks² of distance.
@@ -467,19 +472,19 @@ mod tests {
         assert_eq!(install(BOOTS, &mut m, "mekanism:energy_unit", 3), 3);
         assert_eq!(energy(&m), (128_000_000, 800_000));
         assert_eq!(energy_from(&m, 1_000, 10), (8_000, 80));
-        assert_eq!(tool_efficiency(&m, Some(5)), 128);
-        assert_eq!(tool_efficiency(&m, None), 16);
-        assert_eq!(tool_efficiency(&m, Some(0)), 0);
+        assert_eq!(tool_efficiency(&m, Some(5)), 128.0);
+        assert_eq!(tool_efficiency(&m, None), 16.0);
+        assert_eq!(tool_efficiency(&m, Some(0)), 0.0);
     }
 
     #[test]
     fn tool_energy() {
         let none = Installed::new();
-        assert_eq!(tool_efficiency(&none, Some(5)), 4);
-        assert_eq!(tool_destroy_energy(16, 1.5, false), 160);
-        assert_eq!(tool_destroy_energy(16, 0.0, false), 80);
-        assert_eq!(tool_destroy_energy(4, 1.5, true), 400);
-        assert_eq!(tool_destroy_speed(16, 80, 1.5, false), 2.0);
+        assert_eq!(tool_efficiency(&none, Some(5)), 4.0);
+        assert_eq!(tool_destroy_energy(16.0, 1.5, false), 160);
+        assert_eq!(tool_destroy_energy(16.0, 0.0, false), 80);
+        assert_eq!(tool_destroy_energy(4.0, 1.5, true), 400);
+        assert_eq!(tool_destroy_speed(16.0, 80, 1.5, false), 2.0);
         assert_eq!(area_energy(false, 3.0, 2, false), 20);
         assert_eq!(area_energy(false, 3.0, 4, true), 40);
         assert_eq!(teleport_energy(250.0), 25_000);
