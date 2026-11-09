@@ -4286,13 +4286,18 @@ fn chemical_item_ids() -> Vec<String> {
 
 /// Writes `tank` as the chemical an item holds (its custom data under `CHEMICAL_KEY`).
 fn set_item_tank(stack: &mut ItemStack, tank: &ChemicalTank) {
+    put_item_tank_key(stack, CHEMICAL_KEY, tank);
+}
+
+/// `set_item_tank` into the custom-data entry `key` (the Gauge Dropper's fluid tank apart from its chemical one).
+fn put_item_tank_key(stack: &mut ItemStack, key: &str, tank: &ChemicalTank) {
     let mut c = Compound::new();
     put_tank(&mut c, "t", tank);
     let value = match c.get(&JavaString::from("t")) {
         Some(Tag::Compound(t)) => t.clone(),
         _ => Compound::new(),
     };
-    set_custom_compound(stack, CHEMICAL_KEY, value);
+    set_custom_compound(stack, key, value);
 }
 
 /// `ChemicalInventorySlot.fill` (`fillTankFromSlot`): a chemical tank item in slot `from` gives what it holds
@@ -7211,7 +7216,12 @@ pub(super) fn item_bars(game: &Game<'_>, stack: &ItemStack, bar: &mut Option<(i3
     }
     if &*stack.item == GAUGE_DROPPER {
         // `ItemGaugeDropper.isBarVisible`: only with something in it, the fuller of its two tanks.
-        if let Some(t) = item_tank(stack, CHEMICAL_KEY, dropper_capacity()) {
+        let fuller = [FLUID_KEY, CHEMICAL_KEY]
+            .into_iter()
+            .filter_map(|k| item_tank(stack, k, dropper_capacity()))
+            .filter(|t| t.amount > 0)
+            .max_by_key(|t| t.amount);
+        if let Some(t) = fuller {
             *bar = Some(((13.0 * t.amount as f64 / t.capacity.max(1) as f64).round().clamp(0.0, 13.0) as i32, CHEMICALS.iter().find(|c| Some(c.0) == t.chemical.as_deref()).map_or(0xAAAAAA, |c| c.2)));
         }
         return;
@@ -26558,6 +26568,12 @@ fn dropper_capacity() -> u64 {
     mekanism_core::config::gear_int("gauge_dropper.capacity", 16_000)
 }
 
+/// The dropper's tank a chemical goes to: `ItemGaugeDropper` keeps a fluid tank apart from its chemical tanks. The port
+/// stores both as chemical tanks, so water, lava, milk and heavy water are the fluids.
+fn dropper_key(chemical: &str) -> &'static str {
+    if chemical.starts_with("minecraft:") || chemical == "mekanism:heavy_water" { FLUID_KEY } else { CHEMICAL_KEY }
+}
+
 /// `GuiTankGauge.onClick`: with a Gauge Dropper on the cursor, a left click on a gauge fills the dropper from the tank
 /// (shift: dumps the tank), a right click drains the dropper into it.
 fn dropper_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool, button: &mut Option<i32>) -> bool {
@@ -26593,7 +26609,13 @@ fn dropper_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     };
     let mut tank = get_tank(&entity.nbt, g.key, g.capacity);
     let rate = mekanism_core::config::gear_int("gauge_dropper.transferRate", 250).max(1);
-    let mut dropper = item_tank(&carried, CHEMICAL_KEY, dropper_capacity()).unwrap_or_else(|| ChemicalTank::new(dropper_capacity()));
+    let load = |key: &str| item_tank(&carried, key, dropper_capacity()).unwrap_or_else(|| ChemicalTank::new(dropper_capacity()));
+    // Which of the dropper's two tanks takes part: the one that fits the gauge's chemical, else the one holding something.
+    let key = match tank.chemical.as_deref() {
+        Some(c) => dropper_key(c),
+        None => [FLUID_KEY, CHEMICAL_KEY].into_iter().find(|k| load(k).amount > 0).unwrap_or(CHEMICAL_KEY),
+    };
+    let mut dropper = load(key);
     match action {
         2 => {
             if let Some(chemical) = tank.chemical.clone() {
@@ -26621,7 +26643,7 @@ fn dropper_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
         }
     }
     put_tank(&mut entity.nbt, g.key, &tank);
-    set_item_tank(&mut carried, &dropper);
+    put_item_tank_key(&mut carried, key, &dropper);
     game.carried = Some(carried);
     true
 }
@@ -26639,11 +26661,13 @@ fn dropper_use(game: &mut Game<'_>, claimed: &mut bool) {
     let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == GAUGE_DROPPER) else {
         return;
     };
-    if let Some(tank) = item_tank(held, CHEMICAL_KEY, dropper_capacity()) {
-        if let Some(chemical) = tank.chemical.as_deref() {
-            dump_radiation(&dimension, at, chemical, tank.amount);
+    for key in [FLUID_KEY, CHEMICAL_KEY] {
+        if let Some(tank) = item_tank(held, key, dropper_capacity()) {
+            if let Some(chemical) = tank.chemical.as_deref() {
+                dump_radiation(&dimension, at, chemical, tank.amount);
+            }
+            put_item_tank_key(held, key, &ChemicalTank::new(dropper_capacity()));
         }
-        set_item_tank(held, &ChemicalTank::new(dropper_capacity()));
     }
     *claimed = true;
 }
