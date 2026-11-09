@@ -7630,6 +7630,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     }
     if game.native_window() && game.native_on(MOD_ID) {
         tweaker_key(game);
+        seismic_open(game);
         radial_key(game);
     }
     if !game.native_window() || !game.native_on(MOD_ID) || !game.native_playing() {
@@ -17457,7 +17458,7 @@ fn tick_vibrator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
 }
 
 /// `ItemSeismicReader.use`: in a chunk a running vibrator shakes, for 250 FE (free in creative), it
-/// lists the ores in the column under the player, top first, and how deep the column goes.
+/// opens the reader's screen with the column under the player.
 fn seismic_reader_use(game: &mut Game<'_>, claimed: &mut bool) {
     *claimed = true;
     let Some(at) = game.player.as_ref().map(|p| [p.position.x.floor() as i32, p.position.y.floor() as i32, p.position.z.floor() as i32]) else {
@@ -17480,25 +17481,13 @@ fn seismic_reader_use(game: &mut Game<'_>, claimed: &mut bool) {
         }
         set_energy(held, stored - seismic_reader_usage());
     }
-    let bottom = game.world.bottom_y();
-    let column: Vec<(i32, String)> = (bottom..at[1])
-        .rev()
-        .map(|y| {
-            let state = game.world.block(at[0], y, at[2]);
-            (y, game.res.facts().get(state).name.to_string())
-        })
-        .collect();
-    let ores: Vec<String> = seismic::runs(&column)
-        .into_iter()
-        .filter(|(name, ..)| world_items!(game).block_in_tag(mekanism_core::miner::ORE_TAG, name))
-        .map(|(name, top, low)| if top == low { format!("{name} at y {top}") } else { format!("{name} at y {top} to {low}") })
-        .collect();
-    tell(game, format!("Seismic Reader: {} blocks down to y {bottom} at x {}, z {}", column.len(), at[0], at[2]));
-    if ores.is_empty() {
-        tell(game, "  no ores".to_owned());
-    }
-    for line in ores {
-        tell(game, format!("  {line}"));
+    // The screen (`GuiSeismicReader`) builds the column itself, from the player's block down.
+    if let Some(player) = game.native_acting_player() {
+        let mut data = Vec::new();
+        for c in at {
+            data.extend(c.to_be_bytes());
+        }
+        game.native_send_to_player(player.uuid, SEISMIC_CHANNEL, &data);
     }
 }
 
@@ -23366,7 +23355,9 @@ fn tweaker_payload(game: &mut Game<'_>, data: &[u8]) {
 
 /// The mod's own screens (hook points `native_ui_*`, API 44).
 pub(super) fn ui_draw(game: &Game<'_>, id: &str, batch: &mut horizon_client::hud::HudBatch) {
-    if id == TW_ID {
+    if id == SEISMIC_ID {
+        seismic_draw(game, batch);
+    } else if id == TW_ID {
         tweaker_draw(game, batch);
     } else if id == RADIAL_ID {
         radial_draw(game, batch);
@@ -23382,7 +23373,11 @@ pub(super) fn ui_draw(game: &Game<'_>, id: &str, batch: &mut horizon_client::hud
 }
 
 pub(super) fn ui_click(game: &mut Game<'_>, id: &str, at: [f32; 2], button: u8, pressed: bool) {
-    if id == TW_ID {
+    if id == SEISMIC_ID {
+        if pressed && button == 0 {
+            seismic_click(game, at);
+        }
+    } else if id == TW_ID {
         tweaker_click(game, at, button, pressed);
     } else if id == RADIAL_ID && pressed {
         radial_update(game);
@@ -23437,13 +23432,161 @@ pub(super) fn ui_close_hook(game: &mut Game<'_>, id: &str) {
 }
 
 pub(super) fn ui_wheel(game: &mut Game<'_>, id: &str, steps: f32) {
-    if id == TW_ID {
+    if id == SEISMIC_ID {
+        seismic_scroll(if steps > 0.0 { 1 } else { -1 });
+    } else if id == TW_ID {
         tweaker_wheel(game.native_cursor(), steps);
     } else if id == RADIAL_ID {
         radial_scroll(game, steps);
     } else if id == ROBIT_SCREEN && ROBIT_WIN.with(std::cell::Cell::get) == 2 {
         let rows = ROBIT_UNLOCKED.with_borrow(|u| u.len().div_ceil(3)).saturating_sub(3);
         ROBIT_SKIN_ROW.with(|r| r.set((r.get() as i32 - steps.signum() as i32).clamp(0, rows as i32) as usize));
+    }
+}
+
+// --- Seismic Reader (GuiSeismicReader) -----------------------------------------------------------------------
+
+const SEISMIC_ID: &str = "mekanism:seismic_reader";
+const SEISMIC_CHANNEL: &str = "mekanism:seismic_reader";
+/// `DEFAULT_IMAGE_WIDTH - 26` by `DEFAULT_IMAGE_HEIGHT + 16`.
+const SEISMIC_WINDOW: [f32; 2] = [150.0, 182.0];
+const SEISMIC_BAR: [f32; 4] = [129.0, 25.0, 14.0, 132.0];
+const SEISMIC_UP: [f32; 4] = [129.0, 11.0, 14.0, 14.0];
+const SEISMIC_DOWN: [f32; 4] = [129.0, 157.0, 14.0, 14.0];
+
+#[derive(Default)]
+struct SeismicUi {
+    /// The block ids from the world's bottom up to the player's block, and the lowest y.
+    column: Vec<String>,
+    min_y: i32,
+    /// `GuiScrollBar.getCurrentSelection`: 0 is the top.
+    selection: usize,
+    origin: [f32; 2],
+}
+
+thread_local! {
+    static SEISMIC_PENDING: std::cell::Cell<Option<[i32; 3]>> = const { std::cell::Cell::new(None) };
+    static SEISMIC_UI: std::cell::RefCell<SeismicUi> = std::cell::RefCell::new(SeismicUi::default());
+}
+
+/// A reading the server allowed arrives as a packet; the window builds its column and opens (hook point `native_tick`).
+fn seismic_open(game: &mut Game<'_>) {
+    let Some(at) = SEISMIC_PENDING.take() else {
+        return;
+    };
+    if game.native_ui_open().is_some() {
+        return;
+    }
+    let min_y = game.world.bottom_y();
+    let column: Vec<String> = (min_y..=at[1])
+        .map(|y| {
+            let state = game.world.block(at[0], y, at[2]);
+            let name = game.res.facts().get(state).name.to_string();
+            // Every kind of air counts as air.
+            if matches!(name.as_str(), "minecraft:cave_air" | "minecraft:void_air") { "minecraft:air".to_owned() } else { name }
+        })
+        .collect();
+    SEISMIC_UI.with_borrow_mut(|ui| *ui = SeismicUi { column, min_y, selection: 0, origin: [0.0, 0.0] });
+    game.native_open_ui(SEISMIC_ID);
+}
+
+fn seismic_layer(ui: &SeismicUi) -> Option<usize> {
+    ui.column.len().checked_sub(ui.selection + 1)
+}
+
+/// `GuiScrollBar.adjustScroll`: a positive step scrolls up (toward the top of the column).
+fn seismic_scroll(step: i32) {
+    SEISMIC_UI.with_borrow_mut(|ui| {
+        let last = ui.column.len().saturating_sub(1) as i32;
+        ui.selection = (ui.selection as i32 - step).clamp(0, last) as usize;
+    });
+}
+
+/// "stone_bricks" of "minecraft:stone_bricks": "Stone Bricks".
+fn pretty_id(id: &str) -> String {
+    id.rsplit(':').next().unwrap_or(id).split('_').map(|w| {
+        let mut c = w.chars();
+        c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
+    }).collect::<Vec<_>>().join(" ")
+}
+
+fn seismic_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    let [w, h] = SEISMIC_WINDOW;
+    let o = [((batch.width - w) / 2.0).floor(), ((batch.height - h) / 2.0).floor()];
+    let cursor = game.native_cursor();
+    SEISMIC_UI.with_borrow_mut(|ui| {
+        ui.origin = o;
+        let mouse = [cursor[0] - o[0], cursor[1] - o[1]];
+        nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [o[0] - 3.0, o[1] - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
+        nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [o[0], o[1], w, h], 0xFFFF_FFFF);
+        centred(game, batch, "Seismic Reader", o[0], w, o[1] + 4.0, 0x40_4040);
+        // The name and how many of the block the column holds (`padding(3)`).
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [o[0] + 5.0, o[1] + 11.0, 69.0, 50.0], 0xFFFF_FFFF);
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, [o[0] + 77.0, o[1] + 11.0, 51.0, 160.0], 0xFFFF_FFFF);
+        let layer = seismic_layer(ui);
+        if let Some(l) = layer {
+            let id = ui.column[l].clone();
+            let count = ui.column.iter().filter(|b| **b == id).count();
+            let name = pretty_id(&id);
+            let fit = (63.0 / (game.native_text_width(&name) * 0.8)).min(1.0) * 0.8;
+            game.native_text_scaled(batch, &name, [o[0] + 8.0, o[1] + 14.0], 0x3C_FE9A, fit);
+            game.native_text_scaled(batch, &format!("Abundancy: {count}"), [o[0] + 8.0, o[1] + 14.0 + 11.0], 0x3C_FE9A, 0.8);
+        }
+        // The scroll bar (`GuiScrollBar`): an element holder, the handle riding in it.
+        let bar = [o[0] + SEISMIC_BAR[0], o[1] + SEISMIC_BAR[1], 14.0, SEISMIC_BAR[3]];
+        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, bar, 0xFFFF_FFFF);
+        let last = ui.column.len().saturating_sub(1);
+        let travel = SEISMIC_BAR[3] - 2.0 - 15.0;
+        let handle = if last == 0 { 0.0 } else { (travel * ui.selection as f32 / last as f32).floor() };
+        sprite(game, batch, if last > 0 { "scroll/bar" } else { "scroll/bar_inactive" }, [0.0, 0.0, 12.0, 15.0], [bar[0] + 1.0, bar[1] + 1.0 + handle, 12.0, 15.0]);
+        // The arrow on the current layer, with its y level.
+        sprite(game, batch, "arrow_selection", [0.0, 0.0, 33.0, 19.0], [o[0] + 79.0, o[1] + 81.0, 33.0, 19.0]);
+        if let Some(l) = layer {
+            game.native_text_scaled(batch, &format!("{}", ui.min_y + l as i32), [o[0] + 79.0 + 33.0, o[1] + 81.0 + 6.0], 0x3C_FE9A, 0.8);
+        }
+        for (rect, icon, active) in [(SEISMIC_UP, "button/up", ui.selection > 0), (SEISMIC_DOWN, "button/down", layer.is_some_and(|l| l > 0))] {
+            let r = [o[0] + rect[0], o[1] + rect[1], 14.0, 14.0];
+            nine_slice_tinted(game, batch, if !active { "button_inactive" } else if inside(mouse, rect) { "button_focus" } else { "button" }, [200.0, 20.0], 2.0, r, 0xFFFF_FFFF);
+            sprite(game, batch, icon, [0.0, 0.0, 14.0, 14.0], r);
+        }
+        // Nine layers around the current one: the current at full size, the others at 0.8.
+        if let Some(cur) = layer {
+            for i in 0..9_i32 {
+                let l = cur as i32 + (i - 4);
+                if l < 0 || l as usize >= ui.column.len() {
+                    continue;
+                }
+                let id = &ui.column[l as usize];
+                if id == "minecraft:air" {
+                    continue;
+                }
+                let (x, y) = (95.0, 146.0 - 16.0 * i as f32);
+                if i == 4 {
+                    game.native_item(batch, id, [o[0] + x, o[1] + y], 16.0);
+                } else {
+                    let (dx, dy) = if i < 4 { (1.7, 2.5) } else { (1.5, 0.0) };
+                    game.native_item(batch, id, [o[0] + x + dx, o[1] + y + dy], 12.8);
+                }
+            }
+        }
+    });
+}
+
+fn seismic_click(_game: &mut Game<'_>, at: [f32; 2]) {
+    let up_down = SEISMIC_UI.with_borrow(|ui| {
+        let m = [at[0] - ui.origin[0], at[1] - ui.origin[1]];
+        (inside(m, SEISMIC_UP), inside(m, SEISMIC_DOWN), inside(m, SEISMIC_BAR), m[1])
+    });
+    match up_down {
+        (true, ..) => seismic_scroll(1),
+        (_, true, ..) => seismic_scroll(-1),
+        // The track: the handle jumps to where it was pressed.
+        (_, _, true, y) => SEISMIC_UI.with_borrow_mut(|ui| {
+            let last = ui.column.len().saturating_sub(1);
+            let f = ((y - SEISMIC_BAR[1] - 1.0 - 7.5) / (SEISMIC_BAR[3] - 2.0 - 15.0)).clamp(0.0, 1.0);
+            ui.selection = (f * last as f32).round() as usize;
+        }),
+        _ => {}
     }
 }
 
@@ -24014,6 +24157,10 @@ pub(super) fn mob_died(game: &mut Game<'_>, kind: &str, at: [f64; 3], data: Opti
 
 /// The window's client got the Robits' ids.
 pub(super) fn client_payload(channel: &str, data: &[u8]) {
+    if channel == SEISMIC_CHANNEL && data.len() >= 12 {
+        let int = |i: usize| i32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        SEISMIC_PENDING.set(Some([int(0), int(4), int(8)]));
+    }
     if channel == PLAYER_STATE_CHANNEL {
         player_state_payload(data, CLIENT_TICK.get());
     }
