@@ -6941,6 +6941,41 @@ fn stored_tooltip(stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text
 }
 
 /// "Stored Energy: 1.2 MFE" under a Mekanism item that holds energy.
+/// `MekanismDataComponents.DESCRIPTION`: the blocks that have a description (`IHasDescription`) show it while the
+/// description key (Shift + N) is held, else "Hold Shift + N for a description."
+fn description_tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    use horizon_client::text::Text;
+    let Some(name) = stack.item.strip_prefix("mekanism:") else {
+        return;
+    };
+    let key = format!("description.mekanism.{name}");
+    if !horizon_client::lang::has(&key) || name.starts_with("module_") {
+        return;
+    }
+    let held = |a: winit::keyboard::KeyCode, b: winit::keyboard::KeyCode| game.keys.contains(&a) || game.keys.contains(&b);
+    let shown = held(winit::keyboard::KeyCode::ShiftLeft, winit::keyboard::KeyCode::ShiftRight) && game.keys.contains(&winit::keyboard::KeyCode::KeyN);
+    if shown {
+        // The tooltip wraps at about half the screen; words keep to lines of this width.
+        let text = horizon_client::lang::get(&key);
+        let mut line = String::new();
+        for word in text.split(' ') {
+            let next = if line.is_empty() { word.to_owned() } else { format!("{line} {word}") };
+            if !line.is_empty() && game.native_text_width(&next) > 200.0 {
+                lines.push((Text::literal(std::mem::take(&mut line)), horizon_client::hud::rgba(0xFF, 0xFF, 0xFF, 0xFF)));
+                line = word.to_owned();
+            } else {
+                line = next;
+            }
+        }
+        if !line.is_empty() {
+            lines.push((Text::literal(line), horizon_client::hud::rgba(0xFF, 0xFF, 0xFF, 0xFF)));
+        }
+    } else {
+        let hold = Text::translate("tooltip.mekanism.hold_for_description", &[Text::colored("Shift + N", 0x55_FFFF)]);
+        lines.push((hold, horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+    }
+}
+
 pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
     if !game.native_on(MOD_ID) || !stack.item.starts_with("mekanism") {
         return;
@@ -6959,6 +6994,7 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
         lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
     }
     stored_tooltip(stack, lines);
+    description_tooltip(game, stack, lines);
     // `FormulaComponent.addToTooltip`: the distinct ingredients in order of first use, with how many times each is used.
     if &*stack.item == fa::FORMULA_ITEM
         && let Some(text) = custom_data(stack).and_then(|c| get_string(c, "formula"))
