@@ -6334,6 +6334,12 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
             }
         }
         if !counted.is_empty() {
+            // `ItemCraftingFormula.getName`: Encoded, or Invalid when no recipe takes the pattern.
+            let valid = world_recipes!(game).find(&asm_cells_grid(&fa::decode(&text)), 3).is_some();
+            if let Some(first) = lines.first_mut() {
+                let (word, rgb) = if valid { ("Encoded", 0x00_AA00) } else { ("Invalid", 0xAA_0000) };
+                first.0 = first.0.clone().append(" ").append(horizon_client::text::Text::colored(word, rgb));
+            }
             let gray = horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF);
             lines.push((horizon_client::text::Text::literal("Ingredients:".to_owned()), gray));
             for (id, n) in counted {
