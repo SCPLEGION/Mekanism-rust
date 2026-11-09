@@ -17384,7 +17384,8 @@ fn tick_laser(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
     let hardness = game.res.facts().get(state).hardness;
     let (progress, broke) = laser::dig(progress, firing, hardness);
     put_long(&mut entity.nbt, "progress", progress);
-    if broke {
+    // `general.aestheticWorldDamage`: with it off the beam digs for nothing (the progress still resets).
+    if broke && config_flag("general", "", "aestheticWorldDamage", true) {
         laser_break(game, entity, at);
     }
     Some(true)
@@ -26439,6 +26440,10 @@ fn flame_hits_entity(game: &mut Game<'_>, id: u32, kind: &str, mode: flamethrowe
 /// `EntityFlame.onHitBlock` (with the aesthetic world damage on): the heat mode smelts the block, the inferno mode
 /// lights it or the air beside it.
 fn flame_hits_block(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3], mode: flamethrower::Mode) {
+    // `EntityFlame`: only `general.aestheticWorldDamage`, and never a fluid, lets a flame change the world.
+    if !config_flag("general", "", "aestheticWorldDamage", true) || block_name(game, pos).starts_with("minecraft:water") || block_name(game, pos).starts_with("minecraft:lava") {
+        return;
+    }
     let name = block_name(game, pos).to_owned();
     match mode {
         flamethrower::Mode::Combat => {}

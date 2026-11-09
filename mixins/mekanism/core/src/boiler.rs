@@ -72,6 +72,11 @@ pub const BOIL_TEMP: f64 = 373.15;
 const STEAM_EFFICIENCY: f64 = 0.2;
 const WATER_ENTHALPY: f64 = 10.0;
 
+/// `HeatUtils.getWaterThermalEnthalpy`: `general.energy_conversion.maxEnergyPerSteam`.
+fn water_enthalpy() -> f64 {
+    crate::config_files::active_int("general", "energy_conversion", "maxEnergyPerSteam", WATER_ENTHALPY as u64) as f64
+}
+
 /// `TileEntityResistiveHeater.BASE_USAGE` and `general.resistiveEfficiency`.
 pub const HEATER_USAGE: u64 = 100;
 pub const HEATER_EFFICIENCY: f64 = 0.6;
@@ -138,7 +143,7 @@ impl Boiler {
             return 0;
         }
         let boiled = self.max_boil(*heat).min(steam_room).min(water);
-        *heat -= boiled as f64 * WATER_ENTHALPY / STEAM_EFFICIENCY;
+        *heat -= boiled as f64 * water_enthalpy() / STEAM_EFFICIENCY;
         boiled
     }
 
@@ -150,7 +155,7 @@ impl Boiler {
         }
         let available = ((heat - BOIL_TEMP * capacity) * water_conductivity())
             .min(superheating_heat_transfer() * self.elements as f64);
-        (STEAM_EFFICIENCY * available / WATER_ENTHALPY).floor() as u64
+        (STEAM_EFFICIENCY * available / water_enthalpy()).floor() as u64
     }
 
     /// The second rate bar's level: the max boil rate over what the elements could carry.
@@ -158,7 +163,7 @@ impl Boiler {
         if self.elements == 0 {
             return 0.0;
         }
-        (max as f64 * WATER_ENTHALPY / (self.elements as f64 * superheating_heat_transfer())).min(1.0)
+        (max as f64 * water_enthalpy() / (self.elements as f64 * superheating_heat_transfer())).min(1.0)
     }
 }
 
