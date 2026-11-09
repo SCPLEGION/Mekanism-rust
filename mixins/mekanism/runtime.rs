@@ -6805,8 +6805,10 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     if !game.native_window() || !game.native_on(MOD_ID) || !game.native_playing() {
         return;
     }
+    register_game_events();
     loop_sounds(game);
     player_sounds(game);
+    gravitational_client(game);
     radiation_client(game);
     scuba_client(game);
     free_runners_tick(game);
@@ -6920,6 +6922,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
         robit_op_payload(game, data);
         return;
     }
+    if channel == BOOST_CHANNEL && game.native_on(MOD_ID) {
+        gravitational_boost_paid(game);
+        return;
+    }
     if channel == TW_CHANNEL && game.native_on(MOD_ID) {
         tweaker_payload(game, data);
         return;
@@ -6989,6 +6995,9 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
         p.fall_distance = 0.0;
     }
     jetpack_flames(game);
+    // `CommonPlayerTickHandler`: the burn is a game event every half second.
+    register_game_events();
+    player_game_event(game, "mekanism:jetpack_burn");
 }
 
 /// `IModeItem.changeMode` / `ModuleJetpackUnit.changeMode` for the jetpack worn: the mode moves by `shift` round the four
@@ -22338,6 +22347,7 @@ pub(super) fn mobs_tick(game: &mut Game<'_>) {
     if !game.native_on(MOD_ID) {
         return;
     }
+    register_game_events();
     flames_tick(game);
     tick_meltdowns(game);
     let ids = game.native_mob_ids(robit::TYPE);
@@ -24600,6 +24610,82 @@ pub(super) fn worn_tint(_game: &Game<'_>, stack: &ItemStack, tint: &mut Option<u
     }
 }
 
+/// `MekanismGameEvents`: the mod's game events, with their notification radii and vibration frequencies
+/// (`vibration_frequencies` data map), registered once so sculk hears them.
+fn register_game_events() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        horizon_client::sculk::register_mod_event("mekanism:seismic_vibration", 64, 10);
+        horizon_client::sculk::register_mod_event("mekanism:jetpack_burn", 16, 4);
+        horizon_client::sculk::register_mod_event("mekanism:gravity_modulate", 16, 4);
+        horizon_client::sculk::register_mod_event("mekanism:gravity_modulate_boosted", 32, 5);
+    });
+}
+
+/// `Player.gameEvent` of one of the mod's events every half second (`TICKS_PER_HALF_SECOND`), by the player swapped in.
+fn player_game_event(g: &mut Game<'_>, event: &'static str) {
+    if g.ticks % 10 != 0 {
+        return;
+    }
+    let Some(at) = g.player.as_ref().map(|p| [p.position.x, p.position.y, p.position.z]) else {
+        return;
+    };
+    let ctx = g.who_context(Some(horizon_client::mobs::Who::Player), None);
+    g.post_game_event(event, at, ctx);
+}
+
+/// The boost key (`MekanismKeyHandler.boostKey`, left control) is sent to the server as the gravitational unit uses it.
+const BOOST_CHANNEL: &str = "mekanism:gravitational_boost";
+
+/// `ModuleGravitationalModulatingUnit.BOOST_ENERGY_MULTIPLIER`.
+const GRAVITATIONAL_BOOST_MULTIPLIER: u64 = 4;
+
+/// The unit's speed boost setting (`SprintBoost`): 0, 0.05, 0.1, 0.25 or 0.5.
+fn gravitational_boost(chest: &ItemStack) -> f32 {
+    let module = "mekanism:gravitational_modulating_unit";
+    let installed = installed_modules(chest).get(module).copied().unwrap_or(0);
+    module_config::settings(module, installed)
+        .into_iter()
+        .find(|s| s.key == "speed_boost")
+        .map_or(0.0, |s| [0.0, 0.05, 0.1, 0.25, 0.5][(module_setting(chest, module, &s, installed) as usize).min(4)])
+}
+
+/// `ModuleGravitationalModulatingUnit.tickClient`: flying with the boost key down and the energy for it, the player is
+/// pushed toward where they face (`moveRelative(boost, (0, 0, 1))`); the server is told so it takes the energy.
+fn gravitational_client(game: &mut Game<'_>) {
+    if !gravitational_ready(game) || game.creative || !game.keys.contains(&winit::keyboard::KeyCode::ControlLeft) {
+        return;
+    }
+    let Some(chest) = game.armor[1].as_ref() else {
+        return;
+    };
+    let boost = gravitational_boost(chest);
+    if boost <= 0.0 || stored_energy(chest) < GRAVITATIONAL_BOOST_MULTIPLIER * GRAVITATIONAL_ENERGY {
+        return;
+    }
+    let Some(p) = game.player.as_mut().filter(|p| p.flying && !p.spectator) else {
+        return;
+    };
+    let [x, z] = modules::sprint_push(boost, p.yaw, true, false);
+    p.velocity.x += x;
+    p.velocity.z += z;
+    game.native_send_to_server(BOOST_CHANNEL, &[1]);
+}
+
+/// On the server, the player swapped in: the boost takes the rest of its energy (four ticks' worth, one is paid already)
+/// and posts the boosted event.
+fn gravitational_boost_paid(game: &mut Game<'_>) {
+    let extra = (GRAVITATIONAL_BOOST_MULTIPLIER - 1) * GRAVITATIONAL_ENERGY;
+    let Some(chest) = game.armor[1].as_mut().filter(|s| &*s.item == modules::BODYARMOR && module_on(s, "mekanism:gravitational_modulating_unit")) else {
+        return;
+    };
+    let stored = stored_energy(chest);
+    if stored >= extra && gravitational_boost(chest) > 0.0 {
+        set_energy(chest, stored - extra);
+        player_game_event(game, "mekanism:gravity_modulate_boosted");
+    }
+}
+
 /// `GearConfig.mekaSuitEnergyUsageGravitationalModulation`.
 const GRAVITATIONAL_ENERGY: u64 = 1_000;
 
@@ -24628,6 +24714,7 @@ fn gravitational_upkeep(g: &mut Game<'_>) {
         let stored = stored_energy(chest);
         if stored >= GRAVITATIONAL_ENERGY {
             set_energy(chest, stored - GRAVITATIONAL_ENERGY);
+            player_game_event(g, "mekanism:gravity_modulate");
         }
     }
 }
