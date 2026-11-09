@@ -4198,7 +4198,7 @@ fn drain_tank_into_bucket(game: &Game<'_>, entity: &mut ModBlockEntity, from: us
         if tank.chemical.as_deref() != Some(chem::NUTRITIONAL_PASTE) {
             return false;
         }
-        let moved = tank.amount.min(SUIT_PASTE_CAPACITY.saturating_sub(suit_paste(&bucket)));
+        let moved = tank.amount.min(suit_paste_capacity().saturating_sub(suit_paste(&bucket)));
         if moved == 0 {
             return false;
         }
@@ -6859,11 +6859,16 @@ fn item_chemical(stack: &ItemStack) -> &'static str {
 }
 
 fn jetpack_capacity(stack: &ItemStack) -> u64 {
+    use mekanism_core::config::gear_int;
     if &*stack.item == SCUBA_TANK {
-        SCUBA_CAPACITY
+        gear_int("scuba_tank.capacity", SCUBA_CAPACITY)
     } else if &*stack.item == flamethrower::ITEM {
-        flamethrower::CAPACITY
-    } else if &*stack.item == modules::BODYARMOR { modules::SUIT_JETPACK_CAPACITY } else { gear::JETPACK_CAPACITY }
+        gear_int("flamethrower.capacity", flamethrower::CAPACITY)
+    } else if &*stack.item == modules::BODYARMOR {
+        gear_int("mekasuit.jetpackMaxStorage", modules::SUIT_JETPACK_CAPACITY)
+    } else {
+        gear_int("jetpack.capacity", gear::JETPACK_CAPACITY)
+    }
 }
 
 fn jetpack_fuel(stack: &ItemStack) -> u64 {
@@ -7155,7 +7160,7 @@ pub(super) fn item_bars(game: &Game<'_>, stack: &ItemStack, bar: &mut Option<(i3
         extra.push((12, width(jetpack_fuel(stack), jetpack_capacity(stack)), color_of(item_chemical(stack))));
     } else if &*stack.item == modules::HELMET && modules_of(stack).contains_key(NUTRITION_UNIT) {
         // The helmet's fluid tank (nutritional paste): the bar `MekaSuitBarDecorator` draws for a tank of the piece.
-        extra.push((12, width(suit_paste(stack), SUIT_PASTE_CAPACITY), color_of(chem::NUTRITIONAL_PASTE)));
+        extra.push((12, width(suit_paste(stack), suit_paste_capacity()), color_of(chem::NUTRITIONAL_PASTE)));
     }
 }
 
@@ -7436,7 +7441,7 @@ fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
         }
         // `ModuleNutritionalInjectionUnit.addHUDElements`: the paste in the suit, as a percentage.
         if flag(stack, NUTRITION_UNIT, "enabled") == Some(1) {
-            let ratio = (suit_paste(stack) as f64 / SUIT_PASTE_CAPACITY as f64).min(1.0);
+            let ratio = (suit_paste(stack) as f64 / suit_paste_capacity() as f64).min(1.0);
             let color = if ratio > 0.2 { REGULAR } else if ratio > 0.1 { 0xFFDD4F } else { 0xFF383C };
             elements.push(("nutritional_injection_unit", format!("{}%", (ratio * 100.0).round() as i64), color));
         }
@@ -7911,6 +7916,9 @@ pub(super) fn player_immunities(game: &mut Game<'_>, immune: &mut Vec<String>) {
 
 /// `gear.mekaSuitEnergyUsageMagicReduce`: FE per point of magic damage the Inhalation Purification Unit takes.
 const MAGIC_REDUCE_ENERGY: u64 = 1_000;
+fn magic_reduce_energy() -> u64 {
+    mekanism_core::config::gear_int("mekasuit.energy_usage.magicReduce", MAGIC_REDUCE_ENERGY)
+}
 
 /// A module of a worn piece that is installed and on.
 fn module_on(stack: &ItemStack, module: &str) -> bool {
@@ -7932,7 +7940,7 @@ pub(super) fn player_damage_rules(game: &mut Game<'_>, absorbed: f32, rules: &mu
     const UNIT: &str = "mekanism:inhalation_purification_unit";
     let holders: Vec<usize> = (0..4).filter(|&i| game.armor[i].as_ref().is_some_and(|s| modules::is_container(&s.item) && module_on(s, UNIT))).collect();
     if absorbed > 0.0 && !game.creative {
-        let mut owed = (MAGIC_REDUCE_ENERGY as f32 * absorbed).ceil() as u64;
+        let mut owed = (magic_reduce_energy() as f32 * absorbed).ceil() as u64;
         for &i in &holders {
             if let Some(piece) = game.armor[i].as_mut() {
                 let e = stored_energy(piece);
@@ -7942,10 +7950,11 @@ pub(super) fn player_damage_rules(game: &mut Game<'_>, absorbed: f32, rules: &mu
             }
         }
     }
-    let can_pay = holders.iter().any(|&i| game.armor[i].as_ref().is_some_and(|s| stored_energy(s) >= MAGIC_REDUCE_ENERGY));
+    let can_pay = holders.iter().any(|&i| game.armor[i].as_ref().is_some_and(|s| stored_energy(s) >= magic_reduce_energy()));
     if can_pay || (game.creative && !holders.is_empty()) {
-        rules.push(("minecraft:magic".to_owned(), 1.0));
-        rules.push(("minecraft:indirect_magic".to_owned(), 1.0));
+        let ratio = mekanism_core::config::gear_ratio("mekasuit.damage_absorption.magicDamageReductionRatio") as f32;
+        rules.push(("minecraft:magic".to_owned(), ratio));
+        rules.push(("minecraft:indirect_magic".to_owned(), ratio));
     }
 }
 
@@ -7976,6 +7985,9 @@ pub(super) fn gear_attributes(game: &mut Game<'_>, attributes: &mut Vec<(String,
 }
 
 const ELYTRA_ENERGY: u64 = 32_000;
+fn elytra_energy() -> u64 {
+    mekanism_core::config::gear_int("mekasuit.energy_usage.elytra", ELYTRA_ENERGY)
+}
 
 /// The chest piece's Elytra Unit, when it is on.
 fn elytra_piece(game: &Game<'_>) -> bool {
@@ -7991,7 +8003,7 @@ pub(super) fn glider(game: &mut Game<'_>, glider: &mut bool) {
     let Some(chest) = game.armor[1].as_ref() else {
         return;
     };
-    if stored_energy(chest) < ELYTRA_ENERGY {
+    if stored_energy(chest) < elytra_energy() {
         return;
     }
     if module_on(chest, "mekanism:jetpack_unit") {
@@ -8017,7 +8029,7 @@ pub(super) fn glide_wear(game: &mut Game<'_>, wear: u32, claimed: &mut bool) {
     }
     if let Some(chest) = game.armor[1].as_mut() {
         let stored = stored_energy(chest);
-        set_energy(chest, stored - stored.min(ELYTRA_ENERGY * u64::from(wear)));
+        set_energy(chest, stored - stored.min(elytra_energy() * u64::from(wear)));
     }
 }
 
@@ -8119,12 +8131,22 @@ fn free_runners_fall(game: &mut Game<'_>) {
         return;
     }
     let stored = stored_energy(feet);
-    let Some(cost) = gear::fall_cost(fallen, stored) else {
-        return;
+    let suit = &*feet.item == modules::BOOTS;
+    let (cost, ratio) = if suit {
+        (
+            mekanism_core::config::gear_int("mekasuit.energy_usage.fall", gear::FREE_RUNNER_FALL_COST),
+            mekanism_core::config::gear_ratio("mekasuit.damage_absorption.fallDamageReductionRatio"),
+        )
+    } else {
+        (
+            mekanism_core::config::gear_int("free_runner.fallEnergyCost", gear::FREE_RUNNER_FALL_COST),
+            mekanism_core::config::gear_ratio("free_runner.fallDamageReductionRatio"),
+        )
     };
-    set_energy(feet, stored - cost);
+    let (spent, left) = gear::fall_absorb(fallen, stored, cost, ratio);
+    set_energy(feet, stored - spent);
     if let Some(p) = game.player.as_mut() {
-        p.fall_distance = 0.0;
+        p.fall_distance = left;
     }
 }
 
@@ -16479,7 +16501,7 @@ pub(super) fn player_damage(game: &mut Game<'_>, absorbed: f32, share: &mut f32)
             }
         }
     }
-    *share = modules::suit_share(stored(game));
+    *share = modules::suit_share(stored(game)) * mekanism_core::config::gear_ratio("mekasuit.damage_absorption.unspecifiedDamageReductionRatio") as f32;
 }
 
 /// A player standing on a chargepad gets the first item in their inventory (then armor, then the
@@ -25381,6 +25403,9 @@ const NUTRITION_UNIT: &str = "mekanism:nutritional_injection_unit";
 const SUIT_PASTE_KEY: &str = "mekanism:suit_nutritional_paste";
 /// `GearConfig.mekaSuitNutritionalMaxStorage`: 128 buckets.
 const SUIT_PASTE_CAPACITY: u64 = 128_000;
+fn suit_paste_capacity() -> u64 {
+    mekanism_core::config::gear_int("mekasuit.nutritionalMaxStorage", SUIT_PASTE_CAPACITY)
+}
 /// `GeneralConfig.nutritionalPasteMBPerFood` and `saturation`.
 const PASTE_PER_FOOD: u64 = 50;
 const PASTE_SATURATION: f32 = 0.8;
@@ -25403,7 +25428,7 @@ pub(super) fn fog(game: &Game<'_>, fog_type: u8, fog: &mut horizon_client::fog::
     let Some(helmet) = game.armor[0].as_ref().filter(|s| &*s.item == modules::HELMET) else {
         return;
     };
-    if !module_on(helmet, "mekanism:vision_enhancement_unit") || stored_energy(helmet) < VISION_ENERGY {
+    if !module_on(helmet, "mekanism:vision_enhancement_unit") || stored_energy(helmet) < vision_energy() {
         return;
     }
     let installed = installed_modules(helmet).get("mekanism:vision_enhancement_unit").copied().unwrap_or(0);
@@ -25425,6 +25450,10 @@ pub(super) fn fog(game: &Game<'_>, fog_type: u8, fog: &mut horizon_client::fog::
 /// `GearConfig.mekaToolEnergyUsageShearEntity` (the trim of a block costs the same): FE a shearing takes.
 const SHEAR_ENERGY: u64 = 10;
 
+fn shear_energy() -> u64 {
+    mekanism_core::config::gear_int("mekatool.energy_usage.shearEntity", SHEAR_ENERGY)
+}
+
 /// `ModuleShearingUnit.onInteract` / `onItemUse`: shearing takes `useAllEnergy` of the Meka-Tool's energy.
 pub(super) fn shears_used(game: &mut Game<'_>, stack: &ItemStack) {
     if &*stack.item != modules::MEKA_TOOL || !game.native_on(MOD_ID) {
@@ -25432,8 +25461,8 @@ pub(super) fn shears_used(game: &mut Game<'_>, stack: &ItemStack) {
     }
     if let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == modules::MEKA_TOOL) {
         let stored = stored_energy(held);
-        if stored >= SHEAR_ENERGY {
-            set_energy(held, stored - SHEAR_ENERGY);
+        if stored >= shear_energy() {
+            set_energy(held, stored - shear_energy());
         }
     }
 }
@@ -25522,7 +25551,7 @@ fn gravitational_client(game: &mut Game<'_>) {
         return;
     };
     let boost = gravitational_boost(chest);
-    if boost <= 0.0 || stored_energy(chest) < GRAVITATIONAL_BOOST_MULTIPLIER * GRAVITATIONAL_ENERGY {
+    if boost <= 0.0 || stored_energy(chest) < GRAVITATIONAL_BOOST_MULTIPLIER * gravitational_energy() {
         return;
     }
     let Some(p) = game.player.as_mut().filter(|p| p.flying && !p.spectator) else {
@@ -25537,7 +25566,7 @@ fn gravitational_client(game: &mut Game<'_>) {
 /// On the server, the player swapped in: the boost takes the rest of its energy (four ticks' worth, one is paid already)
 /// and posts the boosted event.
 fn gravitational_boost_paid(game: &mut Game<'_>) {
-    let extra = (GRAVITATIONAL_BOOST_MULTIPLIER - 1) * GRAVITATIONAL_ENERGY;
+    let extra = (GRAVITATIONAL_BOOST_MULTIPLIER - 1) * gravitational_energy();
     let Some(chest) = game.armor[1].as_mut().filter(|s| &*s.item == modules::BODYARMOR && module_on(s, "mekanism:gravitational_modulating_unit")) else {
         return;
     };
@@ -25672,13 +25701,16 @@ fn suit_mode_change(game: &mut Game<'_>, data: &[u8]) {
 
 /// `GearConfig.mekaSuitEnergyUsageGravitationalModulation`.
 const GRAVITATIONAL_ENERGY: u64 = 1_000;
+fn gravitational_energy() -> u64 {
+    mekanism_core::config::gear_int("mekasuit.energy_usage.gravitationalModulation", GRAVITATIONAL_ENERGY)
+}
 
 /// The body armor with its Gravitational Modulating Unit on and enough energy for a tick of flight
 /// (`CommonPlayerTickHandler.isGravitationalModulationOn` without the flying check).
 fn gravitational_ready(game: &Game<'_>) -> bool {
     game.native_on(MOD_ID)
         && game.armor[1].as_ref().is_some_and(|s| {
-            &*s.item == modules::BODYARMOR && module_on(s, "mekanism:gravitational_modulating_unit") && stored_energy(s) >= GRAVITATIONAL_ENERGY
+            &*s.item == modules::BODYARMOR && module_on(s, "mekanism:gravitational_modulating_unit") && stored_energy(s) >= gravitational_energy()
         })
 }
 
@@ -25696,8 +25728,8 @@ fn gravitational_upkeep(g: &mut Game<'_>) {
     }
     if let Some(chest) = g.armor[1].as_mut().filter(|s| &*s.item == modules::BODYARMOR && module_on(s, "mekanism:gravitational_modulating_unit")) {
         let stored = stored_energy(chest);
-        if stored >= GRAVITATIONAL_ENERGY {
-            set_energy(chest, stored - GRAVITATIONAL_ENERGY);
+        if stored >= gravitational_energy() {
+            set_energy(chest, stored - gravitational_energy());
             player_game_event(g, "mekanism:gravity_modulate");
         }
     }
@@ -25705,6 +25737,9 @@ fn gravitational_upkeep(g: &mut Game<'_>) {
 
 /// `GearConfig.mekaSuitEnergyUsageVisionEnhancement`.
 const VISION_ENERGY: u64 = 500;
+fn vision_energy() -> u64 {
+    mekanism_core::config::gear_int("mekasuit.energy_usage.visionEnhancement", VISION_ENERGY)
+}
 
 /// `ModuleVisionEnhancementUnit.tickServer`: the helmet's enabled unit takes 500 FE every tick (`useAllEnergy`: all or nothing).
 fn vision_enhancement_upkeep(g: &mut Game<'_>) {
@@ -25713,8 +25748,8 @@ fn vision_enhancement_upkeep(g: &mut Game<'_>) {
     }
     if let Some(helmet) = g.armor[0].as_mut().filter(|s| &*s.item == modules::HELMET && module_on(s, "mekanism:vision_enhancement_unit")) {
         let stored = stored_energy(helmet);
-        if stored >= VISION_ENERGY {
-            set_energy(helmet, stored - VISION_ENERGY);
+        if stored >= vision_energy() {
+            set_energy(helmet, stored - vision_energy());
             // The original lights the world on the client alone (`ClientTickHandler.isVisionEnhancementOn`); Horizon reads
             // night vision from the player's effects, so a hidden, ambient one stands for it while the unit is paid for.
             let mut effect = EffectInstance::new("night_vision", 220, 0);
@@ -25819,7 +25854,7 @@ fn magnetic_attraction(g: &mut Game<'_>) {
         return;
     }
     let size = f64::from(4.0 + range);
-    let usage = (250.0 * range).ceil() as u64;
+    let usage = (mekanism_core::config::gear_int("mekasuit.energy_usage.itemAttraction", 250) as f32 * range).ceil() as u64;
     let Some((at, velocity)) = g.player.as_ref().map(|p| (p.position, p.velocity)) else {
         return;
     };

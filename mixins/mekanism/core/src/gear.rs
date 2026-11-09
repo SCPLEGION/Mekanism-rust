@@ -382,6 +382,35 @@ pub fn fall_cost(fallen: f64, stored: u64) -> Option<u64> {
     (cost <= stored).then_some(cost)
 }
 
+/// `CommonPlayerTickHandler.livingFall` with its ratio: `fallen` points of damage, `cost` FE a point and
+/// `ratio` of the damage absorbable. Returns the energy taken (at most `stored`) and the fall left over.
+pub fn fall_absorb(fallen: f64, stored: u64, cost: u64, ratio: f64) -> (u64, f64) {
+    if fallen <= 0.0 || ratio <= 0.0 {
+        return (0, fallen.max(0.0));
+    }
+    let required = (cost as f64 * fallen * ratio).ceil() as u64;
+    let (spent, absorbed) = if required == 0 {
+        (0, ratio)
+    } else {
+        let taken = required.min(stored);
+        (taken, ratio * taken as f64 / required as f64)
+    };
+    (spent, fallen * (1.0 - absorbed).max(0.0))
+}
+
+#[cfg(test)]
+mod fall_absorb_tests {
+    use super::*;
+
+    #[test]
+    fn fall_absorb_is_partial_when_short_of_energy() {
+        assert_eq!(fall_absorb(4.0, 1_000, 50, 1.0), (200, 0.0));
+        let (spent, left) = fall_absorb(4.0, 100, 50, 1.0);
+        assert_eq!((spent, left), (100, 2.0));
+        assert_eq!(fall_absorb(4.0, 1_000, 50, 0.5), (100, 2.0));
+    }
+}
+
 #[cfg(test)]
 mod free_runner_tests {
     use super::*;

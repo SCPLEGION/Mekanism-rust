@@ -19,17 +19,41 @@ pub struct GearConfig {
     pub energy: std::collections::BTreeMap<&'static str, (u64, u64)>,
     /// The other whole-number keys by `section.key` (`GEAR_INTS`).
     pub ints: std::collections::BTreeMap<String, u64>,
+    /// The damage reduction ratios by `section.key` (`GEAR_RATIOS`), each 0 to 1.
+    pub ratios: std::collections::BTreeMap<String, f64>,
+}
+
+/// The damage reduction ratios (`defineInRange(key, 1.0, 0, 1)`): (section, key).
+pub const GEAR_RATIOS: [(&str, &str); 4] = [
+    ("free_runner", "fallDamageReductionRatio"),
+    ("mekasuit.damage_absorption", "fallDamageReductionRatio"),
+    ("mekasuit.damage_absorption", "magicDamageReductionRatio"),
+    ("mekasuit.damage_absorption", "unspecifiedDamageReductionRatio"),
+];
+
+/// A damage reduction ratio of the active config (`"mekasuit.damage_absorption.magicDamageReductionRatio"`), else 1.
+pub fn gear_ratio(full_key: &str) -> f64 {
+    ACTIVE
+        .read()
+        .ok()
+        .and_then(|a| a.as_ref().and_then(|c| c.ratios.get(full_key).copied()))
+        .unwrap_or(1.0)
 }
 
 /// The other whole-number gear keys: (section, key, default), `defineInRange(key, default, 0, Integer.MAX_VALUE)`
 /// unless the range says otherwise. The Meka-Tool's and MekaSuit's usages sit in their `energy_usage` section.
-pub const GEAR_INTS: [(&str, &str, u64); 27] = [
+pub const GEAR_INTS: [(&str, &str, u64); 33] = [
     ("atomic_disassembler", "energyUsageWeapon", 2_000),
     ("electric_bow", "energyUsage", 120),
     ("electric_bow", "energyUsageFlame", 1_200),
     ("free_runner", "fallEnergyCost", 50),
     ("seismic_reader", "energyUsage", 250),
     ("mekatool", "maxTeleportReach", 100),
+    ("jetpack", "capacity", 24_000),
+    ("scuba_tank", "capacity", 24_000),
+    ("flamethrower", "capacity", 24_000),
+    ("mekasuit", "jetpackMaxStorage", 24_000),
+    ("mekasuit", "nutritionalMaxStorage", 128_000),
     ("mekatool.energy_usage", "base", 10),
     ("mekatool.energy_usage", "silk", 100),
     ("mekatool.energy_usage", "weapon", 2_000),
@@ -49,6 +73,7 @@ pub const GEAR_INTS: [(&str, &str, u64); 27] = [
     ("mekasuit.energy_usage", "energyUsagePotionTick", 40_000),
     ("mekasuit.energy_usage", "sprintBoost", 100),
     ("mekasuit.energy_usage", "visionEnhancement", 500),
+    ("mekasuit.energy_usage", "gravitationalModulation", 1_000),
     ("mekasuit.energy_usage", "itemAttraction", 250),
     ("mekasuit.energy_usage", "hydrostaticRepulsion", 500),
 ];
@@ -118,6 +143,7 @@ impl Default for GearConfig {
             disassembler_vein_mining: false,
             disassembler_mining_count: 128,
             energy: ENERGY_SECTIONS.iter().map(|(s, _, cap, rate)| (*s, (*cap, *rate))).collect(),
+            ratios: GEAR_RATIOS.iter().map(|(s, k)| (int_key(s, k), 1.0)).collect(),
             ints: GEAR_INTS.iter().map(|(s, k, d)| (int_key(s, k), *d)).collect(),
         }
     }
@@ -149,6 +175,11 @@ impl GearConfig {
                     } else if key == "chargeRate" && n <= i32::MAX as u64 {
                         e.1 = n;
                     }
+                }
+            }
+            if let Some(r) = value.parse::<f64>().ok().filter(|r| (0.0..=1.0).contains(r)) {
+                if let Some(v) = config.ratios.get_mut(int_key(&section, key).as_str()) {
+                    *v = r;
                 }
             }
             if let Some(n) = value.replace('_', "").parse::<u64>().ok().filter(|n| *n <= i32::MAX as u64) {
@@ -214,6 +245,9 @@ impl GearConfig {
                 last = sec;
             }
             out.push_str(&format!("{key} = {}\n", self.ints[int_key(sec, key).as_str()]));
+        }
+        for (sec, key) in GEAR_RATIOS {
+            out.push_str(&format!("[{sec}]\n{key} = {:?}\n", self.ratios[int_key(sec, key).as_str()]));
         }
         for (name, cap_key, _, _) in ENERGY_SECTIONS {
             if name == SECTION {
