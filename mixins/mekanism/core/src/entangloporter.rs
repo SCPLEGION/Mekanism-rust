@@ -13,9 +13,16 @@ pub const FLUID_BUFFER: u64 = 256_000;
 pub const CHEMICAL_BUFFER: u64 = 8_192_000;
 
 /// One frequency's contents.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `InventoryFrequency.storedHeat`: a capacitor of capacity 1 (`HeatAPI.DEFAULT_HEAT_CAPACITY`), so its heat is
+/// its temperature in kelvin.
+pub const HEAT_CAPACITY: f64 = 1.0;
+pub const HEAT_INVERSE_CONDUCTION: f64 = 1.0;
+pub const HEAT_INVERSE_INSULATION: f64 = 1_000.0;
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Frequency {
     pub energy: u64,
+    pub heat: f64,
     pub fluid: ChemicalTank,
     pub chemical: ChemicalTank,
 }
@@ -24,6 +31,7 @@ impl Default for Frequency {
     fn default() -> Self {
         Self {
             energy: 0,
+            heat: crate::heat::AMBIENT_TEMP,
             fluid: ChemicalTank::new(FLUID_BUFFER),
             chemical: ChemicalTank::new(CHEMICAL_BUFFER),
         }
