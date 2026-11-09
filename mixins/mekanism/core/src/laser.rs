@@ -100,7 +100,7 @@ pub fn dig(progress: u64, energy: u64, hardness: f32) -> (u64, bool) {
         return (progress, false);
     }
     let progress = progress.saturating_add(energy);
-    if progress as f64 >= f64::from(hardness) * ENERGY_PER_HARDNESS {
+    if progress as f64 >= f64::from(hardness) * crate::config_files::active_int("general", "laser", "energyPerHardness", ENERGY_PER_HARDNESS as u64) as f64 {
         (0, true)
     } else {
         (progress, false)

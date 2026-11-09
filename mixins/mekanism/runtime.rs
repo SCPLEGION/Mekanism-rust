@@ -17669,8 +17669,10 @@ fn tick_fuelwood_heater(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBloc
     let active = burn > 0;
     let mut heat = heater_heat(game, pos, &entity.nbt);
     if active {
-        burn -= 1;
-        heat.handle_heat(boiler::heat_per_fuel_tick());
+        // `fuelwoodTickMultiplier`: the heater burns that many ticks of fuel (at most what is left) in one.
+        let ticks = burn.min(config_int("general", "heater", "fuelwoodTickMultiplier", 1).max(1) as u32);
+        burn -= ticks;
+        heat.handle_heat(boiler::heat_per_fuel_tick() * f64::from(ticks));
     }
     put_int(&mut entity.nbt, "burn_time", burn);
     simulate_heater(game, pos, entity, heat);
