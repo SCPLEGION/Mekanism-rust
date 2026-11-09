@@ -16227,11 +16227,19 @@ fn meka_tool_use(game: &mut Game<'_>, claimed: &mut bool) {
     let Some((origin, dir)) = game.aim() else {
         return;
     };
-    let Some(hit) = game.clip_ray(origin, dir, mekanism_core::config::gear_int("mekatool.maxTeleportReach", modules::TOOL_TELEPORT_REACH as u64) as f64) else {
-        return;
+    let reach = mekanism_core::config::gear_int("mekatool.maxTeleportReach", modules::TOOL_TELEPORT_REACH as u64) as f64;
+    // `ModuleTeleportationUnit.requiresBlockTarget`: without it a miss teleports to the end of the reach.
+    let requires_block = module_choice(&held, "mekanism:teleportation_unit", "teleportation_requires_block") != Some(0);
+    let p = match game.clip_ray(origin, dir, reach) {
+        Some(hit) => hit.pos,
+        None if !requires_block => [0, 1, 2].map(|k| (origin[k] + dir[k] * reach).floor() as i32),
+        None => return,
     };
-    let p = hit.pos;
-    let free = |game: &Game<'_>, dy: i32| block_name(game, [p[0], p[1] + dy, p[2]]).ends_with("air");
+    // `isValidDestinationBlock`: air or a liquid.
+    let free = |game: &Game<'_>, dy: i32| {
+        let at = [p[0], p[1] + dy, p[2]];
+        block_name(game, at).ends_with("air") || game.res.facts().get(game.world.block(at[0], at[1], at[2])).fluid != horizon_client::blocks::Fluid::None
+    };
     if !free(game, 1) || !free(game, 2) {
         return;
     }
@@ -16254,7 +16262,9 @@ fn meka_tool_use(game: &mut Game<'_>, claimed: &mut bool) {
         }
     }
     *claimed = true;
-    place_player(game, [f64::from(p[0]) + 0.5, f64::from(p[1]) + 1.0, f64::from(p[2]) + 0.5]);
+    // `player.teleportTo(x + 0.5, y + 1.5, z + 0.5)` and the teleport sound.
+    place_player(game, [f64::from(p[0]) + 0.5, f64::from(p[1]) + 1.5, f64::from(p[2]) + 0.5]);
+    game.audio.play_unshared("minecraft:entity.player.teleport", None, 1.0, 1.0);
 }
 
 // --- MekaSuit ---------------------------------------------------------------------------------------
