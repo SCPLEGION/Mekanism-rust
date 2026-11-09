@@ -6465,7 +6465,7 @@ pub(super) fn spend_disassembler_energy(game: &mut Game<'_>, pos: [i32; 3]) {
         let stored = stored_energy(stack);
         let installed = modules_of(stack);
         let silk = installed.contains_key("mekanism:silk_touch_unit");
-        let cost = modules::tool_destroy_energy(modules::tool_efficiency(&installed), hardness, silk);
+        let cost = modules::tool_destroy_energy(tool_efficiency_of(stack, &installed), hardness, silk);
         set_energy(stack, stored.saturating_sub(cost));
     }
 }
@@ -7525,6 +7525,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     loop_sounds(game);
     player_sounds(game);
     gravitational_client(game);
+    hydraulic_client(game);
     radiation_client(game);
     scuba_client(game);
     free_runners_tick(game);
@@ -7648,6 +7649,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     }
     if channel == BOOST_CHANNEL && game.native_on(MOD_ID) {
         gravitational_boost_paid(game);
+        return;
+    }
+    if channel == JUMP_BOOST_CHANNEL && game.native_on(MOD_ID) {
+        hydraulic_jump_paid(game);
         return;
     }
     if channel == TW_CHANNEL && game.native_on(MOD_ID) {
@@ -8121,7 +8126,7 @@ fn free_runners_tick(game: &mut Game<'_>) {
     let runners = worn_free_runners(game).map(|s| (free_runner_mode(s), stored_energy(s)));
     // MekaSuit boots step as high as their Hydraulic Propulsion Unit reaches.
     let height = match worn_free_runners(game) {
-        Some(s) if &*s.item == modules::BOOTS => modules::step_assist(&modules_of(s)),
+        Some(s) if &*s.item == modules::BOOTS => modules::step_assist(&modules_of(s), module_choice(s, "mekanism:hydraulic_propulsion_unit", "step_assist")),
         Some(s) if free_runner_mode(s).step_boost() => gear::FREE_RUNNER_STEP,
         _ => 0.0,
     };
@@ -16157,7 +16162,7 @@ fn module_name(id: &str) -> String {
 fn meka_tool_speed(stack: &ItemStack, hardness: f32) -> f32 {
     let installed = modules_of(stack);
     let silk = installed.contains_key("mekanism:silk_touch_unit");
-    modules::tool_destroy_speed(modules::tool_efficiency(&installed), stored_energy(stack), hardness, silk)
+    modules::tool_destroy_speed(tool_efficiency_of(stack, &installed), stored_energy(stack), hardness, silk)
 }
 
 /// A right click with the Meka-Tool and its Teleportation Unit: to the top of the block looked at, up to
@@ -16209,11 +16214,15 @@ const MEKASUIT_CHANNEL: &str = "mekanism:mekasuit";
 
 /// The window's tick: sprinting in MekaSuit pants with a Locomotive Boosting Unit and the energy for it
 /// pushes the player forward (`ModuleLocomotiveBoostingUnit.tickClient`); the server pays for it.
+fn sprint_boost_of(pants: &ItemStack) -> f32 {
+    modules::sprint_boost(&modules_of(pants), module_choice(pants, "mekanism:locomotive_boosting_unit", "sprint_boost"))
+}
+
 fn mekasuit_sprint(game: &mut Game<'_>) {
     let Some(pants) = game.armor[2].as_ref().filter(|s| &*s.item == modules::PANTS) else {
         return;
     };
-    let boost = modules::sprint_boost(&modules_of(pants));
+    let boost = sprint_boost_of(pants);
     if boost <= 0.0 || stored_energy(pants) < modules::sprint_energy(boost) {
         return;
     }
@@ -16231,7 +16240,7 @@ fn mekasuit_sprint_paid(game: &mut Game<'_>) {
     let Some(pants) = game.armor[2].as_mut().filter(|s| &*s.item == modules::PANTS) else {
         return;
     };
-    let cost = modules::sprint_energy(modules::sprint_boost(&modules_of(pants)));
+    let cost = modules::sprint_energy(sprint_boost_of(pants));
     let stored = stored_energy(pants);
     set_energy(pants, stored.saturating_sub(cost));
 }
@@ -16260,12 +16269,21 @@ pub(super) fn meka_tool_area(game: &mut Game<'_>, pos: [i32; 3]) {
     if !game.native_on(MOD_ID) || game.creative || AREA_MINING.load(Relaxed) {
         return;
     }
-    let Some(installed) = game.held().filter(|s| &*s.item == modules::MEKA_TOOL).map(modules_of) else {
+    let Some((installed, efficiency, blast_mode, extended_range)) = game.held().filter(|s| &*s.item == modules::MEKA_TOOL).map(|s| {
+        let installed = modules_of(s);
+        let efficiency = tool_efficiency_of(s, &installed);
+        let blast = module_choice(s, "mekanism:blasting_unit", "blast_radius");
+        // `ModuleVeinMiningUnit`: the excavation range only counts in extended mode.
+        let vein = "mekanism:vein_mining_unit";
+        let extended = module_choice(s, vein, "extended_mode") == Some(1);
+        let range = if extended { [0, 2, 4, 6, 8][module_choice(s, vein, "mining_range").unwrap_or(1).min(4)] } else { 0 };
+        (installed, efficiency, blast, range)
+    }) else {
         return;
     };
     let silk = installed.contains_key("mekanism:silk_touch_unit");
     let mut initial = vec![pos];
-    let radius = modules::blast_radius(&installed);
+    let radius = modules::blast_radius(&installed, blast_mode);
     let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
     if radius > 0 && !sneaking && can_blast(game, pos)
         && let Some((_, dir)) = game.aim()
@@ -16278,17 +16296,18 @@ pub(super) fn meka_tool_area(game: &mut Game<'_>, pos: [i32; 3]) {
             }
         }
     }
-    // `ModuleVeinMiningUnit.findPositions`, without extended mode: only ores spread.
+    // `ModuleVeinMiningUnit.findPositions`: blocks of a kind in the first set spread through blocks of the same kind
+    // touching them when the kind is an ore (or a log), or while the distance is within the extended range.
     let mut found: Vec<([i32; 3], u32)> = Vec::new();
     if modules::veins(&installed) {
-        let mut ores = std::collections::HashSet::new();
+        let mut kinds = std::collections::HashMap::new();
         for &at in &initial {
             let name = block_name(game, at).to_owned();
-            if is_vein_ore(game, &name) {
-                ores.insert(name);
-            }
+            let ore = is_vein_ore(game, &name);
+            kinds.entry(name).or_insert(ore);
         }
-        let max = initial.len() + modules::VEIN_COUNT * ores.len();
+        let per_kind = gear_config().disassembler_mining_count;
+        let max = initial.len() + per_kind * kinds.len();
         let mut seen: std::collections::HashSet<[i32; 3]> = initial.iter().copied().collect();
         let mut frontier: std::collections::VecDeque<([i32; 3], u32)> = initial.iter().map(|&p| (p, 0)).collect();
         while let Some((at, d)) = frontier.pop_front() {
@@ -16297,7 +16316,8 @@ pub(super) fn meka_tool_area(game: &mut Game<'_>, pos: [i32; 3]) {
                 break;
             }
             let name = block_name(game, at).to_owned();
-            if !ores.contains(&name) {
+            let ore = kinds.get(&name).copied().unwrap_or(false);
+            if !(ore || extended_range > d as i32) {
                 continue;
             }
             for dx in -1..=1 {
@@ -16328,13 +16348,19 @@ pub(super) fn meka_tool_area(game: &mut Game<'_>, pos: [i32; 3]) {
             continue;
         }
         let ore = is_vein_ore(game, &facts.name);
-        let cost = modules::area_energy(silk, facts.hardness, d.max(1), ore);
+        // `MekanismUtils.veinMineArea`: blocks of the first set pay the destroy energy, the rest the vein's.
+        let cost = if d == 0 {
+            modules::tool_destroy_energy(efficiency, facts.hardness, silk)
+        } else {
+            modules::area_energy(silk, facts.hardness, d, ore)
+        };
         let Some(tool) = game.held_mut().as_mut().filter(|s| &*s.item == modules::MEKA_TOOL) else {
             break;
         };
         let stored = stored_energy(tool);
         if stored < cost {
-            break;
+            // Energy scales with hardness, so a softer block further on may still be affordable.
+            continue;
         }
         set_energy(tool, stored - cost);
         let _ = game.break_block_as_player(at);
@@ -16411,7 +16437,15 @@ fn mekasuit_distribute(game: &mut Game<'_>) {
     let Some(body) = game.armor[1].as_ref().filter(|s| &*s.item == modules::BODYARMOR) else {
         return;
     };
-    let mut available = stored_energy(body).min(mekanism_core::config::gear_int("mekasuit.inventoryChargeRate", modules::INVENTORY_CHARGE_RATE) * 20);
+    // `ModuleChargeDistributionUnit`'s two switches: the inventory (off by default) and the suit's own pieces (on).
+    let unit = "mekanism:charge_distribution_unit";
+    let charge_inventory = module_choice(body, unit, "charge_inventory") == Some(1);
+    let charge_suit = module_choice(body, unit, "charge_suit") != Some(0);
+    let mut available = if charge_inventory {
+        stored_energy(body).min(mekanism_core::config::gear_int("mekasuit.inventoryChargeRate", modules::INVENTORY_CHARGE_RATE) * 20)
+    } else {
+        0
+    };
     let mut given = 0;
     let selected = game.selected;
     let order = std::iter::once(selected).chain((0..game.inventory.len().min(36)).filter(|&i| i != selected));
@@ -16438,7 +16472,7 @@ fn mekasuit_distribute(game: &mut Game<'_>) {
         set_energy(body, stored - given);
     }
     let pieces: Vec<usize> = (0..4).filter(|&i| game.armor[i].as_ref().is_some_and(|s| modules::is_container(&s.item))).collect();
-    if pieces.len() < 2 {
+    if !charge_suit || pieces.len() < 2 {
         return;
     }
     let total: u64 = pieces.iter().filter_map(|&i| game.armor[i].as_ref()).map(stored_energy).sum();
@@ -16499,7 +16533,7 @@ pub(super) fn player_attack(game: &mut Game<'_>, strength: f32, amount: &mut f32
     // `ItemMekaTool.adjustAttributes`: `mekatool.baseDamage` before the Attack Amplification Unit's.
     *amount += mekanism_core::config::gear_int("mekatool.baseDamage", 4) as f32 * (0.2 + strength * strength * 0.8);
     let stored = stored_energy(tool);
-    let bonus = modules::attack_bonus(&modules_of(tool));
+    let bonus = modules::attack_bonus(&modules_of(tool), module_choice(tool, "mekanism:attack_amplification_unit", "attack_damage"));
     let (extra, cost) = modules::attack(bonus, if creative { u64::MAX } else { stored });
     if extra <= 0.0 {
         return;
@@ -22208,6 +22242,17 @@ fn module_setting(stack: &ItemStack, module: &str, s: &module_config::Setting, i
     module_config::parse(s.kind, stored.as_deref(), installed)
 }
 
+/// The value of `module`'s option `key` on `stack` (an index for choices, 0 or 1 for switches), None without the module.
+fn module_choice(stack: &ItemStack, module: &str, key: &str) -> Option<usize> {
+    let installed = installed_modules(stack).get(module).copied()?;
+    module_config::settings(module, installed).into_iter().find(|s| s.key == key).map(|s| module_setting(stack, module, &s, installed) as usize)
+}
+
+/// The Meka-Tool's efficiency with the mode its Excavation Escalation Unit is set to.
+fn tool_efficiency_of(stack: &ItemStack, installed: &modules::Installed) -> u64 {
+    modules::tool_efficiency(installed, module_choice(stack, "mekanism:excavation_escalation_unit", "excavation_mode"))
+}
+
 fn tw_set(stack: &mut ItemStack, module: &str, s: &module_config::Setting, installed: u32, value: u32) {
     let mut all = match custom_data(stack).and_then(|c| c.get(&JavaString::from(MODULE_CONFIG_KEY))) {
         Some(Tag::Compound(c)) => c.clone(),
@@ -25605,6 +25650,65 @@ fn gravitational_client(game: &mut Game<'_>) {
     p.velocity.x += x;
     p.velocity.z += z;
     game.native_send_to_server(BOOST_CHANNEL, &[1]);
+}
+
+/// The client's word that a jump got the Hydraulic Propulsion Unit's boost, so the server takes its energy.
+const JUMP_BOOST_CHANNEL: &str = "mekanism:jump_boost";
+
+static JUMP_GROUNDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `CommonPlayerTickHandler.onLivingJump`: a jump with the boost key held, in boots with an enabled Hydraulic Propulsion
+/// Unit, adds the unit's boost to the player's upward motion for `ceil(jump * boost / 0.1)` FE; sprinting with a working
+/// Locomotive Boosting Unit limits it to its square root. The window sees the jump as leaving the ground upward with the
+/// jump key down; the server takes the energy.
+fn hydraulic_client(game: &mut Game<'_>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(p) = game.player.as_ref() else {
+        return;
+    };
+    let grounded = p.ground.on_ground;
+    let jumped = JUMP_GROUNDED.swap(grounded, Relaxed) && !grounded && p.velocity.y > 0.0 && !p.flying && !p.spectator;
+    let sprinting = p.sprinting && !p.fall_flying;
+    if !jumped || !game.keys.contains(&winit::keyboard::KeyCode::Space) || !key_down(game, "boost") {
+        return;
+    }
+    let unit = "mekanism:hydraulic_propulsion_unit";
+    let Some(boots) = game.armor[3].as_ref().filter(|s| &*s.item == modules::BOOTS && module_on(s, unit)) else {
+        return;
+    };
+    let mut boost = modules::jump_boost(&modules_of(boots), module_choice(boots, unit, "jump_boost"));
+    let usage = modules::jump_energy(boost);
+    if boost <= 0.0 || (!game.creative && stored_energy(boots) < usage) {
+        return;
+    }
+    if sprinting
+        && let Some(pants) = game.armor[2].as_ref().filter(|s| &*s.item == modules::PANTS)
+    {
+        let sprint = sprint_boost_of(pants);
+        if sprint > 0.0 && stored_energy(pants) >= modules::sprint_energy(sprint) {
+            boost = boost.sqrt();
+        }
+    }
+    if let Some(p) = game.player.as_mut() {
+        p.velocity.y += f64::from(boost);
+    }
+    game.native_send_to_server(JUMP_BOOST_CHANNEL, &[1]);
+}
+
+/// On the server, the player swapped in: the boost's energy comes out of the boots.
+fn hydraulic_jump_paid(game: &mut Game<'_>) {
+    let unit = "mekanism:hydraulic_propulsion_unit";
+    if game.creative {
+        return;
+    }
+    let Some(boots) = game.armor[3].as_mut().filter(|s| &*s.item == modules::BOOTS && module_on(s, unit)) else {
+        return;
+    };
+    let usage = modules::jump_energy(modules::jump_boost(&modules_of(boots), module_choice(boots, unit, "jump_boost")));
+    let stored = stored_energy(boots);
+    if stored >= usage {
+        set_energy(boots, stored - usage);
+    }
 }
 
 /// On the server, the player swapped in: the boost takes the rest of its energy (four ticks' worth, one is paid already)

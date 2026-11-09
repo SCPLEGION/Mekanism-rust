@@ -125,16 +125,20 @@ pub fn energy_from(installed: &Installed, capacity: u64, rate: u64) -> (u64, u64
     (capacity.saturating_mul(1u64 << n), rate.saturating_mul(1u64 << n))
 }
 
-/// The Meka-Tool's efficiency: 4 without an Excavation Escalation Unit, and with one its fastest mode
-/// the installed units reach (`ExcavationMode`: normal 16, fast 32, super fast 64, extreme 128).
-pub fn tool_efficiency(installed: &Installed) -> u64 {
+/// `ExcavationMode` efficiencies: off, slow, normal, fast, super fast, extreme.
+pub const EXCAVATION_EFFICIENCY: [u64; 6] = [0, 4, 16, 32, 64, 128];
+
+/// The Meka-Tool's efficiency (`ModuleExcavationEscalationUnit.getEfficiency`): the base efficiency without an enabled
+/// Excavation Escalation Unit, and with one the efficiency of the mode chosen in its settings (`mode`, normal by default),
+/// which can reach as far as the installed units allow (`installed + 1`).
+pub fn tool_efficiency(installed: &Installed, mode: Option<usize>) -> u64 {
     match installed
         .get("mekanism:excavation_escalation_unit")
         .copied()
         .unwrap_or(0)
     {
         0 => TOOL_BASE_EFFICIENCY,
-        n => 8 << n.min(4),
+        n => EXCAVATION_EFFICIENCY[mode.unwrap_or(2).min(n as usize + 1).min(5)],
     }
 }
 
@@ -171,13 +175,13 @@ pub fn area_energy(silk: bool, hardness: f32, distance: u32, ore: bool) -> u64 {
     (halved(usage, hardness) as f64 * multiplier).ceil() as u64
 }
 
-/// `ModuleBlastingUnit.BlastingPower`: the radius of the strongest power the installed units reach.
-pub fn blast_radius(installed: &Installed) -> i32 {
-    installed
-        .get("mekanism:blasting_unit")
-        .copied()
-        .unwrap_or(0)
-        .min(4) as i32
+/// `ModuleBlastingUnit.getBlastRadius`: the radius chosen in the unit's settings (`mode`, low by default), at most the
+/// installed units (`BlastRadius.ordinal`), 0 without an enabled unit.
+pub fn blast_radius(installed: &Installed, mode: Option<usize>) -> i32 {
+    match installed.get("mekanism:blasting_unit").copied().unwrap_or(0) {
+        0 => 0,
+        n => mode.unwrap_or(1).min(n as usize).min(4) as i32,
+    }
 }
 
 /// `ModuleVeinMiningUnit`: whether vein mining is installed.
@@ -256,14 +260,16 @@ pub fn teleport_energy(distance_sq: f64) -> u64 {
 /// `GearConfig.mekaToolEnergyUsageWeapon`: the energy a hit costs for each 4 of extra damage.
 pub const TOOL_WEAPON_ENERGY: f64 = 2_000.0;
 
-/// `ModuleAttackAmplificationUnit.AttackDamage`: the extra damage of the strongest mode the installed
-/// units reach (low 4, medium 8, high 16, extreme 24).
-pub fn attack_bonus(installed: &Installed) -> f32 {
-    [0.0, 4.0, 8.0, 16.0, 24.0][installed
-        .get("mekanism:attack_amplification_unit")
-        .copied()
-        .unwrap_or(0)
-        .min(4) as usize]
+/// `ModuleAttackAmplificationUnit.AttackDamage`: off, low 4, medium 8, high 16, extreme 24, max 32.
+pub const ATTACK_DAMAGE: [f32; 6] = [0.0, 4.0, 8.0, 16.0, 24.0, 32.0];
+
+/// The extra damage of the mode chosen in the Attack Amplification Unit's settings (`mode`, medium by default), at most
+/// `installed + 1` steps up.
+pub fn attack_bonus(installed: &Installed, mode: Option<usize>) -> f32 {
+    match installed.get("mekanism:attack_amplification_unit").copied().unwrap_or(0) {
+        0 => 0.0,
+        n => ATTACK_DAMAGE[mode.unwrap_or(2).min(n as usize + 1).min(5)],
+    }
 }
 
 /// `ItemMekaTool.adjustAttributes` and `hurtEnemy`: the extra damage a hit gets with `stored` energy, and
@@ -290,18 +296,33 @@ fn units(installed: &Installed, module: &str) -> u32 {
     installed.get(module).copied().unwrap_or(0)
 }
 
-/// `ModuleHydraulicPropulsionUnit.StepAssist`: the highest step the installed units reach (low 0.5,
-/// medium 1, high 1.5, ultra 2 blocks), 0 without the unit.
-pub fn step_assist(installed: &Installed) -> f64 {
-    [0.0, 0.5, 1.0, 1.5, 2.0]
-        [units(installed, "mekanism:hydraulic_propulsion_unit").min(4) as usize]
+/// The index of an option's chosen value, at most the installed units (`createBounded` offers `installed + 1` values).
+fn bounded(installed: &Installed, module: &str, mode: Option<usize>, default: usize, table: usize) -> Option<usize> {
+    let n = units(installed, module) as usize;
+    (n > 0).then(|| mode.unwrap_or(default).min(n).min(table - 1))
 }
 
-/// `ModuleLocomotiveBoostingUnit.SprintBoost`: the strongest boost the installed units reach (low
-/// 0.05, medium 0.1, high 0.25, ultra 0.5), 0 without the unit.
-pub fn sprint_boost(installed: &Installed) -> f32 {
-    [0.0, 0.05, 0.1, 0.25, 0.5]
-        [units(installed, "mekanism:locomotive_boosting_unit").min(4) as usize]
+/// `ModuleHydraulicPropulsionUnit.StepAssist`: the height chosen in the unit's settings (low 0.5, medium 1, high 1.5,
+/// ultra 2 blocks), 0 without the unit.
+pub fn step_assist(installed: &Installed, mode: Option<usize>) -> f64 {
+    bounded(installed, "mekanism:hydraulic_propulsion_unit", mode, 1, 5).map_or(0.0, |i| [0.0, 0.5, 1.0, 1.5, 2.0][i])
+}
+
+/// `ModuleHydraulicPropulsionUnit.JumpBoost`: the boost chosen in the settings (low 0.5, medium 1, high 3, ultra 5), 0
+/// without the unit.
+pub fn jump_boost(installed: &Installed, mode: Option<usize>) -> f32 {
+    bounded(installed, "mekanism:hydraulic_propulsion_unit", mode, 1, 5).map_or(0.0, |i| [0.0, 0.5, 1.0, 3.0, 5.0][i])
+}
+
+/// The energy a jump with the boost costs (`CommonPlayerTickHandler.onLivingJump`: `ceil(jump * boost / 0.1)`).
+pub fn jump_energy(boost: f32) -> u64 {
+    (crate::config::gear_int("mekasuit.energy_usage.jump", 1_000) as f32 * boost / 0.1).ceil() as u64
+}
+
+/// `ModuleLocomotiveBoostingUnit.SprintBoost`: the boost chosen in the settings (low 0.05, medium 0.1, high 0.25, ultra
+/// 0.5), 0 without the unit.
+pub fn sprint_boost(installed: &Installed, mode: Option<usize>) -> f32 {
+    bounded(installed, "mekanism:locomotive_boosting_unit", mode, 1, 5).map_or(0.0, |i| [0.0, 0.05, 0.1, 0.25, 0.5][i])
 }
 
 /// The energy a tick of sprint boost costs (`canFunction`: 100 FE for each 0.1 of boost).
@@ -446,13 +467,15 @@ mod tests {
         assert_eq!(install(BOOTS, &mut m, "mekanism:energy_unit", 3), 3);
         assert_eq!(energy(&m), (128_000_000, 800_000));
         assert_eq!(energy_from(&m, 1_000, 10), (8_000, 80));
-        assert_eq!(tool_efficiency(&m), 128);
+        assert_eq!(tool_efficiency(&m, Some(5)), 128);
+        assert_eq!(tool_efficiency(&m, None), 16);
+        assert_eq!(tool_efficiency(&m, Some(0)), 0);
     }
 
     #[test]
     fn tool_energy() {
         let none = Installed::new();
-        assert_eq!(tool_efficiency(&none), 4);
+        assert_eq!(tool_efficiency(&none, Some(5)), 4);
         assert_eq!(tool_destroy_energy(16, 1.5, false), 160);
         assert_eq!(tool_destroy_energy(16, 0.0, false), 80);
         assert_eq!(tool_destroy_energy(4, 1.5, true), 400);
@@ -478,9 +501,10 @@ mod tests {
     #[test]
     fn attack_amplification() {
         let mut m = Installed::new();
-        assert_eq!(attack(attack_bonus(&m), 1_000), (0.0, 0));
+        assert_eq!(attack(attack_bonus(&m, None), 1_000), (0.0, 0));
         install(MEKA_TOOL, &mut m, "mekanism:attack_amplification_unit", 2);
-        assert_eq!(attack_bonus(&m), 8.0);
+        assert_eq!(attack_bonus(&m, None), 8.0);
+        assert_eq!(attack_bonus(&m, Some(5)), 16.0);
         assert_eq!(attack(8.0, 10_000), (8.0, 4_000));
         assert_eq!(attack(8.0, 1_000), (2.0, 1_000));
     }
@@ -500,11 +524,16 @@ mod tests {
     #[test]
     fn suit_modules() {
         let mut m = Installed::new();
-        assert_eq!(step_assist(&m), 0.0);
+        assert_eq!(step_assist(&m, None), 0.0);
         install(BOOTS, &mut m, "mekanism:hydraulic_propulsion_unit", 2);
-        assert_eq!(step_assist(&m), 1.0);
+        assert_eq!(step_assist(&m, Some(2)), 1.0);
+        assert_eq!(step_assist(&m, Some(4)), 1.0);
+        assert_eq!(step_assist(&m, None), 0.5);
+        assert_eq!(jump_boost(&m, Some(2)), 1.0);
+        assert_eq!(jump_energy(1.0), 10_000);
         install(PANTS, &mut m, "mekanism:locomotive_boosting_unit", 4);
-        assert_eq!(sprint_boost(&m), 0.5);
+        assert_eq!(sprint_boost(&m, Some(4)), 0.5);
+        assert_eq!(sprint_boost(&m, None), 0.05);
         assert_eq!(sprint_energy(0.5), 500);
         let [x, z] = sprint_push(0.5, 0.0, true, false);
         assert!(x.abs() < 1e-9 && (z - 0.5).abs() < 1e-9);
