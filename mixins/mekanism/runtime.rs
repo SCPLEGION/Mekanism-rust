@@ -21443,6 +21443,21 @@ fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         }
     });
     tw_color_draw(game, batch, o);
+    // `GuiModuleScrollList.updateTooltip`: a module in the list tells how many of the most it can take are installed.
+    if TW_COLOR.with_borrow(Option::is_none) {
+        let cursor = game.native_cursor();
+        let line = TW_UI.with_borrow(|ui| {
+            let stack = tw_stack(game, ui.slot?)?;
+            let installed = installed_modules(stack);
+            (0..TW_ROWS).find(|i| inside(cursor, tw_module_row(*i, o))).and_then(|i| {
+                let id = installed.keys().nth(ui.scroll + i)?;
+                Some(format!("\u{a7}7Installed: {}/{}", installed[id], modules::max_installed(&stack.item, id)))
+            })
+        });
+        if let Some(line) = line {
+            horizon_client::ui::tooltip(batch, &game.gui.atlas, &[horizon_client::text::Text::legacy(&line)], (cursor[0], cursor[1]));
+        }
+    }
 }
 
 fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
