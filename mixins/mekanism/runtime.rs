@@ -3531,12 +3531,14 @@ fn tick_liquifier(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
 /// The Chemical Dissolution Chamber: an item in the first slot and `per_tick` of the chemical piped in,
 /// every tick for 100 ticks, make the output chemical, pushed out to the tanks beside it.
 fn tick_dissolution(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
-    let (_, usage, ticks, capacity) = machine_power(&entity.nbt, usage_const("chemicalDissolutionChamber", nuclear::DISSOLUTION_USAGE), Some(nuclear::DISSOLUTION_TICKS));
+    let (u, usage, ticks, capacity) = machine_power(&entity.nbt, usage_const("chemicalDissolutionChamber", nuclear::DISSOLUTION_USAGE), Some(nuclear::DISSOLUTION_TICKS));
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut input = get_tank(&entity.nbt, "input", nuclear::DISSOLUTION_TANK);
     let mut output = get_tank(&entity.nbt, "output", nuclear::DISSOLUTION_TANK);
     let mut progress = get_int(&entity.nbt, "progress");
+    let mut used = get_int(&entity.nbt, "used");
+    let need = chemical_need(&u, nuclear::DISSOLUTION_TICKS, ticks, progress, used, usage_const("randomizedConsumption", 1) != 0, true, roll(entity));
     let mut active = false;
     fill_tank_from_item(entity, 3, &mut input, nuclear::dissolves_with);
     drain_tank_into_item(entity, 4, &mut output);
@@ -3548,7 +3550,7 @@ fn tick_dissolution(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     let warn = match &recipe {
         None if entity.items.first().is_some_and(|s| s.is_some()) => 8,
         Some((_, r)) => {
-            u32::from(!(input.chemical.as_deref() == Some(r.chemical) && input.amount >= r.per_tick)) << 1
+            u32::from(!(input.chemical.as_deref() == Some(r.chemical) && input.amount >= need)) << 1
                 | u32::from(!(output.accepts(r.output) && output.amount + r.amount <= output.capacity)) << 2
         }
         _ => 0,
@@ -3557,16 +3559,18 @@ fn tick_dissolution(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
     match recipe {
         Some((stack, r))
             if input.chemical.as_deref() == Some(r.chemical)
-                && input.amount >= r.per_tick
+                && input.amount >= need
                 && output.accepts(r.output)
                 && output.amount + r.amount <= output.capacity =>
         {
             if energy.consume(usage) {
                 active = true;
-                input.extract(r.per_tick);
+                input.extract(need);
+                used += need as u32;
                 progress += 1;
                 if progress >= ticks {
                     progress = 0;
+                    used = 0;
                     output.insert(r.output, r.amount);
                     let left = stack.count - r.count;
                     entity.items[0] = (left > 0).then(|| ItemStack { count: left, ..stack });
@@ -3574,11 +3578,15 @@ fn tick_dissolution(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
             }
         }
         Some(_) => {}
-        None => progress = 0,
+        None => {
+            progress = 0;
+            used = 0;
+        }
     }
     push_chemical(game, pos, &mut output, None, u64::MAX, false);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
+    put_int(&mut entity.nbt, "used", used);
     put_tank(&mut entity.nbt, "input", &input);
     put_tank(&mut entity.nbt, "output", &output);
     entity.data = vec![
@@ -3725,6 +3733,28 @@ fn tick_crystallizer(entity: &mut ModBlockEntity) -> Option<bool> {
     Some(active)
 }
 
+/// `ChemicalUsageMultiplier`: what one tick takes of the chemical. Statistical (`randomizedConsumption`): a Poisson draw
+/// around the upgrades' mean. Constant: the operation's total (`UpgradeUtils.getBaseUsage`, `base_ticks` unless speed and
+/// chemical upgrades change it) spread over the ticks, `used` of it spent already.
+fn chemical_need(u: &Upgrades, base_ticks: u32, ticks: u32, progress: u32, used: u32, statistical: bool, chemical_upgrades: bool, roll: f64) -> u64 {
+    if statistical {
+        return mekanism_core::upgrades::inverse_poisson(u.chemical_multiplier(), roll);
+    }
+    let total = if chemical_upgrades {
+        (f64::from(base_ticks) * mekanism_core::upgrades::max_upgrade_multiplier().powf(u.fraction_of(Upgrade::Speed) - u.fraction_of(Upgrade::Chemical))).round() as i64
+    } else {
+        i64::from(base_ticks)
+    };
+    let (remaining, ticks_left) = (total - i64::from(used), i64::from(ticks) - i64::from(progress));
+    if remaining < ticks_left {
+        0
+    } else if remaining == ticks_left || ticks_left <= 0 {
+        1
+    } else {
+        (remaining as f64 / ticks_left as f64) as u64
+    }
+}
+
 /// An advanced electric machine: the Purification Chamber (ore + 1 mB oxygen a tick → 3 clumps) or the
 /// Osmium Compressor (refined obsidian or glowstone dust + osmium → ingot), 200 ticks. Its chemical comes
 /// from the blocks beside it, or from items in the middle slot (`chemical_conversion`: flint → oxygen,
@@ -3741,25 +3771,7 @@ fn tick_advanced(game: &mut Game<'_>, entity: &mut ModBlockEntity, m: &'static c
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut tank = get_tank(&entity.nbt, "chemical", chem::ADVANCED_TANK);
     let mut progress = get_int(&entity.nbt, "progress");
-    // `ChemicalUsageMultiplier`: what this tick takes of the chemical.
-    let need = if statistical {
-        mekanism_core::upgrades::inverse_poisson(u.chemical_multiplier(), roll(entity))
-    } else {
-        // `UpgradeUtils.getBaseUsage`: the total over an operation, 200 unless chemical upgrades change it.
-        let total = if chemical_upgrades {
-            (f64::from(chem::ADVANCED_TICKS) * mekanism_core::upgrades::max_upgrade_multiplier().powf(u.fraction_of(Upgrade::Speed) - u.fraction_of(Upgrade::Chemical))).round() as i64
-        } else {
-            i64::from(chem::ADVANCED_TICKS)
-        };
-        let (remaining, ticks_left) = (total - i64::from(used), i64::from(ticks) - i64::from(progress));
-        if remaining < ticks_left {
-            0
-        } else if remaining == ticks_left || ticks_left <= 0 {
-            1
-        } else {
-            (remaining as f64 / ticks_left as f64) as u64
-        }
-    };
+    let need = chemical_need(&u, chem::ADVANCED_TICKS, ticks, progress, used, statistical, chemical_upgrades, roll(entity));
     let mut active = false;
     let items = world_items!(game);
     let in_tag = |tag: &str, item: &str| items.item_tags.get(tag).is_some_and(|t| t.contains(item));
