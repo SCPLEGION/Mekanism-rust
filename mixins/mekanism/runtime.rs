@@ -6845,11 +6845,37 @@ thread_local! {
 /// `MekanismHUD.render`: the text of the items worn and held (bottom left, at the HUD scale 0.6), then, with a
 /// MekaSuit helmet, `HUDRenderer.renderHUD`: compass, energy of the suit, icons of its modules, all lagging the
 /// head's turn a little. Colours: `ClientConfig` defaults (opacity 0.4, `0x40F5F0`).
+/// `MekaSuitEnergyLevel`: above the armour row, a bar of the energy the worn suit pieces hold together
+/// (`hudRenderMekaSuitEnergyBar`). One row of hearts is assumed for the height.
+fn suit_energy_level(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    if game.creative || game.native_setting(MOD_ID, "suit_energy_bar").as_deref() == Some("false") {
+        return;
+    }
+    let (mut capacity, mut stored) = (0u64, 0u64);
+    for stack in game.armor.iter().flatten().filter(|s| modules::is_container(&s.item)) {
+        if let Some(e) = item_energy_of(stack) {
+            capacity = capacity.saturating_add(e.capacity);
+            stored = stored.saturating_add(stored_energy(stack));
+        }
+    }
+    if capacity == 0 {
+        return;
+    }
+    let x = batch.width / 2.0 - 91.0;
+    let y = batch.height - 57.0;
+    let length = ((stored as f64 / capacity as f64) * 79.0).round() as f32;
+    nine_slice(game, batch, "bar/base", 5.0, 1.0, [x, y, 81.0, 6.0]);
+    if length > 0.0 {
+        sprite(game, batch, "bar/horizontal_power", [0.0, 0.0, length, 4.0], [x + 1.0, y + 1.0, length, 4.0]);
+    }
+}
+
 pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
     if !game.native_on(MOD_ID) || !game.native_playing() || game.spectator() {
         return;
     }
     radiation_overlay(game, batch);
+    suit_energy_level(game, batch);
     // `MekanismConfig.client.enableHUD`, flipped by the HUD key.
     if game.native_setting(MOD_ID, "enable_hud").as_deref() == Some("false") {
         return;
