@@ -6495,6 +6495,17 @@ fn loop_sounds(game: &mut Game<'_>) {
             game.native_loop_sound(&format!("mekanism:alarm:{pos:?}"), "mekanism:tile.machine.industrial_alarm", Some(at), 1.0, 1.0);
         }
     }
+    // The SPS (`withSound(MekanismSounds.SPS)` on its casing and ports): its sound loops from the port while it is on.
+    let sps: Vec<[i32; 3]> = SPS_FX.with_borrow(|set| {
+        set.keys()
+            .filter(|p| game.native_client_block_entity(**p).is_some_and(|(_, c)| get_int(c, "sps_on") != 0))
+            .copied()
+            .collect()
+    });
+    for pos in sps {
+        let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+        game.native_loop_sound(&format!("mekanism:sps:{pos:?}"), "mekanism:tile.machine.sps", Some(at), 1.0, 1.0);
+    }
     let machines: Vec<([i32; 3], &'static str)> = MACHINE_SOUNDS.with_borrow(|m| m.iter().map(|(p, e)| (*p, *e)).collect());
     for (pos, event) in machines {
         if game.native_client_block_entity(pos).is_none() {
@@ -7305,6 +7316,8 @@ pub(super) fn wheel(game: &mut Game<'_>, steps: f32, claimed: &mut bool) {
     if game.armor[1].as_ref().is_some_and(is_jetpack) && steps.round() != 0.0 && !game.armor[1].as_ref().is_some_and(|s| &*s.item == SCUBA_TANK) {
         *claimed = true;
         game.native_send_to_server(JETPACK_MODE_CHANNEL, &[(steps.round().signum() as i8) as u8]);
+        // `MekanismKeyHandler.handlePotentialModeItem`: the hydraulic sound with the mode change.
+        game.audio.play_unshared("mekanism:item.hydraulic", None, 1.0, 1.0);
         return;
     }
     if (steps.round() as i32).abs() % 2 != 1 {
@@ -7315,6 +7328,7 @@ pub(super) fn wheel(game: &mut Game<'_>, steps: f32, claimed: &mut bool) {
     if held || worn {
         *claimed = true;
         game.native_send_to_server(SCUBA_MODE_CHANNEL, &[1]);
+        game.audio.play_unshared("mekanism:item.hydraulic", None, 1.0, 1.0);
     }
 }
 
@@ -21456,6 +21470,7 @@ fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
     }
     let slots = tw_slots(game);
     let mut send = None;
+    let mut beep = None;
     TW_UI.with_borrow_mut(|ui| {
         if let Some(i) = (0..slots.len().min(11)).find(|i| inside(at, tw_item_cell(*i, o))) {
             ui.slot = Some(slots[i]);
@@ -21494,9 +21509,16 @@ fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
             }
             let count = module_config::choices(s.kind, n) as u32;
             let next = if button == 1 { (now + count - 1) % count } else { (now + 1) % count };
+            if matches!(s.kind, module_config::Kind::Bool(_)) {
+                beep = Some(next != 0);
+            }
             send = ui.slot.map(|slot| format!("{slot}|{module}|{}|{next}", s.key));
         }
     });
+    // `BooleanToggle.click`: the digital beep, on or off.
+    if let Some(on) = beep {
+        game.audio.play_unshared(if on { "mekanism:gui.digital_beep_on" } else { "mekanism:gui.digital_beep_off" }, None, 1.0, 1.0);
+    }
     if let Some(text) = send {
         game.native_send_to_server(TW_CHANNEL, text.as_bytes());
     }
