@@ -27216,7 +27216,25 @@ fn dropper_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     let Some(g) = layout(&entity.id).and_then(|l| l.gauges.get(i).copied()) else {
         return true;
     };
-    let mut tank = get_tank(&entity.nbt, g.key, g.capacity);
+    // A Dynamic Tank's gauge shows the tank of its master valve, whose capacity follows the volume of the structure.
+    let dynamic = matches!(kind(&entity.id), Some(Kind::DynamicValve));
+    let remote = if dynamic { multiblock_master(entity, pos).flatten().filter(|m| *m != pos) } else { None };
+    let (mut tank, capacity) = match remote {
+        Some(m) => {
+            let Some((tank, cap)) = game.native_with_mod_block_entity(m, |e| {
+                let cap = dynamic_tank::capacity(get_long(&e.nbt, "volume"));
+                (get_tank(&e.nbt, g.key, cap), cap)
+            }) else {
+                return true;
+            };
+            (tank, cap)
+        }
+        None => {
+            let cap = if dynamic { dynamic_tank::capacity(get_long(&entity.nbt, "volume")) } else { g.capacity };
+            (get_tank(&entity.nbt, g.key, cap), cap)
+        }
+    };
+    let _ = capacity;
     let rate = mekanism_core::config::gear_int("gauge_dropper.transferRate", 250).max(1);
     let load = |key: &str| item_tank(&carried, key, dropper_capacity()).unwrap_or_else(|| ChemicalTank::new(dropper_capacity()));
     // Which of the dropper's two tanks takes part: the one that fits the gauge's chemical, else the one holding something.
@@ -27251,7 +27269,12 @@ fn dropper_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
             dropper.extract(moved);
         }
     }
-    put_tank(&mut entity.nbt, g.key, &tank);
+    match remote {
+        Some(m) => {
+            game.native_with_mod_block_entity(m, |e| put_tank(&mut e.nbt, g.key, &tank));
+        }
+        None => put_tank(&mut entity.nbt, g.key, &tank),
+    }
     put_item_tank_key(&mut carried, key, &dropper);
     game.carried = Some(carried);
     true
