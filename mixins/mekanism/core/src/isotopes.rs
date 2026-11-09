@@ -15,6 +15,7 @@ pub fn pumped(fluid: &str, filter: bool) -> Option<(&'static str, u64)> {
     match fluid {
         "minecraft:water" if filter => Some((crate::chemical::HEAVY_WATER, crate::config_files::active_int("general", "pump", "heavyWaterAmount", HEAVY_WATER_PER_BLOCK))),
         "minecraft:water" => Some(("minecraft:water", 1_000)),
+        "minecraft:lava" => Some(("minecraft:lava", 1_000)),
         _ => None,
     }
 }
@@ -59,7 +60,7 @@ mod tests {
             pumped("minecraft:water", true),
             Some(("mekanism:heavy_water", 10))
         );
-        assert_eq!(pumped("minecraft:lava", true), None);
+        assert_eq!(pumped("minecraft:lava", true), Some(("minecraft:lava", 1_000)));
     }
 
     #[test]

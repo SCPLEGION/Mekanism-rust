@@ -8919,6 +8919,37 @@ fn port_mode(game: &Game<'_>, pos: [i32; 3]) -> Option<usize> {
 /// as a bucket of water or, with a filter upgrade, 10 mB of heavy water. Water left by the
 /// `waterSourceConversion` rule is an infinite source, so the block stays, as in Mekanism. The fluid
 /// goes up into the pipe or tank above.
+/// A source block of a pumpable fluid at `at`: its position, the chemical and the amount it gives.
+fn pump_source(game: &Game<'_>, at: [i32; 3], fluid: &str, filter: bool) -> Option<([i32; 3], &'static str, u64)> {
+    if block_name(game, at) != fluid || game.native_block_property(at, "level").as_deref() != Some("0") {
+        return None;
+    }
+    isotopes::pumped(fluid, filter).map(|(f, a)| (at, f, a))
+}
+
+/// The nearest source of `fluid` reachable through that fluid from `start`, within `pump.range` of the pump.
+fn pump_search(game: &Game<'_>, pump: [i32; 3], start: [i32; 3], fluid: &str, filter: bool) -> Option<([i32; 3], &'static str, u64)> {
+    let range = config_int("general", "pump", "range", 80) as f64;
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut queue = std::collections::VecDeque::from([start]);
+    while let Some(at) = queue.pop_front() {
+        if seen.len() > 20_000 {
+            break;
+        }
+        if let Some(found) = pump_source(game, at, fluid, filter) {
+            return Some(found);
+        }
+        for d in [[0, 1, 0], [0, 0, 1], [0, 0, -1], [1, 0, 0], [-1, 0, 0], [0, -1, 0]] {
+            let n = [at[0] + d[0], at[1] + d[1], at[2] + d[2]];
+            let dist = (0..3).map(|i| f64::from(n[i] - pump[i]).powi(2)).sum::<f64>().sqrt();
+            if dist <= range && block_name(game, n) == fluid && seen.insert(n) {
+                queue.push_back(n);
+            }
+        }
+    }
+    None
+}
+
 fn tick_pump(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> Option<bool> {
     let u = upgrades(&entity.nbt);
     let usage = u.energy_per_tick(usage_const("electricPump", isotopes::PUMP_USAGE));
@@ -8927,19 +8958,28 @@ fn tick_pump(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) ->
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut tank = get_tank(&entity.nbt, "fluid", isotopes::PUMP_TANK);
     let below = [pos[0], pos[1] - 1, pos[2]];
-    let source = (game.native_block_property(below, "level").as_deref() == Some("0"))
-        .then(|| isotopes::pumped(block_name(game, below), u.filter > 0))
-        .flatten();
+    // `suck`: the block under the pump first, then the fluid it is part of out to `pump.range` blocks (the
+    // original shuffles its remembered nodes; this takes the nearest source).
+    let fluid_here = block_name(game, below).to_string();
+    let mut found = pump_source(game, below, &fluid_here, u.filter > 0);
+    if found.is_none() && isotopes::pumped(&fluid_here, false).is_some() {
+        found = pump_search(game, pos, below, &fluid_here, u.filter > 0);
+    }
     let mut progress = get_int(&entity.nbt, "progress");
     let mut active = false;
-    match source {
-        Some((fluid, amount)) if tank.accepts(fluid) && tank.amount + amount <= tank.capacity => {
+    match found {
+        Some((at, fluid, amount)) if tank.accepts(fluid) && tank.amount + amount <= tank.capacity => {
             if energy.consume(usage) {
                 active = true;
                 progress += 1;
                 if progress >= u.ticks(isotopes::PUMP_TICKS) {
                     progress = 0;
                     tank.insert(fluid, amount);
+                    // `isInfiniteSource`: water and lava are not used up while the source-conversion game rules are on
+                    // (assumed on: no game rule is readable by mods) unless `pumpInfiniteFluidSources` is set.
+                    if config_flag("general", "pump", "pumpInfiniteFluidSources", false) {
+                        game.native_set_block(at, "minecraft:air", &[]);
+                    }
                 }
             }
         }
