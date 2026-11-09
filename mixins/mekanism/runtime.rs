@@ -7631,6 +7631,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     if game.native_window() && game.native_on(MOD_ID) {
         tweaker_key(game);
         seismic_open(game);
+        pt_open(game);
         radial_key(game);
     }
     if !game.native_window() || !game.native_on(MOD_ID) || !game.native_playing() {
@@ -7728,6 +7729,12 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
 pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
     if channel == FREQUENCY_CHANNEL && game.native_on(MOD_ID) {
         frequency_payload(game, data);
+        return;
+    }
+    if channel == PT_CHANNEL && game.native_on(MOD_ID) {
+        if data.first() == Some(&1) {
+            portable_teleport(game);
+        }
         return;
     }
     if channel == ADAPTER_CHANNEL && game.native_on(MOD_ID) {
@@ -14918,10 +14925,18 @@ pub(super) fn use_teleporter(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 /// A right click with the Portable Teleporter: to the closest teleporter on its frequency, paid from
 /// its own energy (`ItemPortableTeleporter`).
 fn portable_teleporter_use(game: &mut Game<'_>, claimed: &mut bool) {
+    if game.held_mut().as_ref().is_some_and(|s| &*s.item == teleporter::PORTABLE) {
+        *claimed = true;
+        // `GuiPortableTeleporter`: the screen opens; its Teleport button asks for the jump.
+        pt_push(game);
+    }
+}
+
+/// The Teleport button, on the server (`ClientTickHandler.portableTeleport`).
+fn portable_teleport(game: &mut Game<'_>) {
     let Some(held) = game.held_mut().clone().filter(|s| &*s.item == teleporter::PORTABLE) else {
         return;
     };
-    *claimed = true;
     let frequency = custom_data(&held).and_then(|c| get_string(c, FREQUENCY_KEY));
     let Some(frequency) = frequency else {
         tell(game, "Portable Teleporter: no frequency (right click a teleporter with it)".to_owned());
@@ -17983,6 +17998,10 @@ fn frequency_payload(game: &mut Game<'_>, data: &[u8]) {
     let (Some(r), Some(player)) = (freq::Request::decode(data), game.native_acting_player()) else {
         return;
     };
+    if r.pos == PT_POS {
+        portable_frequency(game, &r, player.uuid, &player.name);
+        return;
+    }
     let near = (0..3).map(|k| (player.position[k] - f64::from(r.pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
     let Some(t) = freq_type(block_name(game, r.pos)).filter(|_| near) else {
         return;
@@ -18071,6 +18090,9 @@ struct FreqView {
 }
 
 fn freq_view(game: &Game<'_>) -> Option<([i32; 3], FreqView)> {
+    if PT_OPEN.get() {
+        return PT_STATE.with_borrow(|s| s.as_ref().map(|s| (PT_POS, FreqView { own: s.view.own.clone(), list: s.view.list.clone(), status: s.view.status })));
+    }
     let (x, y, z) = game.container?;
     let pos = [x, y, z];
     let (_, client) = game.native_client_block_entity(pos)?;
@@ -23355,7 +23377,9 @@ fn tweaker_payload(game: &mut Game<'_>, data: &[u8]) {
 
 /// The mod's own screens (hook points `native_ui_*`, API 44).
 pub(super) fn ui_draw(game: &Game<'_>, id: &str, batch: &mut horizon_client::hud::HudBatch) {
-    if id == SEISMIC_ID {
+    if id == PT_ID {
+        pt_draw(game, batch);
+    } else if id == SEISMIC_ID {
         seismic_draw(game, batch);
     } else if id == TW_ID {
         tweaker_draw(game, batch);
@@ -23373,7 +23397,11 @@ pub(super) fn ui_draw(game: &Game<'_>, id: &str, batch: &mut horizon_client::hud
 }
 
 pub(super) fn ui_click(game: &mut Game<'_>, id: &str, at: [f32; 2], button: u8, pressed: bool) {
-    if id == SEISMIC_ID {
+    if id == PT_ID {
+        if pressed {
+            pt_click(game, at, button);
+        }
+    } else if id == SEISMIC_ID {
         if pressed && button == 0 {
             seismic_click(game, at);
         }
@@ -23388,6 +23416,12 @@ pub(super) fn ui_click(game: &mut Game<'_>, id: &str, at: [f32; 2], button: u8, 
 
 /// A key on a mod screen: typing into the Robit's repair name box (`GuiTextField`, 50 characters).
 pub(super) fn ui_key(game: &mut Game<'_>, id: &str, key: &str, text: Option<&str>, pressed: bool) {
+    if id == PT_ID {
+        if pressed {
+            pt_key(game, key, text);
+        }
+        return;
+    }
     if id == TW_ID && pressed && TW_COLOR.with_borrow(Option::is_some) {
         tw_color_key(game, key, text);
         return;
@@ -23442,6 +23476,245 @@ pub(super) fn ui_wheel(game: &mut Game<'_>, id: &str, steps: f32) {
         let rows = ROBIT_UNLOCKED.with_borrow(|u| u.len().div_ceil(3)).saturating_sub(3);
         ROBIT_SKIN_ROW.with(|r| r.set((r.get() as i32 - steps.signum() as i32).clamp(0, rows as i32) as usize));
     }
+}
+
+// --- Portable Teleporter (GuiPortableTeleporter) -------------------------------------------------------------
+
+const PT_ID: &str = "mekanism:portable_teleporter";
+const PT_CHANNEL: &str = "mekanism:portable_teleporter";
+/// The position a frequency request carries when it is for the held Portable Teleporter.
+const PT_POS: [i32; 3] = [i32::MIN, 0, 0];
+const PT_BUTTON: [f32; 4] = [42.0, 147.0, 92.0, 20.0];
+const PT_WINDOW: [f32; 2] = [176.0, 172.0];
+
+fn put_entry(out: &mut Vec<u8>, e: &freq::Entry) {
+    out.push(e.security.ordinal());
+    out.extend(e.owner.to_be_bytes());
+    out.push(e.color);
+    for text in [&e.name, &e.owner_name] {
+        let b = text.as_bytes();
+        out.push(b.len().min(255) as u8);
+        out.extend(&b[..b.len().min(255)]);
+    }
+}
+
+fn read_entry(data: &[u8], at: &mut usize) -> Option<freq::Entry> {
+    let security = freq::Security::from_ordinal(i64::from(*data.get(*at)?));
+    let owner = u128::from_be_bytes(data.get(*at + 1..*at + 17)?.try_into().ok()?);
+    let color = *data.get(*at + 17)?;
+    *at += 18;
+    let mut text = || -> Option<String> {
+        let n = usize::from(*data.get(*at)?);
+        let s = String::from_utf8(data.get(*at + 1..*at + 1 + n)?.to_vec()).ok()?;
+        *at += 1 + n;
+        Some(s)
+    };
+    let name = text()?;
+    let owner_name = text()?;
+    Some(freq::Entry { name, security, owner, owner_name, color })
+}
+
+/// Tells the player what the held Portable Teleporter's screen shows: its frequency, the list, the status and energy.
+fn pt_push(game: &mut Game<'_>) {
+    let Some(player) = game.native_acting_player() else {
+        return;
+    };
+    let Some(held) = game.held_mut().clone().filter(|s| &*s.item == teleporter::PORTABLE) else {
+        return;
+    };
+    let key = custom_data(&held).and_then(|c| get_string(c, FREQUENCY_KEY));
+    let list = FREQ_LISTS.lock().ok().and_then(|l| l.get(&0).cloned()).unwrap_or_default();
+    let own = key.as_ref().and_then(|k| list.iter().find(|e| &e.key() == k)).cloned();
+    let stored = stored_energy(&held);
+    let from = [player.position[0], player.position[1], player.position[2]];
+    let status: u8 = match (&own, key.as_ref()) {
+        (Some(_), Some(k)) => match teleport_target(game, k, from, None) {
+            None => 2,
+            Some((to, _)) if stored < teleport_cost(from, to, true) => 3,
+            Some(_) => 0,
+        },
+        _ => 2,
+    };
+    let mut out = vec![status, u8::from(own.is_some())];
+    if let Some(e) = &own {
+        put_entry(&mut out, e);
+    }
+    out.extend((list.len().min(65_535) as u16).to_be_bytes());
+    for e in list.iter().take(65_535) {
+        put_entry(&mut out, e);
+    }
+    out.extend(stored.to_be_bytes());
+    game.native_send_to_player(player.uuid, PT_CHANNEL, &out);
+}
+
+/// A frequency request for the held Portable Teleporter (`PacketSetItemFrequency`): the same operations
+/// as on a block, the frequency kept in the item.
+fn portable_frequency(game: &mut Game<'_>, r: &freq::Request, uuid: u128, name: &str) {
+    let owner = if r.security == freq::Security::Public && r.op != freq::Op::Set { r.owner } else { uuid };
+    let key = freq::key(&r.name, r.security, owner);
+    let held_key = game.held_mut().as_ref().filter(|s| &*s.item == teleporter::PORTABLE).map(|s| custom_data(s).and_then(|c| get_string(c, FREQUENCY_KEY)));
+    let Some(held_key) = held_key else {
+        return;
+    };
+    {
+        let Ok(mut lists) = FREQ_LISTS.lock() else {
+            return;
+        };
+        let list = lists.entry(0).or_default();
+        match r.op {
+            freq::Op::Set => {
+                if !list.iter().any(|e| e.key() == key) {
+                    list.push(freq::Entry { name: r.name.clone(), security: r.security, owner, owner_name: name.to_owned(), color: freq::DEFAULT_COLOR });
+                }
+                if let Ok(mut d) = FREQ_DELETED.lock() {
+                    d.remove(&(0, key.clone()));
+                }
+                drop(lists);
+                if let Some(stack) = game.held_mut().as_mut() {
+                    set_custom_string(stack, FREQUENCY_KEY, &key);
+                }
+            }
+            freq::Op::Remove => {
+                let Some(at) = list.iter().position(|e| e.key() == key && e.owner == uuid) else {
+                    return;
+                };
+                list.remove(at);
+                drop(lists);
+                if let Ok(mut d) = FREQ_DELETED.lock() {
+                    d.insert((0, key.clone()));
+                }
+                if let Ok(mut all) = FREQUENCIES.lock() {
+                    all.remove(&key);
+                }
+                if held_key.as_deref() == Some(key.as_str())
+                    && let Some(stack) = game.held_mut().as_mut()
+                    && let Some(extra) = stack.extra.as_mut()
+                    && let Some((_, Tag::Compound(c))) = extra.other.iter_mut().find(|(k, _)| k == "minecraft:custom_data")
+                {
+                    c.remove(&JavaString::from(FREQUENCY_KEY));
+                }
+            }
+            freq::Op::ColorNext | freq::Op::ColorPrevious => {
+                if let Some(e) = list.iter_mut().find(|e| e.key() == key && e.owner == uuid) {
+                    e.color = freq::step_color(e.color, r.op == freq::Op::ColorNext);
+                }
+            }
+        }
+    }
+    pt_push(game);
+}
+
+struct PtState {
+    view: FreqView,
+    stored: u64,
+}
+
+thread_local! {
+    static PT_STATE: std::cell::RefCell<Option<PtState>> = const { std::cell::RefCell::new(None) };
+    static PT_FRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PT_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PT_ORIGIN: std::cell::Cell<[f32; 2]> = const { std::cell::Cell::new([0.0, 0.0]) };
+}
+
+fn pt_payload(data: &[u8]) {
+    let status = u32::from(data.first().copied().unwrap_or(2));
+    let mut at = 2;
+    let own = if data.get(1) == Some(&1) { read_entry(data, &mut at) } else { None };
+    let Some(n) = data.get(at..at + 2).map(|b| usize::from(u16::from_be_bytes([b[0], b[1]]))) else {
+        return;
+    };
+    at += 2;
+    let mut list = Vec::new();
+    for _ in 0..n {
+        match read_entry(data, &mut at) {
+            Some(e) => list.push(e),
+            None => return,
+        }
+    }
+    let Some(stored) = data.get(at..at + 8).map(|b| u64::from_be_bytes(b.try_into().unwrap_or([0; 8]))) else {
+        return;
+    };
+    PT_STATE.with_borrow_mut(|s| *s = Some(PtState { view: FreqView { own, list, status }, stored }));
+    PT_FRESH.set(true);
+}
+
+/// The window opens when the server's first state arrives (hook point `native_tick`).
+fn pt_open(game: &mut Game<'_>) {
+    if !PT_FRESH.take() || PT_OPEN.get() || game.native_ui_open().is_some() {
+        return;
+    }
+    FREQ_UI.with_borrow_mut(|ui| *ui = FreqUi::default());
+    PT_OPEN.set(true);
+    game.native_open_ui(PT_ID);
+}
+
+fn pt_ready() -> bool {
+    PT_STATE.with_borrow(|s| s.as_ref().is_some_and(|s| s.view.own.is_some() && s.view.status == 0))
+}
+
+fn pt_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    let [w, h] = PT_WINDOW;
+    let o = [((batch.width - w) / 2.0).floor(), ((batch.height - h) / 2.0).floor()];
+    PT_ORIGIN.set(o);
+    let cursor = game.native_cursor();
+    nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [o[0] - 3.0, o[1] - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
+    nine_slice(game, batch, "base", 16.0, 4.0, [o[0], o[1], w, h]);
+    let at = |r: [f32; 4]| [o[0] + r[0], o[1] + r[1], r[2], r[3]];
+    // `renderTitleTextWithOffset(status.getRelativeRight())`, `titleLabelY -= 2`.
+    let title = "Portable Teleporter";
+    centred(game, batch, title, o[0] + 24.0, 152.0, o[1] + 2.0, 0x40_4040);
+    draw_mek_button(game, batch, at(TELEPORTER_STATUS), true, false);
+    let (status, stored) = PT_STATE.with_borrow(|s| {
+        s.as_ref().map_or(("no_frequency", 0), |s| {
+            (
+                match (s.view.own.is_some(), s.view.status) {
+                    (true, 0) => "ready",
+                    (true, 3) => "needs_energy",
+                    (true, _) => "no_link",
+                    _ => "no_frequency",
+                },
+                s.stored,
+            )
+        })
+    });
+    sprite(game, batch, &format!("teleporter/{status}"), [0.0, 0.0, 18.0, 18.0], at(TELEPORTER_STATUS));
+    let [x, y, bw, bh] = power_rect(PowerBar::Vertical([158.0, 26.0]));
+    nine_slice(game, batch, "bar/base", 5.0, 1.0, [o[0] + x, o[1] + y, bw, bh]);
+    let filled = (stored as f32 / teleporter::PORTABLE_CAPACITY as f32).clamp(0.0, 1.0) * (bh - 2.0);
+    if filled > 0.0 {
+        sprite(game, batch, "bar/vertical_power", [0.0, 0.0, 2.0, 2.0], [o[0] + x + 1.0, o[1] + y + bh - 1.0 - filled, bw - 2.0, filled]);
+    }
+    draw_freq_selector(game, batch, "mekanism:teleporter", o);
+    // `TranslationButton(this, 42, 147, 92, 20, BUTTON_TELEPORT)`: active while the teleporter is ready.
+    let ready = pt_ready();
+    let hover = inside([cursor[0] - o[0], cursor[1] - o[1]], PT_BUTTON);
+    draw_mek_button(game, batch, at(PT_BUTTON), ready, ready && hover);
+    let label = "Teleport";
+    let lw = game.native_text_width(label);
+    game.native_text(batch, label, [o[0] + PT_BUTTON[0] + (PT_BUTTON[2] - lw) / 2.0, o[1] + PT_BUTTON[1] + 6.0], if ready { 0xFF_FFFF } else { 0xA0_A0A0 }, true);
+}
+
+fn pt_click(game: &mut Game<'_>, at: [f32; 2], button: u8) {
+    let o = PT_ORIGIN.get();
+    let rel = [at[0] - o[0], at[1] - o[1]];
+    let right = button == 1;
+    if !right && inside(rel, PT_BUTTON) {
+        if pt_ready() {
+            game.native_send_to_server(PT_CHANNEL, &[1]);
+            game.native_close_ui();
+        }
+        return;
+    }
+    frequency_click(game, "mekanism:teleporter", rel, right);
+}
+
+fn pt_key(game: &mut Game<'_>, key: &str, text: Option<&str>) {
+    let game = &*game;
+    FREQ_UI.with_borrow_mut(|ui| {
+        if ui.text.focused && ui.text.key(key, text, freq::valid_char, freq::MAX_FREQ_LENGTH) == freq::Typed::Enter {
+            submit_frequency_field(game, PT_POS, ui);
+        }
+    });
 }
 
 // --- Seismic Reader (GuiSeismicReader) -----------------------------------------------------------------------
@@ -24157,6 +24430,9 @@ pub(super) fn mob_died(game: &mut Game<'_>, kind: &str, at: [f64; 3], data: Opti
 
 /// The window's client got the Robits' ids.
 pub(super) fn client_payload(channel: &str, data: &[u8]) {
+    if channel == PT_CHANNEL {
+        pt_payload(data);
+    }
     if channel == SEISMIC_CHANNEL && data.len() >= 12 {
         let int = |i: usize| i32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
         SEISMIC_PENDING.set(Some([int(0), int(4), int(8)]));
@@ -25481,6 +25757,10 @@ fn robit_set_tab(game: &mut Game<'_>, tab: RobitTab) {
 
 /// The mod screen closed (Escape, or another screen replaced it): the Robit's inventory lets go of the cursor.
 pub(super) fn ui_closed(game: &mut Game<'_>, id: &str) {
+    if id == PT_ID {
+        PT_OPEN.set(false);
+        FREQ_UI.with_borrow_mut(|ui| *ui = FreqUi::default());
+    }
     if id == TW_ID {
         TW_COLOR.with_borrow_mut(|c| *c = None);
     }
