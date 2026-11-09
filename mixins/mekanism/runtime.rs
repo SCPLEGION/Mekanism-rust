@@ -26613,3 +26613,16 @@ fn dropper_use(game: &mut Game<'_>, claimed: &mut bool) {
     }
     *claimed = true;
 }
+
+/// `ItemAtomicDisassembler.adjustAttributes` / `ItemMekaTool.adjustAttributes`: the attack speed config of the item held.
+pub(super) fn attack_speed(game: &Game<'_>, stack: &ItemStack, add: &mut f64) {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    let key = match &*stack.item {
+        DISASSEMBLER => "atomic_disassembler.attackSpeed",
+        modules::MEKA_TOOL => "mekatool.attackSpeed",
+        _ => return,
+    };
+    *add = mekanism_core::config::gear_decimal(key, -2.4);
+}

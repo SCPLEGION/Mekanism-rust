@@ -21,6 +21,8 @@ pub struct GearConfig {
     pub ints: std::collections::BTreeMap<String, u64>,
     /// The damage reduction ratios by `section.key` (`GEAR_RATIOS`), each 0 to 1.
     pub ratios: std::collections::BTreeMap<String, f64>,
+    /// The other decimal keys by `section.key` (`GEAR_DECIMALS`).
+    pub decimals: std::collections::BTreeMap<String, f64>,
     /// The switches by `section.key` (`GEAR_FLAGS`).
     pub flags: std::collections::BTreeMap<String, bool>,
     /// The decimals by `section.key` (`GEAR_DOUBLES`).
@@ -41,6 +43,21 @@ pub fn gear_flag(full_key: &str, default: bool) -> bool {
 /// A gear decimal of the active config (`"mekatool.baseEfficiency"`), else `default`.
 pub fn gear_double(full_key: &str, default: f64) -> f64 {
     ACTIVE.read().ok().and_then(|a| a.as_ref().and_then(|c| c.doubles.get(full_key).copied())).unwrap_or(default)
+}
+
+/// The decimal gear keys: (section, key, default, min, max). `attackSpeed` is `defineInRange(-2.4, -4, 100)`.
+pub const GEAR_DECIMALS: [(&str, &str, f64, f64, f64); 2] = [
+    ("atomic_disassembler", "attackSpeed", -2.4, -4.0, 100.0),
+    ("mekatool", "attackSpeed", -2.4, -4.0, 100.0),
+];
+
+/// A decimal gear key of the active config (`"mekatool.attackSpeed"`), else `default`.
+pub fn gear_decimal(full_key: &str, default: f64) -> f64 {
+    ACTIVE
+        .read()
+        .ok()
+        .and_then(|a| a.as_ref().and_then(|c| c.decimals.get(full_key).copied()))
+        .unwrap_or(default)
 }
 
 /// The damage reduction ratios (`defineInRange(key, 1.0, 0, 1)`): (section, key).
@@ -171,6 +188,7 @@ impl Default for GearConfig {
             disassembler_mining_count: 128,
             energy: ENERGY_SECTIONS.iter().map(|(s, _, cap, rate)| (*s, (*cap, *rate))).collect(),
             ratios: GEAR_RATIOS.iter().map(|(s, k)| (int_key(s, k), 1.0)).collect(),
+            decimals: GEAR_DECIMALS.iter().map(|(s, k, d, _, _)| (int_key(s, k), *d)).collect(),
             ints: GEAR_INTS.iter().map(|(s, k, d)| (int_key(s, k), *d)).collect(),
             flags: GEAR_FLAGS.iter().map(|(s, k, d)| (int_key(s, k), *d)).collect(),
             doubles: GEAR_DOUBLES.iter().map(|(s, k, d, ..)| (int_key(s, k), *d)).collect(),
@@ -208,6 +226,14 @@ impl GearConfig {
             }
             if let Some(r) = value.parse::<f64>().ok().filter(|r| (0.0..=1.0).contains(r)) {
                 if let Some(v) = config.ratios.get_mut(int_key(&section, key).as_str()) {
+                    *v = r;
+                }
+            }
+            if let Some(r) = value.parse::<f64>().ok() {
+                if let Some((_, _, _, lo, hi)) = GEAR_DECIMALS.iter().find(|(s, k, ..)| *s == section && *k == key)
+                    && (*lo..=*hi).contains(&r)
+                    && let Some(v) = config.decimals.get_mut(int_key(&section, key).as_str())
+                {
                     *v = r;
                 }
             }
@@ -287,6 +313,9 @@ impl GearConfig {
                 last = sec;
             }
             out.push_str(&format!("{key} = {}\n", self.ints[int_key(sec, key).as_str()]));
+        }
+        for (sec, key, ..) in GEAR_DECIMALS {
+            out.push_str(&format!("[{sec}]\n{key} = {:?}\n", self.decimals[int_key(sec, key).as_str()]));
         }
         for (sec, key) in GEAR_RATIOS {
             out.push_str(&format!("[{sec}]\n{key} = {:?}\n", self.ratios[int_key(sec, key).as_str()]));
