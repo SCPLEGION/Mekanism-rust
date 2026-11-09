@@ -40,10 +40,15 @@ pub fn activating(chemical: &str) -> Option<(u64, &'static str)> {
 /// sees the sun.
 pub fn activator_rate(sees_sun: bool, brightness: f64) -> u64 {
     if sees_sun {
-        (crate::config_files::active_int("general", "", "maxSolarNeutronActivatorRate", ACTIVATOR_PEAK as u64) as f64 * brightness.clamp(0.0, 1.0)) as u64
+        (activator_peak() * brightness.clamp(0.0, 1.0)) as u64
     } else {
         0
     }
+}
+
+/// `general.maxSolarNeutronActivatorRate`: the operations a tick at full sun in a neutral biome.
+pub fn activator_peak() -> f64 {
+    crate::config_files::active_int("general", "", "maxSolarNeutronActivatorRate", ACTIVATOR_PEAK as u64) as f64
 }
 
 #[cfg(test)]

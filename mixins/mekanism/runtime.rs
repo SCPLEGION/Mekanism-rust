@@ -9500,13 +9500,26 @@ fn tick_activator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     } else {
         0.0
     };
+    // `recheckSettings`: the peak rate follows the biome (cool and dry is best), as a solar panel's does.
+    let (t, d, rains) = game
+        .world
+        .chunks
+        .get(&(pos[0] >> 4, pos[2] >> 4))
+        .map(|c| {
+            let b = &game.res.biomes().list[c.biome(pos[0], pos[1], pos[2]) as usize];
+            (b.temperature, b.downfall, b.precipitation)
+        })
+        .unwrap_or((0.8, 0.4, true));
+    let rate = isotopes::activator_peak() * f64::from(mekanism_core::generator::solar_biome_multiplier(t, d, rains)) * brightness;
+    // Below one operation a tick it runs one every `ceil(1 / rate)` ticks (`setRequiredTicks`), above it `floor(rate)` a tick.
+    let mut progress = get_int(&entity.nbt, "progress");
+    let operations = if sees_sun { mekanism_core::evaporation::operations(rate, &mut progress) } else { 0 };
+    put_int(&mut entity.nbt, "progress", progress);
     let mut made = 0;
     if let Some((per, out)) = input.chemical.as_deref().and_then(isotopes::activating)
         && output.accepts(out)
     {
-        made = isotopes::activator_rate(sees_sun, brightness)
-            .min(input.amount / per)
-            .min(output.capacity - output.amount);
+        made = operations.min(input.amount / per).min(output.capacity - output.amount);
         input.extract(made * per);
         output.insert(out, made);
     }
