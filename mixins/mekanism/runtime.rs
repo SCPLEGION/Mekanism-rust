@@ -6913,6 +6913,38 @@ pub(super) fn disassembler_vein(game: &mut Game<'_>, pos: [i32; 3]) {
 
 /// The tank a block keeps in its item when broken (Mekanism's loot copies its fluid or chemical
 /// component): its key in the block entity's NBT and in the item's custom data.
+/// The machine settings a mined machine keeps in its item (`copy_components` of its loot table: `ejector`, `redstone_control`,
+/// `side_config`, `upgrades`; the owner and security go through `stamp_security`, the energy through its own key).
+const MACHINE_STATE_KEY: &str = "mekanism:machine_state";
+const MACHINE_STATE_KEYS: [&str; 18] = [
+    "upgrades", "control", "eject", "ej_out", "ej_in0", "ej_in1", "ej_in2", "ej_in3", "ej_in4", "ej_in5", "ej_strict", "sides", "sides_item",
+    "sides_chemical", "sides_fluid", "sides_heat", "sorting", "sort_mode",
+];
+
+/// What of a machine's block entity its item takes along; none when it has none of the settings.
+fn machine_state(nbt: &Compound) -> Option<Compound> {
+    let mut out = Compound::new();
+    for key in MACHINE_STATE_KEYS {
+        let Some(value) = nbt.get(&JavaString::from(key)) else {
+            continue;
+        };
+        if matches!(value, Tag::Compound(c) if c.is_empty()) {
+            continue;
+        }
+        out.insert(key.into(), value.clone());
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// A placed machine takes the settings its item carries.
+fn restore_machine_state(nbt: &mut Compound, stack: &ItemStack) {
+    if let Some(Tag::Compound(c)) = custom_data(stack).and_then(|c| c.get(&JavaString::from(MACHINE_STATE_KEY))) {
+        for (k, v) in c.iter() {
+            nbt.insert(k.clone(), v.clone());
+        }
+    }
+}
+
 fn kept_tank(kind: Kind) -> Option<(&'static str, &'static str, u64)> {
     match kind {
         Kind::FluidTank(t) => Some(("fluid", FLUID_KEY, tier::fluid_tank(t).0)),
@@ -6924,6 +6956,10 @@ fn kept_tank(kind: Kind) -> Option<(&'static str, &'static str, u64)> {
 const FLUID_KEY: &str = "mekanism:fluid";
 const CHEMICAL_KEY: &str = "mekanism:chemical";
 
+fn has_energy(nbt: &Compound) -> bool {
+    get_long(nbt, "energy") > 0
+}
+
 /// Breaking an energy cube that holds energy, or a fluid or chemical tank that holds something, outside
 /// creative: the block goes as `Level.destroyBlock` takes it (particles, sound, no loot) and drops its
 /// item with what it held, as Mekanism's loot copies the energy and tank components. True when it did,
@@ -6934,10 +6970,11 @@ pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     }
     let held = game.native_with_mod_block_entity(pos, |m| {
         let k = kind(&m.id)?;
+        let state = machine_state(&m.nbt);
         let stack = match k {
             Kind::EnergyCube(_) => {
                 let energy = get_long(&m.nbt, "energy");
-                if energy > 0 { with_energy(&m.id, energy) } else if get_string(&m.nbt, "owner").is_some() { stack_of(&m.id, 1) } else { return None }
+                if energy > 0 { with_energy(&m.id, energy) } else if get_string(&m.nbt, "owner").is_some() || state.is_some() { stack_of(&m.id, 1) } else { return None }
             }
             // A bin keeps its items and lock (`BinUpgradeData` through its item's components).
             Kind::Bin(t) => {
@@ -6975,7 +7012,11 @@ pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
                 m.items.iter_mut().for_each(|i| *i = None);
                 stack
             }
-            _ if kept_tank(k).is_none() && has_security(&m.id) && get_string(&m.nbt, "owner").is_some() => stack_of(&m.id, 1),
+            _ if kept_tank(k).is_none()
+                && ((has_security(&m.id) && get_string(&m.nbt, "owner").is_some()) || state.is_some() || (has_energy(&m.nbt) && !matches!(k, Kind::EnergyCube(_)))) =>
+            {
+                stack_of(&m.id, 1)
+            }
             _ => {
                 let (key, item_key, _) = kept_tank(k)?;
                 let Some(Tag::Compound(tank)) = m.nbt.get(&JavaString::from(key)) else {
@@ -6988,6 +7029,15 @@ pub(super) fn break_keeping_energy(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         };
         let mut stack = stack;
         stamp_security(&mut stack, &m.nbt);
+        if !matches!(k, Kind::Bin(_) | Kind::CardboardBox | Kind::PersonalStorage) {
+            if let Some(c) = state {
+                set_custom_compound(&mut stack, MACHINE_STATE_KEY, c);
+            }
+            let energy = get_long(&m.nbt, "energy");
+            if energy > 0 && stored_energy(&stack) == 0 {
+                set_energy(&mut stack, energy);
+            }
+        }
         Some((stack, m.items.clone()))
     });
     let Some(Some((stack, items))) = held else {
@@ -7132,7 +7182,9 @@ pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
         return;
     }
     let energy = stored_energy(stack);
-    game.native_with_mod_block_entity(pos, |m| match kind(&m.id) {
+    game.native_with_mod_block_entity(pos, |m| {
+        restore_machine_state(&mut m.nbt, stack);
+        match kind(&m.id) {
         Some(Kind::EnergyCube(t)) if energy > 0 => {
             put_long(&mut m.nbt, "energy", energy.min(tier::energy_cube(t).0));
         }
@@ -7144,13 +7196,17 @@ pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
             }
         }
         Some(k) => {
-            if let Some((key, item_key, capacity)) = kept_tank(k)
-                && let Some(tank) = item_tank(stack, item_key, capacity)
-            {
-                put_tank(&mut m.nbt, key, &tank);
+            if let Some((key, item_key, capacity)) = kept_tank(k) {
+                if let Some(tank) = item_tank(stack, item_key, capacity) {
+                    put_tank(&mut m.nbt, key, &tank);
+                }
+            } else if energy > 0 {
+                // `copy_components` of `mekanism:energy`: the machine starts with what its item held.
+                put_long(&mut m.nbt, "energy", energy);
             }
         }
         None => {}
+        }
     });
 }
 
