@@ -10283,6 +10283,18 @@ fn find_box(
     min: i32,
     max: i32,
 ) -> Option<([i32; 3], [i32; 3], std::collections::HashSet<[i32; 3]>)> {
+    find_box_axes(game, start, is_frame, [min; 3], [max; 3])
+}
+
+/// `StructureHelper.fetchCuboid`: the box around the casing blocks joined to `start`, each side between its `min`
+/// and `max` (`VoxelCuboid` bounds, x y z), with the casing blocks found.
+fn find_box_axes(
+    game: &Game<'_>,
+    start: [i32; 3],
+    is_frame: fn(&str) -> bool,
+    min: [i32; 3],
+    max: [i32; 3],
+) -> Option<([i32; 3], [i32; 3], std::collections::HashSet<[i32; 3]>)> {
     let mut seen = std::collections::HashSet::from([start]);
     let mut todo = vec![start];
     let (mut lo, mut hi) = (start, start);
@@ -10290,7 +10302,7 @@ fn find_box(
         for k in 0..3 {
             lo[k] = lo[k].min(at[k]);
             hi[k] = hi[k].max(at[k]);
-            if hi[k] - lo[k] >= max {
+            if hi[k] - lo[k] + 1 > max[k] {
                 return None;
             }
         }
@@ -10302,11 +10314,17 @@ fn find_box(
             }
         }
     }
-    if (0..3).any(|k| hi[k] - lo[k] + 1 < min) {
+    if (0..3).any(|k| hi[k] - lo[k] + 1 < min[k]) {
         return None;
     }
     Some((lo, hi, seen))
 }
+
+/// `VoxelCuboid.getWallRelative(..).isOnEdge()`: the position lies on an edge (or corner) of the box.
+fn on_box_edge(lo: [i32; 3], hi: [i32; 3], at: [i32; 3]) -> bool {
+    (0..3).filter(|&k| at[k] == lo[k] || at[k] == hi[k]).count() >= 2
+}
+
 const FISSILE_FUEL: &str = "mekanism:fissile_fuel";
 
 fn get_pos(nbt: &Compound, key: &str) -> Option<[i32; 3]> {
@@ -17715,25 +17733,56 @@ pub(super) fn use_sps_port(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 
 // --- Thermoelectric Boiler ---------------------------------------------------------------------------
 
-/// `BoilerValidator`, simplified: the frame blocks joined to `start` must be the shell of a box 3 to 18
-/// on each side, with air, superheating elements and one full layer of pressure dispersers inside, the
-/// elements below the dispersers. The boiler, its valves and the Resistive Heaters touching its walls.
-#[allow(clippy::type_complexity)]
+/// `FormationProtocol.explore`: how many blocks join `start` through faces, as far as `ok` says they belong (none
+/// when `start` itself does not).
+fn explore(start: [i32; 3], ok: &dyn Fn([i32; 3]) -> bool) -> u64 {
+    if !ok(start) {
+        return 0;
+    }
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut todo = std::collections::VecDeque::from([start]);
+    while let Some(at) = todo.pop_front() {
+        if seen.len() >= 18 * 18 * 18 {
+            return seen.len() as u64;
+        }
+        for (_, d) in DIRECTIONS {
+            let next = [at[0] + d[0], at[1] + d[1], at[2] + d[2]];
+            if !seen.contains(&next) && ok(next) {
+                seen.insert(next);
+                todo.push_back(next);
+            }
+        }
+    }
+    seen.len() as u64
+}
+
+fn is_air(name: &str) -> bool {
+    matches!(name, "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air")
+}
+
+/// `BoilerValidator`: a box of boiler casing (casing on every edge), valves and glass in the walls; inside a full layer of
+/// dispersers, superheating elements below it in one piece, and nothing else. The water is the air and casing under the
+/// dispersers, the steam the whole footprint above. Returns the boiler, its valves and the heaters touching its walls.
 #[allow(clippy::type_complexity)]
 fn find_boiler(game: &Game<'_>, start: [i32; 3]) -> Option<(boiler::Boiler, Vec<[i32; 3]>, Vec<[i32; 3]>, [i32; 7])> {
-    let (lo, hi, seen) = find_box(game, start, boiler::is_frame, boiler::MIN_SIZE, boiler::MAX_SIZE)?;
+    let (lo, hi, seen) = find_box_axes(game, start, boiler::is_frame, [3; 3], [18; 3])?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
     let mut b = boiler::Boiler { volume: size(0) * size(1) * size(2), ..Default::default() };
     let mut valves = Vec::new();
-    let mut dispersers = Vec::new();
-    let mut elements = Vec::new();
+    let mut dispersers: Vec<[i32; 3]> = Vec::new();
+    let mut elements: Vec<[i32; 3]> = Vec::new();
     for x in lo[0]..=hi[0] {
         for y in lo[1]..=hi[1] {
             for z in lo[2]..=hi[2] {
                 let at = [x, y, z];
-                let shell = x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2];
                 let name = block_name(game, at);
-                if shell {
+                if on_box_edge(lo, hi, at) {
+                    if name != "mekanism:boiler_casing" {
+                        return None;
+                    }
+                    continue;
+                }
+                if x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2] {
                     if !seen.contains(&at) {
                         return None;
                     }
@@ -17745,24 +17794,61 @@ fn find_boiler(game: &Game<'_>, start: [i32; 3]) -> Option<(boiler::Boiler, Vec<
                 match name {
                     boiler::DISPERSER => dispersers.push(at),
                     boiler::ELEMENT => elements.push(at),
-                    "minecraft:air" | "minecraft:cave_air" => {}
+                    n if is_air(n) => {}
                     _ => return None,
                 }
             }
         }
     }
-    // One full layer of dispersers, with the elements below it.
-    let layer = dispersers.first()?[1];
-    let inner = (size(0) - 2) * (size(2) - 2);
-    if dispersers.len() as u64 != inner || dispersers.iter().any(|d| d[1] != layer) || elements.is_empty() || elements.iter().any(|e| e[1] >= layer) {
+    // A full plane of dispersers at the height of the first one, and no others.
+    let first_disperser = *dispersers.first()?;
+    let layer = first_disperser[1];
+    if elements.is_empty() {
         return None;
     }
-    b.elements = elements.len() as u64;
-    b.water_volume = inner * (layer - lo[1] - 1) as u64;
-    b.steam_volume = inner * (hi[1] - layer - 1) as u64;
-    if b.water_volume == 0 || b.steam_volume == 0 {
+    let mut left: std::collections::HashSet<[i32; 3]> = dispersers.iter().copied().collect();
+    for x in 1..(size(0) as i32 - 1) {
+        for z in 1..(size(2) as i32 - 1) {
+            if !left.remove(&[lo[0] + x, layer, lo[2] + z]) {
+                return None;
+            }
+        }
+    }
+    if !left.is_empty() {
         return None;
     }
+    // The elements are one piece, below the dispersers.
+    let element_count = explore(elements[0], &|p| p[1] < layer && block_name(game, p) == boiler::ELEMENT);
+    if elements.len() as u64 > element_count {
+        return None;
+    }
+    b.elements = element_count;
+    // The water: the air and casing under the dispersers, all in one piece.
+    let air_or_frame = |p: [i32; 3]| {
+        let n = block_name(game, p);
+        is_air(n) || boiler::is_frame(n)
+    };
+    let mut init_air = None;
+    let mut total_air = 0u64;
+    for x in lo[0]..lo[0] + size(0) as i32 {
+        for y in lo[1]..layer {
+            for z in lo[2]..lo[2] + size(2) as i32 {
+                if air_or_frame([x, y, z]) {
+                    init_air = Some([x, y, z]);
+                    total_air += 1;
+                }
+            }
+        }
+    }
+    let water = explore(init_air?, &|p| {
+        p[1] >= lo[1] - 1 && p[1] < layer && p[0] >= lo[0] && p[0] < lo[0] + size(0) as i32 && p[2] >= lo[2] && p[2] < lo[2] + size(2) as i32 && air_or_frame(p)
+    });
+    if total_air > water {
+        return None;
+    }
+    b.water_volume = water;
+    let steam_height = i64::from(lo[1]) + size(1) as i64 - 2 - i64::from(layer);
+    b.steam_volume = size(2) * size(0) * steam_height.max(0) as u64;
     // Heaters against a wall, outside the box.
     let mut heaters = Vec::new();
     for x in lo[0] - 1..=hi[0] + 1 {
@@ -18024,39 +18110,116 @@ const TURBINE_VALVE: &str = "mekanismgenerators:turbine_valve";
 /// or air inside; the steam is below the lowest disperser. The turbine and its valves.
 #[allow(clippy::type_complexity)]
 fn find_turbine(game: &Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, Vec<[i32; 3]>, [i32; 3], [i32; 3])> {
-    let (lo, hi, seen) = find_box(game, start, turbine::is_frame, turbine::MIN_SIZE, turbine::MAX_SIZE)?;
+    // `TurbineValidator`: 5 x 3 x 5 to 17 x 18 x 17.
+    let (lo, hi, seen) = find_box_axes(game, start, turbine::is_frame, [5, 3, 5], [17, 18, 17])?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
     let mut t = turbine::Turbine { volume: size(0) * size(1) * size(2), ..Default::default() };
     let mut valves = Vec::new();
-    let mut disperser_y = None;
+    let mut vents = Vec::new();
+    let (mut rotors, mut dispersers, mut coils, mut condensers) = (Vec::new(), std::collections::HashSet::new(), std::collections::HashSet::new(), Vec::new());
+    let mut complex: Option<[i32; 3]> = None;
+    let (center_x, center_z) = (lo[0] + (size(0) as i32 - 1) / 2, lo[2] + (size(2) as i32 - 1) / 2);
     for x in lo[0]..=hi[0] {
         for y in lo[1]..=hi[1] {
             for z in lo[2]..=hi[2] {
                 let at = [x, y, z];
-                let shell = x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2];
                 let name = block_name(game, at);
-                if shell {
+                if on_box_edge(lo, hi, at) {
+                    // The edges are turbine casing only.
+                    if name != "mekanismgenerators:turbine_casing" {
+                        return None;
+                    }
+                } else if x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2] {
                     if !seen.contains(&at) {
                         return None;
                     }
                     match name {
                         TURBINE_VALVE => valves.push(at),
-                        "mekanismgenerators:turbine_vent" => t.vents += 1,
+                        "mekanismgenerators:turbine_vent" => vents.push(at),
                         _ => {}
                     }
                 } else {
-                    if !t.add_inside(name) {
-                        return None;
-                    }
-                    if name == "mekanism:pressure_disperser" {
-                        disperser_y = Some(disperser_y.map_or(y, |d: i32| d.min(y)));
+                    match name {
+                        "mekanismgenerators:rotational_complex" => {
+                            if complex.is_some() || x != center_x || z != center_z {
+                                return None;
+                            }
+                            complex = Some(at);
+                        }
+                        "mekanismgenerators:turbine_rotor" => {
+                            if x != center_x || z != center_z {
+                                return None;
+                            }
+                            rotors.push(at);
+                        }
+                        "mekanism:pressure_disperser" => {
+                            dispersers.insert(at);
+                        }
+                        "mekanismgenerators:electromagnetic_coil" => {
+                            coils.insert(at);
+                        }
+                        "mekanismgenerators:saturating_condenser" => condensers.push(at),
+                        "minecraft:air" | "minecraft:cave_air" => {}
+                        _ => return None,
                     }
                 }
             }
         }
     }
-    t.lower_volume = size(0) * size(2) * (disperser_y? - lo[1]) as u64;
-    (t.rotors > 0 && t.coils > 0).then_some((t, valves, lo, [size(0) as i32, size(1) as i32, size(2) as i32]))
+    // `postcheck`: odd length and width, the complex, the layer of dispersers around it, the rotors below it, the coils above.
+    if size(0) % 2 != 1 || size(2) % 2 != 1 {
+        return None;
+    }
+    let complex = complex?;
+    let rotor_count = i64::from(complex[1] - lo[1] + 1);
+    let inner_radius = (i64::from(size(0).min(size(2)) as i32) - 3) / 2;
+    if inner_radius < rotor_count / 4 || coils.is_empty() || dispersers.is_empty() {
+        return None;
+    }
+    let (radius_x, radius_z) = ((size(0) as i32 - 3) / 2, (size(2) as i32 - 3) / 2);
+    for x in complex[0] - radius_x..=complex[0] + radius_x {
+        for z in complex[2] - radius_z..=complex[2] + radius_z {
+            if (x != center_x || z != center_z) && !dispersers.remove(&[x, complex[1], z]) {
+                return None;
+            }
+        }
+    }
+    if !dispersers.is_empty() || condensers.iter().any(|c| c[1] <= complex[1]) {
+        return None;
+    }
+    // Rotors are contiguous from the complex down; any others are in the wrong place.
+    let mut height = 0u64;
+    for y in (lo[1] + 1..complex[1]).rev() {
+        let at = [center_x, y, center_z];
+        if !rotors.contains(&at) {
+            return None;
+        }
+        height += 1;
+    }
+    if height as usize != rotors.len() || height == 0 {
+        return None;
+    }
+    // The coils are one piece, up from the complex.
+    let mut found = std::collections::HashSet::new();
+    let mut todo = vec![[complex[0], complex[1] + 1, complex[2]]];
+    while let Some(at) = todo.pop() {
+        if block_name(game, at) != "mekanismgenerators:electromagnetic_coil" || !found.insert(at) {
+            continue;
+        }
+        for (_, d) in DIRECTIONS {
+            todo.push([at[0] + d[0], at[1] + d[1], at[2] + d[2]]);
+        }
+    }
+    if coils.len() > found.len() || vents.is_empty() || vents.iter().any(|v| v[1] < complex[1]) {
+        return None;
+    }
+    t.rotors = height;
+    t.dispersers = (radius_x as u64 * 2 + 1) * (radius_z as u64 * 2 + 1) - 1;
+    t.coils = found.len() as u64;
+    t.condensers = condensers.len() as u64;
+    t.vents = vents.len() as u64;
+    t.lower_volume = size(0) * size(2) * height;
+    Some((t, valves, lo, [size(0) as i32, size(1) as i32, size(2) as i32]))
 }
 
 /// An Industrial Turbine valve. Once a second each valve checks its turbine; the first valve runs it: it
