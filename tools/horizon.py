@@ -78,6 +78,11 @@ def stage(horizon, stages):
 
 
 def mixin_stage(horizon, stages):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import check_manifest
+    problems = check_manifest.check(ROOT / "mixins/mekanism")
+    if problems:
+        raise ValueError("manifest check failed: " + "; ".join(problems))
     revision = subprocess.check_output(["git", "-C", str(MIXINS), "rev-parse", "HEAD"], text=True).strip()
     if revision != COMPAT["horizon_mixins_revision"]:
         raise ValueError(f"horizon-mixins must be pinned at {COMPAT['horizon_mixins_revision']}, got {revision}")
