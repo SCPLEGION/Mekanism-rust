@@ -6219,32 +6219,11 @@ struct FormedMatrix {
     size: [i32; 3],
 }
 
-/// `MatrixValidator`, simplified: the frame blocks joined to `start` must be exactly the shell of a box
-/// 3 to 18 on each side, and everything inside must be cells, providers or air.
+/// `MatrixValidator`: the casing blocks joined to `start` must be exactly the shell of a box 3 to 18 on each side
+/// (casing on the edges), and everything inside must be cells, providers or air.
 fn find_matrix(game: &Game<'_>, start: [i32; 3]) -> Option<FormedMatrix> {
     use mekanism_core::matrix::{is_frame, MAX_SIZE, MIN_SIZE};
-    let mut seen = std::collections::HashSet::from([start]);
-    let mut todo = vec![start];
-    let (mut lo, mut hi) = (start, start);
-    while let Some(at) = todo.pop() {
-        for k in 0..3 {
-            lo[k] = lo[k].min(at[k]);
-            hi[k] = hi[k].max(at[k]);
-            if hi[k] - lo[k] >= MAX_SIZE {
-                return None;
-            }
-        }
-        for (_, d) in DIRECTIONS {
-            let next = [at[0] + d[0], at[1] + d[1], at[2] + d[2]];
-            if !seen.contains(&next) && is_frame(block_name(game, next)) {
-                seen.insert(next);
-                todo.push(next);
-            }
-        }
-    }
-    if (0..3).any(|k| hi[k] - lo[k] + 1 < MIN_SIZE) {
-        return None;
-    }
+    let (lo, hi, seen) = find_box_axes(game, start, is_frame, [MIN_SIZE; 3], [MAX_SIZE; 3])?;
     let mut matrix = mekanism_core::matrix::Matrix::default();
     let mut ports = Vec::new();
     for x in lo[0]..=hi[0] {
@@ -6254,7 +6233,8 @@ fn find_matrix(game: &Game<'_>, start: [i32; 3]) -> Option<FormedMatrix> {
                 let shell = x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2];
                 let name = block_name(game, at);
                 if shell {
-                    if !seen.contains(&at) {
+                    // The edges are induction casing only; ports sit in the faces.
+                    if !seen.contains(&at) || (on_box_edge(lo, hi, at) && name != "mekanism:induction_casing") {
                         return None;
                     }
                     if name == "mekanism:induction_port" {
@@ -6446,40 +6426,53 @@ impl Tower {
     }
 }
 
-/// `EvaporationValidator`, simplified: a 4x4 floor of tower blocks, then 4x4 rings of them with air
-/// inside, 3 to 18 blocks high in all, with the controller in a ring.
+/// `EvaporationValidator`: a 4 x 4 box 3 to 18 high of plant blocks (blocks on the edges, valves and the one controller in the
+/// walls), air inside, an open top whose edges are plant blocks and whose corners hold anything.
 fn find_tower(game: &Game<'_>, c: [i32; 3]) -> Option<Tower> {
+    // The box around the plant's blocks joined to the controller: 4 wide each way, 3 to 18 high.
+    let (lo, hi, _) = find_box_axes(game, c, |n| EVAPORATION_PARTS.contains(&n), [4, evap::MIN_HEIGHT as i32, 4], [4, evap::MAX_HEIGHT as i32, 4])?;
     let part = |at: [i32; 3]| EVAPORATION_PARTS.contains(&block_name(game, at));
-    let mut bottom = c[1];
-    while part([c[0], bottom - 1, c[2]]) && c[1] - bottom < evap::MAX_HEIGHT as i32 {
-        bottom -= 1;
-    }
-    for x0 in c[0] - 3..=c[0] {
-        for z0 in c[2] - 3..=c[2] {
-            let on_ring = c[0] == x0 || c[0] == x0 + 3 || c[2] == z0 || c[2] == z0 + 3;
-            if !on_ring {
-                continue;
-            }
-            let floor = (0..4).all(|dx| (0..4).all(|dz| part([x0 + dx, bottom, z0 + dz])));
-            if !floor {
-                continue;
-            }
-            let mut tower = Tower { origin: [x0, bottom, z0], height: 1 };
-            while tower.height < evap::MAX_HEIGHT {
-                let y = bottom + tower.height as i32;
-                let ring = tower.perimeter(y).all(part);
-                let hollow = (1..3).all(|dx| (1..3).all(|dz| block_name(game, [x0 + dx, y, z0 + dz]) == "minecraft:air"));
-                if !(ring && hollow) {
-                    break;
+    let mut controllers = 0;
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                let at = [x, y, z];
+                let name = block_name(game, at);
+                let (xe, ze) = (x == lo[0] || x == hi[0], z == lo[2] || z == hi[2]);
+                if y == hi[1] {
+                    // The open top: its corners hold anything (the solar generators), its other edges are plant blocks, the middle is air.
+                    if xe && ze {
+                        if name == EVAPORATION_PARTS[2] {
+                            controllers += 1;
+                        }
+                        continue;
+                    }
+                    if xe || ze {
+                        if !part(at) {
+                            return None;
+                        }
+                    } else if !is_air(name) {
+                        return None;
+                    }
+                } else if on_box_edge(lo, hi, at) {
+                    if name != EVAPORATION_PARTS[0] {
+                        return None;
+                    }
+                    continue;
+                } else if x == lo[0] || x == hi[0] || y == lo[1] || z == lo[2] || z == hi[2] {
+                    if !part(at) {
+                        return None;
+                    }
+                } else if !is_air(name) {
+                    return None;
                 }
-                tower.height += 1;
-            }
-            if tower.height >= evap::MIN_HEIGHT && c[1] > bottom && c[1] < bottom + tower.height as i32 {
-                return Some(tower);
+                if name == EVAPORATION_PARTS[2] {
+                    controllers += 1;
+                }
             }
         }
     }
-    None
+    (controllers == 1).then_some(Tower { origin: lo, height: (hi[1] - lo[1] + 1) as u32 })
 }
 
 /// The Thermal Evaporation Plant's controller runs the tower: water from buckets, heat from the
