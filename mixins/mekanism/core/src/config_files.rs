@@ -291,9 +291,15 @@ pub fn world() -> Spec {
     Spec { name: "world", title: "World Config", entries: e }
 }
 
+/// `GeneratorsConfig`: the entries the port reads (`excessWaste`, the share of the waste tank at which the fission
+/// reactor's logic adapter outputs).
+pub fn generators() -> Spec {
+    Spec { name: "generators", title: "Generators Config", entries: vec![dbl("fission", "excessWaste", 0.9, 0.001, 1.0)] }
+}
+
 /// Every file of this module.
-pub fn all() -> [Spec; 4] {
-    [storage(), tiers(), general(), world()]
+pub fn all() -> [Spec; 5] {
+    [storage(), tiers(), general(), world(), generators()]
 }
 
 /// The configs of the world that is open, which the tiers and buffers read (`set_active`).

@@ -15838,7 +15838,7 @@ fn logic_modes(k: Kind) -> &'static [LogicMode] {
         mode("Disabled", "Will not handle redstone", "minecraft:gunpowder", "\u{a7}8", enum_color::DARK_GRAY),
         mode("Activation", "Activate the reactor when powered, and deactivate when unpowered", "minecraft:flint_and_steel", "\u{a7}b", enum_color::AQUA),
         mode("High Temperature", "Output when the reactor reaches dangerous temperatures", "minecraft:redstone", "\u{a7}c", RED),
-        mode("Critical Waste Level", "Output when the reactor has reached a critical level of waste (90%)", "minecraft:redstone", "\u{a7}c", RED),
+        mode("Critical Waste Level", "Output when the reactor has reached a critical level of waste (%1$s)", "minecraft:redstone", "\u{a7}c", RED),
         mode("Damage Critical", "Output when the reactor reaches critical damage levels (100%+).", "minecraft:redstone", "\u{a7}c", RED),
         mode("Insufficient Fuel", "Output when the reactor has insufficient fuel to sustain a reaction", "minecraft:redstone", "\u{a7}c", RED),
     ];
@@ -15898,7 +15898,7 @@ fn logic_status(game: &mut Game<'_>, master: [i32; 3], fusion: bool, mode: u32, 
             2 if st.temperature() >= fission::MIN_DAMAGE_TEMPERATURE => 1,
             3 => {
                 // `fissionExcessWasteRatio`.
-                let target = (r.fuel_capacity() as f64 * 0.9) as u64;
+                let target = (r.fuel_capacity() as f64 * config_double("generators", "fission", "excessWaste", 0.9).clamp(0.001, 1.0)) as u64;
                 u32::from(get_tank(nbt, "waste", r.fuel_capacity()).amount >= target)
             }
             4 if st.damage >= fission::MAX_DAMAGE => 1,
@@ -16059,7 +16059,9 @@ fn logic_tooltip(k: Kind, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
     }
     for i in 0..LOGIC_ROWS {
         if let Some(m) = modes.get(first + i).filter(|_| inside(at, logic_row(i))) {
-            lines.push(m.description.to_owned());
+            // `TextUtils.getPercent(fissionExcessWasteRatio)` in the critical waste level's description.
+            let percent = format!("{}%", (config_double("generators", "fission", "excessWaste", 0.9).clamp(0.001, 1.0) * 100.0).round());
+            lines.push(m.description.replace("%1$s", &percent));
             return;
         }
     }
