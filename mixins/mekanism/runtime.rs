@@ -20329,9 +20329,16 @@ fn tick_importer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     }
     let before = net.clone();
     return_to_network(&mut net, &mut entity.items);
-    // With enabled filters only what they name goes in; with none, everything does.
+    // With enabled filters only what they name goes in; with none, everything does unless "import without filter"
+    // is off (the importer keeps that switch, on by default, as the opposite of `auto_eject`).
     let filters = load_sorter(&entity.nbt);
     let active: Vec<String> = filters.active().cloned().collect();
+    if active.is_empty() && filters.auto_eject {
+        if net != before {
+            save_network(game, &net, &at);
+        }
+        return;
+    }
     // The tags are copied out (only for tag filters to read) so the game stays free to move the items.
     let tags = if active.is_empty() { Default::default() } else { world_items!(game).item_tags.clone() };
     let in_tag = |tag: &str, item: &str| tags.get(tag).is_some_and(|t| t.contains(item));
@@ -24918,13 +24925,20 @@ fn qf_row_parts(i: usize) -> ([f32; 4], [f32; 4], [f32; 4]) {
 }
 
 /// A switch's toggle (the digital switch at the right of its inner screen).
-fn qf_switch_toggle(i: usize) -> [f32; 4] {
-    let [x, y, w, _] = QF_SWITCHES[i];
+fn qf_switch_toggle(switch: [f32; 4]) -> [f32; 4] {
+    let [x, y, w, _] = switch;
     [x + w - 17.0, y + 2.0, 15.0, 17.0]
 }
 
+/// The importer's one switch: import without a filter (`GuiQIOImporter`, the screen's width less 18).
+const QF_IMPORT_SWITCH: [[f32; 4]; 1] = [[9.0, 122.0, 218.0, 22.0]];
+
 fn qf_switches(block: &str) -> &'static [[f32; 4]] {
-    if kind(block) == Some(Kind::QioExporter) { &QF_SWITCHES } else { &[] }
+    match kind(block) {
+        Some(Kind::QioExporter) => &QF_SWITCHES,
+        Some(Kind::QioImporter) => &QF_IMPORT_SWITCH,
+        _ => &[],
+    }
 }
 
 /// The first item of a tag filter, which stands for the tag in its slot (the original cycles the tag's items).
@@ -25008,11 +25022,16 @@ fn draw_qio_filter_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudB
         sprite(game, batch, name, [0.0, 0.0, 8.0, 8.0], at(radio));
     }
     for (i, r) in qf_switches(block).iter().enumerate() {
-        let (label, on) = if i == 0 { ("Export without filter", view.eject) } else { ("Round Robin", view.round_robin) };
+        // The importer's `auto_eject` stands for "not import without filter" (which is on by default in Java).
+        let (label, on) = match (kind(block), i) {
+            (Some(Kind::QioImporter), _) => ("Import Without Filter:", !view.eject),
+            (_, 0) => ("Export Without Filter:", view.eject),
+            _ => ("Round robin:", view.round_robin),
+        };
         let s = at(*r);
         nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, s, 0xFFFF_FFFF);
         game.native_text_scaled(batch, label, [s[0] + 4.0, s[1] + 4.0], 0x3C_FE9A, 0.8);
-        let t = at(qf_switch_toggle(i));
+        let t = at(qf_switch_toggle(*r));
         sprite(game, batch, if on { "switch/selected" } else { "switch/unselected" }, [0.0, 0.0, 15.0, 8.0], [t[0], t[1], 15.0, 8.0]);
         sprite(game, batch, if on { "switch/unselected" } else { "switch/selected" }, [0.0, 0.0, 15.0, 8.0], [t[0], t[1] + 9.0, 15.0, 8.0]);
         game.native_text_scaled(batch, "on", [t[0] + (15.0 - game.native_text_width("on") * 0.6) / 2.0, t[1] + 1.0], 0x10_1010, 0.6);
@@ -25029,8 +25048,8 @@ fn qio_filter_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool) -> 
     if windowed(block, at, |wat| filter_window_click(game, pos, &view, wat, right)) {
         return true;
     }
-    for i in 0..qf_switches(block).len() {
-        if inside(at, qf_switch_toggle(i)) {
+    for (i, r) in qf_switches(block).iter().enumerate() {
+        if inside(at, qf_switch_toggle(*r)) {
             send_sorter(game, if i == 0 { Op::AutoEject } else { Op::RoundRobin }, pos, 0);
             return true;
         }
