@@ -30254,9 +30254,21 @@ struct PqState {
     cursor: Option<(String, u32)>,
     own: Option<freq::Entry>,
     entries: Vec<freq::Entry>,
+    /// The three crafting windows' nine inputs and their result.
+    windows: Vec<Vec<Option<(String, u32)>>>,
+}
+
+/// An open crafting window: its number and where its corner is on the screen.
+#[derive(Clone, Copy)]
+struct PqWin {
+    index: usize,
+    pos: [f32; 2],
 }
 
 struct PqUi {
+    wins: Vec<PqWin>,
+    /// The window being dragged by its title, and where the cursor took hold of it.
+    win_drag: Option<(usize, [f32; 2])>,
     origin: [f32; 2],
     select_origin: [f32; 2],
     scroll: f32,
@@ -30275,6 +30287,8 @@ struct PqUi {
 impl Default for PqUi {
     fn default() -> Self {
         PqUi {
+            wins: vec![],
+            win_drag: None,
             origin: [0.0; 2],
             select_origin: [0.0; 2],
             scroll: 0.0,
@@ -30417,6 +30431,13 @@ fn pq_push_items(game: &mut Game<'_>, fresh: bool) {
     for i in 0..36 {
         put_stack(&mut out, &game.inventory.get(player_slot(i)).cloned().flatten());
     }
+    let windows = pq_windows(game);
+    for win in &windows {
+        for cell in win {
+            put_stack(&mut out, cell);
+        }
+        put_stack(&mut out, &pq_result(game, win).map(|(_, r)| r));
+    }
     let list = net.as_ref().map(|(_, n, _)| n.list()).unwrap_or_default();
     out.extend((list.len() as u32).to_be_bytes());
     for (item, count) in list {
@@ -30425,6 +30446,276 @@ fn pq_push_items(game: &mut Game<'_>, fresh: bool) {
         out.extend(count.to_be_bytes());
     }
     game.native_send_to_player(player.uuid, PQ_CHANNEL, &out);
+}
+
+
+// The three crafting windows (`QIOCraftingWindow`): their nine inputs are kept in the item or the block.
+const PQ_WINDOWS: usize = 3;
+const PQ_WINDOWS_KEY: &str = "mekanism:crafting_windows";
+type PqWindows = Vec<Vec<Option<ItemStack>>>;
+
+fn win_encode(w: &PqWindows) -> String {
+    w.iter()
+        .map(|win| win.iter().map(|s| s.as_ref().map_or(String::new(), |s| format!("{}*{}", s.item, s.count))).collect::<Vec<_>>().join(","))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn win_decode(text: &str) -> PqWindows {
+    let mut w: PqWindows = vec![vec![None; 9]; PQ_WINDOWS];
+    for (i, win) in text.split('|').take(PQ_WINDOWS).enumerate() {
+        for (j, cell) in win.split(',').take(9).enumerate() {
+            if let Some((id, n)) = cell.split_once('*')
+                && let Ok(n) = n.parse::<u32>()
+                && n > 0
+            {
+                w[i][j] = Some(stack_of(id, n));
+            }
+        }
+    }
+    w
+}
+
+fn pq_source(game: &mut Game<'_>) -> Option<Option<[i32; 3]>> {
+    let player = game.native_acting_player()?;
+    Some(PQ_SOURCES.with_borrow(|m| m.get(&player.name).copied()).unwrap_or(None))
+}
+
+fn pq_windows(game: &mut Game<'_>) -> PqWindows {
+    let text = match pq_source(game) {
+        Some(Some(pos)) => game.native_with_mod_block_entity(pos, |m| get_string(&m.nbt, PQ_WINDOWS_KEY)).flatten(),
+        Some(None) => pq_held(game).and_then(|h| custom_data(&h).and_then(|c| get_string(c, PQ_WINDOWS_KEY))),
+        None => None,
+    };
+    win_decode(&text.unwrap_or_default())
+}
+
+fn pq_save_windows(game: &mut Game<'_>, w: &PqWindows) {
+    let text = win_encode(w);
+    match pq_source(game) {
+        Some(Some(pos)) => {
+            game.native_with_mod_block_entity(pos, |m| m.nbt.insert(PQ_WINDOWS_KEY.into(), Tag::String(text.as_str().into())));
+        }
+        Some(None) => {
+            if let Some(stack) = game.held_mut().as_mut().filter(|s| &*s.item == qio::PORTABLE) {
+                set_custom_string(stack, PQ_WINDOWS_KEY, &text);
+            }
+        }
+        None => {}
+    }
+}
+
+fn pq_result(game: &Game<'_>, win: &[Option<ItemStack>]) -> Option<(String, ItemStack)> {
+    world_recipes!(game).find(win, 3).map(|(r, s)| (r.to_owned(), s))
+}
+
+/// One craft (`QIOCraftingWindow.performCraft`): each input loses one, its remainder takes the slot or goes
+/// to the frequency, and an emptied input is filled again from the frequency with an item the same recipe takes.
+fn pq_craft_once(game: &mut Game<'_>, win: &mut [Option<ItemStack>], net: &mut qio::Network) -> Option<ItemStack> {
+    let (rid, result) = pq_result(game, win)?;
+    let left = world_recipes!(game).remainders(&rid, win, 3);
+    let before: Vec<Option<ItemStack>> = win.to_vec();
+    for cell in win.iter_mut() {
+        if let Some(s) = cell.as_mut() {
+            s.count -= 1;
+            if s.count == 0 {
+                *cell = None;
+            }
+        }
+    }
+    for (i, r) in left.into_iter().enumerate() {
+        let Some(r) = r else {
+            continue;
+        };
+        if win[i].is_none() {
+            win[i] = Some(r);
+        } else if !(plain(&r) && net.insert(&r.item, u64::from(r.count)) == u64::from(r.count)) {
+            game.give_or_drop(r);
+        }
+    }
+    for i in 0..9 {
+        let Some(prev) = before[i].as_ref().filter(|p| win[i].is_none() && plain(p)) else {
+            continue;
+        };
+        let mut candidates: Vec<String> = vec![prev.item.to_string()];
+        candidates.extend(net.list().into_iter().map(|(id, _)| id).filter(|id| **id != *prev.item).take(256));
+        for c in candidates {
+            let have = net.stored(&c);
+            if have == 0 {
+                continue;
+            }
+            let take = have.min(u64::from(max_stack(game, &c)));
+            win[i] = Some(stack_of(&c, 1));
+            if pq_result(game, win).is_some_and(|(r, _)| r == rid) {
+                let got = net.extract(&c, take) as u32;
+                if got > 0 {
+                    win[i] = Some(stack_of(&c, got));
+                    break;
+                }
+            }
+            win[i] = None;
+        }
+    }
+    Some(result)
+}
+
+/// Crafting windows' ops: 6 a grid slot, 7 the result, 8 the clear button. `data` is after the op byte.
+fn pq_window_op(game: &mut Game<'_>, op: u8, data: &[u8], name: &str) {
+    let (Some(&index), mut windows) = (data.first(), pq_windows(game)) else {
+        return;
+    };
+    let index = usize::from(index);
+    if index >= PQ_WINDOWS {
+        return;
+    }
+    let wrap = |game: &Game<'_>, s: ItemStack| {
+        let m = max_stack(game, &s.item);
+        Wrapped { stack: s, max: m }
+    };
+    let mut cursor = PQ_CURSORS.with_borrow(|c| c.get(name).cloned());
+    let net = pq_network(game);
+    match op {
+        6 => {
+            let (Some(&slot), Some(&how)) = (data.get(1), data.get(2)) else {
+                return;
+            };
+            let slot = usize::from(slot);
+            if slot >= 9 {
+                return;
+            }
+            if how == 2 {
+                // A shift-click moves the stack to the player's inventory.
+                if let Some(s) = windows[index][slot].take() {
+                    let given = if plain(&s) { game.native_give_items(&s.item, s.count) } else { 0 };
+                    if given < s.count {
+                        windows[index][slot] = Some(ItemStack { count: s.count - given, ..s });
+                    }
+                }
+            } else {
+                let mut cells: Vec<Option<Wrapped>> = windows[index].iter().cloned().map(|s| s.map(|s| wrap(game, s))).collect();
+                let mut held = cursor.take().map(|s| wrap(game, s));
+                slot_click::click(&mut cells, &mut held, slot, if how == 1 { slot_click::Click::Right } else { slot_click::Click::Left }, &|_, _| true, &[]);
+                windows[index] = cells.into_iter().map(|c| c.map(|w| w.stack)).collect();
+                cursor = held.map(|w| w.stack);
+            }
+        }
+        7 => {
+            let Some(&how) = data.get(1) else {
+                return;
+            };
+            let Some((_, mut net, at)) = net else {
+                return;
+            };
+            if how == 2 {
+                // `quickMoveStack` on the result: craft while the result fits the inventory.
+                for _ in 0..64 * 9 {
+                    let Some((_, result)) = pq_result(game, &windows[index]) else {
+                        break;
+                    };
+                    if plain(&result) && game.native_room_for(&result.item) < result.count {
+                        break;
+                    }
+                    let Some(result) = pq_craft_once(game, &mut windows[index], &mut net) else {
+                        break;
+                    };
+                    if plain(&result) {
+                        game.native_give_items(&result.item, result.count);
+                    } else {
+                        game.give_or_drop(result);
+                    }
+                }
+            } else if let Some((_, result)) = pq_result(game, &windows[index]) {
+                let m = max_stack(game, &result.item);
+                let fits = match &cursor {
+                    None => true,
+                    Some(c) => c.item == result.item && c.extra == result.extra && c.count + result.count <= m,
+                };
+                if fits && let Some(result) = pq_craft_once(game, &mut windows[index], &mut net) {
+                    cursor = Some(match cursor {
+                        Some(c) => ItemStack { count: c.count + result.count, ..c },
+                        None => result,
+                    });
+                }
+            }
+            save_network(game, &net, &at);
+        }
+        8 => {
+            // `emptyTo`: into the frequency (shift: the player's inventory), the rest to the other.
+            let to_player = data.get(1) == Some(&1);
+            let mut net = net;
+            for cell in windows[index].iter_mut() {
+                let Some(s) = cell.take() else {
+                    continue;
+                };
+                let mut rest = Some(s);
+                for pass in 0..2 {
+                    let Some(s) = rest.take() else {
+                        break;
+                    };
+                    let into_player = to_player == (pass == 0);
+                    rest = if into_player {
+                        let given = if plain(&s) { game.native_give_items(&s.item, s.count) } else { 0 };
+                        (given < s.count).then(|| ItemStack { count: s.count - given, ..s })
+                    } else if let Some((_, n, _)) = net.as_mut().filter(|_| plain(&s)) {
+                        let put = n.insert(&s.item, u64::from(s.count)) as u32;
+                        (put < s.count).then(|| ItemStack { count: s.count - put, ..s })
+                    } else {
+                        Some(s)
+                    };
+                }
+                if let Some(s) = rest {
+                    game.give_or_drop(s);
+                }
+            }
+            if let Some((_, n, at)) = &net {
+                save_network(game, n, at);
+            }
+        }
+        _ => return,
+    }
+    PQ_CURSORS.with_borrow_mut(|c| match cursor {
+        Some(s) => {
+            c.insert(name.to_owned(), s);
+        }
+        None => {
+            c.remove(name);
+        }
+    });
+    pq_save_windows(game, &windows);
+}
+
+/// A shift-click on a player slot with the crafting windows preferred: the stack goes into the open windows'
+/// grids (merging, then empty cells). What is left stays where it was.
+fn pq_into_windows(game: &mut Game<'_>, mut stack: ItemStack, mask: u8) -> Option<ItemStack> {
+    let mut windows = pq_windows(game);
+    let m = max_stack(game, &stack.item);
+    'all: for pass in 0..2 {
+        for (i, win) in windows.iter_mut().enumerate() {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            for cell in win.iter_mut() {
+                match cell {
+                    Some(c) if pass == 0 && c.item == stack.item && c.extra == stack.extra && c.count < m => {
+                        let add = (m - c.count).min(stack.count);
+                        c.count += add;
+                        stack.count -= add;
+                    }
+                    None if pass == 1 => {
+                        let add = stack.count.min(m);
+                        *cell = Some(ItemStack { count: add, ..stack.clone() });
+                        stack.count -= add;
+                    }
+                    _ => {}
+                }
+                if stack.count == 0 {
+                    break 'all;
+                }
+            }
+        }
+    }
+    pq_save_windows(game, &windows);
+    (stack.count > 0).then_some(stack)
 }
 
 /// A click on the dashboard's screen, on the server. Ops: 0 refresh, 1 take, 2 place, 3 shift-take, 4 inventory
@@ -30539,23 +30830,40 @@ fn pq_op_payload(game: &mut Game<'_>, data: &[u8]) {
             let (Some(&slot), Some(&how)) = (data.get(1), data.get(2)) else {
                 return;
             };
+            let (freq_first, mask) = (data.get(3) != Some(&0), data.get(4).copied().unwrap_or(0));
             let slot = usize::from(slot);
             if slot >= 36 {
                 return;
             }
             let at_slot = player_slot(slot);
             if how == 2 {
-                let Some(s) = game.inventory.get(at_slot).cloned().flatten().filter(plain) else {
+                let Some(s) = game.inventory.get(at_slot).cloned().flatten() else {
                     return;
                 };
-                let Some((_, mut net, at)) = pq_network(game) else {
-                    return;
-                };
-                let put = net.insert(&s.item, u64::from(s.count)) as u32;
-                if put > 0 {
-                    game.inventory[at_slot] = (s.count > put).then(|| ItemStack { count: s.count - put, ..s });
-                    save_network(game, &net, &at);
+                // `shiftClickIntoFrequency` picks where it goes first; the other place takes what is left.
+                let mut rest = Some(s);
+                for pass in 0..2 {
+                    let Some(s) = rest.take() else {
+                        break;
+                    };
+                    rest = if freq_first == (pass == 0) {
+                        match pq_network(game) {
+                            Some((_, mut net, at)) if plain(&s) => {
+                                let put = net.insert(&s.item, u64::from(s.count)) as u32;
+                                if put > 0 {
+                                    save_network(game, &net, &at);
+                                }
+                                (put < s.count).then(|| ItemStack { count: s.count - put, ..s })
+                            }
+                            _ => Some(s),
+                        }
+                    } else if mask != 0 {
+                        pq_into_windows(game, s, mask)
+                    } else {
+                        Some(s)
+                    };
                 }
+                game.inventory[at_slot] = rest;
             } else {
                 let wrap = |game: &Game<'_>, s: ItemStack| {
                     let m = max_stack(game, &s.item);
@@ -30576,6 +30884,9 @@ fn pq_op_payload(game: &mut Game<'_>, data: &[u8]) {
                     }
                 });
             }
+        }
+        6..=8 => {
+            pq_window_op(game, op, &data[1..], &name);
         }
         _ => return,
     }
@@ -30656,6 +30967,16 @@ fn pq_payload(data: &[u8]) {
                     return;
                 };
                 next.inv.push(s);
+            }
+            for _ in 0..PQ_WINDOWS {
+                let mut win = Vec::new();
+                for _ in 0..10 {
+                    let Some(s) = stack(&mut at) else {
+                        return;
+                    };
+                    win.push(s);
+                }
+                next.windows.push(win);
             }
             let Some(n) = data.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize) else {
                 return;
@@ -30989,6 +31310,31 @@ fn pq_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
                 scrolling_text(game, batch, name, [o[0] + dd[0] + 3.0, y, o[0] + dd[0] + dd[2] - 3.0, y + 10.0], 0, 0x3C_FE9A, 0.8);
             }
         }
+        // The crafting windows over the screen (`GuiCraftingWindow`).
+        for k in 0..ui.wins.len() {
+            let win = ui.wins[k];
+            if let Some((i, off)) = ui.win_drag.filter(|(i, _)| *i == k) {
+                let p = [(mouse[0] - off[0]).clamp(-o[0], batch.width - o[0] - PQ_WIN_SIZE[0]), (mouse[1] - off[1]).clamp(-o[1], batch.height - o[1] - PQ_WIN_SIZE[1])];
+                ui.wins[i].pos = p;
+            }
+            let win = ui.wins.get(k).copied().unwrap_or(win);
+            let (wx, wy) = (o[0] + win.pos[0], o[1] + win.pos[1]);
+            nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [wx - 3.0, wy - 3.0, PQ_WIN_SIZE[0] + 6.0, PQ_WIN_SIZE[1] + 6.0], 0xBFFF_FFFF);
+            nine_slice(game, batch, "base", 16.0, 4.0, [wx, wy, PQ_WIN_SIZE[0], PQ_WIN_SIZE[1]]);
+            sprite(game, batch, "button/close", [0.0, 0.0, 12.0, 12.0], [wx + FILTER_CLOSE[0], wy + FILTER_CLOSE[1], FILTER_CLOSE[2], FILTER_CLOSE[3]]);
+            let title = format!("Crafting Window {}", win.index + 1);
+            let tw = game.native_text_width(&title);
+            game.native_text(batch, &title, [wx + (PQ_WIN_SIZE[0] - tw) / 2.0, wy + 6.0], 0x40_4040, false);
+            let cells = state.windows.get(win.index).cloned().unwrap_or_default();
+            for i in 0..9 {
+                pq_win_slot(game, batch, [wx, wy], [mouse[0] - win.pos[0], mouse[1] - win.pos[1]], [8.0 + 18.0 * (i % 3) as f32, 18.0 + 18.0 * (i / 3) as f32], cells.get(i).and_then(Option::as_ref));
+            }
+            sprite(game, batch, "arrow/right", [0.0, 0.0, 22.0, 15.0], [wx + 70.0, wy + 38.0, 22.0, 15.0]);
+            pq_win_slot(game, batch, [wx, wy], [mouse[0] - win.pos[0], mouse[1] - win.pos[1]], [100.0, 36.0], cells.get(9).and_then(Option::as_ref));
+            let clear = [PQ_WIN_SIZE[0] - 20.0, PQ_WIN_SIZE[1] - 20.0, 14.0, 14.0];
+            draw_mek_button(game, batch, [wx + clear[0], wy + clear[1], 14.0, 14.0], true, inside([mouse[0] - win.pos[0], mouse[1] - win.pos[1]], clear));
+            sprite(game, batch, "button/clear_sides", [0.0, 0.0, 14.0, 14.0], [wx + clear[0], wy + clear[1], 14.0, 14.0]);
+        }
         // The cursor stack, then the tooltips.
         if let Some((id, count)) = &state.cursor {
             game.native_item(batch, id, [cursor[0] - 8.0, cursor[1] - 8.0], 16.0);
@@ -31017,6 +31363,22 @@ fn pq_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
     });
 }
 
+/// A slot of a crafting window: the frame, the stack and its count, the hover.
+fn pq_win_slot(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, corner: [f32; 2], mouse: [f32; 2], at: [f32; 2], stack: Option<&(String, u32)>) {
+    sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [corner[0] + at[0], corner[1] + at[1], 18.0, 18.0]);
+    if let Some((id, count)) = stack {
+        game.native_item(batch, id, [corner[0] + at[0] + 1.0, corner[1] + at[1] + 1.0], 16.0);
+        if *count > 1 {
+            let text = count.to_string();
+            let tw = game.native_text_width(&text);
+            game.native_text(batch, &text, [corner[0] + at[0] + 17.0 - tw, corner[1] + at[1] + 9.0], 0xFF_FFFF, true);
+        }
+    }
+    if inside(mouse, [at[0], at[1], 18.0, 18.0]) {
+        game.native_fill(batch, [corner[0] + at[0] + 1.0, corner[1] + at[1] + 1.0, 16.0, 16.0], 0x80_FFFFFF);
+    }
+}
+
 fn pq_tooltips(state: &PqState, ui: &PqUi, mouse: [f32; 2], w: f32, lines: &mut Vec<String>) {
     if inside(mouse, [7.0, 15.0, w - 16.0, 12.0]) && state.frequency.is_some() {
         lines.push(format!("\u{a7}7Items: \u{a7}9{}\u{a7}7 / \u{a7}9{}", state.items, state.item_cap));
@@ -31039,6 +31401,15 @@ fn pq_tooltips(state: &PqState, ui: &PqUi, mouse: [f32; 2], w: f32, lines: &mut 
     }
     if inside(mouse, [w + 7.0, 10.0, 18.0, 18.0]) {
         lines.push(if PQ_AUTOFOCUS.get() { "Don't automatically focus the QIO search bar when opening a dashboard." } else { "Auto focus the QIO search bar when opening a dashboard." }.to_owned());
+    }
+    if inside(mouse, PQ_TAB_CRAFT) {
+        lines.push(format!("Crafting ({}/{})", ui.wins.len(), PQ_WINDOWS));
+    }
+    for win in &ui.wins {
+        let r = [mouse[0] - win.pos[0], mouse[1] - win.pos[1]];
+        if inside(r, [PQ_WIN_SIZE[0] - 20.0, PQ_WIN_SIZE[1] - 20.0, 14.0, 14.0]) {
+            lines.push("Empty Crafting Window contents into storage, hold shift to empty into player inventory instead.".to_owned());
+        }
     }
     if inside(mouse, PQ_TAB_TARGET) {
         lines.push(if PQ_TARGET_FREQ.get() { "Prioritize moving items to the crafting window when holding shift" } else { "Prioritize moving items to the frequency when holding shift" }.to_owned());
@@ -31068,6 +31439,13 @@ fn pq_draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [
     let r = [o[0] + w + 7.0, o[1] + 10.0, 18.0, 18.0];
     nine_slice_tinted(game, batch, if inside(mouse, [w + 7.0, 10.0, 18.0, 18.0]) { "button_focus" } else { "button" }, [200.0, 20.0], 2.0, r, 0xFFFF_FFFF);
     sprite(game, batch, if on { "button/searchbar_autofocus_on" } else { "button/searchbar_autofocus_off" }, [0.0, 0.0, 18.0, 18.0], r);
+    // `GuiCraftingWindowTab` (left, 34): inactive once the three windows are open.
+    let open = PQ_UI.with_borrow(|ui| ui.wins.len());
+    nine_slice_tinted(game, batch, "holder_left", [26.0, 9.0], 4.0, [o[0] - 26.0, o[1] + 34.0, 26.0, 26.0], 0xFFFF_FFFF);
+    let b = [o[0] + PQ_TAB_CRAFT[0] + 1.0, o[1] + PQ_TAB_CRAFT[1], 18.0, 18.0];
+    let tab = if open >= PQ_WINDOWS { "button_inactive" } else if inside(mouse, PQ_TAB_CRAFT) { "button_focus" } else { "button" };
+    nine_slice_tinted(game, batch, tab, [200.0, 20.0], 2.0, b, 0xFFFF_FFFF);
+    sprite(game, batch, "button/crafting", [0.0, 0.0, 18.0, 18.0], b);
     // `GuiTargetDirectionTab` (left, 60) and the rejects toggle (left, imageHeight - 35).
     let [_, h] = pq_size();
     for (top, rect, icon) in [
@@ -31108,6 +31486,8 @@ fn pq_resize_rect(screen_h: f32, top: f32) -> [f32; 4] {
 }
 
 const PQ_TAB_TARGET: [f32; 4] = [-22.0, 64.0, 18.0, 18.0];
+const PQ_TAB_CRAFT: [f32; 4] = [-22.0, 38.0, 18.0, 18.0];
+const PQ_WIN_SIZE: [f32; 2] = [124.0, 80.0];
 
 fn pq_tab_rejects(h: f32) -> [f32; 4] {
     [-22.0, h - 35.0 + 4.0, 18.0, 18.0]
@@ -31162,7 +31542,10 @@ fn pq_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
         return;
     }
     if !pressed {
-        PQ_UI.with_borrow_mut(|ui| ui.drag = None);
+        PQ_UI.with_borrow_mut(|ui| {
+            ui.drag = None;
+            ui.win_drag = None;
+        });
         return;
     }
     pq_refresh(game);
@@ -31175,6 +31558,36 @@ fn pq_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
     PQ_UI.with_borrow_mut(|ui| {
         let o = ui.origin;
         let m = [at[0] - o[0], at[1] - o[1]];
+        let how = if shift { 2 } else { button.min(1) };
+        // The crafting windows sit over everything: the topmost one under the cursor takes the press.
+        if let Some(k) = (0..ui.wins.len()).rev().find(|&k| inside(m, [ui.wins[k].pos[0], ui.wins[k].pos[1], PQ_WIN_SIZE[0], PQ_WIN_SIZE[1]])) {
+            let win = ui.wins.remove(k);
+            ui.wins.push(win);
+            let r = [m[0] - win.pos[0], m[1] - win.pos[1]];
+            let idx = win.index as u8;
+            if button == 0 && inside(r, FILTER_CLOSE) {
+                ui.wins.pop();
+            } else if let Some(i) = (0..9).find(|&i| inside(r, [8.0 + 18.0 * (i % 3) as f32, 18.0 + 18.0 * (i / 3) as f32, 18.0, 18.0])) {
+                if button <= 1 {
+                    after = Some(vec![6, idx, i as u8, how]);
+                }
+            } else if inside(r, [100.0, 36.0, 18.0, 18.0]) {
+                if button <= 1 {
+                    after = Some(vec![7, idx, if shift { 2 } else { 0 }]);
+                }
+            } else if button == 0 && inside(r, [PQ_WIN_SIZE[0] - 20.0, PQ_WIN_SIZE[1] - 20.0, 14.0, 14.0]) {
+                after = Some(vec![8, idx, u8::from(shift)]);
+            } else if button == 0 && r[1] < 18.0 {
+                ui.win_drag = Some((ui.wins.len() - 1, r));
+            }
+            return;
+        }
+        if button == 0 && inside(m, PQ_TAB_CRAFT) {
+            if ui.wins.len() < PQ_WINDOWS && let Some(index) = (0..PQ_WINDOWS).find(|i| ui.wins.iter().all(|w| w.index != *i)) {
+                ui.wins.push(PqWin { index, pos: [((w - PQ_WIN_SIZE[0]) / 2.0).floor(), 15.0] });
+            }
+            return;
+        }
         // The dropdown: a press on an option picks it, the field opens and closes it.
         let dd = pq_dropdown_rect(ui.open);
         if ui.open && button == 0 && inside(m, [dd[0], dd[1] + 12.0, dd[2], dd[3] - 12.0]) {
@@ -31278,7 +31691,8 @@ fn pq_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
         }
         for i in 0..36 {
             if inside(m, pq_inv_rect(i)) {
-                after = Some(vec![4, i as u8, if shift { 2 } else { button.min(1) }]);
+                let mask = ui.wins.iter().fold(0u8, |m, w| m | 1 << w.index);
+                after = Some(vec![4, i as u8, how, u8::from(PQ_TARGET_FREQ.get()), mask]);
                 return;
             }
         }
