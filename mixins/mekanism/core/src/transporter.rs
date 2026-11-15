@@ -132,6 +132,15 @@ pub fn next_color(color: Option<u8>) -> Option<u8> {
     }
 }
 
+/// `TransporterUtils.decrement`: the previous colour, the last after none, none before the first.
+pub fn previous_color(color: Option<u8>) -> Option<u8> {
+    match color {
+        None => Some(COLORS.len() as u8 - 1),
+        Some(0) => None,
+        Some(c) => Some(c - 1),
+    }
+}
+
 /// What the pathfinder needs of one transporter (`LogisticalTransporterBase`).
 #[derive(Clone, Debug)]
 pub struct Node {
