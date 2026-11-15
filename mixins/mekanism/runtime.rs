@@ -4581,7 +4581,7 @@ fn drain_tank_into_bucket(game: &Game<'_>, entity: &mut ModBlockEntity, from: us
         return false;
     };
     // A MekaSuit with a Nutritional Injection Unit takes the paste as it comes (`FluidInventorySlot.drainTank`).
-    if &*bucket.item == modules::BODYARMOR && installed_modules(&bucket).contains_key(NUTRITION_UNIT) {
+    if &*bucket.item == modules::HELMET && installed_modules(&bucket).contains_key(NUTRITION_UNIT) {
         if tank.chemical.as_deref() != Some(chem::NUTRITIONAL_PASTE) {
             return false;
         }
@@ -32778,7 +32778,7 @@ fn vision_enhancement_upkeep(g: &mut Game<'_>) {
 }
 
 /// `ModuleNutritionalInjectionUnit.tickServer`, for the player swapped in: while hungry and in a playing mode, the
-/// chest piece turns paste (50 mB) and energy (20,000 FE) into a point of food each, as many as it holds the energy for.
+/// helmet turns paste (50 mB) and energy (20,000 FE) into a point of food each, as many as it holds the energy for.
 fn nutritional_injection(g: &mut Game<'_>) {
     if g.creative || g.spectator() {
         return;
@@ -32786,7 +32786,7 @@ fn nutritional_injection(g: &mut Game<'_>) {
     let Some(missing) = g.player.as_ref().map(|p| 20 - p.health.food.food).filter(|m| *m > 0) else {
         return;
     };
-    let Some(piece) = g.armor[1].as_mut().filter(|s| &*s.item == modules::BODYARMOR && module_on(s, NUTRITION_UNIT)) else {
+    let Some(piece) = g.armor[0].as_mut().filter(|s| &*s.item == modules::HELMET && module_on(s, NUTRITION_UNIT)) else {
         return;
     };
     let by_paste = suit_paste(piece) / paste_per_food();
