@@ -26,6 +26,8 @@ pub fn item_energy(id: &str) -> Option<ItemEnergy> {
             crate::seismic::READER_CHARGE_RATE,
             false,
         ),
+        // `GearConfig.networkReader*`: 60 kFE at 300 FE/t.
+        crate::network_reader::ITEM => (crate::network_reader::CAPACITY, crate::network_reader::CHARGE_RATE, false),
         crate::teleporter::PORTABLE => (
             crate::teleporter::PORTABLE_CAPACITY,
             crate::teleporter::PORTABLE_CHARGE_RATE,
@@ -65,6 +67,7 @@ pub fn energy_item_ids() -> Vec<String> {
         "mekanism:atomic_disassembler",
         "mekanism:electric_bow",
         crate::seismic::READER,
+        crate::network_reader::ITEM,
         crate::teleporter::PORTABLE,
         crate::modules::MEKA_TOOL,
         crate::modules::HELMET,

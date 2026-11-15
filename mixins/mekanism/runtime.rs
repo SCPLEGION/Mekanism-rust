@@ -31804,3 +31804,352 @@ fn pq_closed(game: &mut Game<'_>) {
     FREQ_UI.with_borrow_mut(|ui| *ui = FreqUi::default());
     game.native_send_to_server(PQ_CHANNEL, &[5]);
 }
+
+// --- Network Reader, Tier Installers and alloys -----------------------------------------------------
+
+/// `EnumColor.DARK_BLUE`, the label of the Network Reader's border.
+const DARK_BLUE: u32 = 0x366BD0;
+
+/// What a flood fill over one transmitter network finds (`DynamicNetwork`): its transmitters and acceptors, and
+/// for the buffered kinds what it holds and can hold.
+#[derive(Default)]
+struct NetInfo {
+    transmitters: Vec<[i32; 3]>,
+    /// The acceptor blocks, each with the sides of it that touch a transmitter of the network.
+    acceptors: std::collections::BTreeMap<[i32; 3], Vec<usize>>,
+    stored: u64,
+    capacity: u64,
+    resource: Option<String>,
+}
+
+/// The network of the transmitter of `family` at `start`: every transmitter of the family joined to it through
+/// connections that neither side disabled, and the acceptors they reach (the rules of `show_connections`).
+fn read_network(game: &mut Game<'_>, start: [i32; 3], family: &str) -> NetInfo {
+    let mut info = NetInfo::default();
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut queue = vec![start];
+    while let Some(pos) = queue.pop() {
+        let own = game.native_with_mod_block_entity(pos, |m| {
+            let faces: Vec<u32> = (0..6).map(|f| conn_of(&m.nbt, f)).collect();
+            let (stored, capacity, resource) = match kind(&m.id) {
+                Some(Kind::Cable(rate)) => (get_long(&m.nbt, "energy"), rate, None),
+                Some(Kind::Pipe(rate)) => {
+                    let t = get_tank(&m.nbt, "fluid", rate);
+                    (t.amount, rate, t.chemical.filter(|_| t.amount > 0))
+                }
+                Some(Kind::Tube(rate)) => {
+                    let t = get_tank(&m.nbt, "chemical", rate);
+                    (t.amount, rate, t.chemical.filter(|_| t.amount > 0))
+                }
+                _ => (0, 0, None),
+            };
+            (faces, stored, capacity, resource)
+        });
+        let Some((faces, stored, capacity, resource)) = own else {
+            continue;
+        };
+        info.transmitters.push(pos);
+        info.stored += stored;
+        info.capacity += capacity;
+        if info.resource.is_none() {
+            info.resource = resource;
+        }
+        for (face, (_, d)) in DIRECTIONS.into_iter().enumerate() {
+            if faces[face] == 3 {
+                continue;
+            }
+            let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+            let name = block_name(game, at).to_owned();
+            if pipe_family(&name) == Some(family) {
+                let back = face_index([-d[0], -d[1], -d[2]]);
+                if !seen.contains(&at) && game.native_with_mod_block_entity(at, |m| conn_of(&m.nbt, back)) != Some(3) {
+                    seen.insert(at);
+                    queue.push(at);
+                }
+                continue;
+            }
+            let joined = (family == "transporter" && vanilla_container(&name))
+                || (family == "pipe" && name == EVAPORATION_VALVE)
+                || game.native_with_mod_block_entity(at, |m| kind(&m.id)).flatten().is_some_and(|k| serves(family, k));
+            if joined {
+                // `NetworkAcceptorCache`: the acceptor's side that faces the transmitter.
+                info.acceptors.entry(at).or_default().push(face_index([-d[0], -d[1], -d[2]]));
+            }
+        }
+    }
+    info
+}
+
+/// The name a network reader shows for a chemical or fluid id (`chemical.<mod>.<name>`, else `block.<mod>.<name>`).
+fn resource_name(id: &str) -> String {
+    let (ns, path) = id.split_once(':').unwrap_or(("minecraft", id));
+    for key in [format!("chemical.{ns}.{path}"), format!("block.{ns}.{path}"), format!("fluid.{ns}.{path}")] {
+        let text = lang_text(&key);
+        if text != key {
+            return text;
+        }
+    }
+    path.to_owned()
+}
+
+/// `ItemNetworkReader.displayBorder`: `------------- [label] -------------`.
+fn reader_border(game: &mut Game<'_>, uuid: u128, label: &str, brackets: bool) {
+    use horizon_client::text::Text;
+    let dashes = || Text::colored("-------------", enum_color::GRAY);
+    let label = if brackets { format!("[{label}]") } else { label.to_owned() };
+    let line = dashes().append(Text::colored(" ", enum_color::GRAY)).append(Text::colored(label, DARK_BLUE)).append(Text::colored(" ", enum_color::GRAY)).append(dashes());
+    game.native_tell(uuid, line);
+}
+
+/// `translateColored(GRAY, DARK_GRAY, value)` of one of the reader's ` *Label: value` lines.
+fn reader_line(game: &mut Game<'_>, uuid: u128, key: &str, value: &str) {
+    use horizon_client::text::Text;
+    game.native_tell(uuid, Text::translate(key, &[Text::colored(value, enum_color::DARK_GRAY)]).with_color(enum_color::GRAY));
+}
+
+/// `ItemNetworkReader.compileList`: `[A, B]`.
+fn reader_list(items: &[String]) -> String {
+    format!("[{}]", items.join(", "))
+}
+
+/// `ItemNetworkReader.useOn`: on a block entity, spends the reader's energy (outside creative) and tells the player
+/// about the transmitter network there, or the networks a block is connected to. The energy and chemical networks
+/// do not count the last tick's transfer here, so their throughput reads 0.
+pub(super) fn network_reader_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3], claimed: &mut bool) {
+    if *claimed || &*stack.item != mekanism_core::network_reader::ITEM || !game.native_on(MOD_ID) {
+        return;
+    }
+    let Some(uuid) = game.native_acting_player().map(|p| p.uuid) else {
+        return;
+    };
+    let name = block_name(game, pos).to_owned();
+    let family = pipe_family(&name);
+    let is_tile = game.native_with_mod_block_entity(pos, |_| ()).is_some() || vanilla_container(&name);
+    if !is_tile {
+        return;
+    }
+    *claimed = true;
+    let usage = mekanism_core::config::gear_int("network_reader.energyUsage", mekanism_core::network_reader::USAGE);
+    if !game.creative && usage > 0 {
+        let selected = game.selected;
+        let Some(Some(held)) = game.inventory.get_mut(selected).filter(|s| s.as_ref().is_some_and(|s| &*s.item == mekanism_core::network_reader::ITEM)) else {
+            return;
+        };
+        let stored = stored_energy(held);
+        if stored < usage {
+            return;
+        }
+        set_energy(held, stored - usage);
+    }
+    reader_border(game, uuid, &lang_text("constants.mekanism.mod_name"), true);
+    match family.filter(|_| game.native_with_mod_block_entity(pos, |m| matches!(kind(&m.id), Some(Kind::Cable(_) | Kind::Pipe(_) | Kind::Tube(_) | Kind::Transporter(_)))) == Some(true)) {
+        Some(family) => {
+            let net = read_network(game, pos, family);
+            reader_line(game, uuid, "network_reader.mekanism.transmitters", &net.transmitters.len().to_string());
+            reader_line(game, uuid, "network_reader.mekanism.acceptors", &net.acceptors.len().to_string());
+            let needed = net.capacity.saturating_sub(net.stored);
+            let resource = net.resource.as_deref().map(resource_name);
+            match family {
+                "cable" => {
+                    let fe = mekanism_core::energy::format_fe;
+                    reader_line(game, uuid, "network_reader.mekanism.needed", &fe(needed));
+                    reader_line(game, uuid, "network_reader.mekanism.buffer", &fe(net.stored));
+                    reader_line(game, uuid, "network_reader.mekanism.throughput", &format!("{}/t", fe(0)));
+                    reader_line(game, uuid, "network_reader.mekanism.capacity", &net.capacity.to_string());
+                }
+                "pipe" | "tube" => {
+                    let needed_text = if family == "pipe" { format!("{:?} buckets", needed as f32 / 1000.0) } else { needed.to_string() };
+                    reader_line(game, uuid, "network_reader.mekanism.needed", &needed_text);
+                    let stored = match resource {
+                        Some(name) => format!("{name} ({} mB)", net.stored),
+                        None => lang_text("gui.mekanism.none"),
+                    };
+                    reader_line(game, uuid, "network_reader.mekanism.buffer", &stored);
+                    reader_line(game, uuid, "network_reader.mekanism.throughput", "0 mB/t");
+                    reader_line(game, uuid, "network_reader.mekanism.capacity", &net.capacity.to_string());
+                }
+                _ => {}
+            }
+        }
+        None => {
+            // `displayConnectedNetworks`: each network around the block that has it as an acceptor.
+            let mut done: Vec<[i32; 3]> = Vec::new();
+            reader_end_pending(game, uuid, pos, &mut done);
+        }
+    }
+    reader_border(game, uuid, "[=======]", false);
+}
+
+/// The networks beside `pos` that reach it, one border each (`ItemNetworkReader.displayConnectedNetworks`).
+fn reader_end_pending(game: &mut Game<'_>, uuid: u128, pos: [i32; 3], done: &mut Vec<[i32; 3]>) {
+    for (_, d) in DIRECTIONS {
+        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        let name = block_name(game, at).to_owned();
+        let Some(family) = pipe_family(&name) else {
+            continue;
+        };
+        if done.contains(&at) {
+            continue;
+        }
+        let net = read_network(game, at, family);
+        done.extend(net.transmitters.iter().copied());
+        let Some(sides) = net.acceptors.get(&pos) else {
+            continue;
+        };
+        let kinds = match family {
+            "cable" => "transmission.mekanism.energy",
+            "pipe" => "transmission.mekanism.fluids",
+            "tube" => "transmission.mekanism.chemicals",
+            "transporter" => "transmission.mekanism.items",
+            _ => "transmission.mekanism.heat",
+        };
+        reader_border(game, uuid, &reader_list(&[lang_text(kinds)]), false);
+        let mut faces = sides.clone();
+        faces.sort_unstable();
+        faces.dedup();
+        let names: Vec<String> = faces.iter().map(|f| lang_text(&format!("direction.mekanism.{}", DIRECTIONS[*f].0))).collect();
+        reader_line(game, uuid, "network_reader.mekanism.connected", &reader_list(&names));
+        reader_border(game, uuid, "[=======]", false);
+    }
+}
+
+/// Puts `new_block` where the Mekanism block at `pos` is, with the properties it shares (facing), and gives it the
+/// slots and data `remap` makes of the old block entity's: what the upgrade data of a tier change carries over.
+fn swap_block(
+    game: &mut Game<'_>,
+    pos: [i32; 3],
+    new_block: &str,
+    remap: impl FnOnce(Vec<Option<ItemStack>>, Compound) -> (Vec<Option<ItemStack>>, Compound),
+) -> bool {
+    let Some((items, nbt)) = game.native_with_mod_block_entity(pos, |m| (m.items.clone(), m.nbt.clone())) else {
+        return false;
+    };
+    let props = game.native_block_properties(pos);
+    let all: Vec<(&str, &str)> = props.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let facing: Vec<(&str, &str)> = all.iter().copied().filter(|(k, _)| *k == "facing").collect();
+    if !game.native_set_block(pos, new_block, &all) && !game.native_set_block(pos, new_block, &facing) {
+        return false;
+    }
+    let (items, nbt) = remap(items, nbt);
+    game.native_with_mod_block_entity(pos, |m| {
+        let slots = m.items.len();
+        m.items = items;
+        m.items.resize(slots, None);
+        m.nbt = nbt;
+    });
+    true
+}
+
+/// Takes one of `held` outside creative (`ItemStack.consume`).
+fn consume_held(game: &mut Game<'_>) {
+    if game.creative {
+        return;
+    }
+    let held = game.held_mut();
+    if let Some(s) = held.as_mut() {
+        s.count = s.count.saturating_sub(1);
+        if s.count == 0 {
+            *held = None;
+        }
+    }
+}
+
+/// `ItemTierInstaller.useOn`: a block of the tier the installer upgrades from becomes its next tier, keeping its
+/// contents; the Basic Tier Installer turns a machine into its basic factory.
+pub(super) fn tier_installer_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3], claimed: &mut bool) {
+    use mekanism_core::network_reader as nr;
+    if *claimed || !game.native_on(MOD_ID) {
+        return;
+    }
+    let Some((from, to)) = nr::installer(&stack.item) else {
+        return;
+    };
+    let name = block_name(game, pos).to_owned();
+    // A bounding block stands for the main block of its multiblock (`BlockBounding.getMainBlockPos`); none of the
+    // blocks an installer upgrades has any.
+    let (new_block, machine) = match from {
+        Some(from) => match nr::upgrade_block(&name, from, to) {
+            Some(n) => (n, None),
+            None => return,
+        },
+        None => match nr::factory_of_machine(&name) {
+            Some((n, kind)) => (n, Some(kind)),
+            None => return,
+        },
+    };
+    if kind(&new_block).is_none() {
+        return;
+    }
+    // Everything the installer tries is its click: a block someone else secured refuses it.
+    *claimed = true;
+    if sec_denied(game, pos) {
+        return;
+    }
+    let ok = match machine {
+        None => swap_block(game, pos, &new_block, |items, nbt| (items, nbt)),
+        Some(factory_kind) => swap_block(game, pos, &new_block, |old, mut nbt| {
+            // `TileEntityFactory.parseUpgradeData`: the machine's input, output and extra slots go into the first
+            // process, its energy slot into the factory's; its progress starts over.
+            let at = |i: usize| old.get(i).cloned().flatten();
+            let mut items = vec![None; factory_slot_count(&new_block)];
+            items[0] = at(0);
+            items[FACTORY_ROW] = at(2);
+            match factory_kind {
+                "combining" => items[FACTORY_CHEM] = at(1),
+                "compressing" | "purifying" | "injecting" | "infusing" => items[FACTORY_CHEM] = at(1),
+                _ => items[FACTORY_ENERGY] = at(1),
+            }
+            if factory_kind == "sawing" {
+                items[FACTORY_CHEM] = at(3);
+            }
+            nbt.remove(&JavaString::from("progress"));
+            if factory_kind == "infusing"
+                && let Some(tank) = nbt.remove(&JavaString::from("infuse"))
+            {
+                nbt.insert("chemical".into(), tank);
+            }
+            (items, nbt)
+        }),
+    };
+    if ok {
+        consume_held(game);
+    }
+}
+
+/// `ItemAlloy.useOn` and `TileEntityTransmitter.onAlloyInteraction`: on a transmitter whose tier the alloy follows, the
+/// nearest eight transmitters of its network that are of that tier become the alloy's, keeping what they carry;
+/// one alloy is used if any changed.
+pub(super) fn alloy_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3], claimed: &mut bool) {
+    use mekanism_core::network_reader as nr;
+    if *claimed || !game.native_on(MOD_ID) {
+        return;
+    }
+    let Some(target) = nr::alloy(&stack.item) else {
+        return;
+    };
+    let name = block_name(game, pos).to_owned();
+    let Some(family) = pipe_family(&name) else {
+        return;
+    };
+    if game.native_with_mod_block_entity(pos, |_| ()).is_none() || !config_flag("general", "", "transmitterAlloyUpgrade", true) {
+        return;
+    }
+    *claimed = true;
+    let mut net = read_network(game, pos, family).transmitters;
+    net.sort_by_key(|p| (p[0] - pos[0]).pow(2) + (p[1] - pos[1]).pow(2) + (p[2] - pos[2]).pow(2));
+    let mut upgraded = 0;
+    for at in net {
+        let Some(new_block) = nr::upgrade_transmitter(&block_name(game, at).to_owned(), target) else {
+            continue;
+        };
+        if kind(&new_block).is_some() && swap_block(game, at, &new_block, |items, nbt| (items, nbt)) {
+            upgraded += 1;
+            if upgraded == nr::ALLOY_UPGRADES {
+                break;
+            }
+        }
+    }
+    if upgraded > 0 {
+        consume_held(game);
+    }
+}
