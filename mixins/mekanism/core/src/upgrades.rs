@@ -20,10 +20,22 @@ pub enum Upgrade {
     Anchor,
     /// The advanced machines': less chemical used.
     Chemical,
+    /// Mutes a machine's sound.
+    Muffling,
+    /// The Digital Miner's: stone and cobblestone replacements come from nothing.
+    StoneGenerator,
 }
 
 impl Upgrade {
-    pub const ALL: [Upgrade; 5] = [Upgrade::Speed, Upgrade::Energy, Upgrade::Filter, Upgrade::Anchor, Upgrade::Chemical];
+    pub const ALL: [Upgrade; 7] = [
+        Upgrade::Speed,
+        Upgrade::Energy,
+        Upgrade::Filter,
+        Upgrade::Anchor,
+        Upgrade::Chemical,
+        Upgrade::Muffling,
+        Upgrade::StoneGenerator,
+    ];
 
     /// The `mekanism:upgrade_type` value of the upgrade item.
     pub fn id(self) -> &'static str {
@@ -33,6 +45,8 @@ impl Upgrade {
             Upgrade::Filter => "mekanism:filter",
             Upgrade::Anchor => "mekanism:anchor",
             Upgrade::Chemical => "mekanism:chemical",
+            Upgrade::Muffling => "mekanism:muffling",
+            Upgrade::StoneGenerator => "mekanism:stone_generator",
         }
     }
 
@@ -42,7 +56,7 @@ impl Upgrade {
 
     pub fn max(self) -> u32 {
         match self {
-            Upgrade::Filter | Upgrade::Anchor => 1,
+            Upgrade::Filter | Upgrade::Anchor | Upgrade::Muffling | Upgrade::StoneGenerator => 1,
             _ => 8,
         }
     }
@@ -60,6 +74,8 @@ pub struct Upgrades {
     pub filter: u32,
     pub anchor: u32,
     pub chemical: u32,
+    pub muffling: u32,
+    pub stone_generator: u32,
 }
 
 impl Upgrades {
@@ -70,6 +86,8 @@ impl Upgrades {
             Upgrade::Filter => self.filter,
             Upgrade::Anchor => self.anchor,
             Upgrade::Chemical => self.chemical,
+            Upgrade::Muffling => self.muffling,
+            Upgrade::StoneGenerator => self.stone_generator,
         }
     }
 
@@ -83,6 +101,8 @@ impl Upgrades {
             Upgrade::Filter => self.filter += n,
             Upgrade::Anchor => self.anchor += n,
             Upgrade::Chemical => self.chemical += n,
+            Upgrade::Muffling => self.muffling += n,
+            Upgrade::StoneGenerator => self.stone_generator += n,
         }
         n
     }
@@ -175,6 +195,8 @@ mod tests {
             filter: 0,
             anchor: 0,
             chemical: 0,
+            muffling: 0,
+            stone_generator: 0,
         };
         assert_eq!(u.ticks(200), 20);
         assert_eq!(u.energy_per_tick(50), 5000);
@@ -185,6 +207,8 @@ mod tests {
             filter: 0,
             anchor: 0,
             chemical: 0,
+            muffling: 0,
+            stone_generator: 0,
         };
         assert_eq!((half.ticks(200), half.energy_per_tick(50)), (63, 500));
     }
@@ -197,6 +221,8 @@ mod tests {
             filter: 0,
             anchor: 0,
             chemical: 0,
+            muffling: 0,
+            stone_generator: 0,
         };
         assert_eq!((u.energy_per_tick(50), u.max_energy(200)), (5, 2000));
         let both = Upgrades {
@@ -205,6 +231,8 @@ mod tests {
             filter: 0,
             anchor: 0,
             chemical: 0,
+            muffling: 0,
+            stone_generator: 0,
         };
         assert_eq!(both.energy_per_tick(50), 500);
     }
@@ -228,6 +256,7 @@ mod tests {
         assert_eq!(u.install(Upgrade::Speed, 1), 0);
         assert_eq!(Upgrade::from_id("mekanism:energy"), Some(Upgrade::Energy));
         assert_eq!(Upgrade::from_id("mekanism:anchor"), Some(Upgrade::Anchor));
-        assert_eq!(Upgrade::from_id("mekanism:muffling"), None);
+        assert_eq!(Upgrade::from_id("mekanism:muffling"), Some(Upgrade::Muffling));
+        assert_eq!(Upgrade::from_id("mekanism:unknown"), None);
     }
 }

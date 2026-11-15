@@ -162,6 +162,8 @@ mod tests {
                 filter: 0,
                 anchor: 0,
                 chemical: 0,
+                muffling: 0,
+                stone_generator: 0,
             },
         );
         assert_eq!(
@@ -180,6 +182,8 @@ mod tests {
                 filter: 0,
                 anchor: 0,
                 chemical: 0,
+                muffling: 0,
+                stone_generator: 0,
             },
         );
         let mut dust = Slot {
