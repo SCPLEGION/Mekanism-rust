@@ -3243,6 +3243,18 @@ pub(super) fn network_changed() {
     TOPOLOGY.set(TOPOLOGY.get() + 1);
 }
 
+/// Transmitters a neighbour change reached, which look at their sides on their next tick.
+thread_local! {
+    static TOLD: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// `neighborChanged` reached the block `name` at `pos`: a transmitter is told (`onNeighborBlockChange`).
+pub(super) fn transmitter_told(pos: [i32; 3], name: &str) {
+    if pipe_family(name).is_some() {
+        TOLD.with_borrow_mut(|t| t.insert(pos));
+    }
+}
+
 /// A block became another: networks form again when either was a Mekanism block (a transmitter or what it joins).
 pub(super) fn network_changed_at(old: &str, new: &str) {
     if old.starts_with("mekanism") || new.starts_with("mekanism") {
@@ -5276,7 +5288,8 @@ fn serves(family: &str, kind: Kind) -> bool {
 /// mushroom stem template's) are `false` toward a transmitter of its kind or a block it serves. Mekanism
 /// renders the same from its connection cache.
 fn show_connections(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
-    let ticker = get_int(&entity.nbt, "shape_ticker");
+    let told = TOLD.with_borrow_mut(|t| !t.is_empty() && t.remove(&pos));
+    let ticker = if told { 0 } else { get_int(&entity.nbt, "shape_ticker") };
     put_int(&mut entity.nbt, "shape_ticker", (ticker + 1) % 10);
     if ticker != 0 {
         return;
@@ -7132,7 +7145,7 @@ fn carrier_network_step(game: &mut Game<'_>, me: &mut TickingMember<'_>, net: u6
         pulls.extend(pulling.into_iter().map(|f| (*p, f, i)));
     }
     let capacity: u64 = rates.iter().sum();
-    // The network holds the chemical of the first transmitter that has one; a transmitter with another keeps it.
+    // The network holds the chemical of the first transmitter that has one; a tube with another is not in the network (`discover`), the check stays for a tube that was filled since it formed.
     let mut chemical = tanks.iter().find(|t| t.amount > 0).and_then(|t| t.chemical.clone());
     let holds = |t: &ChemicalTank, c: &Option<String>| t.amount > 0 && t.chemical == *c;
     let mut buffer: u64 = tanks.iter().filter(|t| holds(t, &chemical)).map(|t| t.amount).sum();
@@ -34188,6 +34201,11 @@ fn discover(game: &mut Game<'_>, me: &mut TickingMember<'_>, start: [i32; 3], fa
         let Some((faces, stored, capacity, resource, flow, heat)) = own else {
             continue;
         };
+        // `CompatibleChemicalTransmitterValidator` / `CompatibleFluidTransmitterValidator`: a tube or pipe holding another
+        // chemical or fluid than the network's does not join it (it stays a network of its own).
+        if pos != start && matches!((&info.resource, &resource), (Some(a), Some(b)) if a != b) {
+            continue;
+        }
         info.transmitters.push(pos);
         info.stored += stored;
         info.capacity += capacity;
