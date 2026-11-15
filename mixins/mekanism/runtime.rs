@@ -6104,7 +6104,7 @@ fn tick_transporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
 
 /// `LogisticalTransporterBase.insert` for a block beside a transporter: a sorter hands `item` over. Returns what
 /// went nowhere.
-fn insert_into_transporter(game: &mut Game<'_>, at: P3, source: P3, item: ItemStack, round_robin: bool, rr: &mut Option<(P3, usize)>) -> Option<ItemStack> {
+fn insert_into_transporter(game: &mut Game<'_>, at: P3, source: P3, item: ItemStack, round_robin: bool, rr: &mut Option<(P3, usize)>, out_color: Option<u8>) -> Option<ItemStack> {
     let id = block_name(game, at).to_owned();
     let now = game.world.game_time.max(0) as u64;
     let Some((nbt, mut stacks)) = game.native_with_mod_block_entity(at, |m| (m.nbt.clone(), load_transit(&m.nbt))) else {
@@ -6114,7 +6114,8 @@ fn insert_into_transporter(game: &mut Game<'_>, at: P3, source: P3, item: ItemSt
     let Some(from) = tnet::side_between(at, source) else {
         return Some(item);
     };
-    let color = node.color;
+    // `TransitRequest.eject`: the sender's colour, else the transporter's.
+    let color = out_color.or(node.color);
     if !node.can_receive_from(from) {
         return Some(item);
     }
@@ -6438,6 +6439,11 @@ fn tick_sorter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
             }
             None => settings.auto_eject_allows(&s.item, &in_tag),
         };
+        // A filter's colour, and the sorter's own for what it ejects without one (`request.eject(.., color, ..)`).
+        let out_color = match filter {
+            Some(_) => opts.and_then(|o| o.color),
+            None => get_int(&entity.nbt, "dcolor").checked_sub(1).map(|c| c as u8),
+        };
         let stack = game.native_extract_item_where(back, back_face, take, &wanted);
         let Some(stack) = stack else {
             continue;
@@ -6450,7 +6456,7 @@ fn tick_sorter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
         }
         let left = if is_transporter(block_name(game, front)) {
             let mut rr = get_pos(&entity.nbt, "rr").map(|p| (p, get_int(&entity.nbt, "rr_side") as usize));
-            let left = insert_into_transporter(game, front, pos, stack, settings.round_robin, &mut rr);
+            let left = insert_into_transporter(game, front, pos, stack, settings.round_robin, &mut rr, out_color);
             match rr {
                 Some((p, side)) => {
                     entity.nbt.insert("rr".into(), pos_tag(p));
@@ -23087,6 +23093,8 @@ struct SorterView {
     single: bool,
     eject: bool,
     round_robin: bool,
+    /// The sorter's own colour (a `tnet::COLORS` index).
+    color: Option<u8>,
     opts: std::collections::BTreeMap<String, sorter::Opts>,
     /// A QIO importer or exporter: its frequency, and what that holds (items, capacity, types, capacity).
     qio: Option<QioInfo>,
@@ -23115,7 +23123,7 @@ fn sorter_view(game: &Game<'_>) -> Option<([i32; 3], SorterView)> {
     let flag = |k: &str| get_int(c, k) == 1;
     let qio = flag("qio").then(|| QioInfo { frequency: get_string(c, "frequency"), totals: [get_long(c, "items"), get_long(c, "item_cap"), get_long(c, "types"), get_long(c, "type_cap")] });
     FILTER_QIO.set(qio.is_some());
-    Some(([x, y, z], SorterView { filters: strings_of(c, "filters"), disabled: strings_of(c, "disabled"), single: flag("single"), eject: flag("eject"), round_robin: flag("round_robin"), opts: match c.get(&JavaString::from("filter_opts")) { Some(Tag::String(o)) => Sorter::parse_opts(&o.to_string().unwrap_or_default()), _ => Default::default() }, qio }))
+    Some(([x, y, z], SorterView { filters: strings_of(c, "filters"), disabled: strings_of(c, "disabled"), single: flag("single"), eject: flag("eject"), round_robin: flag("round_robin"), color: get_int(c, "dcolor").checked_sub(1).map(|c| c as u8), opts: match c.get(&JavaString::from("filter_opts")) { Some(Tag::String(o)) => Sorter::parse_opts(&o.to_string().unwrap_or_default()), _ => Default::default() }, qio }))
 }
 
 /// Sends the sorter's settings to the players looking at it when they change.
@@ -23146,11 +23154,12 @@ fn sorter_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
     put_int(&mut client, "single", u32::from(s.single_item));
     put_int(&mut client, "eject", u32::from(s.auto_eject));
     put_int(&mut client, "round_robin", u32::from(s.round_robin));
+    put_int(&mut client, "dcolor", get_int(&entity.nbt, "dcolor"));
     put_client(
         game,
         pos,
         entity,
-        &["filters", "disabled", "filter_opts", "single", "eject", "round_robin", "qio", "frequency", "items", "item_cap", "types", "type_cap"],
+        &["filters", "disabled", "filter_opts", "single", "eject", "round_robin", "dcolor", "qio", "frequency", "items", "item_cap", "types", "type_cap"],
         client,
     );
 }
@@ -23222,6 +23231,11 @@ fn sorter_payload(game: &mut Game<'_>, data: &[u8]) {
                     s.filters.push(f);
                 }
             }
+            sorter::Op::DefaultColor => {
+                if r.value <= 18 {
+                    put_int(&mut m.nbt, "dcolor", u32::from(r.value));
+                }
+            }
             sorter::Op::Rename => {
                 if let Some(f) = sorter::Sorter::named_filter(r.value, &r.name)
                     && f.as_bytes().first() == s.filters.get(index).and_then(|o| o.as_bytes().first())
@@ -23229,7 +23243,7 @@ fn sorter_payload(game: &mut Game<'_>, data: &[u8]) {
                     s.rename(index, f);
                 }
             }
-            sorter::Op::SetColor if r.value <= 16 => {
+            sorter::Op::SetColor if r.value <= 18 => {
                 s.edit(index, |o| o.color = r.value.checked_sub(1).map(|c| c as u8));
             }
             sorter::Op::SetColor => {}
@@ -23284,16 +23298,21 @@ fn sorter_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool) -> bool
             return true;
         }
     }
-    if inside(at, SORTER_NEW) {
-        // The New Filter button opens the select window (`GuiFilterHolder`); the held item's filters
-        // stay on a right click, and on sneaking.
-        if right {
-            send_sorter(game, Op::AddTag, pos, 0);
+    if inside(at, SORTER_COLOR) {
+        // `ColorButton`: left steps on (shift clears), right steps back (`TransporterUtils.increment`, `decrement`).
+        let next = if right {
+            tnet::previous_color(view.color)
         } else if shift {
-            send_sorter(game, Op::AddMod, pos, 0);
+            None
         } else {
-            FILTER_SELECT.set(Some(pos));
-        }
+            tnet::next_color(view.color)
+        };
+        send_sorter_value(game, Op::DefaultColor, pos, 0, next.map_or(0, |c| u16::from(c) + 1));
+        return true;
+    }
+    if inside(at, SORTER_NEW) {
+        // The New Filter button opens the select window (`GuiFilterHolder`).
+        FILTER_SELECT.set(Some(pos));
         return true;
     }
     let first = sorter_scroll(pos);
@@ -23316,9 +23335,7 @@ fn sorter_click(game: &Game<'_>, block: &str, at: [f32; 2], right: bool) -> bool
             send_sorter(game, if shift { Op::Bottom } else { Op::Down }, pos, index);
         } else if inside(at, radio) {
             send_sorter(game, Op::Toggle, pos, index);
-        } else if right {
-            send_sorter(game, Op::Delete, pos, index);
-        } else {
+        } else if !right {
             // A click on the filter opens its window (`GuiSorterItemStackFilter` and the others).
             open_filter_window(&view, pos, index);
         }
@@ -23350,7 +23367,7 @@ fn draw_sorter_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
     let view = sorter_view(game);
     let (pos, view) = match view {
         Some((p, v)) => (p, v),
-        None => ([0; 3], SorterView { filters: vec![], disabled: vec![], single: false, eject: false, round_robin: false, opts: Default::default(), qio: None }),
+        None => ([0; 3], SorterView { filters: vec![], disabled: vec![], single: false, eject: false, round_robin: false, color: None, opts: Default::default(), qio: None }),
     };
     // `OnOff.of(..).getTextComponent()`: the lang's plain "on" and "off".
     let on = |b: bool| if b { "on" } else { "off" };
@@ -23370,7 +23387,9 @@ fn draw_sorter_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
         draw_button(game, batch, at(*r), hovered, true, 0xFFFF_FFFF, Some((&format!("button/{icon}"), 14.0)));
     }
     sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 12.0, oy + 136.0, 18.0, 18.0]);
-    let _ = SORTER_COLOR;
+    if let Some(c) = view.color {
+        game.native_fill(batch, at(SORTER_COLOR), 0xFF00_0000 | tnet::COLORS[usize::from(c) % tnet::COLORS.len()].1);
+    }
     draw_mek_button(game, batch, at(SORTER_NEW), true, inside(mouse, SORTER_NEW));
     let w = game.native_text_width("New Filter");
     game.native_text(batch, "New Filter", [ox + 96.0 + (156.0 - w) / 2.0, oy + 142.0], 0xFF_FFFF, true);
@@ -23386,18 +23405,27 @@ fn draw_sorter_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
         let [rx, ry] = [ox + row[0], oy + row[1]];
         let hovered = inside(mouse, row);
         nine_slice_tinted(game, batch, if hovered { "list/filter/hovered" } else { "list/filter/base" }, [156.0, 29.0], 1.0, [rx, ry, 156.0, 29.0], 0xFFFF_FFFF);
-        let tint = if f.starts_with('#') { 0x4D54_FF54 } else { 0x4D54_54FF };
+        let tint = match f.as_bytes().first() {
+            Some(b'#') => 0x4D54_FF54,
+            Some(b'@') => 0x4DFF_5454,
+            _ => 0x4D54_54FF,
+        };
         game.native_fill(batch, [rx, ry, 156.0, 29.0], tint);
         sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [rx + 2.0, ry + 2.0, 18.0, 18.0]);
         if !f.starts_with('#') {
             game.native_item_stack(batch, &qio_stack(f, 1), [rx + 3.0, ry + 3.0], 16.0);
         }
-        game.native_text(batch, &filter_name(f), [rx + 22.0, ry + 3.0], 0x40_4040, false);
+        game.native_text(batch, &filter_name(f), [rx + 19.0, ry + 3.0], 0x40_4040, false);
         game.native_fill(batch, [rx + 22.0, ry + 13.0, 6.0, 1.0], 0xFF39_3939);
         game.native_fill(batch, [rx + 22.0, ry + 18.0, 6.0, 1.0], 0xFF39_3939);
         game.native_fill(batch, [rx + 22.0, ry + 13.0, 1.0, 6.0], 0xFF39_3939);
         game.native_fill(batch, [rx + 27.0, ry + 13.0, 1.0, 6.0], 0xFF39_3939);
-        game.native_text_scaled(batch, "No color", [rx + 30.0, ry + 14.0], 0x40_4040, 0.7);
+        let fcolor = view.opts.get(f).and_then(|o| o.color);
+        if let Some(c) = fcolor {
+            game.native_fill(batch, [rx + 23.0, ry + 14.0, 4.0, 4.0], 0xFF00_0000 | tnet::COLORS[usize::from(c) % tnet::COLORS.len()].1);
+        }
+        let cname = fcolor.map_or("No color", |c| tnet::COLORS[usize::from(c) % tnet::COLORS.len()].0);
+        game.native_text_scaled(batch, cname, [rx + 27.0, ry + 14.0], 0x40_4040, 0.7);
         let (up, down, radio) = sorter_row_parts(i);
         if index > 0 {
             let name = if inside(mouse, up) { "button/filter_arrow/up_hovered" } else { "button/filter_arrow/up" };
@@ -23870,7 +23898,7 @@ fn draw_filter_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
             // The colour slot and button (`ColorButton`).
             sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [x + 7.0, y + 43.0, 18.0, 18.0]);
             if let Some(c) = o.color {
-                game.native_fill(batch, screen(FILTER_COLOR), 0xFF00_0000 | freq::COLORS[usize::from(c) % 16].1);
+                game.native_fill(batch, screen(FILTER_COLOR), 0xFF00_0000 | tnet::COLORS[usize::from(c) % tnet::COLORS.len()].1);
             }
             draw_button(game, batch, screen(FILTER_DEFAULT), hover(FILTER_DEFAULT), true, 0xFFFF_FFFF, Some(("button/default", 11.0)));
             game.native_text(batch, if o.allow_default { "on" } else { "off" }, [x + 159.0, y + 20.0], 0x40_4040, false);
@@ -24094,7 +24122,7 @@ fn filter_window_tooltip(game: &Game<'_>, at: [f32; 2], lines: &mut Vec<String>)
             Some(i) => view.filters.get(i).and_then(|f| view.opts.get(f)).and_then(|o| o.color),
             None => draft.color,
         };
-        lines.push(color.map_or("None", |c| freq::COLORS[usize::from(c) % 16].0).into());
+        lines.push(color.map_or("None", |c| tnet::COLORS[usize::from(c) % tnet::COLORS.len()].0).into());
     }
     inside(at, filter_window())
 }

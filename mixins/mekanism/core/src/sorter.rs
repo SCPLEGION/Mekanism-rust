@@ -43,16 +43,9 @@ impl Opts {
         min <= max && max <= u16::from(crate::sorter::MAX_MOVE as u8)
     }
 
-    /// `TransporterUtils.increment` and `decrement` over none and the 16 dye colours.
+    /// `TransporterUtils.increment` and `decrement` over none and the colours (`EnumColor.VALUES`).
     pub fn step_color(color: Option<u8>, next: bool) -> Option<u8> {
-        match (color, next) {
-            (None, true) => Some(0),
-            (Some(15), true) => None,
-            (Some(c), true) => Some(c + 1),
-            (None, false) => Some(15),
-            (Some(0), false) => None,
-            (Some(c), false) => Some(c - 1),
-        }
+        if next { crate::transporter::next_color(color) } else { crate::transporter::previous_color(color) }
     }
 
     fn save(&self) -> String {
@@ -341,9 +334,11 @@ pub enum Op {
     /// A tag or mod filter's new name (the text window of an existing filter): `index` the filter, `value` its
     /// kind (1 tag, 2 mod id), `name` the typed name.
     Rename,
+    /// The sorter's own colour (`TileEntityLogisticalSorter.color`, the dye + 1, 0 for none), for what no filter colours.
+    DefaultColor,
 }
 
-const OPS: [Op; 22] = [
+const OPS: [Op; 23] = [
     Op::Single,
     Op::RoundRobin,
     Op::AutoEject,
@@ -366,6 +361,7 @@ const OPS: [Op; 22] = [
     Op::SetColor,
     Op::Fuzzy,
     Op::Rename,
+    Op::DefaultColor,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -548,8 +544,8 @@ mod tests {
         assert!(!s.auto_eject_allows("minecraft:dirt", &tag));
         s.edit(1, |o| o.allow_default = true);
         assert!(s.auto_eject_allows("minecraft:dirt", &tag));
-        assert_eq!(Opts::step_color(None, false), Some(15));
-        assert_eq!(Opts::step_color(Some(15), true), None);
+        assert_eq!(Opts::step_color(None, false), Some(17));
+        assert_eq!(Opts::step_color(Some(17), true), None);
         assert!(!Opts::valid_range(5, 4) && !Opts::valid_range(0, 65));
     }
 
