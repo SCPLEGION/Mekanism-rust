@@ -1,7 +1,7 @@
-//! Side configuration, simplified: each face of a machine is left as the machine makes it, turned off,
+//! Side configuration: each face of a machine is left as the machine makes it, turned off,
 //! or limited to taking in or giving out, for each transmission type (items, fluids, chemicals, energy, heat), as
-//! Mekanism's `TileComponentConfig` keeps a mode per face and type. There is no screen: the Configurator
-//! cycles a face of the type it is set to.
+//! Mekanism's `TileComponentConfig` keeps a mode per face and type. The side configuration window and
+//! the Configurator change a face's mode.
 
 /// The kinds of thing a face passes (`TransmissionType`), in the Configurator's order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

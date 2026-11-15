@@ -73,8 +73,8 @@ pub fn key(name: &str, security: Security, owner: u128) -> String {
 
 /// The frequencies the selector lists in `security` mode for player `viewer`
 /// (`getPublicCache`/`getPrivateCache`/`getTrustedCache`): every public one, the viewer's own private
-/// ones, and the trusted ones of owners who trust the viewer (trust lists are not ported, so the
-/// viewer's own).
+/// ones, and (the caller adds these, which needs the owners' trust lists) the trusted ones of owners who
+/// trust the viewer.
 pub fn visible(entries: &[Entry], security: Security, viewer: u128) -> Vec<&Entry> {
     entries
         .iter()
