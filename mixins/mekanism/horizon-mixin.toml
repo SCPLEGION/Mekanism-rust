@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "bdf11cef198a45547206ebfb15bc425220c1801f"
+horizon_revision = "10a3ef41c02780d3bc77fb81ed96690a0a969669"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -899,4 +899,14 @@ bindings = [
   { name = "from", ty = "[f64; 3]", value = "from" },
   { name = "to", ty = "[f64; 3]", value = "to" },
   { name = "absorbed", ty = "&mut bool", value = "&mut *absorbed" },
+]
+
+[[injection]]
+id = "biome-spawns"
+hook = "biome_spawns"
+hook_version = 1
+kind = "HEAD"
+helper = "biome_spawns.rs"
+bindings = [
+  { name = "biomes", ty = "&mut horizon_client::biome::Biomes", value = "&mut *biomes" },
 ]

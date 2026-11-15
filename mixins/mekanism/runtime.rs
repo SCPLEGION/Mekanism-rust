@@ -29298,6 +29298,18 @@ const BABY_CHANNEL: &str = "mekanismadditions:babies";
 /// Every tick: the server tells the clients which mobs are babies; every client draws them at their scale.
 fn babies_tick(game: &mut Game<'_>) {
     if !game.native_window() {
+        // `EntityBabyCreeper`, `xpReward * 2.5` on all of them: the factors Horizon applies to a mob's reward and blast.
+        for (name, _, _) in BABIES {
+            for id in game.native_mob_ids(&format!("mekanismadditions:baby_{name}")) {
+                game.native_with_mob(id, |m| {
+                    m.extra.mod_xp = 2.5;
+                    if name == "creeper" {
+                        // `explodeCreeper`: half the radius, and a charged one the radius of an uncharged vanilla creeper.
+                        m.extra.mod_blast = 0.5;
+                    }
+                });
+            }
+        }
         if game.ticks % 20 == 0 {
             let mut list = Vec::new();
             for (name, scale, _) in BABIES {
@@ -29314,6 +29326,41 @@ fn babies_tick(game: &mut Game<'_>) {
     }
     for (id, scale) in BABY_SCALES.with_borrow(|m| m.iter().map(|(i, s)| (*i, *s)).collect::<Vec<_>>()) {
         game.native_with_mob(id, |m| m.extra.mod_scale = f32::from(scale) / 100.0);
+    }
+}
+
+/// `BabyEntitySpawnBiomeModifier` with the config's defaults (`weightPercentage` 0.05, `sizePercentage` 0.5, one
+/// spawn cost per entity and in total as the parent's): every biome that spawns the parent among its monsters
+/// spawns the baby too. The `blacklist` biome tags are empty by default.
+pub(super) fn biome_spawns(biomes: &mut horizon_client::biome::Biomes) {
+    for info in &mut biomes.list {
+        for (name, _, _) in BABIES {
+            let parent = format!("minecraft:{name}");
+            let baby = format!("mekanismadditions:baby_{name}");
+            let added: Vec<horizon_client::biome::SpawnEntry> = info
+                .spawns
+                .get("monster")
+                .into_iter()
+                .flatten()
+                .filter(|e| e.entity == parent)
+                .map(|e| horizon_client::biome::SpawnEntry {
+                    entity: baby.clone(),
+                    weight: (f64::from(e.weight) * 0.05).ceil() as u32,
+                    min: (f64::from(e.min) * 0.5).ceil() as u32,
+                    max: (f64::from(e.max) * 0.5).ceil() as u32,
+                    constant: e.constant,
+                })
+                .collect();
+            if added.is_empty() {
+                continue;
+            }
+            if let Some(list) = info.spawns.get_mut("monster") {
+                list.extend(added);
+            }
+            if let Some(cost) = info.spawn_costs.get(&parent).cloned() {
+                info.spawn_costs.insert(baby, cost);
+            }
+        }
     }
 }
 
