@@ -4808,7 +4808,7 @@ fn miner_found(nbt: &Compound) -> Vec<i32> {
 
 /// `TileEntityDigitalMiner.reset`: forgets the search and what it found; the miner stops.
 fn miner_reset(nbt: &mut Compound) {
-    for key in ["mstate", "cursor", "running", "delay", "to_mine", "full"] {
+    for key in ["mstate", "cursor", "running", "delay", "to_mine", "overflow"] {
         put_int(nbt, key, 0);
     }
     nbt.remove(&JavaString::from("found"));
@@ -4844,6 +4844,34 @@ fn miner_insert(game: &Game<'_>, items: &mut [Option<ItemStack>], mut stack: Ite
         }
     }
     Some(stack)
+}
+
+/// `overflow`: what a broken block gave besides its loot table's drops (a chest's contents), kept until it fits the
+/// miner's slots (`TileEntityDigitalMiner.addOverflow`, `tryAddOverflow`).
+fn miner_overflow(nbt: &Compound) -> Vec<ItemStack> {
+    horizon_items::item_nbt::decode_items(nbt.get(&JavaString::from("overflow")), 100).into_iter().flatten().collect()
+}
+
+fn put_miner_overflow(nbt: &mut Compound, stacks: &[ItemStack]) {
+    if stacks.is_empty() {
+        nbt.remove(&JavaString::from("overflow"));
+    } else {
+        let slots: Vec<Option<ItemStack>> = stacks.iter().take(100).cloned().map(Some).collect();
+        nbt.insert("overflow".into(), horizon_items::item_nbt::encode_items(&slots));
+    }
+}
+
+/// `tryAddOverflow`: what fits goes into the miner's slots, the rest stays overflow.
+fn miner_flush_overflow(game: &Game<'_>, entity: &mut ModBlockEntity) {
+    let stacks = miner_overflow(&entity.nbt);
+    if stacks.is_empty() {
+        return;
+    }
+    let mut slots = entity.items.clone();
+    slots.resize(MINER_FIRST + MINER_SLOTS, None);
+    let left: Vec<ItemStack> = stacks.into_iter().filter_map(|s| miner_insert(game, &mut slots, s)).collect();
+    entity.items = slots;
+    put_miner_overflow(&mut entity.nbt, &left);
 }
 
 /// The block ids the miner never breaks (`MekanismTags.Blocks.MINER_BLACKLIST`, `isAir`).
@@ -4933,7 +4961,9 @@ fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
     let running = get_int(&entity.nbt, "running") == 1;
     let mut delay = get_int(&entity.nbt, "delay").min(delay_length);
     let mut active = false;
-    if running && state == MINER_FINISHED {
+    miner_flush_overflow(game, entity);
+    // With any overflow it neither works nor uses energy until the overflow is dealt with.
+    if running && state == MINER_FINISHED && miner_overflow(&entity.nbt).is_empty() {
         if found.is_empty() {
             put_int(&mut entity.nbt, "running", 0);
         } else if energy.consume(usage) {
@@ -5014,7 +5044,6 @@ fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fo
     let Some(&index) = found.last() else {
         return false;
     };
-    put_int(&mut entity.nbt, "full", 0);
     let region = miner_region(&entity.nbt);
     let at = region.position(pos, index as u32);
     let state = game.world.block(at[0], at[1], at[2]);
@@ -5048,8 +5077,6 @@ fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fo
     for stack in drops.into_iter().filter(|s| s.count > 0 && &*s.item != "minecraft:air") {
         // Nothing fits: it waits for room (`tryInsert` fails) and the block stays.
         if miner_insert(game, &mut slots, stack).is_some() {
-            // `hasOverflow`: the screen's `NO_SPACE_IN_OUTPUT_OVERFLOW` warning.
-            put_int(&mut entity.nbt, "full", 1);
             return false;
         }
     }
@@ -5079,7 +5106,19 @@ fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fo
     entity.nbt.remove(&JavaString::from("missing"));
     entity.items = slots;
     found.pop();
+    let block_name_owned = game.res.facts().get(state).name.to_string();
     let block = horizon_core::position::BlockPos::new(at[0], at[1], at[2]);
+    // The contents of a container it breaks go to the overflow (`Mekanism.worldTickHandler.fallbackItemCollector`).
+    if vanilla_container(&block_name_owned) {
+        let mut extra = miner_overflow(&entity.nbt);
+        for _ in 0..4096 {
+            let Some(s) = game.native_extract_item_where(at, horizon_core::geometry::Direction::Down, 64, &|_| true) else {
+                break;
+            };
+            extra.push(s);
+        }
+        put_miner_overflow(&mut entity.nbt, &extra);
+    }
     game.with_level(|b, level, ticks| b.destroy_block(level, ticks, block, false));
     if replacement && let Some(new) = game.pack.assets.registry.default_state(&target) {
         game.with_level(|b, level, ticks| b.set_block(level, ticks, block, new, 3));
@@ -13390,7 +13429,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
 fn miner_flags(nbt: &Compound) -> u32 {
     let flag = |key: &str, bit: u32| u32::from(get_int(nbt, key) == 1) << bit;
     let low = u32::from(miner_usage(nbt) > mekanism_core::miner::STORAGE) << 10;
-    get_int(nbt, "warn") & 1 | u32::from(get_int(nbt, "full") == 1) << 2 | (get_int(nbt, "mstate") & 3) << 4 | flag("running", 6) | flag("eject", 7) | flag("pull", 8) | flag("silk", 9) | low
+    get_int(nbt, "warn") & 1 | u32::from(!miner_overflow(nbt).is_empty()) << 2 | (get_int(nbt, "mstate") & 3) << 4 | flag("running", 6) | flag("eject", 7) | flag("pull", 8) | flag("silk", 9) | low
 }
 
 /// What a machine takes a tick before upgrades (its `getEnergyPerTick`), for the machines whose bar warns.
