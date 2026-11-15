@@ -13282,6 +13282,8 @@ fn layout(block: &str) -> Option<Layout> {
             power: Some(PowerBar::Gauge([55.0, 18.0])),
             progress: None,
         },
+        // GuiLaserTractorBeam: no elements but its 27 slots (`dynamicSlots`) and the security tab.
+        Kind::TractorBeam => Layout { slots: [None; 3], gauges: vec![], power: None, progress: None },
         // GuiLaserAmplifier: the standard energy gauge at (6, 10); the thresholds ride in a never-drawn gauge
         // (the lower one in the amount, the upper one in the capacity).
         Kind::LaserAmplifier => Layout {
@@ -13859,6 +13861,7 @@ fn tabs(block: &str) -> u8 {
         Some(Kind::EnergyCube(_) | Kind::ChemicalTank(_)) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
         Some(Kind::Vibrator | Kind::Heater | Kind::FuelwoodHeater | Kind::LaserAmplifier) => TAB_REDSTONE | TAB_SECURITY,
         Some(Kind::Oredictionificator) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
+        Some(Kind::TractorBeam) => TAB_SECURITY,
         Some(Kind::FissionLogic | Kind::FusionLogic) => TAB_REDSTONE,
         Some(Kind::FluidTank(_)) => TAB_SECURITY | TAB_EDIT_MODE,
         Some(Kind::DynamicValve) => TAB_EDIT_MODE,
@@ -16118,6 +16121,13 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         });
         return;
     }
+    // `GuiLaserTractorBeam`: the tile's 27 output slots, `OutputInventorySlot.at(8 + x * 18, 16 + y * 18)` with
+    // the columns outermost, over the standard inventory.
+    if kind(block) == Some(Kind::TractorBeam) {
+        let slots = (0..laser::TRACTOR_SLOTS).map(|i| Some([8.0 + 18.0 * (i / 3) as f32, 16.0 + 18.0 * (i % 3) as f32])).collect();
+        *screen = Some(super::native_hooks::NativeScreen { width: 176.0, height: 166.0, slots, inventory_y: 84.0, inventory_x: 8.0, own_labels: false, alt: None, ..Default::default() });
+        return;
+    }
     let Some(l) = layout(block) else {
         return;
     };
@@ -17501,6 +17511,13 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     // `GuiElementHolder` (141, 16, 26, 56) behind the dynamic tank's two container slots.
     if matches!(kind(block), Some(Kind::DynamicValve | Kind::InductionPort)) {
         nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, [ox + 141.0, oy + 16.0, 26.0, 56.0], 0xFFFF_FFFF);
+    }
+    if kind(block) == Some(Kind::TractorBeam) {
+        for x in 0..9 {
+            for y in 0..3 {
+                sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + 18.0 * x as f32, oy + 15.0 + 18.0 * y as f32, 18.0, 18.0]);
+            }
+        }
     }
     let warn = warning_bits(block, &l, data);
     let extra = extra_slots(block);
