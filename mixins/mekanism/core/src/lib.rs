@@ -58,6 +58,7 @@ pub mod sorter;
 pub mod sps;
 pub mod teleporter;
 pub mod tier;
+pub mod transporter;
 pub mod turbine;
 pub mod upgrades;
 

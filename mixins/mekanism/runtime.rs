@@ -22,6 +22,7 @@ use mekanism_core::seismic;
 use mekanism_core::chargepad;
 use mekanism_core::entangloporter::{self as qe, Frequency};
 use mekanism_core::sorter::{self, Sorter};
+use mekanism_core::transporter as tnet;
 use mekanism_core::oredictionificator as od;
 use mekanism_core::formulaic as fa;
 use mekanism_core::stabilizer as st;
@@ -124,6 +125,8 @@ enum Kind {
     InductionPort,
     /// A logistical transporter and how many items it pulls at a time.
     Transporter(u32),
+    /// A turbine rotor and the blades (0 to 2) it houses.
+    TurbineRotor,
     Infuser,
     Separator,
     GasGenerator,
@@ -286,6 +289,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:isotopic_centrifuge" => return Some(Kind::Centrifuge),
         "mekanismgenerators:fission_reactor_port" => return Some(Kind::FissionPort),
         TURBINE_VALVE => return Some(Kind::TurbineValve),
+        TURBINE_ROTOR => return Some(Kind::TurbineRotor),
         fusion::PORT => return Some(Kind::FusionPort),
         sps::PORT => return Some(Kind::SpsPort),
         dynamic_tank::VALVE => return Some(Kind::DynamicValve),
@@ -311,6 +315,9 @@ fn kind(id: &str) -> Option<Kind> {
     }
     if let Some(m) = chem::ADVANCED_MACHINES.iter().find(|m| m.block == id) {
         return Some(Kind::Advanced(m));
+    }
+    if id == "mekanism:restrictive_transporter" || id == "mekanism:diversion_transporter" {
+        return tier::transporter_pull(BaseTier::Basic).map(Kind::Transporter);
     }
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_logistical_transporter")) {
         let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
@@ -701,6 +708,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::TurbineValve => tick_turbine_valve(game, pos, entity),
+            Kind::TurbineRotor => {
+                remember_blades(pos, get_int(&entity.nbt, "blades"));
+                None
+            }
             Kind::FusionPort => {
                 tick_fusion_port(game, pos, entity);
                 None
@@ -2162,7 +2173,7 @@ fn configurator_overlay(game: &Game<'_>, quads: &mut Vec<super::native_hooks::Na
     let (Some(eye), Some(player)) = (game.native_eye(), game.player.as_ref()) else {
         return;
     };
-    let (yaw, pitch) = (f64::from(player.yaw).to_radians(), f64::from(player.pitch).to_radians());
+    let (yaw, pitch) = (f64::from(game.yaw).to_radians(), f64::from(game.pitch).to_radians());
     let look = [-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos()];
     let reach = 4.5;
     let Some((_, block, face)) = game.native_clip(eye, [0, 1, 2].map(|i| eye[i] + look[i] * reach)) else {
@@ -2706,20 +2717,28 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
             let Some(Tag::IntArray(column)) = c.get(&JavaString::from("rot_col")) else {
                 return true;
             };
-            if column.len() < 3 {
+            // [x, z, then each rotor's y and the blades it houses, from the bottom].
+            if column.len() < 4 {
                 return true;
             }
-            let rotors = column.len() - 2;
+            let rotors = (column.len() - 2) / 2;
             if turns.len() != rotors {
                 *turns = vec![[0.0; 2]; rotors];
             }
             let speed = get_int(c, "rot_flow") as f32 / 1000.0 * 512.0;
             for (i, turn) in turns.iter_mut().enumerate() {
+                let (y, housed) = (column[2 + i * 2], column[3 + i * 2]);
+                // `RenderTurbineRotor`: no blades, nothing to draw (and nothing turns); the lower blade
+                // with one, the upper one too with two.
+                if housed <= 0 {
+                    continue;
+                }
                 let base = i * 2;
                 turn[0] = (turn[0] + speed / (base + 1) as f32) % 360.0;
                 turn[1] = (turn[1] + speed / (base + 2) as f32) % 360.0;
-                let at = [column[0], column[2 + i], column[1]];
-                for (k, (turn, up)) in [(turn[0], 0.25), (turn[1], 0.75)].into_iter().enumerate() {
+                let at = [column[0], y, column[1]];
+                let rings: &[(f32, f64)] = if housed >= 2 { &[(turn[0], 0.25), (turn[1], 0.75)] } else { &[(turn[0], 0.25)] };
+                for (k, (turn, up)) in rings.iter().copied().enumerate() {
                     models.push(super::native_hooks::NativeWorldModel {
                         model: format!("mekanismgenerators:turbine_blade_{}", (base + k).min(27)),
                         position: [f64::from(at[0]) + 0.5, f64::from(at[1]) + up, f64::from(at[2]) + 0.5],
@@ -3323,10 +3342,14 @@ pub(super) fn configure_side(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3])
     }
     let t = conf.transmission().unwrap_or_default();
     // Sneaking on a transmitter cycles the connection of the face (`TileEntityTransmitter.onSneakRightClick`).
-    if game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    if is_transporter(block_name(game, pos)) && configure_transporter(game, pos, face, sneaking) {
+        return true;
+    }
+    if sneaking {
+        let face_at = looking_arm(game, pos).unwrap_or_else(|| face_index(face));
         let changed = game.native_with_mod_block_entity(pos, |m| {
             pipe_family(&m.id)?;
-            let face_at = face_index(face);
             let next = (conn_of(&m.nbt, face_at) + 1) & 3;
             let all = (get_int(&m.nbt, "conn") & !(3 << (2 * face_at))) | (next << (2 * face_at));
             put_int(&mut m.nbt, "conn", all);
@@ -5118,6 +5141,18 @@ fn show_connections(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
                 joined = false;
             }
         }
+        // Transporters of different colours do not join, nor do the faces a diversion transporter's redstone mode switches off.
+        if family == "transporter" && transmitter && joined {
+            let own_id = entity.id.clone();
+            let other_id = name.clone();
+            let mine = node_from(game, pos, &own_id, &entity.nbt);
+            let onbt = game.native_with_mod_block_entity(at, |m| m.nbt.clone()).unwrap_or_default();
+            let other = node_from(game, at, &other_id, &onbt);
+            let mut net = tnet::Network::default();
+            net.nodes.insert(pos, mine);
+            net.nodes.insert(at, other);
+            joined = net.joined(pos, face);
+        }
         // Between transmitters the connection is normal; push and pull show on the arm to a machine.
         if joined && !transmitter && (mode == 1 || mode == 2) {
             shown |= mode << (2 * face);
@@ -5132,45 +5167,975 @@ fn show_connections(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
 }
 
 // --- Logistical transporters ------------------------------------------------------------------------
+//
+// `LogisticalTransporterBase`: every transporter holds the stacks travelling through it (`transit`), each with
+// its path, progress (100 a block, `<tier>Speed` a tick) and colour. A stack that reaches the end of a
+// transporter goes on into the next one (when that one lets its colour and connections in) or into the
+// container at the end of its path; one that cannot recalculates its path, goes home or idles, and is
+// dropped when it has nowhere to be. Paths are `TransporterPathfinder`'s A* (`mekanism_core::transporter`).
 
 fn is_transporter(name: &str) -> bool {
-    name.strip_prefix("mekanism:").is_some_and(|n| n.ends_with("_logistical_transporter"))
+    name.strip_prefix("mekanism:").is_some_and(|n| n.ends_with("_logistical_transporter") || n == "restrictive_transporter" || n == "diversion_transporter")
 }
 
-/// A logistical transporter, simplified: twice a second it pulls up to its tier's count from a container
-/// beside it (a chest, a furnace's output, a machine's output when its face gives out), and sends it
-/// at once along the connected transporters into the nearest container that takes it: a chest, a
-/// furnace, a hopper or another machine's input, through the side it faces. What fits nowhere goes back.
-/// Mekanism moves items visibly along the pipe at the tier's speed and sorts by colour and filters.
-fn tick_transporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, pull: u32) {
-    let ticker = get_int(&entity.nbt, "ticker");
-    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 10);
-    if ticker != 0 {
+type P3 = [i32; 3];
+
+/// `TransporterStack.Path`.
+const PATH_DEST: u8 = 0;
+const PATH_HOME: u8 = 1;
+const PATH_NONE: u8 = 2;
+
+/// A `TransporterStack`.
+#[derive(Clone)]
+struct Transit {
+    id: u32,
+    item: ItemStack,
+    progress: u32,
+    color: Option<u8>,
+    /// The transporters it passes in order, then (for a stack with a target) the container it goes to.
+    path: Vec<P3>,
+    ptype: u8,
+    /// `originalLocation`: where it came from, the block before the first of its path.
+    orig: P3,
+    home: Option<P3>,
+    idle: Option<usize>,
+    init: bool,
+    /// When (game time) and how far along its block the clients last heard of it.
+    sync_t: u64,
+    sync_pr: u32,
+}
+
+fn pos_tag(p: P3) -> Tag {
+    Tag::IntArray(p.to_vec())
+}
+
+impl Transit {
+    fn save(&self) -> Compound {
+        let mut c = Compound::new();
+        put_int(&mut c, "id", self.id);
+        c.insert("it".into(), horizon_items::item_nbt::item_to_nbt(&self.item));
+        put_int(&mut c, "pr", self.progress);
+        put_int(&mut c, "col", self.color.map_or(0, |c| u32::from(c) + 1));
+        c.insert("path".into(), Tag::IntArray(self.path.iter().flatten().copied().collect()));
+        put_int(&mut c, "pt", u32::from(self.ptype));
+        c.insert("orig".into(), pos_tag(self.orig));
+        if let Some(h) = self.home {
+            c.insert("home".into(), pos_tag(h));
+        }
+        put_int(&mut c, "idle", self.idle.map_or(0, |d| d as u32 + 1));
+        put_int(&mut c, "init", u32::from(self.init));
+        put_long(&mut c, "st", self.sync_t);
+        put_int(&mut c, "spr", self.sync_pr);
+        c
+    }
+
+    fn load(c: &Compound) -> Option<Transit> {
+        let item = horizon_items::item_nbt::item_from_nbt(c.get(&JavaString::from("it"))?)?;
+        let path = match c.get(&JavaString::from("path")) {
+            Some(Tag::IntArray(v)) => v.chunks(3).filter(|p| p.len() == 3).map(|p| [p[0], p[1], p[2]]).collect(),
+            _ => Vec::new(),
+        };
+        Some(Transit {
+            id: get_int(c, "id"),
+            item,
+            progress: get_int(c, "pr"),
+            color: match get_int(c, "col") {
+                0 => None,
+                n => Some((n - 1) as u8),
+            },
+            path,
+            ptype: get_int(c, "pt").min(2) as u8,
+            orig: get_pos(c, "orig").unwrap_or_default(),
+            home: get_pos(c, "home"),
+            idle: match get_int(c, "idle") {
+                0 => None,
+                n => Some((n - 1).min(5) as usize),
+            },
+            init: get_int(c, "init") != 0,
+            sync_t: get_long(c, "st"),
+            sync_pr: get_int(c, "spr"),
+        })
+    }
+
+    fn has_target(&self) -> bool {
+        self.ptype != PATH_NONE
+    }
+
+    fn has_path(&self) -> bool {
+        self.path.len() >= 2
+    }
+
+    /// `getNext`: the block after `at` on its path.
+    fn next(&self, at: P3) -> Option<P3> {
+        let i = self.path.iter().position(|p| *p == at)?;
+        self.path.get(i + 1).copied()
+    }
+
+    /// `getPrev`: the block before `at` on its path, or where it came from.
+    fn prev(&self, at: P3) -> P3 {
+        match self.path.iter().position(|p| *p == at) {
+            Some(i) if i > 0 => self.path[i - 1],
+            _ => self.orig,
+        }
+    }
+
+    /// `isFinal`: `at` is the last transporter of its path.
+    fn is_final(&self, at: P3) -> bool {
+        let i = if self.has_target() { self.path.len().checked_sub(2) } else { self.path.len().checked_sub(1) };
+        i.and_then(|i| self.path.get(i)) == Some(&at)
+    }
+
+    /// `getSide`: the side it is nearest in the transporter at `at`, down when it has none.
+    fn side(&self, at: P3) -> usize {
+        let side = if self.progress < 50 { tnet::side_between(self.prev(at), at) } else { self.next(at).and_then(|n| tnet::side_between(at, n)) };
+        side.unwrap_or(0)
+    }
+
+    /// Tells the clients about it as it is now.
+    fn touch(&mut self, now: u64) {
+        self.sync_t = now;
+        self.sync_pr = self.progress;
+    }
+}
+
+fn load_transit(nbt: &Compound) -> Vec<Transit> {
+    match nbt.get(&JavaString::from("transit")) {
+        Some(Tag::List(l)) => l
+            .iter()
+            .filter_map(|t| match t {
+                Tag::Compound(c) => Transit::load(c),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn save_transit(nbt: &mut Compound, stacks: &[Transit]) {
+    if stacks.is_empty() {
+        nbt.remove(&JavaString::from("transit"));
+    } else {
+        nbt.insert("transit".into(), Tag::List(stacks.iter().map(|s| Tag::Compound(s.save())).collect()));
+    }
+}
+
+/// What the clients draw of the stacks of the transporter at `pos` (`PacketTransporterBatch`).
+fn client_transit(pos: P3, stacks: &[Transit]) -> Tag {
+    Tag::List(
+        stacks
+            .iter()
+            .filter(|s| s.item.count > 0)
+            .map(|s| {
+                let mut c = Compound::new();
+                put_int(&mut c, "id", s.id);
+                c.insert("i".into(), Tag::String(s.item.item.as_ref().into()));
+                put_int(&mut c, "pr", s.sync_pr);
+                put_long(&mut c, "t", s.sync_t);
+                c.insert("pv".into(), pos_tag(s.prev(pos)));
+                if let Some(n) = s.next(pos) {
+                    c.insert("nx".into(), pos_tag(n));
+                }
+                Tag::Compound(c)
+            })
+            .collect(),
+    )
+}
+
+thread_local! {
+    /// The stacks inside each transporter this server runs, to drop when it is broken (`preRemoveSideEffects`).
+    static TRANSIT_DROPS: std::cell::RefCell<std::collections::HashMap<P3, Vec<ItemStack>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn remember_transit(pos: P3, stacks: &[Transit]) {
+    TRANSIT_DROPS.with_borrow_mut(|m| {
+        if stacks.is_empty() {
+            m.remove(&pos);
+        } else {
+            m.insert(pos, stacks.iter().map(|s| s.item.clone()).collect());
+        }
+    });
+}
+
+fn color_of(nbt: &Compound) -> Option<u8> {
+    match get_int(nbt, "color") {
+        0 => None,
+        c => Some((c - 1) as u8),
+    }
+}
+
+/// Saves the stacks of the ticking transporter and tells the clients what changed.
+fn store_transit(game: &mut Game<'_>, pos: P3, entity: &mut ModBlockEntity, stacks: &[Transit]) {
+    save_transit(&mut entity.nbt, stacks);
+    let mut client = Compound::new();
+    client.insert("transit".into(), client_transit(pos, stacks));
+    put_int(&mut client, "color", get_int(&entity.nbt, "color"));
+    put_client(game, pos, entity, &["transit", "color"], client);
+    remember_transit(pos, stacks);
+}
+
+/// The same for a transporter that is not ticking now (its neighbour hands a stack over, a sorter inserts one).
+fn store_transit_other(game: &mut Game<'_>, pos: P3, stacks: &[Transit], next_id: u32) {
+    game.native_with_mod_block_entity(pos, |m| {
+        save_transit(&mut m.nbt, stacks);
+        put_int(&mut m.nbt, "next_id", next_id);
+        let mut client = match m.nbt.get(&JavaString::from("client")) {
+            Some(Tag::Compound(c)) => c.clone(),
+            _ => Compound::new(),
+        };
+        client.insert("transit".into(), client_transit(pos, stacks));
+        put_int(&mut client, "color", get_int(&m.nbt, "color"));
+        m.nbt.insert("client".into(), Tag::Compound(client));
+    });
+    game.native_sync_block_entity(pos);
+    remember_transit(pos, stacks);
+}
+
+/// The stacks of a transporter that is broken fall out of it.
+pub(super) fn transporter_spill(game: &mut Game<'_>, pos: P3, old: &str, new: &str) {
+    if old == new || !is_transporter(old) || !game.native_on(MOD_ID) {
         return;
     }
-    for (_, d) in DIRECTIONS {
-        let source = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
-        let back = [-d[0], -d[1], -d[2]];
-        // A Mekanism block's face must give out (side configuration); any container then gives what a
-        // hopper there could take (API 24 `native_extract_item`).
+    let Some(items) = TRANSIT_DROPS.with_borrow_mut(|m| m.remove(&pos)) else {
+        return;
+    };
+    let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+    for item in items {
+        game.native_drop_item(item, at, [0, 1, 0]);
+    }
+}
+
+/// `TransporterTier` `<tier>Speed` of a logistical transporter: progress a tick (100 is a block).
+fn transporter_speed(id: &str) -> u32 {
+    let name = id.strip_prefix("mekanism:").unwrap_or(id);
+    let (tier, default) = [("basic", 5), ("advanced", 10), ("elite", 20), ("ultimate", 50)].into_iter().find(|(t, _)| name.starts_with(t)).unwrap_or(("basic", 5));
+    mekanism_core::config_files::active_int("tiers", "transmitters.items", &format!("{tier}Speed"), default).max(1) as u32
+}
+
+/// One transporter as the pathfinder sees it, from its block and its data.
+fn node_from(game: &mut Game<'_>, at: P3, id: &str, nbt: &Compound) -> tnet::Node {
+    let cost = if id == "mekanism:restrictive_transporter" {
+        1000.0
+    } else {
+        tnet::tier_cost(transporter_speed("mekanism:ultimate_logistical_transporter"), transporter_speed(id))
+    };
+    let mut blocked = [false; 6];
+    if id == "mekanism:diversion_transporter" {
+        let modes = get_int(nbt, "div");
+        if modes != 0 {
+            let bp = horizon_core::position::BlockPos::new(at[0], at[1], at[2]);
+            let powered = game.with_level(|b, level, ticks| b.has_neighbor_signal(level, ticks, bp));
+            for (d, flag) in blocked.iter_mut().enumerate() {
+                *flag = !tnet::Diversion::from_id((modes >> (2 * d)) & 3).met(powered);
+            }
+        }
+    }
+    tnet::Node { cost, color: color_of(nbt), conn: std::array::from_fn(|d| tnet::Conn::from_bits(conn_of(nbt, d) )), blocked }
+}
+
+/// What the world around the transporters offers: the transporters joined to the start and the stacks already on
+/// their way to each container (`TransporterManager`'s prediction).
+struct Snap {
+    net: tnet::Network,
+    inflight: std::collections::HashMap<(P3, String), u32>,
+}
+
+fn add_inflight(snap: &mut Snap, stacks: &[Transit], exclude: Option<u32>, here: bool) {
+    for s in stacks {
+        if here && Some(s.id) == exclude {
+            continue;
+        }
+        if s.has_target()
+            && s.has_path()
+            && let Some(dest) = s.path.last()
+        {
+            *snap.inflight.entry((*dest, s.item.item.to_string())).or_default() += s.item.count;
+        }
+    }
+}
+
+/// The transporters joined to the one at `here` (its data `here_nbt`, its stacks `here_stacks`), as
+/// `InventoryNetwork` holds them. `exclude` is a stack of `here` that is not counted as on its way.
+fn snapshot(game: &mut Game<'_>, here: P3, here_nbt: &Compound, here_stacks: &[Transit], exclude: Option<u32>) -> Snap {
+    let mut snap = Snap { net: tnet::Network::default(), inflight: std::collections::HashMap::new() };
+    let id = block_name(game, here).to_owned();
+    let node = node_from(game, here, &id, here_nbt);
+    snap.net.nodes.insert(here, node);
+    add_inflight(&mut snap, here_stacks, exclude, true);
+    let mut order = vec![here];
+    let mut member: std::collections::HashSet<P3> = std::collections::HashSet::from([here]);
+    let mut i = 0;
+    while i < order.len() && order.len() < 1024 {
+        let at = order[i];
+        i += 1;
+        for d in 0..6 {
+            let n = tnet::offset(at, d);
+            if !snap.net.nodes.contains_key(&n) {
+                let nid = block_name(game, n).to_owned();
+                if !is_transporter(&nid) {
+                    continue;
+                }
+                let (nbt, stacks) = game.native_with_mod_block_entity(n, |m| (m.nbt.clone(), load_transit(&m.nbt))).unwrap_or_default();
+                let node = node_from(game, n, &nid, &nbt);
+                snap.net.nodes.insert(n, node);
+                add_inflight(&mut snap, &stacks, None, false);
+            }
+            if !member.contains(&n) && snap.net.joined(at, d) {
+                member.insert(n);
+                order.push(n);
+            }
+        }
+    }
+    snap
+}
+
+/// `TransporterUtils.canInsert`'s colour rule: a machine with strict input only takes what its colour for that
+/// side says.
+fn strict_input_ok(game: &mut Game<'_>, dest: P3, face: usize, color: Option<u8>) -> bool {
+    let facing = game.native_block_property(dest, "facing").and_then(|f| direction(&f)).map_or(2, face_index);
+    game.native_with_mod_block_entity(dest, |m| {
+        if get_int(&m.nbt, "ej_strict") == 0 {
+            return true;
+        }
+        let rel = (0..6).find(|&s| side_config::relative_face(facing, s) == face).unwrap_or(0);
+        let wanted = get_int(&m.nbt, &format!("ej_in{rel}"));
+        wanted == 0 || color.map(|c| u32::from(c) + 1) == Some(wanted)
+    })
+    .unwrap_or(true)
+}
+
+/// How many of `item` the container at `dest` takes through its side `face`, besides the `inflight` items already
+/// on their way to it.
+fn accepted_by(game: &mut Game<'_>, dest: P3, face: usize, item: &ItemStack, inflight: u32, color: Option<u8>, force: bool) -> u32 {
+    if !force && !strict_input_ok(game, dest, face, color) {
+        return 0;
+    }
+    let mut probe = item.clone();
+    probe.count = item.count + inflight;
+    game.native_can_insert_item(dest, horizon_core::geometry::Direction::ALL[face], &probe).saturating_sub(inflight).min(item.count)
+}
+
+/// A way to a container (`Destination`).
+struct Plan {
+    /// The transporters, then the container.
+    path: Vec<P3>,
+    dest: P3,
+    /// The side of the container's neighbour transporter it goes in through, seen from the transporter.
+    side: usize,
+    sending: u32,
+    score: f64,
+}
+
+/// `TransporterPathfinder.getPaths`: every container beside the network that takes the item and can be reached,
+/// best first.
+fn plan_routes(game: &mut Game<'_>, snap: &Snap, start: P3, item: &ItemStack, color: Option<u8>, home: Option<P3>, min: u32) -> Vec<Plan> {
+    let min = min.max(1);
+    let mut cands: std::collections::BTreeMap<P3, Vec<usize>> = std::collections::BTreeMap::new();
+    for t in snap.net.component(start) {
+        let node = &snap.net.nodes[&t];
+        for d in 0..6 {
+            let n = tnet::offset(t, d);
+            if node.can_emit_to(d) && !snap.net.nodes.contains_key(&n) && Some(n) != home {
+                cands.entry(n).or_default().push(d);
+            }
+        }
+    }
+    let key = item.item.to_string();
+    let mut found: Vec<Plan> = Vec::new();
+    for (dest, dirs) in cands {
+        let inflight = snap.inflight.get(&(dest, key.clone())).copied().unwrap_or(0);
+        let mut accepted = [0u32; 6];
+        for &d in &dirs {
+            accepted[d] = accepted_by(game, dest, tnet::opposite(d), item, inflight, color, false);
+        }
+        if accepted.iter().all(|a| *a < min) {
+            continue;
+        }
+        if let Some(f) = tnet::find_path(&snap.net, start, dest, color, home, &|d| accepted[d] >= min) {
+            let mut path = f.path;
+            path.push(dest);
+            found.push(Plan { path, dest, side: f.side, sending: accepted[f.side], score: f.score });
+        }
+    }
+    found.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal).then(a.path.len().cmp(&b.path.len())));
+    found
+}
+
+/// `getNewRRPath`: with round robin the sorter takes the destinations in turns, remembering the next one.
+fn choose_plan(plans: &[Plan], round_robin: bool, rr: &mut Option<(P3, usize)>) -> Option<usize> {
+    if plans.is_empty() {
+        return None;
+    }
+    if !round_robin {
+        return Some(0);
+    }
+    let mark = |p: &Plan| (p.dest, tnet::opposite(p.side));
+    let n = plans.len();
+    if n > 1
+        && let Some(target) = *rr
+        && let Some(i) = plans.iter().position(|p| mark(p) == target)
+    {
+        *rr = Some(mark(&plans[(i + 1) % n]));
+        return Some(i);
+    }
+    *rr = Some(mark(&plans[if n > 1 { 1 } else { 0 }]));
+    Some(0)
+}
+
+/// `TransporterStack.calculateIdle`: back home when it can, else wandering along the transporters (or off to a
+/// container it found after all). False when it can do neither.
+fn calc_idle(game: &mut Game<'_>, snap: &Snap, here: P3, s: &mut Transit) -> bool {
+    if let Some(home) = s.home {
+        let accepts: [bool; 6] = std::array::from_fn(|d| game.native_can_insert_item(home, horizon_core::geometry::Direction::ALL[tnet::opposite(d)], &s.item) > 0);
+        if let Some(f) = tnet::find_path(&snap.net, here, home, s.color, Some(home), &|d| accepts[d]) {
+            s.path = f.path;
+            s.path.push(home);
+            s.ptype = PATH_HOME;
+            s.idle = None;
+            s.orig = here;
+            s.init = true;
+            return true;
+        }
+        s.home = None;
+    }
+    let (item, color, home, closest) = (s.item.clone(), s.color, s.home, s.side(here));
+    let mut idle = s.idle;
+    let mut reroute = || {
+        plan_routes(game, snap, here, &item, color, home, 0).into_iter().next().map(|p| tnet::Found { path: p.path[..p.path.len() - 1].to_vec(), side: p.side, score: p.score })
+    };
+    let Some(result) = tnet::idle_path(&snap.net, here, color, &mut idle, closest, &mut reroute) else {
+        return false;
+    };
+    s.idle = idle;
+    if let Some(f) = result.dest {
+        let dest = tnet::offset(*f.path.last().unwrap_or(&here), f.side);
+        s.path = f.path;
+        s.path.push(dest);
+        s.ptype = PATH_DEST;
+    } else {
+        s.path = result.path;
+        s.ptype = PATH_NONE;
+    }
+    s.orig = here;
+    s.init = true;
+    true
+}
+
+/// A stack with nowhere to go falls out of the transporter (`drop`).
+fn drop_stack(game: &mut Game<'_>, here: P3, s: &Transit) {
+    if s.item.count == 0 {
+        return;
+    }
+    let at = [f64::from(here[0]) + 0.5, f64::from(here[1]) + 0.5, f64::from(here[2]) + 0.5];
+    game.native_drop_item(s.item.clone(), at, [0, 1, 0]);
+}
+
+/// `recalculate`: a new way to a container, else home or idling. False when the stack was dropped instead.
+fn recalculate(game: &mut Game<'_>, here: P3, here_nbt: &Compound, others: &[Transit], s: &mut Transit, from: Option<P3>) -> bool {
+    let snap = snapshot(game, here, here_nbt, others, Some(s.id));
+    let mut ok = false;
+    if s.ptype != PATH_NONE {
+        let plans = plan_routes(game, &snap, here, &s.item, s.color, s.home, 0);
+        if let Some(p) = plans.into_iter().next() {
+            s.path = p.path;
+            s.ptype = PATH_DEST;
+            s.idle = None;
+            s.init = true;
+            ok = true;
+        }
+    }
+    if !ok && !calc_idle(game, &snap, here, s) {
+        drop_stack(game, here, s);
+        return false;
+    }
+    if let Some(f) = from {
+        s.orig = f;
+    }
+    true
+}
+
+/// The next transporter takes the stack in, if its colour and connections let it (`entityEntering`).
+fn hand_over(game: &mut Game<'_>, here: P3, here_id: &str, here_nbt: &Compound, s: &Transit, next: P3, now: u64) -> bool {
+    let nid = block_name(game, next).to_owned();
+    if !is_transporter(&nid) {
+        return false;
+    }
+    let Some((nbt, mut stacks)) = game.native_with_mod_block_entity(next, |m| (m.nbt.clone(), load_transit(&m.nbt))) else {
+        return false;
+    };
+    let Some(dir) = tnet::side_between(here, next) else {
+        return false;
+    };
+    let mut net = tnet::Network::default();
+    let me = node_from(game, here, here_id, here_nbt);
+    let other = node_from(game, next, &nid, &nbt);
+    net.nodes.insert(here, me);
+    net.nodes.insert(next, other);
+    if !net.can_enter(s.color, here, dir) {
+        return false;
+    }
+    let id = get_int(&nbt, "next_id");
+    let mut moved = s.clone();
+    moved.id = id;
+    moved.progress = s.progress % 100;
+    moved.touch(now);
+    stacks.push(moved);
+    store_transit_other(game, next, &stacks, id + 1);
+    true
+}
+
+/// Whether the container at the end of the stack's path still takes it at the half-way mark (`canInsert`).
+fn dest_still_takes(game: &mut Game<'_>, dest: P3, face: usize, s: &Transit) -> bool {
+    let force = s.ptype == PATH_HOME;
+    if !force && !strict_input_ok(game, dest, face, s.color) {
+        return false;
+    }
+    game.native_can_insert_item(dest, horizon_core::geometry::Direction::ALL[face], &s.item) > 0
+}
+
+/// One tick of one stack in the transporter at `pos` (`tickTransit`). False when it left (or was dropped).
+fn step(game: &mut Game<'_>, pos: P3, id: &str, nbt: &Compound, speed: u32, stacks: &mut [Transit], i: usize, now: u64) -> bool {
+    let mut s = stacks[i].clone();
+    if !s.init {
+        if s.item.count == 0 || !recalculate(game, pos, nbt, stacks, &mut s, None) {
+            return false;
+        }
+        s.touch(now);
+    }
+    let before = s.progress;
+    s.progress += speed;
+    if s.progress >= 100 {
+        let mut prev_set = None;
+        if s.has_path() {
+            if s.path.last() == Some(&pos) {
+                return false;
+            }
+            if let Some(next) = s.next(pos) {
+                if !s.is_final(pos) {
+                    if hand_over(game, pos, id, nbt, &s, next, now) {
+                        return false;
+                    }
+                    prev_set = Some(next);
+                } else if s.has_target() {
+                    let face = tnet::side_between(pos, next).map_or(0, tnet::opposite);
+                    let had = s.item.count;
+                    match game.native_insert_item(next, horizon_core::geometry::Direction::ALL[face], s.item.clone()) {
+                        None => return false,
+                        Some(rest) if rest.count < had => s.item = rest,
+                        Some(_) => {}
+                    }
+                    prev_set = Some(next);
+                }
+            }
+        }
+        if !recalculate(game, pos, nbt, stacks, &mut s, prev_set) {
+            return false;
+        }
+        s.progress = if prev_set.is_none() { 50 } else { 0 };
+        s.touch(now);
+    } else if before < 50 && s.progress >= 50 {
+        let again = if s.is_final(pos) {
+            if s.has_target() {
+                match (s.path.last().copied(), tnet::side_between(pos, s.path.last().copied().unwrap_or(pos))) {
+                    (Some(dest), Some(dir)) => {
+                        let can_send = tnet::Conn::from_bits(conn_of(nbt, dir)).can_send_to();
+                        !can_send || !dest_still_takes(game, dest, tnet::opposite(dir), &s)
+                    }
+                    _ => true,
+                }
+            } else {
+                true
+            }
+        } else {
+            match s.next(pos) {
+                None => true,
+                Some(next) => {
+                    let dir = tnet::side_between(pos, next).unwrap_or(0);
+                    let nid = block_name(game, next).to_owned();
+                    if !is_transporter(&nid) && !s.has_target() && s.path.len() == 2 {
+                        // An idle stack in a lone transporter only turns when it cannot go that way.
+                        !tnet::Conn::from_bits(conn_of(nbt, dir)).can_send_to()
+                    } else if is_transporter(&nid) {
+                        let nnbt = game.native_with_mod_block_entity(next, |m| m.nbt.clone()).unwrap_or_default();
+                        let mut net = tnet::Network::default();
+                        let me = node_from(game, pos, id, nbt);
+                        let other = node_from(game, next, &nid, &nnbt);
+                        net.nodes.insert(pos, me);
+                        net.nodes.insert(next, other);
+                        !net.can_enter(s.color, pos, dir)
+                    } else {
+                        true
+                    }
+                }
+            }
+        };
+        if again {
+            if !recalculate(game, pos, nbt, stacks, &mut s, None) {
+                return false;
+            }
+            s.touch(now);
+        }
+    }
+    stacks[i] = s;
+    true
+}
+
+/// `tryPull`: from each container beside a pull face the transporter takes up to its tier's count and sends it
+/// where `plan_routes` says; what goes nowhere is put back and the next try waits longer.
+fn try_pull(game: &mut Game<'_>, pos: P3, entity: &mut ModBlockEntity, pull: u32, stacks: &mut Vec<Transit>, now: u64) -> bool {
+    let mut changed = false;
+    let color = color_of(&entity.nbt);
+    for d in 0..6 {
+        if conn_of(&entity.nbt, d) != 2 {
+            continue;
+        }
+        let source = tnet::offset(pos, d);
+        let back = DIRECTIONS[tnet::opposite(d)].1;
         let closed = game
             .native_with_mod_block_entity(source, |m| !sides_of(&m.nbt, Transmission::Item).get(face_index(back)).gives_out())
             .unwrap_or(false);
         if closed || is_transporter(block_name(game, source)) {
             continue;
         }
-        let face = horizon_core::geometry::Direction::ALL[face_index(back)];
+        let face = horizon_core::geometry::Direction::ALL[tnet::opposite(d)];
         let Some(stack) = game.native_extract_item(source, face, pull) else {
             continue;
         };
-        if let Some(left) = route_items(game, pos, source, stack) {
-            // What fits nowhere goes back where it came from.
-            if let Some(lost) = game.native_insert_item(source, face, left) {
-                game.native_insert_item(source, horizon_core::geometry::Direction::Up, lost);
+        let snap = snapshot(game, pos, &entity.nbt, stacks, None);
+        let plans = plan_routes(game, &snap, pos, &stack, color, Some(source), 1);
+        let mut none = None;
+        match choose_plan(&plans, false, &mut none).map(|i| &plans[i]) {
+            Some(plan) => {
+                let sending = plan.sending.min(stack.count);
+                if sending < stack.count {
+                    let mut rest = stack.clone();
+                    rest.count = stack.count - sending;
+                    if let Some(lost) = game.native_insert_item(source, face, rest) {
+                        game.native_insert_item(source, horizon_core::geometry::Direction::Up, lost);
+                    }
+                }
+                let mut item = stack;
+                item.count = sending;
+                let id = get_int(&entity.nbt, "next_id");
+                put_int(&mut entity.nbt, "next_id", id + 1);
+                let mut s = Transit { id, item, progress: 0, color, path: plan.path.clone(), ptype: PATH_DEST, orig: source, home: Some(source), idle: None, init: true, sync_t: 0, sync_pr: 0 };
+                s.touch(now);
+                stacks.push(s);
+                put_int(&mut entity.nbt, "delay", 10);
+                put_int(&mut entity.nbt, "delay_count", 0);
+                changed = true;
+            }
+            None => {
+                if let Some(lost) = game.native_insert_item(source, face, stack) {
+                    game.native_insert_item(source, horizon_core::geometry::Direction::Up, lost);
+                }
+                // Backs off: `min(40, e^tries)` ticks.
+                let tries = get_int(&entity.nbt, "delay_count") + 1;
+                put_int(&mut entity.nbt, "delay_count", tries);
+                put_int(&mut entity.nbt, "delay", (f64::from(tries).exp() as u32).min(40));
             }
         }
-        return;
     }
+    changed
+}
+
+/// `LogisticalTransporterBase.onUpdateServer`: pulls (every 3 ticks, or 10 after a success) and moves the stacks.
+fn tick_transporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, pull: u32) {
+    let now = game.world.game_time.max(0) as u64;
+    let mut stacks = load_transit(&entity.nbt);
+    let mut changed = false;
+    let delay = get_int(&entity.nbt, "delay");
+    if delay > 0 {
+        put_int(&mut entity.nbt, "delay", delay - 1);
+    } else {
+        put_int(&mut entity.nbt, "delay", 3);
+        changed |= try_pull(game, pos, entity, pull, &mut stacks, now);
+    }
+    if !stacks.is_empty() {
+        let speed = transporter_speed(&entity.id);
+        let id = entity.id.clone();
+        let nbt = entity.nbt.clone();
+        let mut i = 0;
+        while i < stacks.len() {
+            let before = (stacks[i].sync_t, stacks[i].path.len());
+            if step(game, pos, &id, &nbt, speed, &mut stacks, i, now) {
+                changed |= before != (stacks[i].sync_t, stacks[i].path.len());
+                i += 1;
+            } else {
+                stacks.remove(i);
+                changed = true;
+            }
+        }
+        // The progress lives in the saved data; the clients count it on their own.
+        save_transit(&mut entity.nbt, &stacks);
+    }
+    if changed || game.ticks % 40 == 0 {
+        store_transit(game, pos, entity, &stacks);
+    }
+}
+
+/// `LogisticalTransporterBase.insert` for a block beside a transporter: a sorter hands `item` over. Returns what
+/// went nowhere.
+fn insert_into_transporter(game: &mut Game<'_>, at: P3, source: P3, item: ItemStack, round_robin: bool, rr: &mut Option<(P3, usize)>) -> Option<ItemStack> {
+    let id = block_name(game, at).to_owned();
+    let now = game.world.game_time.max(0) as u64;
+    let Some((nbt, mut stacks)) = game.native_with_mod_block_entity(at, |m| (m.nbt.clone(), load_transit(&m.nbt))) else {
+        return Some(item);
+    };
+    let node = node_from(game, at, &id, &nbt);
+    let Some(from) = tnet::side_between(at, source) else {
+        return Some(item);
+    };
+    let color = node.color;
+    if !node.can_receive_from(from) {
+        return Some(item);
+    }
+    let snap = snapshot(game, at, &nbt, &stacks, None);
+    let plans = plan_routes(game, &snap, at, &item, color, Some(source), 1);
+    let Some(i) = choose_plan(&plans, round_robin, rr) else {
+        return Some(item);
+    };
+    let plan = &plans[i];
+    let sending = plan.sending.min(item.count);
+    let mut moved = item.clone();
+    moved.count = sending;
+    let left = (sending < item.count).then(|| {
+        let mut rest = item.clone();
+        rest.count = item.count - sending;
+        rest
+    });
+    let id_no = get_int(&nbt, "next_id");
+    let mut s = Transit { id: id_no, item: moved, progress: 0, color, path: plan.path.clone(), ptype: PATH_DEST, orig: source, home: Some(source), idle: None, init: true, sync_t: 0, sync_pr: 0 };
+    s.touch(now);
+    stacks.push(s);
+    store_transit_other(game, at, &stacks, id_no + 1);
+    left
+}
+
+// --- The Configurator on a transporter ---
+
+/// A right click with the Configurator on a transporter: the plain one shows the colour (a diversion transporter
+/// changes the mode of the face instead); sneaking on the core, not on an arm, bumps the colour. False when the
+/// click is not for the transporter itself (a sneak on an arm changes that face's connection).
+fn configure_transporter(game: &mut Game<'_>, pos: P3, face: P3, sneaking: bool) -> bool {
+    let id = block_name(game, pos).to_owned();
+    if !is_transporter(&id) {
+        return false;
+    }
+    let f = face_index(face);
+    let logistical = id.ends_with("_logistical_transporter");
+    let arm = looking_arm(game, pos);
+    if sneaking {
+        let connected = game.native_with_mod_block_entity(pos, |m| conn_of(&m.nbt, f) != 3).unwrap_or(false);
+        if arm.is_some() || !connected || !logistical {
+            return false;
+        }
+        let next = game
+            .native_with_mod_block_entity(pos, |m| {
+                let next = tnet::next_color(color_of(&m.nbt));
+                put_int(&mut m.nbt, "color", next.map_or(0, |c| u32::from(c) + 1));
+                put_int(&mut m.nbt, "shape_ticker", 0);
+                next
+            })
+            .flatten();
+        announce_color(game, "configurator.mekanism.toggle_color", next);
+        return true;
+    }
+    if logistical {
+        let color = game.native_with_mod_block_entity(pos, |m| color_of(&m.nbt)).flatten();
+        announce_color(game, "configurator.mekanism.view_color", color);
+    } else if id == "mekanism:diversion_transporter" {
+        let f = arm.unwrap_or(f);
+        let mode = game.native_with_mod_block_entity(pos, |m| {
+            let all = get_int(&m.nbt, "div");
+            let next = tnet::Diversion::from_id((all >> (2 * f)) & 3).next();
+            let code = match next {
+                tnet::Diversion::Disabled => 0,
+                tnet::Diversion::High => 1,
+                tnet::Diversion::Low => 2,
+            };
+            put_int(&mut m.nbt, "div", (all & !(3 << (2 * f))) | (code << (2 * f)));
+            put_int(&mut m.nbt, "shape_ticker", 0);
+            next
+        });
+        if let (Some(mode), Some(player)) = (mode, game.native_acting_player()) {
+            let key = match mode {
+                tnet::Diversion::Disabled => "transmitter.mekanism.control.disabled.desc",
+                tnet::Diversion::High => "transmitter.mekanism.control.high.desc",
+                tnet::Diversion::Low => "transmitter.mekanism.control.low.desc",
+            };
+            let label = horizon_client::text::Text::colored(lang_text(key), enum_color::RED);
+            let text = horizon_client::text::Text::translate("transmitter.mekanism.configurator.toggle_diverter", &[label]);
+            game.native_action_bar(player.uuid, text);
+        }
+    }
+    true
+}
+
+fn announce_color(game: &mut Game<'_>, key: &str, color: Option<u8>) {
+    let Some(player) = game.native_acting_player() else {
+        return;
+    };
+    let name = match color {
+        Some(c) => horizon_client::text::Text::colored(tnet::COLORS[usize::from(c)].0, tnet::COLORS[usize::from(c)].1),
+        None => horizon_client::text::Text::colored(lang_text("gui.mekanism.none"), 0xFFFFFF),
+    };
+    game.native_action_bar(player.uuid, horizon_client::text::Text::translate(key, &[name]));
+}
+
+
+/// `TileEntityTransmitter.getCollisionBoxes`: the parts of the transmitter at `pos` the player can point at: the arm
+/// of each connected face (its shape by connection type) and the core. `large` transmitters (pipes, transporters)
+/// have the 8-pixel core, the others the 6-pixel one.
+fn transmitter_parts(game: &Game<'_>, pos: P3, nbt_conn: u32, large: bool) -> Vec<(Option<usize>, [f64; 3], [f64; 3])> {
+    // (lateral low, lateral high, along low, along high) pixels of a shape pointing down, as `rotateAllInitialDown` turns it.
+    let shapes = |mode: u32| -> &'static [(f64, f64, f64, f64)] {
+        match (large, mode) {
+            (true, 1) => &[(4.0, 12.0, 3.0, 4.0), (5.0, 11.0, 1.0, 3.0), (6.0, 10.0, 0.0, 1.0)],
+            (true, 2) => &[(4.0, 12.0, 3.0, 4.0), (5.0, 11.0, 2.0, 3.0), (3.0, 13.0, 0.0, 2.0)],
+            (true, _) => &[(4.0, 12.0, 0.0, 4.0)],
+            (false, 1) => &[(5.0, 11.0, 3.0, 5.0), (6.0, 10.0, 1.0, 3.0), (7.0, 9.0, 0.0, 1.0)],
+            (false, 2) => &[(5.0, 11.0, 4.0, 5.0), (6.0, 10.0, 2.0, 4.0), (4.0, 12.0, 0.0, 2.0)],
+            (false, _) => &[(5.0, 11.0, 0.0, 5.0)],
+        }
+    };
+    let mut out = Vec::new();
+    let origin = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
+    for (d, (name, v)) in DIRECTIONS.iter().enumerate() {
+        if game.native_block_property(pos, name).as_deref() != Some("false") {
+            continue;
+        }
+        let neighbor = [pos[0] + v[0], pos[1] + v[1], pos[2] + v[2]];
+        let mode = if pipe_family(block_name(game, neighbor)).is_some() { 0 } else { (nbt_conn >> (2 * d)) & 3 };
+        let axis = [1, 1, 2, 2, 0, 0][d];
+        let positive = d % 2 == 1;
+        for &(lo, hi, a0, a1) in shapes(mode) {
+            let (a0, a1) = if positive { (16.0 - a1, 16.0 - a0) } else { (a0, a1) };
+            let (mut min, mut max) = ([lo; 3], [hi; 3]);
+            min[axis] = a0;
+            max[axis] = a1;
+            out.push((Some(d), std::array::from_fn(|k| origin[k] + min[k] / 16.0), std::array::from_fn(|k| origin[k] + max[k] / 16.0)));
+        }
+    }
+    let (lo, hi) = if large { (4.0, 12.0) } else { (5.0, 11.0) };
+    out.push((None, std::array::from_fn(|k| origin[k] + lo / 16.0), std::array::from_fn(|k| origin[k] + hi / 16.0)));
+    out
+}
+
+/// `getSideLookingAt` (`MultipartUtils.collisionRayTrace`): the arm of the transmitter at `pos` the acting player points
+/// at, none for the core (or when nothing is hit).
+fn looking_arm(game: &mut Game<'_>, pos: P3) -> Option<usize> {
+    let player = game.native_acting_player()?;
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let eye = [player.position[0], player.position[1] + if sneaking { 1.27 } else { 1.62 }, player.position[2]];
+    let (yaw, pitch) = (f64::from(game.yaw).to_radians(), f64::from(game.pitch).to_radians());
+    let dir = [-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos()];
+    let id = block_name(game, pos).to_owned();
+    let conn = game.native_with_mod_block_entity(pos, |m| get_int(&m.nbt, "conn")).unwrap_or(0);
+    let large = matches!(pipe_family(&id), Some("pipe" | "transporter"));
+    let mut best: Option<(f64, Option<usize>)> = None;
+    for (part, min, max) in transmitter_parts(game, pos, conn, large) {
+        let (mut near, mut far) = (0.0f64, 6.0f64);
+        let mut hit = true;
+        for k in 0..3 {
+            if dir[k].abs() < 1e-9 {
+                if eye[k] < min[k] || eye[k] > max[k] {
+                    hit = false;
+                    break;
+                }
+            } else {
+                let (a, b) = ((min[k] - eye[k]) / dir[k], (max[k] - eye[k]) / dir[k]);
+                near = near.max(a.min(b));
+                far = far.min(a.max(b));
+            }
+        }
+        if hit && near <= far && best.is_none_or(|(t, _)| near < t) {
+            best = Some((near, part));
+        }
+    }
+    best.and_then(|(_, part)| part)
+}
+
+/// The colour of a coloured transporter, drawn over its core and arms (the model's colour layer).
+fn transporter_tint(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    TRANSPORTERS.with_borrow(|set| {
+        for pos in set {
+            let Some((_, client)) = game.native_client_block_entity(*pos) else {
+                continue;
+            };
+            let Some(color) = (match get_int(&client, "color") {
+                0 => None,
+                c => tnet::COLORS.get(c as usize - 1),
+            }) else {
+                continue;
+            };
+            let argb = 0x99_00_00_00 | color.1;
+            let conn = get_int(&client, "conn_show");
+            for (_, min, max) in transmitter_parts(game, *pos, conn, true) {
+                let grow = 0.004;
+                boxes.push(super::native_hooks::NativeWorldBox {
+                    min: min.map(|v| v - grow),
+                    max: max.map(|v| v + grow),
+                    colors: [argb; 6],
+                    sprite: None,
+                });
+            }
+        }
+    });
+}
+
+/// The items moving along the transporters (hook point `native_world_items`): each stack a transporter's clients
+/// know of is drawn where `TransporterUtils.getStackPosition` puts it: along the side it is nearest, by its progress.
+fn transit_items(game: &Game<'_>, items: &mut Vec<super::native_hooks::NativeWorldItem>) {
+    let time = game.ticks as f32 + game.clock.fraction() as f32;
+    let mut alive = std::collections::HashSet::new();
+    TRANSPORTERS.with_borrow(|set| {
+        for pos in set {
+            let Some((id, client)) = game.native_client_block_entity(*pos) else {
+                continue;
+            };
+            let Some(Tag::List(list)) = client.get(&JavaString::from("transit")) else {
+                continue;
+            };
+            let speed = transporter_speed(&id) as f32;
+            for tag in list {
+                let Tag::Compound(c) = tag else {
+                    continue;
+                };
+                let Some(item) = get_string(c, "i") else {
+                    continue;
+                };
+                let key = (*pos, get_int(c, "id"), get_long(c, "t"));
+                alive.insert(key);
+                let seen = TRANSIT_SEEN.with_borrow_mut(|m| *m.entry(key).or_insert(time));
+                let progress = (get_int(c, "pr") as f32 + (time - seen) * speed).clamp(0.0, 100.0);
+                let side = if progress < 50.0 {
+                    get_pos(c, "pv").and_then(|p| tnet::side_between(p, *pos))
+                } else {
+                    get_pos(c, "nx").and_then(|n| tnet::side_between(*pos, n))
+                }
+                .unwrap_or(0);
+                let d = tnet::DIRS[side];
+                let k = f64::from(progress) / 100.0 - 0.5;
+                let at = [f64::from(pos[0]) + 0.5 + f64::from(d[0]) * k, f64::from(pos[1]) + 0.25 + f64::from(d[1]) * k, f64::from(pos[2]) + 0.5 + f64::from(d[2]) * k];
+                let matrix = glam::DMat4::from_translation(glam::DVec3::from_array(at)) * glam::DMat4::from_scale(glam::DVec3::splat(0.5));
+                items.push(super::native_hooks::NativeWorldItem {
+                    item,
+                    matrix: matrix.to_cols_array(),
+                    light_at: *pos,
+                    seed: key.1 as i32,
+                    ground: true,
+                });
+            }
+        }
+    });
+    TRANSIT_SEEN.with_borrow_mut(|m| m.retain(|k, _| alive.contains(k)));
+}
+
+thread_local! {
+    /// The logistical transporters this client has heard of, and when it first saw each stack's latest state
+    /// (by transporter, stack, sync time).
+    static TRANSPORTERS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+    static TRANSIT_SEEN: std::cell::RefCell<std::collections::HashMap<([i32; 3], u32, u64), f32>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 fn load_sorter(nbt: &Compound) -> Sorter {
@@ -5251,7 +6216,18 @@ fn tick_sorter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
             continue;
         }
         let left = if is_transporter(block_name(game, front)) {
-            route_items(game, front, pos, stack)
+            let mut rr = get_pos(&entity.nbt, "rr").map(|p| (p, get_int(&entity.nbt, "rr_side") as usize));
+            let left = insert_into_transporter(game, front, pos, stack, settings.round_robin, &mut rr);
+            match rr {
+                Some((p, side)) => {
+                    entity.nbt.insert("rr".into(), pos_tag(p));
+                    put_int(&mut entity.nbt, "rr_side", side as u32);
+                }
+                None => {
+                    entity.nbt.remove(&JavaString::from("rr"));
+                }
+            }
+            left
         } else {
             game.native_insert_item(front, front_face, stack)
         };
@@ -5303,154 +6279,6 @@ pub(super) fn use_sorter(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     true
 }
 
-/// Walks the transporters joined to `start`, nearest first, offering `stack` to every container beside
-/// them except `source`. Returns what no container took. What a container took is shown travelling along the
-/// transporters that led to it (`transit_seen`).
-fn route_items(game: &mut Game<'_>, start: [i32; 3], source: [i32; 3], stack: ItemStack) -> Option<ItemStack> {
-    let mut seen = std::collections::HashSet::from([start]);
-    let mut queue = std::collections::VecDeque::from([start]);
-    let mut parent: std::collections::HashMap<[i32; 3], [i32; 3]> = std::collections::HashMap::new();
-    let mut stack = Some(stack);
-    while let Some(node) = queue.pop_front() {
-        for (_, d) in DIRECTIONS {
-            let at = [node[0] + d[0], node[1] + d[1], node[2] + d[2]];
-            if at == source || seen.contains(&at) {
-                continue;
-            }
-            if is_transporter(block_name(game, at)) {
-                if seen.len() < 512 {
-                    seen.insert(at);
-                    parent.insert(at, node);
-                    queue.push_back(at);
-                }
-                continue;
-            }
-            let face = horizon_core::geometry::Direction::ALL[face_index([-d[0], -d[1], -d[2]])];
-            let offered = stack.take()?;
-            let (item, before) = (offered.item.to_string(), offered.count);
-            stack = game.native_insert_item(at, face, offered);
-            let taken = before - stack.as_ref().map_or(0, |s| s.count);
-            if taken > 0 {
-                let mut path = vec![node];
-                while let Some(&p) = parent.get(path.last().unwrap()) {
-                    path.push(p);
-                }
-                path.reverse();
-                record_transit(game, start, &item, source, &path, at);
-            }
-            if stack.is_none() {
-                return None;
-            }
-        }
-    }
-    stack
-}
-
-/// What a transporter shows of the stacks that travel through it (`TransporterStack` on the client): the item, the
-/// transporters it passes (from `start`), the container it ends in and when it left, in its `client` compound.
-fn record_transit(game: &mut Game<'_>, start: [i32; 3], item: &str, source: [i32; 3], path: &[[i32; 3]], dest: [i32; 3]) {
-    let now = game.world.game_time.max(0) as u64;
-    let speed = transporter_speed(block_name(game, start));
-    let ticks_per_block = (100 / speed.max(1)).max(1);
-    let mut e = Compound::new();
-    e.insert("i".into(), Tag::String(item.into()));
-    e.insert("s".into(), Tag::IntArray(source.to_vec()));
-    e.insert("p".into(), Tag::IntArray(path.iter().flatten().copied().collect()));
-    e.insert("d".into(), Tag::IntArray(dest.to_vec()));
-    put_long(&mut e, "t", now);
-    put_int(&mut e, "tpb", ticks_per_block);
-    game.native_with_mod_block_entity(start, |m| {
-        let mut client = match m.nbt.get(&JavaString::from("client")) {
-            Some(Tag::Compound(c)) => c.clone(),
-            _ => Compound::new(),
-        };
-        let mut list: Vec<Tag> = match client.get(&JavaString::from("transit")) {
-            Some(Tag::List(l)) => l.clone(),
-            _ => vec![],
-        };
-        // Drop what has arrived; the latest few are enough to draw.
-        list.retain(|t| matches!(t, Tag::Compound(c) if now.saturating_sub(get_long(c, "t")) < 20 * 20));
-        if list.len() < 16 {
-            list.push(Tag::Compound(e));
-        }
-        client.insert("transit".into(), Tag::List(list));
-        m.nbt.insert("client".into(), Tag::Compound(client));
-    });
-    game.native_sync_block_entity(start);
-}
-
-/// `TierConfig` `<tier>Speed` of a logistical transporter: progress a tick (100 is a block).
-fn transporter_speed(id: &str) -> u32 {
-    let name = id.strip_prefix("mekanism:").unwrap_or(id);
-    let (tier, default) = [("basic", 5), ("advanced", 10), ("elite", 20), ("ultimate", 50)].into_iter().find(|(t, _)| name.starts_with(t)).unwrap_or(("basic", 5));
-    mekanism_core::config_files::active_int("tiers", "transmitters.items", &format!("{tier}Speed"), default).max(1) as u32
-}
-
-thread_local! {
-    /// The logistical transporters this client has heard of, and when it first saw each stack travel (by transporter, stack).
-    static TRANSPORTERS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
-    static TRANSIT_SEEN: std::cell::RefCell<std::collections::HashMap<([i32; 3], u64), f32>> = std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// The items moving along the transporters (hook point `native_world_items`): each travels from the face of its
-/// source through the block centres of the transporters to the face of the container that took it, at the tier's speed.
-fn transit_items(game: &Game<'_>, items: &mut Vec<super::native_hooks::NativeWorldItem>) {
-    let time = game.ticks as f32 + game.clock.fraction() as f32;
-    let points = |c: &Compound| -> Option<Vec<[f64; 3]>> {
-        let center = |p: &[i32]| [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
-        let (Some(Tag::IntArray(src)), Some(Tag::IntArray(path)), Some(Tag::IntArray(dest))) = (c.get(&JavaString::from("s")), c.get(&JavaString::from("p")), c.get(&JavaString::from("d"))) else {
-            return None;
-        };
-        let nodes: Vec<[f64; 3]> = path.chunks(3).filter(|p| p.len() == 3).map(center).collect();
-        let (first, last) = (*nodes.first()?, *nodes.last()?);
-        let mid = |a: [f64; 3], b: [f64; 3]| [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0, (a[2] + b[2]) / 2.0];
-        let mut out = vec![mid(center(src), first)];
-        out.extend(nodes);
-        out.push(mid(last, center(dest)));
-        Some(out)
-    };
-    TRANSPORTERS.with_borrow(|set| {
-        for pos in set {
-            let Some((_, client)) = game.native_client_block_entity(*pos) else {
-                continue;
-            };
-            let Some(Tag::List(list)) = client.get(&JavaString::from("transit")) else {
-                continue;
-            };
-            for tag in list {
-                let Tag::Compound(c) = tag else {
-                    continue;
-                };
-                let (Some(item), Some(line)) = (get_string(c, "i"), points(c)) else {
-                    continue;
-                };
-                let key = (*pos, get_long(c, "t"));
-                let start = TRANSIT_SEEN.with_borrow_mut(|m| *m.entry(key).or_insert(time));
-                let per_block = get_int(c, "tpb").max(1) as f32;
-                let travelled = (time - start) / per_block;
-                let length = (line.len() - 1) as f32;
-                if travelled >= length || travelled < 0.0 {
-                    continue;
-                }
-                let segment = (travelled.floor() as usize).min(line.len() - 2);
-                let f = f64::from(travelled - segment as f32);
-                let (a, b) = (line[segment], line[segment + 1]);
-                let at = [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f - 0.2, a[2] + (b[2] - a[2]) * f];
-                let matrix = glam::DMat4::from_translation(glam::DVec3::from_array(at)) * glam::DMat4::from_scale(glam::DVec3::splat(0.5));
-                items.push(super::native_hooks::NativeWorldItem {
-                    item,
-                    matrix: matrix.to_cols_array(),
-                    light_at: *pos,
-                    seed: key.1 as i32,
-                    ground: true,
-                });
-            }
-        }
-    });
-    // Forget the ones long over.
-    TRANSIT_SEEN.with_borrow_mut(|m| m.retain(|_, start| time - *start < 20.0 * 20.0));
-}
-
 // --- Induction Matrix --------------------------------------------------------------------------------
 
 /// A formed matrix: its storage and rate, and its ports, the first of which keeps the energy.
@@ -5461,32 +6289,11 @@ struct FormedMatrix {
     size: [i32; 3],
 }
 
-/// `MatrixValidator`, simplified: the frame blocks joined to `start` must be exactly the shell of a box
-/// 3 to 18 on each side, and everything inside must be cells, providers or air.
+/// `MatrixValidator`: the casing blocks joined to `start` must be exactly the shell of a box 3 to 18 on each side
+/// (casing on the edges), and everything inside must be cells, providers or air.
 fn find_matrix(game: &Game<'_>, start: [i32; 3]) -> Option<FormedMatrix> {
     use mekanism_core::matrix::{is_frame, MAX_SIZE, MIN_SIZE};
-    let mut seen = std::collections::HashSet::from([start]);
-    let mut todo = vec![start];
-    let (mut lo, mut hi) = (start, start);
-    while let Some(at) = todo.pop() {
-        for k in 0..3 {
-            lo[k] = lo[k].min(at[k]);
-            hi[k] = hi[k].max(at[k]);
-            if hi[k] - lo[k] >= MAX_SIZE {
-                return None;
-            }
-        }
-        for (_, d) in DIRECTIONS {
-            let next = [at[0] + d[0], at[1] + d[1], at[2] + d[2]];
-            if !seen.contains(&next) && is_frame(block_name(game, next)) {
-                seen.insert(next);
-                todo.push(next);
-            }
-        }
-    }
-    if (0..3).any(|k| hi[k] - lo[k] + 1 < MIN_SIZE) {
-        return None;
-    }
+    let (lo, hi, seen) = find_box_axes(game, start, is_frame, [MIN_SIZE; 3], [MAX_SIZE; 3])?;
     let mut matrix = mekanism_core::matrix::Matrix::default();
     let mut ports = Vec::new();
     for x in lo[0]..=hi[0] {
@@ -5496,7 +6303,8 @@ fn find_matrix(game: &Game<'_>, start: [i32; 3]) -> Option<FormedMatrix> {
                 let shell = x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2];
                 let name = block_name(game, at);
                 if shell {
-                    if !seen.contains(&at) {
+                    // The edges are induction casing only; ports sit in the faces.
+                    if !seen.contains(&at) || (on_box_edge(lo, hi, at) && name != "mekanism:induction_casing") {
                         return None;
                     }
                     if name == "mekanism:induction_port" {
@@ -5688,40 +6496,53 @@ impl Tower {
     }
 }
 
-/// `EvaporationValidator`, simplified: a 4x4 floor of tower blocks, then 4x4 rings of them with air
-/// inside, 3 to 18 blocks high in all, with the controller in a ring.
+/// `EvaporationValidator`: a 4 x 4 box 3 to 18 high of plant blocks (blocks on the edges, valves and the one controller in the
+/// walls), air inside, an open top whose edges are plant blocks and whose corners hold anything.
 fn find_tower(game: &Game<'_>, c: [i32; 3]) -> Option<Tower> {
+    // The box around the plant's blocks joined to the controller: 4 wide each way, 3 to 18 high.
+    let (lo, hi, _) = find_box_axes(game, c, |n| EVAPORATION_PARTS.contains(&n), [4, evap::MIN_HEIGHT as i32, 4], [4, evap::MAX_HEIGHT as i32, 4])?;
     let part = |at: [i32; 3]| EVAPORATION_PARTS.contains(&block_name(game, at));
-    let mut bottom = c[1];
-    while part([c[0], bottom - 1, c[2]]) && c[1] - bottom < evap::MAX_HEIGHT as i32 {
-        bottom -= 1;
-    }
-    for x0 in c[0] - 3..=c[0] {
-        for z0 in c[2] - 3..=c[2] {
-            let on_ring = c[0] == x0 || c[0] == x0 + 3 || c[2] == z0 || c[2] == z0 + 3;
-            if !on_ring {
-                continue;
-            }
-            let floor = (0..4).all(|dx| (0..4).all(|dz| part([x0 + dx, bottom, z0 + dz])));
-            if !floor {
-                continue;
-            }
-            let mut tower = Tower { origin: [x0, bottom, z0], height: 1 };
-            while tower.height < evap::MAX_HEIGHT {
-                let y = bottom + tower.height as i32;
-                let ring = tower.perimeter(y).all(part);
-                let hollow = (1..3).all(|dx| (1..3).all(|dz| block_name(game, [x0 + dx, y, z0 + dz]) == "minecraft:air"));
-                if !(ring && hollow) {
-                    break;
+    let mut controllers = 0;
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                let at = [x, y, z];
+                let name = block_name(game, at);
+                let (xe, ze) = (x == lo[0] || x == hi[0], z == lo[2] || z == hi[2]);
+                if y == hi[1] {
+                    // The open top: its corners hold anything (the solar generators), its other edges are plant blocks, the middle is air.
+                    if xe && ze {
+                        if name == EVAPORATION_PARTS[2] {
+                            controllers += 1;
+                        }
+                        continue;
+                    }
+                    if xe || ze {
+                        if !part(at) {
+                            return None;
+                        }
+                    } else if !is_air(name) {
+                        return None;
+                    }
+                } else if on_box_edge(lo, hi, at) {
+                    if name != EVAPORATION_PARTS[0] {
+                        return None;
+                    }
+                    continue;
+                } else if x == lo[0] || x == hi[0] || y == lo[1] || z == lo[2] || z == hi[2] {
+                    if !part(at) {
+                        return None;
+                    }
+                } else if !is_air(name) {
+                    return None;
                 }
-                tower.height += 1;
-            }
-            if tower.height >= evap::MIN_HEIGHT && c[1] > bottom && c[1] < bottom + tower.height as i32 {
-                return Some(tower);
+                if name == EVAPORATION_PARTS[2] {
+                    controllers += 1;
+                }
             }
         }
     }
-    None
+    (controllers == 1).then_some(Tower { origin: lo, height: (hi[1] - lo[1] + 1) as u32 })
 }
 
 /// The Thermal Evaporation Plant's controller runs the tower: water from buckets, heat from the
@@ -6988,6 +7809,14 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
         }
         return;
     }
+    if !*claimed && &*stack.item == CONFIG_CARD && game.native_on(MOD_ID) {
+        config_card_clear(game, claimed);
+        return;
+    }
+    if !*claimed && &*stack.item == WALKIE && game.native_on(MOD_ID) {
+        walkie_use(game, claimed);
+        return;
+    }
     if !*claimed && &*stack.item == CONFIGURATOR {
         configurator_use(game, claimed);
         return;
@@ -7613,6 +8442,8 @@ fn tooltip_body(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_cli
         tier_tooltip(name, lines);
     }
     waste_barrel_tooltip(stack, lines);
+    walkie_tooltip(stack, lines);
+    config_card_tooltip(stack, lines);
     stored_tooltip(stack, lines);
     cardboard_tooltip(stack, lines);
     // `FormulaComponent.addToTooltip`: the distinct ingredients in order of first use, with how many times each is used.
@@ -8918,6 +9749,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
         scuba_breathe(game);
         return;
     }
+    if channel == WALKIE_CHANNEL && game.native_on(MOD_ID) {
+        walkie_change_channel(game, data.first().map_or(1, |b| *b as i8));
+        return;
+    }
     if channel == SCUBA_MODE_CHANNEL && game.native_on(MOD_ID) {
         scuba_toggle(game);
         return;
@@ -9064,6 +9899,200 @@ fn set_custom_long(stack: &mut ItemStack, key: &str, value: u64) {
     });
     if let Tag::Compound(c) = &mut extra.other[at].1 {
         put_long(c, key, value);
+    }
+}
+
+// --- Configuration Card -----------------------------------------------------------------------------
+
+const CONFIG_CARD: &str = "mekanism:configuration_card";
+/// The card's `ConfigurationData`: `data_name`, `data_type` (the block) and `config`.
+const CONFIG_CARD_KEY: &str = "mekanism:configuration_data";
+/// What of a block entity `writeConfigurationData` takes: its sustained data (upgrades, sides, ejector, redstone), the
+/// Resistive Heater's usage and the frequencies it is set to.
+const CONFIG_CARD_EXTRA_KEYS: [&str; 7] = ["usage_set", "usage", "frequency", "freq_name", "freq_security", "freq_owner", "freq_color"];
+
+/// `TileEntityFactory.isConfigurationDataCompatible` and the Combiner's: factories of one type take each other's data.
+fn factory_type(id: &str) -> Option<&'static str> {
+    match kind(id) {
+        Some(Kind::Factory(_, recipe, _)) => Some(recipe),
+        Some(Kind::Machine(recipe, _)) if id == "mekanism:combiner" => Some(recipe),
+        _ => None,
+    }
+}
+
+fn block_description_key(id: &str) -> String {
+    let (ns, name) = id.split_once(':').unwrap_or(("mekanism", id));
+    format!("block.{ns}.{name}")
+}
+
+/// `ItemConfigurationCard.useOn`: sneaking copies the block's settings into the card; otherwise the card's
+/// settings go into a block of the same type.
+pub(super) fn use_config_card(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) {
+        return false;
+    }
+    let selected = game.selected;
+    let Some(Some(held)) = game.inventory.get(selected).cloned() else {
+        return false;
+    };
+    if &*held.item != CONFIG_CARD {
+        return false;
+    }
+    let block = block_name(game, pos).to_owned();
+    if kind(&block).is_none() {
+        return false;
+    }
+    let sneaking = shift_down(game);
+    if sneaking {
+        let config = game
+            .native_with_mod_block_entity(pos, |m| {
+                let mut config = machine_state(&m.nbt).unwrap_or_default();
+                for key in CONFIG_CARD_EXTRA_KEYS {
+                    if let Some(v) = m.nbt.get(&JavaString::from(key)) {
+                        config.insert(key.into(), v.clone());
+                    }
+                }
+                config
+            });
+        let Some(config) = config else {
+            return false;
+        };
+        let mut data = Compound::new();
+        data.insert("name".into(), Tag::String(block_description_key(&block).as_str().into()));
+        data.insert("type".into(), Tag::String(block.as_str().into()));
+        if !config.is_empty() {
+            data.insert("config".into(), Tag::Compound(config));
+        }
+        let mut stack = held;
+        set_custom_compound(&mut stack, CONFIG_CARD_KEY, data);
+        game.inventory[selected] = Some(stack);
+        let name = horizon_client::lang::get(&block_description_key(&block));
+        tell(game, format!("Retrieved configuration data from {name}"));
+        return true;
+    }
+    let Some(Tag::Compound(data)) = custom_data(&held).and_then(|c| c.get(&JavaString::from(CONFIG_CARD_KEY))).cloned() else {
+        return false;
+    };
+    let Some(stored) = get_string(&data, "type") else {
+        return false;
+    };
+    let compatible = stored == block || factory_type(&stored).is_some_and(|t| factory_type(&block) == Some(t));
+    if !compatible {
+        tell(game, "Unequal configuration data formats.".to_owned());
+        return true;
+    }
+    if let Some(Tag::Compound(config)) = data.get(&JavaString::from("config")) {
+        game.native_with_mod_block_entity(pos, |m| {
+            // `read` of the components starts from the defaults: what the card does not carry is cleared.
+            for key in MACHINE_STATE_KEYS.iter().chain(CONFIG_CARD_EXTRA_KEYS.iter()) {
+                m.nbt.remove(&JavaString::from(*key));
+            }
+            for (k, v) in config.iter() {
+                m.nbt.insert(k.clone(), v.clone());
+            }
+        });
+    }
+    let name = horizon_client::lang::get(&get_string(&data, "name").unwrap_or_default());
+    tell(game, format!("Injected configuration data of type {name}"));
+    true
+}
+
+/// `ItemConfigurationCard.use`: sneaking in the air clears the card.
+fn config_card_clear(game: &mut Game<'_>, claimed: &mut bool) {
+    if !shift_down(game) {
+        return;
+    }
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == CONFIG_CARD) else {
+        return;
+    };
+    if let Some(extra) = held.extra.as_mut() {
+        for (key, data) in extra.other.iter_mut() {
+            if key == "minecraft:custom_data"
+                && let Tag::Compound(c) = data
+            {
+                c.remove(&JavaString::from(CONFIG_CARD_KEY));
+            }
+        }
+        extra.other.retain(|(key, data)| key != "minecraft:custom_data" || !matches!(data, Tag::Compound(c) if c.is_empty()));
+    }
+    *claimed = true;
+    tell(game, "Cleared Configuration Card".to_owned());
+}
+
+/// `ConfigurationData.addToTooltip`: the stored block's name, or None.
+fn config_card_tooltip(stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    use horizon_client::text::Text;
+    if &*stack.item != CONFIG_CARD {
+        return;
+    }
+    let name = match custom_data(stack).and_then(|c| c.get(&JavaString::from(CONFIG_CARD_KEY))) {
+        Some(Tag::Compound(d)) => get_string(d, "name").map(|key| horizon_client::lang::get(&key)),
+        _ => None,
+    };
+    let name = name.unwrap_or_else(|| "None".to_owned());
+    lines.push((Text::translate("configuration_card.mekanism.has_data", &[Text::colored(name.as_str(), enum_color::INDIGO)]), tooltip_rgba(enum_color::GRAY)));
+}
+
+// --- Walkie-Talkie ----------------------------------------------------------------------------------
+
+const WALKIE: &str = "mekanismadditions:walkie_talkie";
+const WALKIE_CHANNEL: &str = "mekanismadditions:walkie_channel";
+/// `WalkieData`: the channel (1 to `MAX_CHANNEL` - 1 by the wheel, 1 to 9 stored) and whether it runs.
+const WALKIE_KEY: &str = "mekanismadditions:walkie_channel";
+const WALKIE_RUNNING_KEY: &str = "mekanismadditions:walkie_running";
+const WALKIE_MAX_CHANNEL: i64 = 9;
+
+fn walkie_data(stack: &ItemStack) -> (i64, bool) {
+    let c = custom_data(stack);
+    let channel = c.map_or(0, |c| get_long(c, WALKIE_KEY) as i64);
+    (if channel == 0 { 1 } else { channel }, c.is_some_and(|c| get_long(c, WALKIE_RUNNING_KEY) == 1))
+}
+
+/// `ItemWalkieTalkie.use`: sneaking turns the radio on or off (the voice itself needs `MekanismAdditions`'
+/// own voice server, which a Horizon mod has no socket for).
+fn walkie_use(game: &mut Game<'_>, claimed: &mut bool) {
+    if !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+        return;
+    }
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == WALKIE) else {
+        return;
+    };
+    let (channel, running) = walkie_data(held);
+    set_custom_long(held, WALKIE_KEY, channel as u64);
+    set_custom_long(held, WALKIE_RUNNING_KEY, u64::from(!running));
+    *claimed = true;
+}
+
+/// `ItemWalkieTalkie.changeMode` on the server: the channel steps within 1..8 (`floorMod(channel + shift - 1, 8) + 1`).
+fn walkie_change_channel(game: &mut Game<'_>, shift: i8) {
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == WALKIE) else {
+        return;
+    };
+    let (channel, running) = walkie_data(held);
+    if !running {
+        return;
+    }
+    let new = (channel + i64::from(shift) - 1).rem_euclid(WALKIE_MAX_CHANNEL - 1) + 1;
+    if new == channel {
+        return;
+    }
+    set_custom_long(held, WALKIE_KEY, new as u64);
+    if let Some(player) = game.native_acting_player() {
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(format!("Channel changed to: {new}")));
+    }
+}
+
+/// `WalkieData.addToTooltip`: On or Off, the channel, and a warning while the voice server is off.
+fn walkie_tooltip(stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    if &*stack.item != WALKIE {
+        return;
+    }
+    let (channel, running) = walkie_data(stack);
+    let on = |on: bool| (horizon_client::text::Text::literal(if on { "On" } else { "Off" }.to_owned()), tooltip_rgba(if on { enum_color::BRIGHT_GREEN } else { enum_color::RED }));
+    lines.push(on(running));
+    lines.push(colored_line("walkie.mekanismadditions.channel", 0x00F3D0, enum_color::GRAY, &[&channel.to_string()]));
+    if !config_flag("additions", "voice_server", "enabled", false) {
+        lines.push(colored_line("walkie.mekanismadditions.disabled", enum_color::DARK_RED, enum_color::DARK_RED, &[]));
     }
 }
 
@@ -9324,6 +10353,13 @@ pub(super) fn wheel(game: &mut Game<'_>, steps: f32, claimed: &mut bool) {
         game.audio.play_unshared("mekanism:item.hydraulic", None, 1.0, 1.0);
         return;
     }
+    // `ItemWalkieTalkie.changeMode`: a running radio in hand changes channel.
+    if steps.round() != 0.0 && game.inventory.get(game.selected).and_then(|s| s.as_ref()).is_some_and(|s| &*s.item == WALKIE && walkie_data(s).1) {
+        *claimed = true;
+        game.native_send_to_server(WALKIE_CHANNEL, &[(steps.round().signum() as i8) as u8]);
+        game.audio.play_unshared("mekanism:item.hydraulic", None, 1.0, 1.0);
+        return;
+    }
     if (steps.round() as i32).abs() % 2 != 1 {
         return;
     }
@@ -9454,7 +10490,7 @@ fn free_runners_use(game: &mut Game<'_>, claimed: &mut bool) {
 /// ports.
 #[allow(clippy::type_complexity)]
 fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, Vec<[i32; 3]>, [i32; 3], [i32; 3], Vec<[i32; 4]>)> {
-    let (lo, hi, seen) = find_box(game, start, fission::is_frame, fission::MIN_SIZE, fission::MAX_SIZE)?;
+    let (lo, hi, seen) = find_box_axes(game, start, fission::is_frame, [3; 3], [18; 3])?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
     let mut reactor = fission::Reactor { volume: size(0) * size(1) * size(2), ..Default::default() };
     let mut ports = Vec::new();
@@ -9465,7 +10501,9 @@ fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, V
                 let shell = x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2];
                 let name = block_name(game, at);
                 if shell {
-                    if !seen.contains(&at) {
+                    // The edges are casing or reactor glass; ports and logic adapters sit in the faces.
+                    let casing = matches!(name, "mekanismgenerators:fission_reactor_casing" | "mekanismgenerators:reactor_glass");
+                    if !seen.contains(&at) || (on_box_edge(lo, hi, at) && !casing) {
                         return None;
                     }
                     reactor.locations += 1;
@@ -9478,22 +10516,20 @@ fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, V
             }
         }
     }
-    // Each column of fuel assemblies: its lowest block and how many are stacked (`FormedAssembly`).
+    // Each column holds fuel assemblies stacked from its lowest block and one control rod directly above them
+    // (`FuelAssembly.validate`); a column with the one and not the other, or a gap, does not form.
     let mut columns = Vec::new();
     for x in lo[0] + 1..hi[0] {
         for z in lo[2] + 1..hi[2] {
-            let mut y = lo[1] + 1;
-            while y < hi[1] {
-                if block_name(game, [x, y, z]) == "mekanismgenerators:fission_fuel_assembly" {
-                    let start = y;
-                    while y < hi[1] && block_name(game, [x, y, z]) == "mekanismgenerators:fission_fuel_assembly" {
-                        y += 1;
-                    }
-                    columns.push([x, start, z, y - start]);
-                } else {
-                    y += 1;
-                }
+            let fuel: Vec<i32> = (lo[1] + 1..hi[1]).filter(|&y| block_name(game, [x, y, z]) == "mekanismgenerators:fission_fuel_assembly").collect();
+            let rods: Vec<i32> = (lo[1] + 1..hi[1]).filter(|&y| block_name(game, [x, y, z]) == "mekanismgenerators:control_rod_assembly").collect();
+            if fuel.is_empty() && rods.is_empty() {
+                continue;
             }
+            if rods.len() != 1 || fuel.is_empty() || fuel.windows(2).any(|w| w[1] != w[0] + 1) || rods[0] != fuel[fuel.len() - 1] + 1 {
+                return None;
+            }
+            columns.push([x, fuel[0], z, fuel.len() as i32]);
         }
     }
     // `FissionReactorValidator.postcheck`: 6 faces per fuel assembly, 2 fewer for each neighbour it touches.
@@ -9529,6 +10565,18 @@ fn find_box(
     min: i32,
     max: i32,
 ) -> Option<([i32; 3], [i32; 3], std::collections::HashSet<[i32; 3]>)> {
+    find_box_axes(game, start, is_frame, [min; 3], [max; 3])
+}
+
+/// `StructureHelper.fetchCuboid`: the box around the casing blocks joined to `start`, each side between its `min`
+/// and `max` (`VoxelCuboid` bounds, x y z), with the casing blocks found.
+fn find_box_axes(
+    game: &Game<'_>,
+    start: [i32; 3],
+    is_frame: fn(&str) -> bool,
+    min: [i32; 3],
+    max: [i32; 3],
+) -> Option<([i32; 3], [i32; 3], std::collections::HashSet<[i32; 3]>)> {
     let mut seen = std::collections::HashSet::from([start]);
     let mut todo = vec![start];
     let (mut lo, mut hi) = (start, start);
@@ -9536,7 +10584,7 @@ fn find_box(
         for k in 0..3 {
             lo[k] = lo[k].min(at[k]);
             hi[k] = hi[k].max(at[k]);
-            if hi[k] - lo[k] >= max {
+            if hi[k] - lo[k] + 1 > max[k] {
                 return None;
             }
         }
@@ -9548,11 +10596,17 @@ fn find_box(
             }
         }
     }
-    if (0..3).any(|k| hi[k] - lo[k] + 1 < min) {
+    if (0..3).any(|k| hi[k] - lo[k] + 1 < min[k]) {
         return None;
     }
     Some((lo, hi, seen))
 }
+
+/// `VoxelCuboid.getWallRelative(..).isOnEdge()`: the position lies on an edge (or corner) of the box.
+fn on_box_edge(lo: [i32; 3], hi: [i32; 3], at: [i32; 3]) -> bool {
+    (0..3).filter(|&k| at[k] == lo[k] || at[k] == hi[k]).count() >= 2
+}
+
 const FISSILE_FUEL: &str = "mekanism:fissile_fuel";
 
 fn get_pos(nbt: &Compound, key: &str) -> Option<[i32; 3]> {
@@ -16961,25 +18015,56 @@ pub(super) fn use_sps_port(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 
 // --- Thermoelectric Boiler ---------------------------------------------------------------------------
 
-/// `BoilerValidator`, simplified: the frame blocks joined to `start` must be the shell of a box 3 to 18
-/// on each side, with air, superheating elements and one full layer of pressure dispersers inside, the
-/// elements below the dispersers. The boiler, its valves and the Resistive Heaters touching its walls.
-#[allow(clippy::type_complexity)]
+/// `FormationProtocol.explore`: how many blocks join `start` through faces, as far as `ok` says they belong (none
+/// when `start` itself does not).
+fn explore(start: [i32; 3], ok: &dyn Fn([i32; 3]) -> bool) -> u64 {
+    if !ok(start) {
+        return 0;
+    }
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut todo = std::collections::VecDeque::from([start]);
+    while let Some(at) = todo.pop_front() {
+        if seen.len() >= 18 * 18 * 18 {
+            return seen.len() as u64;
+        }
+        for (_, d) in DIRECTIONS {
+            let next = [at[0] + d[0], at[1] + d[1], at[2] + d[2]];
+            if !seen.contains(&next) && ok(next) {
+                seen.insert(next);
+                todo.push_back(next);
+            }
+        }
+    }
+    seen.len() as u64
+}
+
+fn is_air(name: &str) -> bool {
+    matches!(name, "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air")
+}
+
+/// `BoilerValidator`: a box of boiler casing (casing on every edge), valves and glass in the walls; inside a full layer of
+/// dispersers, superheating elements below it in one piece, and nothing else. The water is the air and casing under the
+/// dispersers, the steam the whole footprint above. Returns the boiler, its valves and the heaters touching its walls.
 #[allow(clippy::type_complexity)]
 fn find_boiler(game: &Game<'_>, start: [i32; 3]) -> Option<(boiler::Boiler, Vec<[i32; 3]>, Vec<[i32; 3]>, [i32; 7])> {
-    let (lo, hi, seen) = find_box(game, start, boiler::is_frame, boiler::MIN_SIZE, boiler::MAX_SIZE)?;
+    let (lo, hi, seen) = find_box_axes(game, start, boiler::is_frame, [3; 3], [18; 3])?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
     let mut b = boiler::Boiler { volume: size(0) * size(1) * size(2), ..Default::default() };
     let mut valves = Vec::new();
-    let mut dispersers = Vec::new();
-    let mut elements = Vec::new();
+    let mut dispersers: Vec<[i32; 3]> = Vec::new();
+    let mut elements: Vec<[i32; 3]> = Vec::new();
     for x in lo[0]..=hi[0] {
         for y in lo[1]..=hi[1] {
             for z in lo[2]..=hi[2] {
                 let at = [x, y, z];
-                let shell = x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2];
                 let name = block_name(game, at);
-                if shell {
+                if on_box_edge(lo, hi, at) {
+                    if name != "mekanism:boiler_casing" {
+                        return None;
+                    }
+                    continue;
+                }
+                if x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2] {
                     if !seen.contains(&at) {
                         return None;
                     }
@@ -16991,24 +18076,61 @@ fn find_boiler(game: &Game<'_>, start: [i32; 3]) -> Option<(boiler::Boiler, Vec<
                 match name {
                     boiler::DISPERSER => dispersers.push(at),
                     boiler::ELEMENT => elements.push(at),
-                    "minecraft:air" | "minecraft:cave_air" => {}
+                    n if is_air(n) => {}
                     _ => return None,
                 }
             }
         }
     }
-    // One full layer of dispersers, with the elements below it.
-    let layer = dispersers.first()?[1];
-    let inner = (size(0) - 2) * (size(2) - 2);
-    if dispersers.len() as u64 != inner || dispersers.iter().any(|d| d[1] != layer) || elements.is_empty() || elements.iter().any(|e| e[1] >= layer) {
+    // A full plane of dispersers at the height of the first one, and no others.
+    let first_disperser = *dispersers.first()?;
+    let layer = first_disperser[1];
+    if elements.is_empty() {
         return None;
     }
-    b.elements = elements.len() as u64;
-    b.water_volume = inner * (layer - lo[1] - 1) as u64;
-    b.steam_volume = inner * (hi[1] - layer - 1) as u64;
-    if b.water_volume == 0 || b.steam_volume == 0 {
+    let mut left: std::collections::HashSet<[i32; 3]> = dispersers.iter().copied().collect();
+    for x in 1..(size(0) as i32 - 1) {
+        for z in 1..(size(2) as i32 - 1) {
+            if !left.remove(&[lo[0] + x, layer, lo[2] + z]) {
+                return None;
+            }
+        }
+    }
+    if !left.is_empty() {
         return None;
     }
+    // The elements are one piece, below the dispersers.
+    let element_count = explore(elements[0], &|p| p[1] < layer && block_name(game, p) == boiler::ELEMENT);
+    if elements.len() as u64 > element_count {
+        return None;
+    }
+    b.elements = element_count;
+    // The water: the air and casing under the dispersers, all in one piece.
+    let air_or_frame = |p: [i32; 3]| {
+        let n = block_name(game, p);
+        is_air(n) || boiler::is_frame(n)
+    };
+    let mut init_air = None;
+    let mut total_air = 0u64;
+    for x in lo[0]..lo[0] + size(0) as i32 {
+        for y in lo[1]..layer {
+            for z in lo[2]..lo[2] + size(2) as i32 {
+                if air_or_frame([x, y, z]) {
+                    init_air = Some([x, y, z]);
+                    total_air += 1;
+                }
+            }
+        }
+    }
+    let water = explore(init_air?, &|p| {
+        p[1] >= lo[1] - 1 && p[1] < layer && p[0] >= lo[0] && p[0] < lo[0] + size(0) as i32 && p[2] >= lo[2] && p[2] < lo[2] + size(2) as i32 && air_or_frame(p)
+    });
+    if total_air > water {
+        return None;
+    }
+    b.water_volume = water;
+    let steam_height = i64::from(lo[1]) + size(1) as i64 - 2 - i64::from(layer);
+    b.steam_volume = size(2) * size(0) * steam_height.max(0) as u64;
     // Heaters against a wall, outside the box.
     let mut heaters = Vec::new();
     for x in lo[0] - 1..=hi[0] + 1 {
@@ -17264,45 +18386,245 @@ pub(super) fn use_boiler(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 // --- Industrial Turbine ------------------------------------------------------------------------------
 
 const TURBINE_VALVE: &str = "mekanismgenerators:turbine_valve";
+const TURBINE_ROTOR: &str = "mekanismgenerators:turbine_rotor";
+const TURBINE_BLADE: &str = "mekanismgenerators:turbine_blade";
+
+thread_local! {
+    /// The blades each loaded rotor houses, kept for the block's removal (the block entity is gone by then).
+    static ROTOR_BLADES: std::cell::RefCell<std::collections::HashMap<[i32; 3], u32>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn remember_blades(pos: [i32; 3], blades: u32) {
+    ROTOR_BLADES.with_borrow_mut(|m| {
+        if blades > 0 {
+            m.insert(pos, blades);
+        } else {
+            m.remove(&pos);
+        }
+    });
+}
+
+/// The blades a rotor houses; none when there is no rotor.
+fn rotor_blades(game: &mut Game<'_>, pos: [i32; 3]) -> Option<u32> {
+    game.native_with_mod_block_entity(pos, |m| (kind(&m.id) == Some(Kind::TurbineRotor)).then(|| get_int(&m.nbt, "blades"))).flatten()
+}
+
+fn set_rotor_blades(game: &mut Game<'_>, pos: [i32; 3], blades: u32) {
+    game.native_with_mod_block_entity(pos, |m| put_int(&mut m.nbt, "blades", blades));
+    remember_blades(pos, blades);
+}
+
+/// `TileEntityTurbineRotor.addBlade`: the rotor below takes it first when it has room (`checkBelow`), then this
+/// one, then the ones above.
+fn add_blade(game: &mut Game<'_>, pos: [i32; 3], check_below: bool) -> bool {
+    let below = [pos[0], pos[1] - 1, pos[2]];
+    if check_below && rotor_blades(game, below).is_some_and(|b| b < 2) {
+        return add_blade(game, below, true);
+    }
+    match rotor_blades(game, pos) {
+        Some(b) if b < 2 => {
+            set_rotor_blades(game, pos, b + 1);
+            true
+        }
+        Some(_) => {
+            let above = [pos[0], pos[1] + 1, pos[2]];
+            rotor_blades(game, above).is_some() && add_blade(game, above, false)
+        }
+        None => false,
+    }
+}
+
+/// `TileEntityTurbineRotor.removeBlade`: the rotor above gives up its blades first, then this one, then the ones below.
+fn remove_blade(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    let above = [pos[0], pos[1] + 1, pos[2]];
+    if rotor_blades(game, above).is_some_and(|b| b > 0) {
+        return remove_blade(game, above);
+    }
+    match rotor_blades(game, pos) {
+        Some(b) if b > 0 => {
+            set_rotor_blades(game, pos, b - 1);
+            true
+        }
+        Some(_) => {
+            let below = [pos[0], pos[1] - 1, pos[2]];
+            rotor_blades(game, below).is_some() && remove_blade(game, below)
+        }
+        None => false,
+    }
+}
+
+/// `BlockTurbineRotor.useItemOn` and `useWithoutItem`: a blade in hand (not sneaking) is added; an empty hand, or
+/// a sneaking one that holds a blade stack that is not full, takes one back; the rotor must house one for that.
+pub(super) fn use_turbine_rotor(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || block_name(game, pos) != TURBINE_ROTOR {
+        return false;
+    }
+    let sneaking = shift_down(game);
+    let selected = game.selected;
+    let held = game.inventory.get(selected).cloned().flatten();
+    let is_blade = held.as_ref().is_some_and(|h| &*h.item == TURBINE_BLADE);
+    if is_blade && !sneaking {
+        let held = held.unwrap();
+        if rotor_blades(game, pos).is_none() {
+            return false;
+        }
+        if add_blade(game, pos, true) && !game.creative {
+            let left = held.count - 1;
+            game.inventory[selected] = (left > 0).then(|| ItemStack { count: left, ..held });
+        }
+        return true;
+    }
+    let max = game.res.items().get(TURBINE_BLADE).map_or(64, |i| i.max_stack.max(1));
+    let may_remove = if sneaking {
+        held.as_ref().is_none_or(|h| is_blade && h.count < max)
+    } else {
+        true
+    };
+    if !may_remove || rotor_blades(game, pos).is_none_or(|b| b == 0) {
+        return false;
+    }
+    if remove_blade(game, pos) {
+        if game.native_give_items(TURBINE_BLADE, 1) == 0 {
+            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
+            game.native_drop_item(stack_of(TURBINE_BLADE, 1), at, [0, 1, 0]);
+        }
+    }
+    true
+}
+
+/// `TileEntityTurbineRotor.preRemoveSideEffects`: a broken rotor drops the blades it housed.
+pub(super) fn turbine_rotor_spill(game: &mut Game<'_>, pos: [i32; 3], old: &str, new: &str) {
+    if old == new || old != TURBINE_ROTOR || !game.native_on(MOD_ID) {
+        return;
+    }
+    let Some(n) = ROTOR_BLADES.with_borrow_mut(|m| m.remove(&pos)) else {
+        return;
+    };
+    let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+    game.native_drop_item(stack_of(TURBINE_BLADE, n), at, [0, 1, 0]);
+}
 
 /// `TurbineValidator`, simplified: the frame blocks joined to `start` must be exactly the shell of a
 /// box 3 to 17 on each side, with rotors, a rotational complex, pressure dispersers, coils, condensers
 /// or air inside; the steam is below the lowest disperser. The turbine and its valves.
 #[allow(clippy::type_complexity)]
-fn find_turbine(game: &Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, Vec<[i32; 3]>, [i32; 3], [i32; 3])> {
-    let (lo, hi, seen) = find_box(game, start, turbine::is_frame, turbine::MIN_SIZE, turbine::MAX_SIZE)?;
+fn find_turbine(game: &mut Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, Vec<[i32; 3]>, [i32; 3], [i32; 3])> {
+    // `TurbineValidator`: 5 x 3 x 5 to 17 x 18 x 17.
+    let (lo, hi, seen) = find_box_axes(game, start, turbine::is_frame, [5, 3, 5], [17, 18, 17])?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
     let mut t = turbine::Turbine { volume: size(0) * size(1) * size(2), ..Default::default() };
     let mut valves = Vec::new();
-    let mut disperser_y = None;
+    let mut vents = Vec::new();
+    let (mut rotors, mut dispersers, mut coils, mut condensers) = (Vec::new(), std::collections::HashSet::new(), std::collections::HashSet::new(), Vec::new());
+    let mut complex: Option<[i32; 3]> = None;
+    let (center_x, center_z) = (lo[0] + (size(0) as i32 - 1) / 2, lo[2] + (size(2) as i32 - 1) / 2);
     for x in lo[0]..=hi[0] {
         for y in lo[1]..=hi[1] {
             for z in lo[2]..=hi[2] {
                 let at = [x, y, z];
-                let shell = x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2];
                 let name = block_name(game, at);
-                if shell {
+                if on_box_edge(lo, hi, at) {
+                    // The edges are turbine casing only.
+                    if name != "mekanismgenerators:turbine_casing" {
+                        return None;
+                    }
+                } else if x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2] {
                     if !seen.contains(&at) {
                         return None;
                     }
                     match name {
                         TURBINE_VALVE => valves.push(at),
-                        "mekanismgenerators:turbine_vent" => t.vents += 1,
+                        "mekanismgenerators:turbine_vent" => vents.push(at),
                         _ => {}
                     }
                 } else {
-                    if !t.add_inside(name) {
-                        return None;
-                    }
-                    if name == "mekanism:pressure_disperser" {
-                        disperser_y = Some(disperser_y.map_or(y, |d: i32| d.min(y)));
+                    match name {
+                        "mekanismgenerators:rotational_complex" => {
+                            if complex.is_some() || x != center_x || z != center_z {
+                                return None;
+                            }
+                            complex = Some(at);
+                        }
+                        "mekanismgenerators:turbine_rotor" => {
+                            if x != center_x || z != center_z {
+                                return None;
+                            }
+                            rotors.push(at);
+                        }
+                        "mekanism:pressure_disperser" => {
+                            dispersers.insert(at);
+                        }
+                        "mekanismgenerators:electromagnetic_coil" => {
+                            coils.insert(at);
+                        }
+                        "mekanismgenerators:saturating_condenser" => condensers.push(at),
+                        "minecraft:air" | "minecraft:cave_air" => {}
+                        _ => return None,
                     }
                 }
             }
         }
     }
-    t.lower_volume = size(0) * size(2) * (disperser_y? - lo[1]) as u64;
-    (t.rotors > 0 && t.coils > 0).then_some((t, valves, lo, [size(0) as i32, size(1) as i32, size(2) as i32]))
+    // `postcheck`: odd length and width, the complex, the layer of dispersers around it, the rotors below it, the coils above.
+    if size(0) % 2 != 1 || size(2) % 2 != 1 {
+        return None;
+    }
+    let complex = complex?;
+    let rotor_count = i64::from(complex[1] - lo[1] + 1);
+    let inner_radius = (i64::from(size(0).min(size(2)) as i32) - 3) / 2;
+    if inner_radius < rotor_count / 4 || coils.is_empty() || dispersers.is_empty() {
+        return None;
+    }
+    let (radius_x, radius_z) = ((size(0) as i32 - 3) / 2, (size(2) as i32 - 3) / 2);
+    for x in complex[0] - radius_x..=complex[0] + radius_x {
+        for z in complex[2] - radius_z..=complex[2] + radius_z {
+            if (x != center_x || z != center_z) && !dispersers.remove(&[x, complex[1], z]) {
+                return None;
+            }
+        }
+    }
+    if !dispersers.is_empty() || condensers.iter().any(|c| c[1] <= complex[1]) {
+        return None;
+    }
+    // Rotors are contiguous from the complex down; any others are in the wrong place.
+    let mut height = 0u64;
+    for y in (lo[1] + 1..complex[1]).rev() {
+        let at = [center_x, y, center_z];
+        if !rotors.contains(&at) {
+            return None;
+        }
+        height += 1;
+    }
+    if height as usize != rotors.len() || height == 0 {
+        return None;
+    }
+    // `blades += rotor.getHousedBlades()`: a turbine with none does not form.
+    let blades: u64 = rotors.iter().map(|at| u64::from(rotor_blades(game, *at).unwrap_or(0))).sum();
+    if blades == 0 {
+        return None;
+    }
+    // The coils are one piece, up from the complex.
+    let mut found = std::collections::HashSet::new();
+    let mut todo = vec![[complex[0], complex[1] + 1, complex[2]]];
+    while let Some(at) = todo.pop() {
+        if block_name(game, at) != "mekanismgenerators:electromagnetic_coil" || !found.insert(at) {
+            continue;
+        }
+        for (_, d) in DIRECTIONS {
+            todo.push([at[0] + d[0], at[1] + d[1], at[2] + d[2]]);
+        }
+    }
+    if coils.len() > found.len() || vents.is_empty() || vents.iter().any(|v| v[1] < complex[1]) {
+        return None;
+    }
+    t.rotors = height;
+    t.blades = blades;
+    t.dispersers = (radius_x as u64 * 2 + 1) * (radius_z as u64 * 2 + 1) - 1;
+    t.coils = found.len() as u64;
+    t.condensers = condensers.len() as u64;
+    t.vents = vents.len() as u64;
+    t.lower_volume = size(0) * size(2) * height;
+    Some((t, valves, lo, [size(0) as i32, size(1) as i32, size(2) as i32]))
 }
 
 /// An Industrial Turbine valve. Once a second each valve checks its turbine; the first valve runs it: it
@@ -17312,6 +18634,7 @@ fn turbine_of(nbt: &Compound) -> turbine::Turbine {
     let g = |key: &str| get_long(nbt, key);
     turbine::Turbine {
         rotors: g("rotors"),
+        blades: g("blades"),
         dispersers: g("dispersers"),
         coils: g("coils"),
         condensers: g("condensers"),
@@ -17330,6 +18653,7 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
                 entity.nbt.insert("box".into(), Tag::IntArray(vec![lo[0], lo[1], lo[2], size[0], size[1], size[2]]));
                 for (key, v) in [
                     ("rotors", t.rotors),
+                    ("blades", t.blades),
                     ("dispersers", t.dispersers),
                     ("coils", t.coils),
                     ("condensers", t.condensers),
@@ -17344,6 +18668,7 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
             }
             None => {
                 put_long(&mut entity.nbt, "rotors", 0);
+                put_long(&mut entity.nbt, "blades", 0);
                 entity.nbt.remove(&JavaString::from("master"));
                 entity.nbt.remove(&JavaString::from("box"));
             }
@@ -17423,8 +18748,9 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
         let (x, z) = (b[0] + b[3] / 2, b[2] + b[5] / 2);
         let mut column = vec![x, z];
         for y in b[1] + 1..b[1] + b[4] - 1 {
-            if block_name(game, [x, y, z]) == "mekanismgenerators:turbine_rotor" {
+            if block_name(game, [x, y, z]) == TURBINE_ROTOR {
                 column.push(y);
+                column.push(rotor_blades(game, [x, y, z]).unwrap_or(0) as i32);
             }
         }
         shown.insert("rot_col".into(), Tag::IntArray(column));
@@ -21469,6 +22795,7 @@ fn miner_toggle_visuals(game: &Game<'_>) {
 /// The regions of the miners that show them (hook point `native_world_boxes`, API 41): one translucent box
 /// each, 0.01 inside the region (`RenderDigitalMiner`), white at the faces' brightness. Only within 64.
 pub(super) fn world_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    transporter_tint(game, boxes);
     let shown: Vec<[i32; 3]> = MINER_VISUALS.with_borrow(|v| v.iter().copied().collect());
     for pos in shown {
         let Some((id, c)) = game.native_client_block_entity(pos) else {
@@ -26614,6 +27941,10 @@ fn radial_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
             let angle = dy.atan2(dx).to_degrees();
             torus(game, batch, centre, angle - 180.0 / n as f32, size, RADIAL_INNER, RADIAL_OUTER, 0x4D_CCCCCC);
             torus(game, batch, centre, radial::start_angle(i, n), size, RADIAL_INNER, RADIAL_OUTER, 0xB3_999999);
+        }
+        // `shouldHideCrosshair`: the game's crosshair stays under the root radial and goes with a nested one.
+        if !ui.has_parent {
+            game.native_sprite(batch, "hud/crosshair", [0.0, 0.0, 15.0, 15.0], [centre[0] - 7.0, centre[1] - 7.0, 15.0, 15.0]);
         }
         let mut labels: Vec<([f32; 2], String, u32)> = vec![];
         ui.over_back = false;
