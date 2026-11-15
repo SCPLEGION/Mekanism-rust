@@ -7414,6 +7414,7 @@ fn tooltip_body(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_cli
     if let Some(name) = stack.item.strip_prefix("mekanism:") {
         tier_tooltip(name, lines);
     }
+    waste_barrel_tooltip(stack, lines);
     stored_tooltip(stack, lines);
     cardboard_tooltip(stack, lines);
     // `FormulaComponent.addToTooltip`: the distinct ingredients in order of first use, with how many times each is used.
@@ -7470,6 +7471,26 @@ fn tooltip_body(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_cli
     }
     // `MekanismLang.STORED_ENERGY.translateColored(BRIGHT_GREEN, GRAY, EnergyDisplay)`.
     lines.push(colored_line("tooltip.mekanism.stored_energy", enum_color::BRIGHT_GREEN, enum_color::GRAY, &[&mekanism_core::energy::format_fe(energy)]));
+}
+
+/// The `WASTE_DECAY` appender of the Radioactive Waste Barrel item: capacity and decay rate, INDIGO labels, GRAY values.
+fn waste_barrel_tooltip(stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    if &*stack.item != WASTE_BARREL {
+        return;
+    }
+    let (indigo, gray) = (enum_color::INDIGO, enum_color::GRAY);
+    lines.push(colored_line("capacity.mekanism.mb", indigo, gray, &[&thousands(waste_barrel_capacity())]));
+    let ticks = config_int("general", "radiation", "wasteBarrelProcessTicks", 20).max(1);
+    let amount = config_int("general", "radiation", "wasteBarrelDecayAmount", 1).max(0);
+    if amount == 0 || ticks == 1 {
+        lines.push(colored_line("waste_barrel.mekanism.decay_rate", indigo, gray, &[&thousands(amount as u64)]));
+    } else {
+        // `UnitDisplayUtils.roundDecimals(.., 4)` shown without trailing zeros.
+        let rate = format!("{:.4}", amount as f64 / ticks as f64);
+        let rate = rate.trim_end_matches('0').trim_end_matches('.').to_owned();
+        lines.push(colored_line("waste_barrel.mekanism.decay_rate", indigo, gray, &[&rate]));
+        lines.push(colored_line("waste_barrel.mekanism.decay_rate.actual", indigo, gray, &[&thousands(amount as u64), &thousands(ticks as u64)]));
+    }
 }
 
 /// The display name of a module (`module.<namespace>.<path>`), falling back to the title-cased id.
