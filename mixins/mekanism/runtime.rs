@@ -127,6 +127,8 @@ enum Kind {
     Transporter(u32),
     /// A turbine rotor and the blades (0 to 2) it houses.
     TurbineRotor,
+    /// An Obsidian TNT block: it lights itself from redstone.
+    ObsidianTnt,
     Infuser,
     Separator,
     GasGenerator,
@@ -290,6 +292,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanismgenerators:fission_reactor_port" => return Some(Kind::FissionPort),
         TURBINE_VALVE => return Some(Kind::TurbineValve),
         TURBINE_ROTOR => return Some(Kind::TurbineRotor),
+        OBSIDIAN_TNT => return Some(Kind::ObsidianTnt),
         fusion::PORT => return Some(Kind::FusionPort),
         sps::PORT => return Some(Kind::SpsPort),
         dynamic_tank::VALVE => return Some(Kind::DynamicValve),
@@ -708,6 +711,12 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::TurbineValve => tick_turbine_valve(game, pos, entity),
+            Kind::ObsidianTnt => {
+                if game.native_has_neighbor_signal(pos) {
+                    prime_obsidian_tnt(game, pos, false);
+                }
+                None
+            }
             Kind::TurbineRotor => {
                 remember_blades(pos, get_int(&entity.nbt, "blades"));
                 None
@@ -2757,6 +2766,27 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
             true
         });
     });
+    // `RenderObsidianTnt` through `TntRenderer`: the block's model, swelling over its last ten ticks and lit white
+    // every fifth tick.
+    for (_, at, _, fuse) in CLIENT_TNT.with_borrow(|v| v.clone()) {
+        let f = fuse as f32 + 1.0;
+        let scale = if f < 10.0 { 1.0 + (1.0 - f / 10.0).clamp(0.0, 1.0).powi(4) * 0.3 } else { 1.0 };
+        let lit = f >= 0.0 && (f / 5.0) as i32 % 2 == 0;
+        let cell = [at[0].floor() as i32, (at[1] + 0.5).floor() as i32, at[2].floor() as i32];
+        models.push(super::native_hooks::NativeWorldModel {
+            model: "mekanismadditions:obsidian_tnt".into(),
+            position: [at[0], at[1] + 0.49, at[2]],
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+            light_at: cell,
+            color: 0xFFFF_FFFF,
+            rotation: None,
+            full_bright: lit,
+            scale,
+            parts: Vec::new(),
+        });
+    }
     // `RenderRobit`: the model stands on the mob's feet, turned with its body (the window's client draws the
     // mob as its base type, which `mob_hidden` leaves out).
     for id in ROBITS.with_borrow(|set| set.iter().copied().collect::<Vec<u32>>()) {
@@ -9533,10 +9563,14 @@ fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
 /// the server, which spends the hydrogen.
 pub(super) fn client_tick(game: &mut Game<'_>) {
     if !game.native_window() && game.native_on(MOD_ID) {
+        obsidian_tnt_tick(game);
         radiation_server_tick(game);
         player_state_broadcast(game);
     }
     if game.native_window() && game.native_on(MOD_ID) {
+        for at in TNT_SOUNDS.with_borrow_mut(std::mem::take) {
+            game.audio.play("minecraft:entity.tnt.primed", Some(at), 1.0, 1.0);
+        }
         tweaker_key(game);
         seismic_open(game);
         pt_open(game);
@@ -9900,6 +9934,222 @@ fn set_custom_long(stack: &mut ItemStack, key: &str, value: u64) {
     if let Tag::Compound(c) = &mut extra.other[at].1 {
         put_long(c, key, value);
     }
+}
+
+// --- Obsidian TNT -----------------------------------------------------------------------------------
+
+const OBSIDIAN_TNT: &str = "mekanismadditions:obsidian_tnt";
+const TNT_CHANNEL: &str = "mekanismadditions:obsidian_tnt";
+/// `AdditionsConfig`: `obsidianTNTDelay` (5 seconds) and `obsidianTNTBlastRadius`.
+const TNT_DELAY: i32 = 100;
+const TNT_RADIUS: f32 = 12.0;
+/// `PrimedTnt` is 0.98 blocks wide and tall.
+const TNT_SIZE: f64 = 0.98;
+
+/// One primed Obsidian TNT, kept by the server (`EntityObsidianTNT`, a `PrimedTnt` with its own fuse and power).
+#[derive(Clone, Debug)]
+struct PrimedObsidian {
+    id: u32,
+    pos: [f64; 3],
+    vel: [f64; 3],
+    fuse: i32,
+    on_ground: bool,
+    /// Whether the clients play the fuse sound (a chain reaction's TNT is silent).
+    sound: bool,
+}
+
+thread_local! {
+    static PRIMED: std::cell::RefCell<Vec<PrimedObsidian>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PRIMED_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+    /// Blocks a player broke (they drop as items and do not light).
+    static TNT_BROKEN: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+    /// The client's view of them: the entity, and the ones it has already heard fuse for.
+    static TNT_SOUNDS: std::cell::RefCell<Vec<[f64; 3]>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TNT_SENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CLIENT_TNT: std::cell::RefCell<Vec<(u32, [f64; 3], [f64; 3], i32)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `BlockObsidianTNT.createAndAddEntity` and `wasExploded` (`short`: a random short fuse, no sound): the block goes
+/// and a primed TNT takes its place at the block's bottom centre, pushed along a random direction.
+fn prime_obsidian_tnt(game: &mut Game<'_>, pos: [i32; 3], short: bool) {
+    use horizon_core::random::RandomSource;
+    if block_name(game, pos) == OBSIDIAN_TNT {
+        game.native_set_block(pos, "minecraft:air", &[]);
+    }
+    let rot = game.world.random.next_double() * f64::from(std::f32::consts::TAU);
+    let fuse = if short { game.world.random.next_int_bound(TNT_DELAY / 4).unwrap_or(0) + TNT_DELAY / 8 } else { TNT_DELAY };
+    let id = PRIMED_ID.get();
+    PRIMED_ID.set(id.wrapping_add(1).max(1));
+    PRIMED.with_borrow_mut(|v| {
+        v.push(PrimedObsidian {
+            id,
+            pos: [f64::from(pos[0]) + 0.5, f64::from(pos[1]), f64::from(pos[2]) + 0.5],
+            vel: [-rot.sin() * 0.02, f64::from(0.2f32), -rot.cos() * 0.02],
+            fuse,
+            on_ground: false,
+            sound: !short,
+        });
+    });
+}
+
+/// A block player-broken by this click does not light when the break reports it gone.
+pub(super) fn obsidian_tnt_broken(game: &Game<'_>, pos: [i32; 3]) {
+    if block_name(game, pos) == OBSIDIAN_TNT {
+        TNT_BROKEN.with_borrow_mut(|s| {
+            s.insert(pos);
+        });
+    }
+}
+
+/// `BlockObsidianTNT.wasExploded` (and fire, a piston or a command): a block of it that goes without a player
+/// breaking it lights with a short fuse.
+pub(super) fn obsidian_tnt_removed(game: &mut Game<'_>, pos: [i32; 3], old: &str, new: &str) {
+    if old != OBSIDIAN_TNT || old == new || !game.native_on(MOD_ID) {
+        return;
+    }
+    if TNT_BROKEN.with_borrow_mut(|s| s.remove(&pos)) {
+        return;
+    }
+    // Only an explosion lights it: a block replaced by air with no player involved and the world's rule on.
+    if game.native_game_rule("tnt_explodes") == Some(0) || !is_air(new) {
+        return;
+    }
+    prime_obsidian_tnt(game, pos, true);
+}
+
+/// `TntBlock.useItemOn` through `onCaughtFire`: flint and steel or a fire charge lights it.
+pub(super) fn use_obsidian_tnt(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || block_name(game, pos) != OBSIDIAN_TNT {
+        return false;
+    }
+    let selected = game.selected;
+    let Some(Some(held)) = game.inventory.get(selected).cloned() else {
+        return false;
+    };
+    let flint = &*held.item == "minecraft:flint_and_steel";
+    if !flint && &*held.item != "minecraft:fire_charge" {
+        return false;
+    }
+    if game.native_game_rule("tnt_explodes") == Some(0) {
+        return true;
+    }
+    prime_obsidian_tnt(game, pos, false);
+    if !game.creative {
+        let mut stack = held;
+        if flint {
+            // `hurtAndBreak(1)`: the steel has 64 uses.
+            if stack.damage + 1 >= 64 {
+                game.inventory[selected] = None;
+            } else {
+                stack.damage += 1;
+                game.inventory[selected] = Some(stack);
+            }
+        } else {
+            let left = stack.count - 1;
+            game.inventory[selected] = (left > 0).then(|| ItemStack { count: left, ..stack });
+        }
+    }
+    true
+}
+
+/// Whether the cell stops a primed TNT.
+fn tnt_blocked(game: &Game<'_>, at: [f64; 3]) -> bool {
+    let cell = [at[0].floor() as i32, at[1].floor() as i32, at[2].floor() as i32];
+    let name = block_name(game, cell);
+    !is_air(name) && !cell_is_free(name) && !matches!(name, "minecraft:lava" | "minecraft:fire")
+}
+
+/// `PrimedTnt.tick` for the server's primed Obsidian TNT: gravity and drag, the ground's friction and bounce, the
+/// fuse; at 0 it explodes with the config's radius.
+fn obsidian_tnt_tick(game: &mut Game<'_>) {
+    TNT_BROKEN.with_borrow_mut(|s| s.clear());
+    let mut list = PRIMED.with_borrow_mut(std::mem::take);
+    if list.is_empty() && !TNT_SENT.get() {
+        return;
+    }
+    let half = TNT_SIZE / 2.0;
+    let mut exploded = Vec::new();
+    list.retain_mut(|t| {
+        t.vel[1] -= 0.04;
+        let want = t.vel;
+        let mut p = t.pos;
+        // Horizontal axes stop at a block in the way at the TNT's feet or head height.
+        for axis in [0, 2] {
+            let mut next = p;
+            next[axis] += want[axis];
+            let edge = next[axis] + half * want[axis].signum();
+            let mut probe = next;
+            probe[axis] = edge;
+            if tnt_blocked(game, [probe[0], probe[1] + 0.1, probe[2]]) || tnt_blocked(game, [probe[0], probe[1] + 0.9, probe[2]]) {
+                t.vel[axis] = 0.0;
+            } else {
+                p[axis] = next[axis];
+            }
+        }
+        let next_y = p[1] + want[1];
+        let below = want[1] < 0.0 && tnt_blocked(game, [p[0], next_y, p[2]]);
+        let above = want[1] > 0.0 && tnt_blocked(game, [p[0], next_y + TNT_SIZE, p[2]]);
+        if below {
+            p[1] = next_y.floor() + 1.0;
+            t.vel[1] = 0.0;
+        } else if above {
+            t.vel[1] = 0.0;
+        } else {
+            p[1] = next_y;
+        }
+        t.on_ground = below;
+        t.pos = p;
+        t.vel = [t.vel[0] * 0.98, t.vel[1] * 0.98, t.vel[2] * 0.98];
+        if t.on_ground {
+            t.vel = [t.vel[0] * 0.7, t.vel[1] * -0.5, t.vel[2] * 0.7];
+        }
+        t.fuse -= 1;
+        if t.fuse <= 0 {
+            exploded.push([t.pos[0], t.pos[1] + TNT_SIZE * 0.0625, t.pos[2]]);
+            return false;
+        }
+        true
+    });
+    PRIMED.with_borrow_mut(|v| {
+        // What exploded left a fresh one in the list (a chain reaction); keep both.
+        list.append(v);
+        *v = list.clone();
+    });
+    for center in exploded {
+        game.native_explode(center, TNT_RADIUS, false);
+    }
+    // Tell the clients where they are (`id, x, y, z, fuse, sound`), every tick as a tracked entity moves.
+    let now = PRIMED.with_borrow(|v| v.clone());
+    let mut data = Vec::with_capacity(now.len() * 33);
+    for t in &now {
+        data.extend_from_slice(&t.id.to_be_bytes());
+        for c in t.pos.iter().chain(t.vel.iter()) {
+            data.extend_from_slice(&(*c as f32).to_be_bytes());
+        }
+        data.extend_from_slice(&t.fuse.to_be_bytes());
+        data.push(u8::from(t.sound));
+        PRIMED.with_borrow_mut(|v| v.iter_mut().filter(|x| x.id == t.id).for_each(|x| x.sound = false));
+    }
+    TNT_SENT.set(!now.is_empty());
+    for to in game.native_online_players() {
+        game.native_send_to_player(to, TNT_CHANNEL, &data);
+    }
+}
+
+/// Client: the primed TNT the server tells of, and the fuse sound of each new one.
+fn obsidian_tnt_payload(data: &[u8]) {
+    let mut seen = Vec::new();
+    for chunk in data.chunks_exact(33) {
+        let id = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let f = |i: usize| f64::from(f32::from_be_bytes([chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]]));
+        let pos = [f(4), f(8), f(12)];
+        let fuse = i32::from_be_bytes([chunk[28], chunk[29], chunk[30], chunk[31]]);
+        if chunk[32] == 1 {
+            TNT_SOUNDS.with_borrow_mut(|v| v.push(pos));
+        }
+        seen.push((id, pos, [f(16), f(20), f(24)], fuse));
+    }
+    CLIENT_TNT.with_borrow_mut(|v| *v = seen);
 }
 
 // --- Configuration Card -----------------------------------------------------------------------------
@@ -28375,6 +28625,9 @@ pub(super) fn mob_died(game: &mut Game<'_>, kind: &str, at: [f64; 3], data: Opti
 
 /// The window's client got the Robits' ids.
 pub(super) fn client_payload(channel: &str, data: &[u8]) {
+    if channel == TNT_CHANNEL {
+        obsidian_tnt_payload(data);
+    }
     if channel == PT_CHANNEL {
         pt_payload(data);
     }
