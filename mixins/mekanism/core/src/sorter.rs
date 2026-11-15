@@ -183,11 +183,13 @@ impl Sorter {
             return (name.len() <= 4096 && !name.contains(['\n', '\t', '\r']) && snbt_id(name).is_some()).then(|| name.to_owned());
         }
         let name = name.trim().trim_start_matches(['#', '@']);
+        // A tag or mod id may have `WildcardMatcher`'s characters (`InputValidator.WILDCARD_CHARS`).
+        let wildcards = if kind == 0 { "" } else { "*?#" };
         let ok = !name.is_empty()
             && name.len() <= 64
             && name
                 .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-./:".contains(c));
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-./:".contains(c) || wildcards.contains(c));
         if !ok {
             return None;
         }
@@ -206,7 +208,7 @@ impl Sorter {
             Some(b'#') => in_tag(&filter[1..], item),
             Some(b'@') => item
                 .split_once(':')
-                .is_some_and(|(ns, _)| ns == &filter[1..]),
+                .is_some_and(|(ns, _)| crate::wildcard::matches(&filter[1..], ns)),
             // An item with components (`{id:"..",count:1,components:{..}}`): any stack of that item here; the
             // exact comparison is the caller's, who has the stack.
             Some(b'{') => snbt_id(filter) == Some(item),
@@ -249,6 +251,27 @@ impl Sorter {
             }
             None => self.disabled.push(f.clone()),
         }
+        true
+    }
+
+    /// Gives filter `index` another name, keeping its place, switch and options (`GuiTextFilter` editing an
+    /// existing filter). False if the name is the same, taken, or `index` is not a filter.
+    pub fn rename(&mut self, index: usize, new: String) -> bool {
+        let Some(old) = self.filters.get(index).cloned() else {
+            return false;
+        };
+        if old == new || self.filters.contains(&new) {
+            return false;
+        }
+        for d in &mut self.disabled {
+            if *d == old {
+                d.clone_from(&new);
+            }
+        }
+        if let Some(o) = self.opts.remove(&old) {
+            self.opts.insert(new.clone(), o);
+        }
+        self.filters[index] = new;
         true
     }
 
@@ -315,9 +338,12 @@ pub enum Op {
     SetColor,
     /// `SorterItemStackFilter.fuzzyMode`.
     Fuzzy,
+    /// A tag or mod filter's new name (the text window of an existing filter): `index` the filter, `value` its
+    /// kind (1 tag, 2 mod id), `name` the typed name.
+    Rename,
 }
 
-const OPS: [Op; 21] = [
+const OPS: [Op; 22] = [
     Op::Single,
     Op::RoundRobin,
     Op::AutoEject,
@@ -339,6 +365,7 @@ const OPS: [Op; 21] = [
     Op::AddNamed,
     Op::SetColor,
     Op::Fuzzy,
+    Op::Rename,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -382,6 +409,25 @@ impl Request {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wildcard_names_and_rename() {
+        assert_eq!(Sorter::named_filter(1, "c:ores/*").as_deref(), Some("#c:ores/*"));
+        assert_eq!(Sorter::named_filter(2, "mek*").as_deref(), Some("@mek*"));
+        assert_eq!(Sorter::named_filter(0, "minecraft:st*"), None);
+        let in_tag = |_: &str, _: &str| false;
+        assert!(Sorter::matches_item("@mek*", "mekanism:steel", &in_tag));
+        let mut s = Sorter::default();
+        s.filters = vec!["#a:b".into(), "@c".into()];
+        s.disabled.push("#a:b".into());
+        s.opts.insert("#a:b".into(), Opts { min: 3, ..Opts::default() });
+        assert!(s.rename(0, "#a:c".into()));
+        assert_eq!(s.filters[0], "#a:c");
+        assert_eq!(s.disabled, vec!["#a:c".to_owned()]);
+        assert_eq!(s.opts.get("#a:c").map(|o| o.min), Some(3));
+        assert!(!s.rename(0, "@c".into()));
+        assert!(!s.rename(0, "#a:c".into()));
+    }
+
     use super::*;
 
     #[test]

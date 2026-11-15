@@ -162,7 +162,7 @@ impl Filter {
         match self.kind {
             FilterKind::Item => self.name == block,
             FilterKind::Tag => in_tag(&self.name, block),
-            FilterKind::Mod => block.split_once(':').is_some_and(|(ns, _)| ns == self.name),
+            FilterKind::Mod => block.split_once(':').is_some_and(|(ns, _)| crate::wildcard::matches(&self.name, ns)),
         }
     }
 
