@@ -123,6 +123,8 @@ enum Kind {
     InductionPort,
     /// A logistical transporter and how many items it pulls at a time.
     Transporter(u32),
+    /// A turbine rotor and the blades (0 to 2) it houses.
+    TurbineRotor,
     Infuser,
     Separator,
     GasGenerator,
@@ -285,6 +287,7 @@ fn kind(id: &str) -> Option<Kind> {
         "mekanism:isotopic_centrifuge" => return Some(Kind::Centrifuge),
         "mekanismgenerators:fission_reactor_port" => return Some(Kind::FissionPort),
         TURBINE_VALVE => return Some(Kind::TurbineValve),
+        TURBINE_ROTOR => return Some(Kind::TurbineRotor),
         fusion::PORT => return Some(Kind::FusionPort),
         sps::PORT => return Some(Kind::SpsPort),
         dynamic_tank::VALVE => return Some(Kind::DynamicValve),
@@ -695,6 +698,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 None
             }
             Kind::TurbineValve => tick_turbine_valve(game, pos, entity),
+            Kind::TurbineRotor => {
+                remember_blades(pos, get_int(&entity.nbt, "blades"));
+                None
+            }
             Kind::FusionPort => {
                 tick_fusion_port(game, pos, entity);
                 None
@@ -2699,20 +2706,28 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
             let Some(Tag::IntArray(column)) = c.get(&JavaString::from("rot_col")) else {
                 return true;
             };
-            if column.len() < 3 {
+            // [x, z, then each rotor's y and the blades it houses, from the bottom].
+            if column.len() < 4 {
                 return true;
             }
-            let rotors = column.len() - 2;
+            let rotors = (column.len() - 2) / 2;
             if turns.len() != rotors {
                 *turns = vec![[0.0; 2]; rotors];
             }
             let speed = get_int(c, "rot_flow") as f32 / 1000.0 * 512.0;
             for (i, turn) in turns.iter_mut().enumerate() {
+                let (y, housed) = (column[2 + i * 2], column[3 + i * 2]);
+                // `RenderTurbineRotor`: no blades, nothing to draw (and nothing turns); the lower blade
+                // with one, the upper one too with two.
+                if housed <= 0 {
+                    continue;
+                }
                 let base = i * 2;
                 turn[0] = (turn[0] + speed / (base + 1) as f32) % 360.0;
                 turn[1] = (turn[1] + speed / (base + 2) as f32) % 360.0;
-                let at = [column[0], column[2 + i], column[1]];
-                for (k, (turn, up)) in [(turn[0], 0.25), (turn[1], 0.75)].into_iter().enumerate() {
+                let at = [column[0], y, column[1]];
+                let rings: &[(f32, f64)] = if housed >= 2 { &[(turn[0], 0.25), (turn[1], 0.75)] } else { &[(turn[0], 0.25)] };
+                for (k, (turn, up)) in rings.iter().copied().enumerate() {
                     models.push(super::native_hooks::NativeWorldModel {
                         model: format!("mekanismgenerators:turbine_blade_{}", (base + k).min(27)),
                         position: [f64::from(at[0]) + 0.5, f64::from(at[1]) + up, f64::from(at[2]) + 0.5],
@@ -18097,12 +18112,129 @@ pub(super) fn use_boiler(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 // --- Industrial Turbine ------------------------------------------------------------------------------
 
 const TURBINE_VALVE: &str = "mekanismgenerators:turbine_valve";
+const TURBINE_ROTOR: &str = "mekanismgenerators:turbine_rotor";
+const TURBINE_BLADE: &str = "mekanismgenerators:turbine_blade";
+
+thread_local! {
+    /// The blades each loaded rotor houses, kept for the block's removal (the block entity is gone by then).
+    static ROTOR_BLADES: std::cell::RefCell<std::collections::HashMap<[i32; 3], u32>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn remember_blades(pos: [i32; 3], blades: u32) {
+    ROTOR_BLADES.with_borrow_mut(|m| {
+        if blades > 0 {
+            m.insert(pos, blades);
+        } else {
+            m.remove(&pos);
+        }
+    });
+}
+
+/// The blades a rotor houses; none when there is no rotor.
+fn rotor_blades(game: &mut Game<'_>, pos: [i32; 3]) -> Option<u32> {
+    game.native_with_mod_block_entity(pos, |m| (kind(&m.id) == Some(Kind::TurbineRotor)).then(|| get_int(&m.nbt, "blades"))).flatten()
+}
+
+fn set_rotor_blades(game: &mut Game<'_>, pos: [i32; 3], blades: u32) {
+    game.native_with_mod_block_entity(pos, |m| put_int(&mut m.nbt, "blades", blades));
+    remember_blades(pos, blades);
+}
+
+/// `TileEntityTurbineRotor.addBlade`: the rotor below takes it first when it has room (`checkBelow`), then this
+/// one, then the ones above.
+fn add_blade(game: &mut Game<'_>, pos: [i32; 3], check_below: bool) -> bool {
+    let below = [pos[0], pos[1] - 1, pos[2]];
+    if check_below && rotor_blades(game, below).is_some_and(|b| b < 2) {
+        return add_blade(game, below, true);
+    }
+    match rotor_blades(game, pos) {
+        Some(b) if b < 2 => {
+            set_rotor_blades(game, pos, b + 1);
+            true
+        }
+        Some(_) => {
+            let above = [pos[0], pos[1] + 1, pos[2]];
+            rotor_blades(game, above).is_some() && add_blade(game, above, false)
+        }
+        None => false,
+    }
+}
+
+/// `TileEntityTurbineRotor.removeBlade`: the rotor above gives up its blades first, then this one, then the ones below.
+fn remove_blade(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    let above = [pos[0], pos[1] + 1, pos[2]];
+    if rotor_blades(game, above).is_some_and(|b| b > 0) {
+        return remove_blade(game, above);
+    }
+    match rotor_blades(game, pos) {
+        Some(b) if b > 0 => {
+            set_rotor_blades(game, pos, b - 1);
+            true
+        }
+        Some(_) => {
+            let below = [pos[0], pos[1] - 1, pos[2]];
+            rotor_blades(game, below).is_some() && remove_blade(game, below)
+        }
+        None => false,
+    }
+}
+
+/// `BlockTurbineRotor.useItemOn` and `useWithoutItem`: a blade in hand (not sneaking) is added; an empty hand, or
+/// a sneaking one that holds a blade stack that is not full, takes one back; the rotor must house one for that.
+pub(super) fn use_turbine_rotor(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || block_name(game, pos) != TURBINE_ROTOR {
+        return false;
+    }
+    let sneaking = shift_down(game);
+    let selected = game.selected;
+    let held = game.inventory.get(selected).cloned().flatten();
+    let is_blade = held.as_ref().is_some_and(|h| &*h.item == TURBINE_BLADE);
+    if is_blade && !sneaking {
+        let held = held.unwrap();
+        if rotor_blades(game, pos).is_none() {
+            return false;
+        }
+        if add_blade(game, pos, true) && !game.creative {
+            let left = held.count - 1;
+            game.inventory[selected] = (left > 0).then(|| ItemStack { count: left, ..held });
+        }
+        return true;
+    }
+    let max = game.res.items().get(TURBINE_BLADE).map_or(64, |i| i.max_stack.max(1));
+    let may_remove = if sneaking {
+        held.as_ref().is_none_or(|h| is_blade && h.count < max)
+    } else {
+        true
+    };
+    if !may_remove || rotor_blades(game, pos).is_none_or(|b| b == 0) {
+        return false;
+    }
+    if remove_blade(game, pos) {
+        if game.native_give_items(TURBINE_BLADE, 1) == 0 {
+            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
+            game.native_drop_item(stack_of(TURBINE_BLADE, 1), at, [0, 1, 0]);
+        }
+    }
+    true
+}
+
+/// `TileEntityTurbineRotor.preRemoveSideEffects`: a broken rotor drops the blades it housed.
+pub(super) fn turbine_rotor_spill(game: &mut Game<'_>, pos: [i32; 3], old: &str, new: &str) {
+    if old == new || old != TURBINE_ROTOR || !game.native_on(MOD_ID) {
+        return;
+    }
+    let Some(n) = ROTOR_BLADES.with_borrow_mut(|m| m.remove(&pos)) else {
+        return;
+    };
+    let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+    game.native_drop_item(stack_of(TURBINE_BLADE, n), at, [0, 1, 0]);
+}
 
 /// `TurbineValidator`, simplified: the frame blocks joined to `start` must be exactly the shell of a
 /// box 3 to 17 on each side, with rotors, a rotational complex, pressure dispersers, coils, condensers
 /// or air inside; the steam is below the lowest disperser. The turbine and its valves.
 #[allow(clippy::type_complexity)]
-fn find_turbine(game: &Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, Vec<[i32; 3]>, [i32; 3], [i32; 3])> {
+fn find_turbine(game: &mut Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, Vec<[i32; 3]>, [i32; 3], [i32; 3])> {
     // `TurbineValidator`: 5 x 3 x 5 to 17 x 18 x 17.
     let (lo, hi, seen) = find_box_axes(game, start, turbine::is_frame, [5, 3, 5], [17, 18, 17])?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
@@ -18192,6 +18324,11 @@ fn find_turbine(game: &Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, V
     if height as usize != rotors.len() || height == 0 {
         return None;
     }
+    // `blades += rotor.getHousedBlades()`: a turbine with none does not form.
+    let blades: u64 = rotors.iter().map(|at| u64::from(rotor_blades(game, *at).unwrap_or(0))).sum();
+    if blades == 0 {
+        return None;
+    }
     // The coils are one piece, up from the complex.
     let mut found = std::collections::HashSet::new();
     let mut todo = vec![[complex[0], complex[1] + 1, complex[2]]];
@@ -18207,6 +18344,7 @@ fn find_turbine(game: &Game<'_>, start: [i32; 3]) -> Option<(turbine::Turbine, V
         return None;
     }
     t.rotors = height;
+    t.blades = blades;
     t.dispersers = (radius_x as u64 * 2 + 1) * (radius_z as u64 * 2 + 1) - 1;
     t.coils = found.len() as u64;
     t.condensers = condensers.len() as u64;
@@ -18222,6 +18360,7 @@ fn turbine_of(nbt: &Compound) -> turbine::Turbine {
     let g = |key: &str| get_long(nbt, key);
     turbine::Turbine {
         rotors: g("rotors"),
+        blades: g("blades"),
         dispersers: g("dispersers"),
         coils: g("coils"),
         condensers: g("condensers"),
@@ -18240,6 +18379,7 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
                 entity.nbt.insert("box".into(), Tag::IntArray(vec![lo[0], lo[1], lo[2], size[0], size[1], size[2]]));
                 for (key, v) in [
                     ("rotors", t.rotors),
+                    ("blades", t.blades),
                     ("dispersers", t.dispersers),
                     ("coils", t.coils),
                     ("condensers", t.condensers),
@@ -18254,6 +18394,7 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
             }
             None => {
                 put_long(&mut entity.nbt, "rotors", 0);
+                put_long(&mut entity.nbt, "blades", 0);
                 entity.nbt.remove(&JavaString::from("master"));
                 entity.nbt.remove(&JavaString::from("box"));
             }
@@ -18333,8 +18474,9 @@ fn tick_turbine_valve(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
         let (x, z) = (b[0] + b[3] / 2, b[2] + b[5] / 2);
         let mut column = vec![x, z];
         for y in b[1] + 1..b[1] + b[4] - 1 {
-            if block_name(game, [x, y, z]) == "mekanismgenerators:turbine_rotor" {
+            if block_name(game, [x, y, z]) == TURBINE_ROTOR {
                 column.push(y);
+                column.push(rotor_blades(game, [x, y, z]).unwrap_or(0) as i32);
             }
         }
         shown.insert("rot_col".into(), Tag::IntArray(column));
