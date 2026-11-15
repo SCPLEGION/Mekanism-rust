@@ -495,6 +495,14 @@ def build_module(ns, out):
                         if (d / ns / "textures/block/nutritional_liquifier.png").is_file()), None)
         if blade is not None and texture is not None:
             worn_models.build_element_world_model(ns, "liquifier_blade", json.loads(blade.read_text()), texture, out, report)
+    if ns == "mekanismadditions":
+        # Obsidian TNT as a primed entity: the mod keeps the entity itself and draws the block's model, swelling.
+        tnt = next((d / ns / "models/block/obsidian_tnt.json" for d in search
+                    if (d / ns / "models/block/obsidian_tnt.json").is_file()), None)
+        texture = next((d / ns / "textures/block/models/obsidian_tnt.png" for d in search
+                        if (d / ns / "textures/block/models/obsidian_tnt.png").is_file()), None)
+        if tnt is not None and texture is not None:
+            worn_models.build_element_world_model(ns, "obsidian_tnt", json.loads(tnt.read_text()), texture, out, report)
     if ns == "mekanism":
         # The Robit (`RenderRobit`): its element model, the glowing eyes and back light apart from the body.
         # The Robit item (`RenderRobitItem`) draws its base skin model; Horizon has no such special model, so the item
