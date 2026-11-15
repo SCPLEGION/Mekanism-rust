@@ -19,6 +19,9 @@ pub struct Opts {
     pub max: u16,
     /// A transporter colour (`EnumColor` ordinal), none for default.
     pub color: Option<u8>,
+    /// `SorterItemStackFilter.fuzzyMode`: an item filter takes any stack of its item; off, only one with no
+    /// components of its own (the filter keeps the item alone).
+    pub fuzzy: bool,
 }
 
 impl Default for Opts {
@@ -29,6 +32,7 @@ impl Default for Opts {
             min: 0,
             max: 64,
             color: None,
+            fuzzy: false,
         }
     }
 }
@@ -53,12 +57,13 @@ impl Opts {
 
     fn save(&self) -> String {
         format!(
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
             u8::from(self.allow_default),
             u8::from(self.size_mode),
             self.min,
             self.max,
-            self.color.map_or(-1, i32::from)
+            self.color.map_or(-1, i32::from),
+            u8::from(self.fuzzy)
         )
     }
 
@@ -76,6 +81,7 @@ impl Opts {
                 .ok()
                 .and_then(|c| u8::try_from(c).ok())
                 .filter(|c| *c < 16),
+            fuzzy: f.next() == Some("1"),
         };
         Opts::valid_range(o.min, o.max).then_some(o)
     }
@@ -294,9 +300,11 @@ pub enum Op {
     AddNamed,
     /// The colour: `value` is the dye + 1, or 0 for none.
     SetColor,
+    /// `SorterItemStackFilter.fuzzyMode`.
+    Fuzzy,
 }
 
-const OPS: [Op; 20] = [
+const OPS: [Op; 21] = [
     Op::Single,
     Op::RoundRobin,
     Op::AutoEject,
@@ -317,6 +325,7 @@ const OPS: [Op; 20] = [
     Op::Range,
     Op::AddNamed,
     Op::SetColor,
+    Op::Fuzzy,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -361,6 +370,13 @@ impl Request {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzzy_mode_saves_and_old_saves_load() {
+        let o = Opts { fuzzy: true, ..Opts::default() };
+        assert_eq!(Opts::load(&o.save()), Some(o));
+        assert_eq!(Opts::load("0\t0\t0\t64\t-1"), Some(Opts::default()));
+    }
 
     #[test]
     fn filters_toggle_and_round_trip() {

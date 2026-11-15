@@ -6431,7 +6431,11 @@ fn tick_sorter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
         let ranged = opts.filter(|o| o.size_mode && !settings.single_item);
         let take = ranged.map_or(max, |o| u32::from(o.max).clamp(1, max));
         let wanted = |s: &ItemStack| match filter {
-            Some(f) => Sorter::matches_item(f, &s.item, &in_tag),
+            // An item filter that is not fuzzy takes only a plain stack of its item (`itemType.equals(toCheck)`).
+            Some(f) => {
+                Sorter::matches_item(f, &s.item, &in_tag)
+                    && (f.starts_with(['#', '@']) || settings.opts_of(f).fuzzy || (s.damage == 0 && s.extra.is_none()))
+            }
             None => settings.auto_eject_allows(&s.item, &in_tag),
         };
         let stack = game.native_extract_item_where(back, back_face, take, &wanted);
@@ -23017,6 +23021,9 @@ fn sorter_payload(game: &mut Game<'_>, data: &[u8]) {
             sorter::Op::SizeMode => {
                 s.edit(index, |o| o.size_mode = !o.size_mode);
             }
+            sorter::Op::Fuzzy => {
+                s.edit(index, |o| o.fuzzy = !o.fuzzy);
+            }
             sorter::Op::ColorNext | sorter::Op::ColorPrevious => {
                 let next = r.op == sorter::Op::ColorNext;
                 s.edit(index, |o| o.color = sorter::Opts::step_color(o.color, next));
@@ -23478,6 +23485,8 @@ const FILTER_DELETE: [f32; 4] = [24.0, 62.0, 60.0, 20.0];
 const FILTER_SAVE: [f32; 4] = [86.0, 62.0, 60.0, 20.0];
 const FILTER_DEFAULT: [f32; 4] = [148.0, 18.0, 11.0, 11.0];
 const FILTER_SIZE: [f32; 4] = [148.0, 56.0, 11.0, 11.0];
+/// `GuiSorterItemStackFilter`'s fuzzy button (its text is at 159, 71).
+const FILTER_FUZZY: [f32; 4] = [148.0, 68.0, 11.0, 11.0];
 const FILTER_COLOR: [f32; 4] = [8.0, 44.0, 16.0, 16.0];
 const FILTER_MIN: [f32; 4] = [174.0, 31.0, 20.0, 11.0];
 const FILTER_MAX: [f32; 4] = [174.0, 43.0, 20.0, 11.0];
@@ -23661,6 +23670,10 @@ fn draw_filter_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
             draw_button(game, batch, screen(FILTER_SIZE), hover(FILTER_SIZE), true, 0xFFFF_FFFF, Some(("button/silk_touch", 11.0)));
             let size_text = if view.single && o.size_mode { "\u{a7}con!" } else if o.size_mode { "on" } else { "off" };
             game.native_text(batch, size_text, [x + 159.0, y + 58.0], 0x40_4040, false);
+            if e.kind == 0 {
+                draw_button(game, batch, screen(FILTER_FUZZY), hover(FILTER_FUZZY), true, 0xFFFF_FFFF, Some(("button/fuzzy", 11.0)));
+                game.native_text(batch, if o.fuzzy { "on" } else { "off" }, [x + 159.0, y + 71.0], 0x40_4040, false);
+            }
             game.native_text(batch, "Min:", [x + 146.0, y + 32.0], 0x40_4040, false);
             game.native_text(batch, "Max:", [x + 146.0, y + 44.0], 0x40_4040, false);
             for (r, t) in [(FILTER_MIN, &e.min), (FILTER_MAX, &e.max)] {
@@ -23737,6 +23750,11 @@ fn filter_window_click(game: &Game<'_>, pos: [i32; 3], view: &SorterView, at: [f
             Some(i) => send_sorter(game, Op::AllowDefault, pos, i),
             None => draft(&|o| o.allow_default = !o.allow_default),
         }
+    } else if sorter && kind == 0 && on(FILTER_FUZZY) {
+        match index {
+            Some(i) => send_sorter(game, Op::Fuzzy, pos, i),
+            None => draft(&|o| o.fuzzy = !o.fuzzy),
+        }
     } else if sorter && on(FILTER_SIZE) {
         match index {
             Some(i) => send_sorter(game, Op::SizeMode, pos, i),
@@ -23808,6 +23826,9 @@ fn filter_window_save(game: &Game<'_>, pos: [i32; 3], view: &SorterView, index: 
             }
             if draft.size_mode {
                 send_sorter(game, Op::SizeMode, pos, at);
+            }
+            if draft.fuzzy && kind == 0 {
+                send_sorter(game, Op::Fuzzy, pos, at);
             }
             if let Some(c) = draft.color {
                 send_sorter_value(game, Op::SetColor, pos, at, u16::from(c) + 1);
