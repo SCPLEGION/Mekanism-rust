@@ -9096,7 +9096,9 @@ fn jetpack_capacity(stack: &ItemStack) -> u64 {
     } else if &*stack.item == flamethrower::ITEM {
         gear_int("flamethrower.capacity", flamethrower::CAPACITY)
     } else if &*stack.item == modules::BODYARMOR {
-        gear_int("mekasuit.jetpackMaxStorage", modules::SUIT_JETPACK_CAPACITY)
+        // `ItemMekaSuitArmor`: the tank holds `mekaSuitJetpackMaxStorage` per installed Jetpack Unit, none without one.
+        let count = u64::from(installed_modules(stack).get("mekanism:jetpack_unit").copied().unwrap_or(0));
+        gear_int("mekasuit.jetpackMaxStorage", modules::SUIT_JETPACK_CAPACITY) * count
     } else {
         gear_int("jetpack.capacity", gear::JETPACK_CAPACITY)
     }
@@ -27001,6 +27003,14 @@ fn stn_payload(game: &mut Game<'_>, data: &[u8]) {
             kept.remove(&JavaString::from(id));
         }
         write_modules(held, &installed, kept);
+        // `IModule.onRemoved` (`ModuleEnergyUnit`, `ModuleJetpackUnit`): what no longer fits the smaller tanks is lost.
+        if let Some(e) = item_energy_of(held) {
+            set_energy(held, stored_energy(held).min(e.capacity));
+        }
+        if is_jetpack(held) {
+            let fuel = jetpack_fuel(held);
+            set_jetpack_fuel(held, fuel);
+        }
         Some(ItemStack { count: took, ..item })
     });
     if let Some(Some(stack)) = out {
