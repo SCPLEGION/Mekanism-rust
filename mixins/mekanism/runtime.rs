@@ -17434,6 +17434,37 @@ fn plain(stack: &ItemStack) -> bool {
     stack.damage == 0 && stack.extra.is_none()
 }
 
+/// What a network files a stack under: the bare id for a plain one, else its whole item as SNBT (the id, the
+/// damage and the components, no count), so two enchanted swords of different enchantments stay two types.
+fn net_key(stack: &ItemStack) -> String {
+    if plain(stack) {
+        return stack.item.to_string();
+    }
+    horizon_client::snbt::to_snbt(&horizon_items::item_nbt::item_to_nbt(&ItemStack { count: 1, ..stack.clone() }))
+}
+
+thread_local! {
+    static QIO_KEYS: std::cell::RefCell<std::collections::HashMap<String, ItemStack>> = std::cell::RefCell::new(Default::default());
+}
+
+/// The stack a network key stands for, `count` of it.
+fn qio_stack(key: &str, count: u32) -> ItemStack {
+    if !key.starts_with('{') {
+        return stack_of(key, count);
+    }
+    let proto = QIO_KEYS.with_borrow_mut(|m| {
+        m.entry(key.to_owned())
+            .or_insert_with(|| horizon_items::item_data::parse_stack(key).ok().flatten().unwrap_or_else(|| stack_of("minecraft:air", 1)))
+            .clone()
+    });
+    ItemStack { count, ..proto }
+}
+
+/// The item id behind a network key.
+fn qio_id(key: &str) -> String {
+    if key.starts_with('{') { qio_stack(key, 1).item.to_string() } else { key.to_owned() }
+}
+
 /// The bin with what its output slot shows put back in it (the output slot is a window on the bin for
 /// hoppers below; the bin refills it each tick).
 fn settle_bin(entity: &mut ModBlockEntity, tier: BaseTier) -> Bin {
@@ -17656,10 +17687,10 @@ fn save_network(game: &mut Game<'_>, net: &qio::Network, at: &[([i32; 3], usize)
 /// Puts the plain stacks of `slots` into the network, keeping what doesn't fit.
 fn return_to_network(net: &mut qio::Network, slots: &mut [Option<ItemStack>]) {
     for slot in slots.iter_mut() {
-        let Some(s) = slot.clone().filter(plain) else {
+        let Some(s) = slot.clone() else {
             continue;
         };
-        let took = net.insert(&s.item, u64::from(s.count)) as u32;
+        let took = net.insert(&net_key(&s), u64::from(s.count)) as u32;
         *slot = (s.count > took).then(|| ItemStack { count: s.count - took, ..s });
     }
 }
@@ -17771,7 +17802,7 @@ fn tick_exporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     let in_tag = |tag: &str, item: &str| world_items!(game).item_tags.get(tag).is_some_and(|t| t.contains(item));
     let stored = net.list();
     let pick = |filter: Option<&String>| -> Option<String> {
-        stored.iter().find(|(item, n)| *n > 0 && filter.is_none_or(|f| Sorter::matches_item(f, item, &in_tag))).map(|(item, _)| item.clone())
+        stored.iter().find(|(item, n)| *n > 0 && filter.is_none_or(|f| Sorter::matches_item(f, &qio_id(item), &in_tag))).map(|(item, _)| item.clone())
     };
     let count = active.len().max(1);
     let start = if settings.round_robin { get_int(&entity.nbt, "round_robin_at") as usize % count } else { 0 };
@@ -17790,11 +17821,11 @@ fn tick_exporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     if settings.round_robin {
         put_int(&mut entity.nbt, "round_robin_at", ((i + 1) % count) as u32);
     }
-    let n = net.extract(&item, u64::from(qio::TRANSIT_COUNT.min(max_stack(game, &item)))) as u32;
+    let n = net.extract(&item, u64::from(qio::TRANSIT_COUNT.min(max_stack(game, &qio_id(&item))))) as u32;
     if n == 0 {
         return;
     }
-    if let Some(rest) = game.native_insert_item(back, face, stack_of(&item, n)) {
+    if let Some(rest) = game.native_insert_item(back, face, qio_stack(&item, n)) {
         net.insert(&item, u64::from(rest.count));
     }
     save_network(game, &net, &at);
@@ -30354,11 +30385,12 @@ fn portable_qio_use(game: &mut Game<'_>, claimed: &mut bool) {
 fn put_stack(out: &mut Vec<u8>, s: &Option<ItemStack>) {
     match s {
         Some(s) => {
+            let key = net_key(s);
             out.extend((s.count.min(65_535) as u16).to_be_bytes());
-            out.push(s.item.len() as u8);
-            out.extend(s.item.bytes());
+            out.extend((key.len().min(65_535) as u16).to_be_bytes());
+            out.extend(&key.as_bytes()[..key.len().min(65_535)]);
         }
-        None => out.extend([0, 0, 0]),
+        None => out.extend([0, 0, 0, 0]),
     }
 }
 
@@ -30437,8 +30469,8 @@ fn pq_push_items(game: &mut Game<'_>, fresh: bool) {
     let list = net.as_ref().map(|(_, n, _)| n.list()).unwrap_or_default();
     out.extend((list.len() as u32).to_be_bytes());
     for (item, count) in list {
-        out.push(item.len() as u8);
-        out.extend(item.bytes());
+        out.extend((item.len().min(65_535) as u16).to_be_bytes());
+        out.extend(&item.as_bytes()[..item.len().min(65_535)]);
         out.extend(count.to_be_bytes());
     }
     game.native_send_to_player(player.uuid, PQ_CHANNEL, &out);
@@ -30450,26 +30482,16 @@ const PQ_WINDOWS: usize = 3;
 const PQ_WINDOWS_KEY: &str = "mekanism:crafting_windows";
 type PqWindows = Vec<Vec<Option<ItemStack>>>;
 
-fn win_encode(w: &PqWindows) -> String {
-    w.iter()
-        .map(|win| win.iter().map(|s| s.as_ref().map_or(String::new(), |s| format!("{}*{}", s.item, s.count))).collect::<Vec<_>>().join(","))
-        .collect::<Vec<_>>()
-        .join("|")
+fn win_encode(w: &PqWindows) -> Compound {
+    let mut c = Compound::new();
+    for (i, win) in w.iter().enumerate() {
+        c.insert(format!("w{i}").as_str().into(), horizon_items::item_nbt::encode_items(win));
+    }
+    c
 }
 
-fn win_decode(text: &str) -> PqWindows {
-    let mut w: PqWindows = vec![vec![None; 9]; PQ_WINDOWS];
-    for (i, win) in text.split('|').take(PQ_WINDOWS).enumerate() {
-        for (j, cell) in win.split(',').take(9).enumerate() {
-            if let Some((id, n)) = cell.split_once('*')
-                && let Ok(n) = n.parse::<u32>()
-                && n > 0
-            {
-                w[i][j] = Some(stack_of(id, n));
-            }
-        }
-    }
-    w
+fn win_decode(c: Option<&Compound>) -> PqWindows {
+    (0..PQ_WINDOWS).map(|i| horizon_items::item_nbt::decode_items(c.and_then(|c| c.get(&JavaString::from(format!("w{i}").as_str()))), 9)).collect()
 }
 
 fn pq_source(game: &mut Game<'_>) -> Option<Option<[i32; 3]>> {
@@ -30478,23 +30500,30 @@ fn pq_source(game: &mut Game<'_>) -> Option<Option<[i32; 3]>> {
 }
 
 fn pq_windows(game: &mut Game<'_>) -> PqWindows {
-    let text = match pq_source(game) {
-        Some(Some(pos)) => game.native_with_mod_block_entity(pos, |m| get_string(&m.nbt, PQ_WINDOWS_KEY)).flatten(),
-        Some(None) => pq_held(game).and_then(|h| custom_data(&h).and_then(|c| get_string(c, PQ_WINDOWS_KEY))),
+    let stored = match pq_source(game) {
+        Some(Some(pos)) => game.native_with_mod_block_entity(pos, |m| match m.nbt.get(&JavaString::from(PQ_WINDOWS_KEY)) {
+            Some(Tag::Compound(c)) => Some(c.clone()),
+            _ => None,
+        })
+        .flatten(),
+        Some(None) => pq_held(game).and_then(|h| match custom_data(&h).and_then(|c| c.get(&JavaString::from(PQ_WINDOWS_KEY))) {
+            Some(Tag::Compound(c)) => Some(c.clone()),
+            _ => None,
+        }),
         None => None,
     };
-    win_decode(&text.unwrap_or_default())
+    win_decode(stored.as_ref())
 }
 
 fn pq_save_windows(game: &mut Game<'_>, w: &PqWindows) {
-    let text = win_encode(w);
+    let stored = win_encode(w);
     match pq_source(game) {
         Some(Some(pos)) => {
-            game.native_with_mod_block_entity(pos, |m| m.nbt.insert(PQ_WINDOWS_KEY.into(), Tag::String(text.as_str().into())));
+            game.native_with_mod_block_entity(pos, |m| m.nbt.insert(PQ_WINDOWS_KEY.into(), Tag::Compound(stored)));
         }
         Some(None) => {
             if let Some(stack) = game.held_mut().as_mut().filter(|s| &*s.item == qio::PORTABLE) {
-                set_custom_string(stack, PQ_WINDOWS_KEY, &text);
+                set_custom_compound(stack, PQ_WINDOWS_KEY, stored);
             }
         }
         None => {}
@@ -30525,7 +30554,7 @@ fn pq_craft_once(game: &mut Game<'_>, win: &mut [Option<ItemStack>], net: &mut q
         };
         if win[i].is_none() {
             win[i] = Some(r);
-        } else if !(plain(&r) && net.insert(&r.item, u64::from(r.count)) == u64::from(r.count)) {
+        } else if net.insert(&net_key(&r), u64::from(r.count)) != u64::from(r.count) {
             game.give_or_drop(r);
         }
     }
@@ -30533,19 +30562,20 @@ fn pq_craft_once(game: &mut Game<'_>, win: &mut [Option<ItemStack>], net: &mut q
         let Some(prev) = before[i].as_ref().filter(|p| win[i].is_none() && plain(p)) else {
             continue;
         };
-        let mut candidates: Vec<String> = vec![prev.item.to_string()];
-        candidates.extend(net.list().into_iter().map(|(id, _)| id).filter(|id| **id != *prev.item).take(256));
+        let prev_key = net_key(prev);
+        let mut candidates: Vec<String> = vec![prev_key.clone()];
+        candidates.extend(net.list().into_iter().map(|(id, _)| id).filter(|id| *id != prev_key).take(256));
         for c in candidates {
             let have = net.stored(&c);
             if have == 0 {
                 continue;
             }
-            let take = have.min(u64::from(max_stack(game, &c)));
-            win[i] = Some(stack_of(&c, 1));
+            let take = have.min(u64::from(max_stack(game, &qio_id(&c))));
+            win[i] = Some(qio_stack(&c, 1));
             if pq_result(game, win).is_some_and(|(r, _)| r == rid) {
                 let got = net.extract(&c, take) as u32;
                 if got > 0 {
-                    win[i] = Some(stack_of(&c, got));
+                    win[i] = Some(qio_stack(&c, got));
                     break;
                 }
             }
@@ -30652,8 +30682,8 @@ fn pq_window_op(game: &mut Game<'_>, op: u8, data: &[u8], name: &str) {
                     rest = if into_player {
                         let given = if plain(&s) { game.native_give_items(&s.item, s.count) } else { 0 };
                         (given < s.count).then(|| ItemStack { count: s.count - given, ..s })
-                    } else if let Some((_, n, _)) = net.as_mut().filter(|_| plain(&s)) {
-                        let put = n.insert(&s.item, u64::from(s.count)) as u32;
+                    } else if let Some((_, n, _)) = net.as_mut() {
+                        let put = n.insert(&net_key(&s), u64::from(s.count)) as u32;
                         (put < s.count).then(|| ItemStack { count: s.count - put, ..s })
                     } else {
                         Some(s)
@@ -30737,8 +30767,8 @@ fn pq_op_payload(game: &mut Game<'_>, data: &[u8]) {
     }
     let name = player.name.clone();
     let item_at = |at: usize| -> Option<String> {
-        let n = usize::from(*data.get(at)?);
-        String::from_utf8(data.get(at + 1..at + 1 + n)?.to_vec()).ok()
+        let n = usize::from(u16::from_be_bytes([*data.get(at)?, *data.get(at + 1)?]));
+        String::from_utf8(data.get(at + 2..at + 2 + n)?.to_vec()).ok()
     };
     let cursor = PQ_CURSORS.with_borrow(|c| c.get(&name).cloned());
     match op {
@@ -30751,7 +30781,7 @@ fn pq_op_payload(game: &mut Game<'_>, data: &[u8]) {
             let Some((_, mut net, at)) = pq_network(game) else {
                 return;
             };
-            let max = max_stack(game, &item);
+            let max = max_stack(game, &qio_id(&item));
             let stored = net.stored(&item);
             match cursor {
                 None if stored > 0 => {
@@ -30764,12 +30794,12 @@ fn pq_op_payload(game: &mut Game<'_>, data: &[u8]) {
                     };
                     let took = net.extract(&item, u64::from(n)) as u32;
                     if took > 0 {
-                        PQ_CURSORS.with_borrow_mut(|c| c.insert(name, stack_of(&item, took)));
+                        PQ_CURSORS.with_borrow_mut(|c| c.insert(name, qio_stack(&item, took)));
                         save_network(game, &net, &at);
                     }
                 }
                 // Middle click with the same item held: one more onto the stack.
-                Some(held) if button == 2 && *held.item == *item && plain(&held) && held.count < max && stored > 0 => {
+                Some(held) if button == 2 && net_key(&held) == item && held.count < max && stored > 0 => {
                     if net.extract(&item, 1) == 1 {
                         PQ_CURSORS.with_borrow_mut(|c| c.insert(name, ItemStack { count: held.count + 1, ..held }));
                         save_network(game, &net, &at);
@@ -30786,11 +30816,8 @@ fn pq_op_payload(game: &mut Game<'_>, data: &[u8]) {
             let Some((_, mut net, at)) = pq_network(game) else {
                 return;
             };
-            if !plain(&held) {
-                return;
-            }
             let add = if button == 0 { held.count } else { 1 };
-            let put = net.insert(&held.item, u64::from(add)) as u32;
+            let put = net.insert(&net_key(&held), u64::from(add)) as u32;
             if put > 0 {
                 let left = held.count - put;
                 PQ_CURSORS.with_borrow_mut(|c| {
@@ -30811,10 +30838,11 @@ fn pq_op_payload(game: &mut Game<'_>, data: &[u8]) {
             let Some((_, mut net, at)) = pq_network(game) else {
                 return;
             };
-            let n = net.stored(&item).min(u64::from(max_stack(game, &item))) as u32;
+            let n = net.stored(&item).min(u64::from(max_stack(game, &qio_id(&item)))) as u32;
             let took = net.extract(&item, u64::from(n)) as u32;
             if took > 0 {
-                let given = game.native_give_items(&item, took);
+                // A plain item goes where `Inventory.add` puts it; one with components needs the whole stack.
+                let given = if item.starts_with('{') { game.give_or_drop(qio_stack(&item, took)); took } else { game.native_give_items(&item, took) };
                 if given < took {
                     net.insert(&item, u64::from(took - given));
                 }
@@ -30844,8 +30872,8 @@ fn pq_op_payload(game: &mut Game<'_>, data: &[u8]) {
                     };
                     rest = if freq_first == (pass == 0) {
                         match pq_network(game) {
-                            Some((_, mut net, at)) if plain(&s) => {
-                                let put = net.insert(&s.item, u64::from(s.count)) as u32;
+                            Some((_, mut net, at)) => {
+                                let put = net.insert(&net_key(&s), u64::from(s.count)) as u32;
                                 if put > 0 {
                                     save_network(game, &net, &at);
                                 }
@@ -30949,9 +30977,9 @@ fn pq_payload(data: &[u8]) {
             [next.items, next.item_cap, next.types, next.type_cap] = nums;
             let mut stack = |at: &mut usize| -> Option<Option<(String, u32)>> {
                 let count = u16::from_be_bytes([*data.get(*at)?, *data.get(*at + 1)?]);
-                let len = usize::from(*data.get(*at + 2)?);
-                let id = String::from_utf8(data.get(*at + 3..*at + 3 + len)?.to_vec()).ok()?;
-                *at += 3 + len;
+                let len = usize::from(u16::from_be_bytes([*data.get(*at + 2)?, *data.get(*at + 3)?]));
+                let id = String::from_utf8(data.get(*at + 4..*at + 4 + len)?.to_vec()).ok()?;
+                *at += 4 + len;
                 Some((count > 0).then_some((id, u32::from(count))))
             };
             let Some(cursor) = stack(&mut at) else {
@@ -30979,15 +31007,14 @@ fn pq_payload(data: &[u8]) {
             };
             at += 4;
             for _ in 0..n {
-                let Some(&len) = data.get(at) else {
+                let Some(len) = data.get(at..at + 2).map(|b| usize::from(u16::from_be_bytes([b[0], b[1]]))) else {
                     return;
                 };
-                let len = usize::from(len);
-                let (Some(id), Some(c)) = (data.get(at + 1..at + 1 + len).and_then(|b| String::from_utf8(b.to_vec()).ok()), data.get(at + 1 + len..at + 9 + len)) else {
+                let (Some(id), Some(c)) = (data.get(at + 2..at + 2 + len).and_then(|b| String::from_utf8(b.to_vec()).ok()), data.get(at + 2 + len..at + 10 + len)) else {
                     return;
                 };
                 next.list.push((id, u64::from_be_bytes(c.try_into().unwrap_or([0; 8]))));
-                at += 9 + len;
+                at += 10 + len;
             }
             PQ_STATE.with_borrow_mut(|s| {
                 next.own = s.own.take();
@@ -31047,11 +31074,33 @@ fn pq_open(game: &mut Game<'_>) {
 }
 
 /// `ListSortType`'s comparators, with `SortDirection`.
+/// What an item is called: a custom name over the item's own (`ItemStack.getHoverName`).
+fn pq_name(game: &Game<'_>, key: &str) -> String {
+    if key.starts_with('{') {
+        let stack = qio_stack(key, 1);
+        if let Some(name) = stack.custom_name() {
+            return name.to_string();
+        }
+        return game.pack.names.display_item(&stack.item);
+    }
+    game.pack.names.display_item(key)
+}
+
+/// Draws a network key's item, with its components when it has them.
+fn pq_item(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, key: &str, at: [f32; 2]) {
+    if key.starts_with('{') {
+        game.native_item_stack(batch, &qio_stack(key, 1), at, 16.0);
+    } else {
+        game.native_item(batch, key, at, 16.0);
+    }
+}
+
 fn pq_sort(game: &Game<'_>, list: &mut [(String, u64)], sort: usize, descending: bool) {
-    let name = |id: &str| game.pack.names.display_item(id);
-    let modid = |id: &str| id.split_once(':').map_or("minecraft", |(m, _)| m).to_owned();
-    let ns_path = |id: &str| {
-        let (n, p) = id.split_once(':').unwrap_or(("minecraft", id));
+    let name = |key: &str| pq_name(game, key);
+    let modid = |key: &str| qio_id(key).split_once(':').map_or("minecraft", |(m, _)| m).to_owned();
+    let ns_path = |key: &str| {
+        let id = qio_id(key);
+        let (n, p) = id.split_once(':').unwrap_or(("minecraft", id.as_str()));
         (n.to_owned(), p.to_owned())
     };
     list.sort_by(|a, b| {
@@ -31087,16 +31136,16 @@ struct PqItem<'a> {
 
 impl qio_search::Item for PqItem<'_> {
     fn name(&self) -> String {
-        self.game.pack.names.display_item(self.id)
+        pq_name(self.game, self.id)
     }
     fn mod_id(&self) -> String {
-        self.id.split_once(':').map_or("minecraft", |(m, _)| m).to_owned()
+        qio_id(self.id).split_once(':').map_or("minecraft", |(m, _)| m).to_owned()
     }
     fn tooltip(&self) -> Vec<String> {
-        vec![self.name()]
+        self.game.stack_tooltip(&qio_stack(self.id, 1)).into_iter().map(|(t, _)| t.plain()).collect()
     }
     fn tags(&self) -> Vec<String> {
-        PQ_TAGS.with_borrow(|t| t.get(self.id).cloned().unwrap_or_default())
+        PQ_TAGS.with_borrow(|t| t.get(&qio_id(self.id)).cloned().unwrap_or_default())
     }
 }
 
@@ -31240,7 +31289,7 @@ fn pq_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
                 break;
             };
             let (sx, sy) = (o[0] + gx + 18.0 * (i % pq_x()) as f32, o[1] + gy + 18.0 * (i / pq_x()) as f32);
-            game.native_item(batch, id, [sx + 1.0, sy + 1.0], 16.0);
+            pq_item(game, batch, id, [sx + 1.0, sy + 1.0]);
             let text = if *count == 0 { Some("0".to_owned()) } else if *count > 1 { Some(pq_count_text(*count)) } else { None };
             if let Some(text) = text {
                 let mut scale = 0.6;
@@ -31277,7 +31326,7 @@ fn pq_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
             let r = pq_inv_rect(i);
             sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [o[0] + r[0], o[1] + r[1], 18.0, 18.0]);
             if let Some((id, count)) = state.inv.get(i).cloned().flatten() {
-                game.native_item(batch, &id, [o[0] + r[0] + 1.0, o[1] + r[1] + 1.0], 16.0);
+                pq_item(game, batch, &id, [o[0] + r[0] + 1.0, o[1] + r[1] + 1.0]);
                 if count > 1 {
                     let text = count.to_string();
                     let tw = game.native_text_width(&text);
@@ -31333,26 +31382,37 @@ fn pq_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         }
         // The cursor stack, then the tooltips.
         if let Some((id, count)) = &state.cursor {
-            game.native_item(batch, id, [cursor[0] - 8.0, cursor[1] - 8.0], 16.0);
+            pq_item(game, batch, id, [cursor[0] - 8.0, cursor[1] - 8.0]);
             if *count > 1 {
                 game.native_text(batch, &count.to_string(), [cursor[0] + 3.0, cursor[1] + 1.0], 0xFF_FFFF, true);
             }
         } else {
             let mut lines: Vec<String> = vec![];
+            let mut text: Vec<horizon_client::text::Text> = vec![];
+            let item_lines = |key: &str| game.stack_tooltip(&qio_stack(key, 1)).into_iter().map(|(t, _)| t);
             if let Some(i) = hovered {
                 let (id, count) = &ui.shown[i];
-                lines.push(game.pack.names.display_item(id));
+                text.extend(item_lines(id));
                 if *count >= 10_000 {
-                    lines.push(format!("\u{a7}7Stored count: \u{a7}9{count}"));
+                    text.push(horizon_client::text::Text::legacy(&format!("\u{a7}7Stored count: \u{a7}9{count}")));
                 }
             } else if let Some(i) = (0..36).find(|&i| inside(mouse, pq_inv_rect(i))) {
                 if let Some((id, _)) = state.inv.get(i).cloned().flatten() {
-                    lines.push(game.pack.names.display_item(&id));
+                    text.extend(item_lines(&id));
+                }
+            } else {
+                for win in &ui.wins {
+                    let r = [mouse[0] - win.pos[0], mouse[1] - win.pos[1]];
+                    let cells = state.windows.get(win.index).cloned().unwrap_or_default();
+                    let slot = (0..9).find(|&i| inside(r, [8.0 + 18.0 * (i % 3) as f32, 18.0 + 18.0 * (i / 3) as f32, 18.0, 18.0])).or_else(|| inside(r, [100.0, 36.0, 18.0, 18.0]).then_some(9));
+                    if let Some((id, _)) = slot.and_then(|i| cells.get(i).cloned().flatten()) {
+                        text.extend(item_lines(&id));
+                    }
                 }
             }
             pq_tooltips(&state, ui, mouse, w, &mut lines);
-            if !lines.is_empty() {
-                let text: Vec<horizon_client::text::Text> = lines.iter().map(|l| horizon_client::text::Text::legacy(l)).collect();
+            text.extend(lines.iter().map(|l| horizon_client::text::Text::legacy(l)));
+            if !text.is_empty() {
                 horizon_client::ui::tooltip(batch, &game.gui.atlas, &text, (cursor[0], cursor[1]));
             }
         }
@@ -31363,7 +31423,7 @@ fn pq_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
 fn pq_win_slot(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, corner: [f32; 2], mouse: [f32; 2], at: [f32; 2], stack: Option<&(String, u32)>) {
     sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [corner[0] + at[0], corner[1] + at[1], 18.0, 18.0]);
     if let Some((id, count)) = stack {
-        game.native_item(batch, id, [corner[0] + at[0] + 1.0, corner[1] + at[1] + 1.0], 16.0);
+        pq_item(game, batch, id, [corner[0] + at[0] + 1.0, corner[1] + at[1] + 1.0]);
         if *count > 1 {
             let text = count.to_string();
             let tw = game.native_text_width(&text);
