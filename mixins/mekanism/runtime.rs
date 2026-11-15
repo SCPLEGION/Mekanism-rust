@@ -26235,6 +26235,11 @@ thread_local! {
     static RADIAL_UI: std::cell::RefCell<RadialUi> = std::cell::RefCell::new(RadialUi::default());
 }
 
+thread_local! {
+    /// The wheel's last tick and what has not made a whole step yet.
+    static RADIAL_WHEEL: std::cell::Cell<(u64, f64)> = const { std::cell::Cell::new((0, 0.0)) };
+}
+
 static RADIAL_KEY_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The root slices an item offers: its enabled modules that handle the radial.
@@ -26382,9 +26387,16 @@ fn radial_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
             sprite(game, batch, &if slice.icon.contains('/') { slice.icon.to_owned() } else { format!("radial/{}", slice.icon) }, [0.0, 0.0, 18.0, 18.0], [(centre[0] + x - 12.0).round(), (centre[1] + y - 20.0).round(), 24.0, 24.0]);
             labels.push(([x, y], slice.name.to_owned(), slice.color));
         }
+        // The labels (`guiGraphics.text(font, text, x, lineHeight, 0xCCFFFFFF, true)` at 0.8): shadowed, a fifth transparent,
+        // each in its mode's colour unless `whiteRadialText` resets the style.
+        let white = game.native_setting(MOD_ID, "white_radial_text").as_deref() == Some("true");
         for ([x, y], text, rgb) in labels {
             let w = game.native_text_width(&text) * 0.8;
-            game.native_text_scaled(batch, &text, [centre[0] + x - w / 2.0, centre[1] + y + 7.0], rgb, 0.8);
+            let at = [centre[0] + x - w / 2.0, centre[1] + y + 7.0];
+            let [_, r, g, b] = if white { 0xFF_FFFFu32 } else { rgb }.to_be_bytes();
+            let first = batch.vertices.len();
+            batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(&text), at[0], at[1], horizon_client::hud::rgba(r, g, b, 0xCC), true);
+            batch.scale_since(first, at[0], at[1], 0.8, 0.8);
         }
     });
 }
@@ -26430,7 +26442,20 @@ fn radial_update(game: &mut Game<'_>) {
 
 /// The wheel steps the mode (`mouseScrolled`): wraps around, only inside a module's options.
 fn radial_scroll(game: &mut Game<'_>, steps: f32) {
-    let shift: i32 = if steps > 0.0 { 1 } else if steps < 0.0 { -1 } else { return };
+    // `ScrollIncrementer(true)`: what is turned adds up, whole steps count (one at most), and a pause of a second forgets it.
+    let shift = RADIAL_WHEEL.with(|w| {
+        let (last, mut delta) = w.get();
+        if game.ticks.saturating_sub(last) > 20 {
+            delta = 0.0;
+        }
+        delta += f64::from(steps);
+        let whole = delta.trunc();
+        w.set((game.ticks, delta - whole));
+        (whole as i32).clamp(-1, 1)
+    });
+    if shift == 0 {
+        return;
+    }
     let mut send = None;
     RADIAL_UI.with_borrow(|ui| {
         let (Some(m), Some(stack)) = (ui.module, radial_stack(game, ui.slot)) else {
