@@ -26498,6 +26498,10 @@ fn radial_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
             torus(game, batch, centre, angle - 180.0 / n as f32, size, RADIAL_INNER, RADIAL_OUTER, 0x4D_CCCCCC);
             torus(game, batch, centre, radial::start_angle(i, n), size, RADIAL_INNER, RADIAL_OUTER, 0xB3_999999);
         }
+        // `shouldHideCrosshair`: the game's crosshair stays under the root radial and goes with a nested one.
+        if !ui.has_parent {
+            game.native_sprite(batch, "hud/crosshair", [0.0, 0.0, 15.0, 15.0], [centre[0] - 7.0, centre[1] - 7.0, 15.0, 15.0]);
+        }
         let mut labels: Vec<([f32; 2], String, u32)> = vec![];
         ui.over_back = false;
         if ui.has_parent {
