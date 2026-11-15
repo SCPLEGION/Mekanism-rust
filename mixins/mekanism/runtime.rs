@@ -23528,6 +23528,46 @@ fn sec_data_of(owner: &str, nbt: &Compound) -> Option<sec::Data> {
     sec_data(owner).or_else(|| get_string(nbt, "sec_copy").map(|t| sec::Data::load(&t)))
 }
 
+thread_local! {
+    static SEC_LOADED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SEC_SAVED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The world's folder keeps every owner's security data (`SecurityFrequency` in the original's saved data), so it holds
+/// whether or not a desk is loaded: read once when the world opens, written when it changes.
+fn sec_persist(game: &Game<'_>) {
+    let Some(file) = game.native_world_dir().map(|d| d.join("mekanism").join("security.txt")) else {
+        return;
+    };
+    if !SEC_LOADED.replace(true)
+        && let Some(text) = std::fs::read_to_string(&file).ok()
+        && let Ok(mut all) = SEC_DATA.lock()
+    {
+        for line in text.lines() {
+            if let Some((owner, data)) = line.split_once('\t') {
+                all.entry(owner.to_owned()).or_insert_with(|| sec::Data::load(data));
+            }
+        }
+        SEC_SAVED.with_borrow_mut(|s| *s = text);
+    }
+    if game.ticks % 20 != 0 {
+        return;
+    }
+    let text = match SEC_DATA.lock() {
+        Ok(all) => {
+            let mut lines: Vec<String> = all.iter().map(|(o, d)| format!("{o}\t{}\n", d.save())).collect();
+            lines.sort();
+            lines.concat()
+        }
+        Err(_) => return,
+    };
+    if text.is_empty() || SEC_SAVED.with_borrow(|s| *s == text) {
+        return;
+    }
+    let _ = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&file, &text));
+    SEC_SAVED.with_borrow_mut(|s| *s = text);
+}
+
 /// Keeps the live data in the block's own copy.
 fn sec_keep_copy(nbt: &mut Compound) {
     if let Some(data) = get_string(nbt, "owner").and_then(|o| sec_data(&o)) {
@@ -28632,6 +28672,7 @@ fn rad_client_payload(data: &[u8]) {
 fn radiation_server_tick(game: &mut Game<'_>) {
     sync_gear_config(game);
     sync_input_sets(game);
+    sec_persist(game);
     // The world's folder keeps the sources and the doses (`RadiationLevelData`, the radiation attachment).
     let file = game.native_world_dir().map(|d| d.join("mekanism").join("radiation.txt"));
     if file.is_some()
