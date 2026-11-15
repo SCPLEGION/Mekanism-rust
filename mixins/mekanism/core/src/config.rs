@@ -79,7 +79,7 @@ pub fn gear_ratio(full_key: &str) -> f64 {
 
 /// The other whole-number gear keys: (section, key, default), `defineInRange(key, default, 0, Integer.MAX_VALUE)`
 /// unless the range says otherwise. The Meka-Tool's and MekaSuit's usages sit in their `energy_usage` section.
-pub const GEAR_INTS: [(&str, &str, u64); 47] = [
+pub const GEAR_INTS: [(&str, &str, u64); 48] = [
     // `fillRate` of the tank items (mB a tick a machine's slot moves) and the paste transfer rates.
     ("flamethrower", "fillRate", 16),
     ("jetpack", "fillRate", 16),
@@ -97,6 +97,7 @@ pub const GEAR_INTS: [(&str, &str, u64); 47] = [
     ("electric_bow", "energyUsageFlame", 1_200),
     ("free_runner", "fallEnergyCost", 50),
     ("seismic_reader", "energyUsage", 250),
+    ("network_reader", "energyUsage", 400),
     ("mekatool", "maxTeleportReach", 100),
     ("jetpack", "capacity", 24_000),
     ("canteen", "maxStorage", 64_000),
@@ -146,12 +147,13 @@ pub fn gear_int(full_key: &str, default: u64) -> u64 {
 
 /// The gear sections that hold an item's energy: (section, key of its capacity, capacity, charge rate), all
 /// `GearConfig` defaults.
-pub const ENERGY_SECTIONS: [(&str, &str, u64, u64); 8] = [
+pub const ENERGY_SECTIONS: [(&str, &str, u64, u64); 9] = [
     ("energy_tablet", "maxEnergy", 1_000_000, 5_000),
     ("atomic_disassembler", "maxEnergy", 1_000_000, 5_000),
     ("electric_bow", "maxEnergy", 120_000, 600),
     ("free_runner", "maxEnergy", 64_000, 320),
     ("seismic_reader", "maxEnergy", 12_000, 60),
+    ("network_reader", "maxEnergy", 60_000, 300),
     ("portable_teleporter", "maxEnergy", 1_000_000, 5_000),
     ("mekatool", "baseEnergyCapacity", 16_000_000, 100_000),
     ("mekasuit", "baseEnergyCapacity", 16_000_000, 100_000),
@@ -165,6 +167,7 @@ pub fn energy_section(id: &str) -> Option<&'static str> {
         "mekanism:electric_bow" => "electric_bow",
         "mekanism:free_runners" | "mekanism:free_runners_armored" => "free_runner",
         crate::seismic::READER => "seismic_reader",
+        crate::network_reader::ITEM => "network_reader",
         "mekanism:portable_teleporter" => "portable_teleporter",
         "mekanism:meka_tool" => "mekatool",
         "mekanism:mekasuit_helmet" | "mekanism:mekasuit_bodyarmor" | "mekanism:mekasuit_pants" | "mekanism:mekasuit_boots" => "mekasuit",
