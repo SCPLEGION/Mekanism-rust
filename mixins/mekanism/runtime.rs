@@ -22,6 +22,7 @@ use mekanism_core::seismic;
 use mekanism_core::chargepad;
 use mekanism_core::entangloporter::{self as qe, Frequency};
 use mekanism_core::sorter::{self, Sorter};
+use mekanism_core::transporter as tnet;
 use mekanism_core::oredictionificator as od;
 use mekanism_core::formulaic as fa;
 use mekanism_core::stabilizer as st;
@@ -309,6 +310,9 @@ fn kind(id: &str) -> Option<Kind> {
     }
     if let Some(m) = chem::ADVANCED_MACHINES.iter().find(|m| m.block == id) {
         return Some(Kind::Advanced(m));
+    }
+    if id == "mekanism:restrictive_transporter" || id == "mekanism:diversion_transporter" {
+        return tier::transporter_pull(BaseTier::Basic).map(Kind::Transporter);
     }
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_logistical_transporter")) {
         let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
@@ -3271,7 +3275,11 @@ pub(super) fn configure_side(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3])
     }
     let t = conf.transmission().unwrap_or_default();
     // Sneaking on a transmitter cycles the connection of the face (`TileEntityTransmitter.onSneakRightClick`).
-    if game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    if is_transporter(block_name(game, pos)) && configure_transporter(game, pos, face, sneaking) {
+        return true;
+    }
+    if sneaking {
         let changed = game.native_with_mod_block_entity(pos, |m| {
             pipe_family(&m.id)?;
             let face_at = face_index(face);
@@ -5063,6 +5071,18 @@ fn show_connections(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
                 joined = false;
             }
         }
+        // Transporters of different colours do not join, nor do the faces a diversion transporter's redstone mode switches off.
+        if family == "transporter" && transmitter && joined {
+            let own_id = entity.id.clone();
+            let other_id = name.clone();
+            let mine = node_from(game, pos, &own_id, &entity.nbt);
+            let onbt = game.native_with_mod_block_entity(at, |m| m.nbt.clone()).unwrap_or_default();
+            let other = node_from(game, at, &other_id, &onbt);
+            let mut net = tnet::Network::default();
+            net.nodes.insert(pos, mine);
+            net.nodes.insert(at, other);
+            joined = net.joined(pos, face);
+        }
         // Between transmitters the connection is normal; push and pull show on the arm to a machine.
         if joined && !transmitter && (mode == 1 || mode == 2) {
             shown |= mode << (2 * face);
@@ -5077,45 +5097,873 @@ fn show_connections(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
 }
 
 // --- Logistical transporters ------------------------------------------------------------------------
+//
+// `LogisticalTransporterBase`: every transporter holds the stacks travelling through it (`transit`), each with
+// its path, progress (100 a block, `<tier>Speed` a tick) and colour. A stack that reaches the end of a
+// transporter goes on into the next one (when that one lets its colour and connections in) or into the
+// container at the end of its path; one that cannot recalculates its path, goes home or idles, and is
+// dropped when it has nowhere to be. Paths are `TransporterPathfinder`'s A* (`mekanism_core::transporter`).
 
 fn is_transporter(name: &str) -> bool {
-    name.strip_prefix("mekanism:").is_some_and(|n| n.ends_with("_logistical_transporter"))
+    name.strip_prefix("mekanism:").is_some_and(|n| n.ends_with("_logistical_transporter") || n == "restrictive_transporter" || n == "diversion_transporter")
 }
 
-/// A logistical transporter, simplified: twice a second it pulls up to its tier's count from a container
-/// beside it (a chest, a furnace's output, a machine's output when its face gives out), and sends it
-/// at once along the connected transporters into the nearest container that takes it: a chest, a
-/// furnace, a hopper or another machine's input, through the side it faces. What fits nowhere goes back.
-/// Mekanism moves items visibly along the pipe at the tier's speed and sorts by colour and filters.
-fn tick_transporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, pull: u32) {
-    let ticker = get_int(&entity.nbt, "ticker");
-    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 10);
-    if ticker != 0 {
+type P3 = [i32; 3];
+
+/// `TransporterStack.Path`.
+const PATH_DEST: u8 = 0;
+const PATH_HOME: u8 = 1;
+const PATH_NONE: u8 = 2;
+
+/// A `TransporterStack`.
+#[derive(Clone)]
+struct Transit {
+    id: u32,
+    item: ItemStack,
+    progress: u32,
+    color: Option<u8>,
+    /// The transporters it passes in order, then (for a stack with a target) the container it goes to.
+    path: Vec<P3>,
+    ptype: u8,
+    /// `originalLocation`: where it came from, the block before the first of its path.
+    orig: P3,
+    home: Option<P3>,
+    idle: Option<usize>,
+    init: bool,
+    /// When (game time) and how far along its block the clients last heard of it.
+    sync_t: u64,
+    sync_pr: u32,
+}
+
+fn pos_tag(p: P3) -> Tag {
+    Tag::IntArray(p.to_vec())
+}
+
+impl Transit {
+    fn save(&self) -> Compound {
+        let mut c = Compound::new();
+        put_int(&mut c, "id", self.id);
+        c.insert("it".into(), horizon_items::item_nbt::item_to_nbt(&self.item));
+        put_int(&mut c, "pr", self.progress);
+        put_int(&mut c, "col", self.color.map_or(0, |c| u32::from(c) + 1));
+        c.insert("path".into(), Tag::IntArray(self.path.iter().flatten().copied().collect()));
+        put_int(&mut c, "pt", u32::from(self.ptype));
+        c.insert("orig".into(), pos_tag(self.orig));
+        if let Some(h) = self.home {
+            c.insert("home".into(), pos_tag(h));
+        }
+        put_int(&mut c, "idle", self.idle.map_or(0, |d| d as u32 + 1));
+        put_int(&mut c, "init", u32::from(self.init));
+        put_long(&mut c, "st", self.sync_t);
+        put_int(&mut c, "spr", self.sync_pr);
+        c
+    }
+
+    fn load(c: &Compound) -> Option<Transit> {
+        let item = horizon_items::item_nbt::item_from_nbt(c.get(&JavaString::from("it"))?)?;
+        let path = match c.get(&JavaString::from("path")) {
+            Some(Tag::IntArray(v)) => v.chunks(3).filter(|p| p.len() == 3).map(|p| [p[0], p[1], p[2]]).collect(),
+            _ => Vec::new(),
+        };
+        Some(Transit {
+            id: get_int(c, "id"),
+            item,
+            progress: get_int(c, "pr"),
+            color: match get_int(c, "col") {
+                0 => None,
+                n => Some((n - 1) as u8),
+            },
+            path,
+            ptype: get_int(c, "pt").min(2) as u8,
+            orig: get_pos(c, "orig").unwrap_or_default(),
+            home: get_pos(c, "home"),
+            idle: match get_int(c, "idle") {
+                0 => None,
+                n => Some((n - 1).min(5) as usize),
+            },
+            init: get_int(c, "init") != 0,
+            sync_t: get_long(c, "st"),
+            sync_pr: get_int(c, "spr"),
+        })
+    }
+
+    fn has_target(&self) -> bool {
+        self.ptype != PATH_NONE
+    }
+
+    fn has_path(&self) -> bool {
+        self.path.len() >= 2
+    }
+
+    /// `getNext`: the block after `at` on its path.
+    fn next(&self, at: P3) -> Option<P3> {
+        let i = self.path.iter().position(|p| *p == at)?;
+        self.path.get(i + 1).copied()
+    }
+
+    /// `getPrev`: the block before `at` on its path, or where it came from.
+    fn prev(&self, at: P3) -> P3 {
+        match self.path.iter().position(|p| *p == at) {
+            Some(i) if i > 0 => self.path[i - 1],
+            _ => self.orig,
+        }
+    }
+
+    /// `isFinal`: `at` is the last transporter of its path.
+    fn is_final(&self, at: P3) -> bool {
+        let i = if self.has_target() { self.path.len().checked_sub(2) } else { self.path.len().checked_sub(1) };
+        i.and_then(|i| self.path.get(i)) == Some(&at)
+    }
+
+    /// `getSide`: the side it is nearest in the transporter at `at`, down when it has none.
+    fn side(&self, at: P3) -> usize {
+        let side = if self.progress < 50 { tnet::side_between(self.prev(at), at) } else { self.next(at).and_then(|n| tnet::side_between(at, n)) };
+        side.unwrap_or(0)
+    }
+
+    /// Tells the clients about it as it is now.
+    fn touch(&mut self, now: u64) {
+        self.sync_t = now;
+        self.sync_pr = self.progress;
+    }
+}
+
+fn load_transit(nbt: &Compound) -> Vec<Transit> {
+    match nbt.get(&JavaString::from("transit")) {
+        Some(Tag::List(l)) => l
+            .iter()
+            .filter_map(|t| match t {
+                Tag::Compound(c) => Transit::load(c),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn save_transit(nbt: &mut Compound, stacks: &[Transit]) {
+    if stacks.is_empty() {
+        nbt.remove(&JavaString::from("transit"));
+    } else {
+        nbt.insert("transit".into(), Tag::List(stacks.iter().map(|s| Tag::Compound(s.save())).collect()));
+    }
+}
+
+/// What the clients draw of the stacks of the transporter at `pos` (`PacketTransporterBatch`).
+fn client_transit(pos: P3, stacks: &[Transit]) -> Tag {
+    Tag::List(
+        stacks
+            .iter()
+            .filter(|s| s.item.count > 0)
+            .map(|s| {
+                let mut c = Compound::new();
+                put_int(&mut c, "id", s.id);
+                c.insert("i".into(), Tag::String(s.item.item.as_ref().into()));
+                put_int(&mut c, "pr", s.sync_pr);
+                put_long(&mut c, "t", s.sync_t);
+                c.insert("pv".into(), pos_tag(s.prev(pos)));
+                if let Some(n) = s.next(pos) {
+                    c.insert("nx".into(), pos_tag(n));
+                }
+                Tag::Compound(c)
+            })
+            .collect(),
+    )
+}
+
+thread_local! {
+    /// The stacks inside each transporter this server runs, to drop when it is broken (`preRemoveSideEffects`).
+    static TRANSIT_DROPS: std::cell::RefCell<std::collections::HashMap<P3, Vec<ItemStack>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn remember_transit(pos: P3, stacks: &[Transit]) {
+    TRANSIT_DROPS.with_borrow_mut(|m| {
+        if stacks.is_empty() {
+            m.remove(&pos);
+        } else {
+            m.insert(pos, stacks.iter().map(|s| s.item.clone()).collect());
+        }
+    });
+}
+
+fn color_of(nbt: &Compound) -> Option<u8> {
+    match get_int(nbt, "color") {
+        0 => None,
+        c => Some((c - 1) as u8),
+    }
+}
+
+/// Saves the stacks of the ticking transporter and tells the clients what changed.
+fn store_transit(game: &mut Game<'_>, pos: P3, entity: &mut ModBlockEntity, stacks: &[Transit]) {
+    save_transit(&mut entity.nbt, stacks);
+    let mut client = Compound::new();
+    client.insert("transit".into(), client_transit(pos, stacks));
+    put_int(&mut client, "color", get_int(&entity.nbt, "color"));
+    put_client(game, pos, entity, &["transit", "color"], client);
+    remember_transit(pos, stacks);
+}
+
+/// The same for a transporter that is not ticking now (its neighbour hands a stack over, a sorter inserts one).
+fn store_transit_other(game: &mut Game<'_>, pos: P3, stacks: &[Transit], next_id: u32) {
+    game.native_with_mod_block_entity(pos, |m| {
+        save_transit(&mut m.nbt, stacks);
+        put_int(&mut m.nbt, "next_id", next_id);
+        let mut client = match m.nbt.get(&JavaString::from("client")) {
+            Some(Tag::Compound(c)) => c.clone(),
+            _ => Compound::new(),
+        };
+        client.insert("transit".into(), client_transit(pos, stacks));
+        put_int(&mut client, "color", get_int(&m.nbt, "color"));
+        m.nbt.insert("client".into(), Tag::Compound(client));
+    });
+    game.native_sync_block_entity(pos);
+    remember_transit(pos, stacks);
+}
+
+/// The stacks of a transporter that is broken fall out of it.
+pub(super) fn transporter_spill(game: &mut Game<'_>, pos: P3, old: &str, new: &str) {
+    if old == new || !is_transporter(old) || !game.native_on(MOD_ID) {
         return;
     }
-    for (_, d) in DIRECTIONS {
-        let source = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
-        let back = [-d[0], -d[1], -d[2]];
-        // A Mekanism block's face must give out (side configuration); any container then gives what a
-        // hopper there could take (API 24 `native_extract_item`).
+    let Some(items) = TRANSIT_DROPS.with_borrow_mut(|m| m.remove(&pos)) else {
+        return;
+    };
+    let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+    for item in items {
+        game.native_drop_item(item, at, [0, 1, 0]);
+    }
+}
+
+/// `TransporterTier` `<tier>Speed` of a logistical transporter: progress a tick (100 is a block).
+fn transporter_speed(id: &str) -> u32 {
+    let name = id.strip_prefix("mekanism:").unwrap_or(id);
+    let (tier, default) = [("basic", 5), ("advanced", 10), ("elite", 20), ("ultimate", 50)].into_iter().find(|(t, _)| name.starts_with(t)).unwrap_or(("basic", 5));
+    mekanism_core::config_files::active_int("tiers", "transmitters.items", &format!("{tier}Speed"), default).max(1) as u32
+}
+
+/// One transporter as the pathfinder sees it, from its block and its data.
+fn node_from(game: &mut Game<'_>, at: P3, id: &str, nbt: &Compound) -> tnet::Node {
+    let cost = if id == "mekanism:restrictive_transporter" {
+        1000.0
+    } else {
+        tnet::tier_cost(transporter_speed("mekanism:ultimate_logistical_transporter"), transporter_speed(id))
+    };
+    let mut blocked = [false; 6];
+    if id == "mekanism:diversion_transporter" {
+        let modes = get_int(nbt, "div");
+        if modes != 0 {
+            let bp = horizon_core::position::BlockPos::new(at[0], at[1], at[2]);
+            let powered = game.with_level(|b, level, ticks| b.has_neighbor_signal(level, ticks, bp));
+            for (d, flag) in blocked.iter_mut().enumerate() {
+                *flag = !tnet::Diversion::from_id((modes >> (2 * d)) & 3).met(powered);
+            }
+        }
+    }
+    tnet::Node { cost, color: color_of(nbt), conn: std::array::from_fn(|d| tnet::Conn::from_bits(conn_of(nbt, d) )), blocked }
+}
+
+/// What the world around the transporters offers: the transporters joined to the start and the stacks already on
+/// their way to each container (`TransporterManager`'s prediction).
+struct Snap {
+    net: tnet::Network,
+    inflight: std::collections::HashMap<(P3, String), u32>,
+}
+
+fn add_inflight(snap: &mut Snap, stacks: &[Transit], exclude: Option<u32>, here: bool) {
+    for s in stacks {
+        if here && Some(s.id) == exclude {
+            continue;
+        }
+        if s.has_target()
+            && s.has_path()
+            && let Some(dest) = s.path.last()
+        {
+            *snap.inflight.entry((*dest, s.item.item.to_string())).or_default() += s.item.count;
+        }
+    }
+}
+
+/// The transporters joined to the one at `here` (its data `here_nbt`, its stacks `here_stacks`), as
+/// `InventoryNetwork` holds them. `exclude` is a stack of `here` that is not counted as on its way.
+fn snapshot(game: &mut Game<'_>, here: P3, here_nbt: &Compound, here_stacks: &[Transit], exclude: Option<u32>) -> Snap {
+    let mut snap = Snap { net: tnet::Network::default(), inflight: std::collections::HashMap::new() };
+    let id = block_name(game, here).to_owned();
+    let node = node_from(game, here, &id, here_nbt);
+    snap.net.nodes.insert(here, node);
+    add_inflight(&mut snap, here_stacks, exclude, true);
+    let mut order = vec![here];
+    let mut member: std::collections::HashSet<P3> = std::collections::HashSet::from([here]);
+    let mut i = 0;
+    while i < order.len() && order.len() < 1024 {
+        let at = order[i];
+        i += 1;
+        for d in 0..6 {
+            let n = tnet::offset(at, d);
+            if !snap.net.nodes.contains_key(&n) {
+                let nid = block_name(game, n).to_owned();
+                if !is_transporter(&nid) {
+                    continue;
+                }
+                let (nbt, stacks) = game.native_with_mod_block_entity(n, |m| (m.nbt.clone(), load_transit(&m.nbt))).unwrap_or_default();
+                let node = node_from(game, n, &nid, &nbt);
+                snap.net.nodes.insert(n, node);
+                add_inflight(&mut snap, &stacks, None, false);
+            }
+            if !member.contains(&n) && snap.net.joined(at, d) {
+                member.insert(n);
+                order.push(n);
+            }
+        }
+    }
+    snap
+}
+
+/// `TransporterUtils.canInsert`'s colour rule: a machine with strict input only takes what its colour for that
+/// side says.
+fn strict_input_ok(game: &mut Game<'_>, dest: P3, face: usize, color: Option<u8>) -> bool {
+    let facing = game.native_block_property(dest, "facing").and_then(|f| direction(&f)).map_or(2, face_index);
+    game.native_with_mod_block_entity(dest, |m| {
+        if get_int(&m.nbt, "ej_strict") == 0 {
+            return true;
+        }
+        let rel = (0..6).find(|&s| side_config::relative_face(facing, s) == face).unwrap_or(0);
+        let wanted = get_int(&m.nbt, &format!("ej_in{rel}"));
+        wanted == 0 || color.map(|c| u32::from(c) + 1) == Some(wanted)
+    })
+    .unwrap_or(true)
+}
+
+/// How many of `item` the container at `dest` takes through its side `face`, besides the `inflight` items already
+/// on their way to it.
+fn accepted_by(game: &mut Game<'_>, dest: P3, face: usize, item: &ItemStack, inflight: u32, color: Option<u8>, force: bool) -> u32 {
+    if !force && !strict_input_ok(game, dest, face, color) {
+        return 0;
+    }
+    let mut probe = item.clone();
+    probe.count = item.count + inflight;
+    game.native_can_insert_item(dest, horizon_core::geometry::Direction::ALL[face], &probe).saturating_sub(inflight).min(item.count)
+}
+
+/// A way to a container (`Destination`).
+struct Plan {
+    /// The transporters, then the container.
+    path: Vec<P3>,
+    dest: P3,
+    /// The side of the container's neighbour transporter it goes in through, seen from the transporter.
+    side: usize,
+    sending: u32,
+    score: f64,
+}
+
+/// `TransporterPathfinder.getPaths`: every container beside the network that takes the item and can be reached,
+/// best first.
+fn plan_routes(game: &mut Game<'_>, snap: &Snap, start: P3, item: &ItemStack, color: Option<u8>, home: Option<P3>, min: u32) -> Vec<Plan> {
+    let min = min.max(1);
+    let mut cands: std::collections::BTreeMap<P3, Vec<usize>> = std::collections::BTreeMap::new();
+    for t in snap.net.component(start) {
+        let node = &snap.net.nodes[&t];
+        for d in 0..6 {
+            let n = tnet::offset(t, d);
+            if node.can_emit_to(d) && !snap.net.nodes.contains_key(&n) && Some(n) != home {
+                cands.entry(n).or_default().push(d);
+            }
+        }
+    }
+    let key = item.item.to_string();
+    let mut found: Vec<Plan> = Vec::new();
+    for (dest, dirs) in cands {
+        let inflight = snap.inflight.get(&(dest, key.clone())).copied().unwrap_or(0);
+        let mut accepted = [0u32; 6];
+        for &d in &dirs {
+            accepted[d] = accepted_by(game, dest, tnet::opposite(d), item, inflight, color, false);
+        }
+        if accepted.iter().all(|a| *a < min) {
+            continue;
+        }
+        if let Some(f) = tnet::find_path(&snap.net, start, dest, color, home, &|d| accepted[d] >= min) {
+            let mut path = f.path;
+            path.push(dest);
+            found.push(Plan { path, dest, side: f.side, sending: accepted[f.side], score: f.score });
+        }
+    }
+    found.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal).then(a.path.len().cmp(&b.path.len())));
+    found
+}
+
+/// `getNewRRPath`: with round robin the sorter takes the destinations in turns, remembering the next one.
+fn choose_plan(plans: &[Plan], round_robin: bool, rr: &mut Option<(P3, usize)>) -> Option<usize> {
+    if plans.is_empty() {
+        return None;
+    }
+    if !round_robin {
+        return Some(0);
+    }
+    let mark = |p: &Plan| (p.dest, tnet::opposite(p.side));
+    let n = plans.len();
+    if n > 1
+        && let Some(target) = *rr
+        && let Some(i) = plans.iter().position(|p| mark(p) == target)
+    {
+        *rr = Some(mark(&plans[(i + 1) % n]));
+        return Some(i);
+    }
+    *rr = Some(mark(&plans[if n > 1 { 1 } else { 0 }]));
+    Some(0)
+}
+
+/// `TransporterStack.calculateIdle`: back home when it can, else wandering along the transporters (or off to a
+/// container it found after all). False when it can do neither.
+fn calc_idle(game: &mut Game<'_>, snap: &Snap, here: P3, s: &mut Transit) -> bool {
+    if let Some(home) = s.home {
+        let accepts: [bool; 6] = std::array::from_fn(|d| game.native_can_insert_item(home, horizon_core::geometry::Direction::ALL[tnet::opposite(d)], &s.item) > 0);
+        if let Some(f) = tnet::find_path(&snap.net, here, home, s.color, Some(home), &|d| accepts[d]) {
+            s.path = f.path;
+            s.path.push(home);
+            s.ptype = PATH_HOME;
+            s.idle = None;
+            s.orig = here;
+            s.init = true;
+            return true;
+        }
+        s.home = None;
+    }
+    let (item, color, home, closest) = (s.item.clone(), s.color, s.home, s.side(here));
+    let mut idle = s.idle;
+    let mut reroute = || {
+        plan_routes(game, snap, here, &item, color, home, 0).into_iter().next().map(|p| tnet::Found { path: p.path[..p.path.len() - 1].to_vec(), side: p.side, score: p.score })
+    };
+    let Some(result) = tnet::idle_path(&snap.net, here, color, &mut idle, closest, &mut reroute) else {
+        return false;
+    };
+    s.idle = idle;
+    if let Some(f) = result.dest {
+        let dest = tnet::offset(*f.path.last().unwrap_or(&here), f.side);
+        s.path = f.path;
+        s.path.push(dest);
+        s.ptype = PATH_DEST;
+    } else {
+        s.path = result.path;
+        s.ptype = PATH_NONE;
+    }
+    s.orig = here;
+    s.init = true;
+    true
+}
+
+/// A stack with nowhere to go falls out of the transporter (`drop`).
+fn drop_stack(game: &mut Game<'_>, here: P3, s: &Transit) {
+    if s.item.count == 0 {
+        return;
+    }
+    let at = [f64::from(here[0]) + 0.5, f64::from(here[1]) + 0.5, f64::from(here[2]) + 0.5];
+    game.native_drop_item(s.item.clone(), at, [0, 1, 0]);
+}
+
+/// `recalculate`: a new way to a container, else home or idling. False when the stack was dropped instead.
+fn recalculate(game: &mut Game<'_>, here: P3, here_nbt: &Compound, others: &[Transit], s: &mut Transit, from: Option<P3>) -> bool {
+    let snap = snapshot(game, here, here_nbt, others, Some(s.id));
+    let mut ok = false;
+    if s.ptype != PATH_NONE {
+        let plans = plan_routes(game, &snap, here, &s.item, s.color, s.home, 0);
+        if let Some(p) = plans.into_iter().next() {
+            s.path = p.path;
+            s.ptype = PATH_DEST;
+            s.idle = None;
+            s.init = true;
+            ok = true;
+        }
+    }
+    if !ok && !calc_idle(game, &snap, here, s) {
+        drop_stack(game, here, s);
+        return false;
+    }
+    if let Some(f) = from {
+        s.orig = f;
+    }
+    true
+}
+
+/// The next transporter takes the stack in, if its colour and connections let it (`entityEntering`).
+fn hand_over(game: &mut Game<'_>, here: P3, here_id: &str, here_nbt: &Compound, s: &Transit, next: P3, now: u64) -> bool {
+    let nid = block_name(game, next).to_owned();
+    if !is_transporter(&nid) {
+        return false;
+    }
+    let Some((nbt, mut stacks)) = game.native_with_mod_block_entity(next, |m| (m.nbt.clone(), load_transit(&m.nbt))) else {
+        return false;
+    };
+    let Some(dir) = tnet::side_between(here, next) else {
+        return false;
+    };
+    let mut net = tnet::Network::default();
+    let me = node_from(game, here, here_id, here_nbt);
+    let other = node_from(game, next, &nid, &nbt);
+    net.nodes.insert(here, me);
+    net.nodes.insert(next, other);
+    if !net.can_enter(s.color, here, dir) {
+        return false;
+    }
+    let id = get_int(&nbt, "next_id");
+    let mut moved = s.clone();
+    moved.id = id;
+    moved.progress = s.progress % 100;
+    moved.touch(now);
+    stacks.push(moved);
+    store_transit_other(game, next, &stacks, id + 1);
+    true
+}
+
+/// Whether the container at the end of the stack's path still takes it at the half-way mark (`canInsert`).
+fn dest_still_takes(game: &mut Game<'_>, dest: P3, face: usize, s: &Transit) -> bool {
+    let force = s.ptype == PATH_HOME;
+    if !force && !strict_input_ok(game, dest, face, s.color) {
+        return false;
+    }
+    game.native_can_insert_item(dest, horizon_core::geometry::Direction::ALL[face], &s.item) > 0
+}
+
+/// One tick of one stack in the transporter at `pos` (`tickTransit`). False when it left (or was dropped).
+fn step(game: &mut Game<'_>, pos: P3, id: &str, nbt: &Compound, speed: u32, stacks: &mut [Transit], i: usize, now: u64) -> bool {
+    let mut s = stacks[i].clone();
+    if !s.init {
+        if s.item.count == 0 || !recalculate(game, pos, nbt, stacks, &mut s, None) {
+            return false;
+        }
+        s.touch(now);
+    }
+    let before = s.progress;
+    s.progress += speed;
+    if s.progress >= 100 {
+        let mut prev_set = None;
+        if s.has_path() {
+            if s.path.last() == Some(&pos) {
+                return false;
+            }
+            if let Some(next) = s.next(pos) {
+                if !s.is_final(pos) {
+                    if hand_over(game, pos, id, nbt, &s, next, now) {
+                        return false;
+                    }
+                    prev_set = Some(next);
+                } else if s.has_target() {
+                    let face = tnet::side_between(pos, next).map_or(0, tnet::opposite);
+                    let had = s.item.count;
+                    match game.native_insert_item(next, horizon_core::geometry::Direction::ALL[face], s.item.clone()) {
+                        None => return false,
+                        Some(rest) if rest.count < had => s.item = rest,
+                        Some(_) => {}
+                    }
+                    prev_set = Some(next);
+                }
+            }
+        }
+        if !recalculate(game, pos, nbt, stacks, &mut s, prev_set) {
+            return false;
+        }
+        s.progress = if prev_set.is_none() { 50 } else { 0 };
+        s.touch(now);
+    } else if before < 50 && s.progress >= 50 {
+        let again = if s.is_final(pos) {
+            if s.has_target() {
+                match (s.path.last().copied(), tnet::side_between(pos, s.path.last().copied().unwrap_or(pos))) {
+                    (Some(dest), Some(dir)) => {
+                        let can_send = tnet::Conn::from_bits(conn_of(nbt, dir)).can_send_to();
+                        !can_send || !dest_still_takes(game, dest, tnet::opposite(dir), &s)
+                    }
+                    _ => true,
+                }
+            } else {
+                true
+            }
+        } else {
+            match s.next(pos) {
+                None => true,
+                Some(next) => {
+                    let dir = tnet::side_between(pos, next).unwrap_or(0);
+                    let nid = block_name(game, next).to_owned();
+                    if !is_transporter(&nid) && !s.has_target() && s.path.len() == 2 {
+                        // An idle stack in a lone transporter only turns when it cannot go that way.
+                        !tnet::Conn::from_bits(conn_of(nbt, dir)).can_send_to()
+                    } else if is_transporter(&nid) {
+                        let nnbt = game.native_with_mod_block_entity(next, |m| m.nbt.clone()).unwrap_or_default();
+                        let mut net = tnet::Network::default();
+                        let me = node_from(game, pos, id, nbt);
+                        let other = node_from(game, next, &nid, &nnbt);
+                        net.nodes.insert(pos, me);
+                        net.nodes.insert(next, other);
+                        !net.can_enter(s.color, pos, dir)
+                    } else {
+                        true
+                    }
+                }
+            }
+        };
+        if again {
+            if !recalculate(game, pos, nbt, stacks, &mut s, None) {
+                return false;
+            }
+            s.touch(now);
+        }
+    }
+    stacks[i] = s;
+    true
+}
+
+/// `tryPull`: from each container beside a pull face the transporter takes up to its tier's count and sends it
+/// where `plan_routes` says; what goes nowhere is put back and the next try waits longer.
+fn try_pull(game: &mut Game<'_>, pos: P3, entity: &mut ModBlockEntity, pull: u32, stacks: &mut Vec<Transit>, now: u64) -> bool {
+    let mut changed = false;
+    let color = color_of(&entity.nbt);
+    for d in 0..6 {
+        if conn_of(&entity.nbt, d) != 2 {
+            continue;
+        }
+        let source = tnet::offset(pos, d);
+        let back = DIRECTIONS[tnet::opposite(d)].1;
         let closed = game
             .native_with_mod_block_entity(source, |m| !sides_of(&m.nbt, Transmission::Item).get(face_index(back)).gives_out())
             .unwrap_or(false);
         if closed || is_transporter(block_name(game, source)) {
             continue;
         }
-        let face = horizon_core::geometry::Direction::ALL[face_index(back)];
+        let face = horizon_core::geometry::Direction::ALL[tnet::opposite(d)];
         let Some(stack) = game.native_extract_item(source, face, pull) else {
             continue;
         };
-        if let Some(left) = route_items(game, pos, source, stack) {
-            // What fits nowhere goes back where it came from.
-            if let Some(lost) = game.native_insert_item(source, face, left) {
-                game.native_insert_item(source, horizon_core::geometry::Direction::Up, lost);
+        let snap = snapshot(game, pos, &entity.nbt, stacks, None);
+        let plans = plan_routes(game, &snap, pos, &stack, color, Some(source), 1);
+        let mut none = None;
+        match choose_plan(&plans, false, &mut none).map(|i| &plans[i]) {
+            Some(plan) => {
+                let sending = plan.sending.min(stack.count);
+                if sending < stack.count {
+                    let mut rest = stack.clone();
+                    rest.count = stack.count - sending;
+                    if let Some(lost) = game.native_insert_item(source, face, rest) {
+                        game.native_insert_item(source, horizon_core::geometry::Direction::Up, lost);
+                    }
+                }
+                let mut item = stack;
+                item.count = sending;
+                let id = get_int(&entity.nbt, "next_id");
+                put_int(&mut entity.nbt, "next_id", id + 1);
+                let mut s = Transit { id, item, progress: 0, color, path: plan.path.clone(), ptype: PATH_DEST, orig: source, home: Some(source), idle: None, init: true, sync_t: 0, sync_pr: 0 };
+                s.touch(now);
+                stacks.push(s);
+                put_int(&mut entity.nbt, "delay", 10);
+                put_int(&mut entity.nbt, "delay_count", 0);
+                changed = true;
+            }
+            None => {
+                if let Some(lost) = game.native_insert_item(source, face, stack) {
+                    game.native_insert_item(source, horizon_core::geometry::Direction::Up, lost);
+                }
+                // Backs off: `min(40, e^tries)` ticks.
+                let tries = get_int(&entity.nbt, "delay_count") + 1;
+                put_int(&mut entity.nbt, "delay_count", tries);
+                put_int(&mut entity.nbt, "delay", (f64::from(tries).exp() as u32).min(40));
             }
         }
-        return;
     }
+    changed
+}
+
+/// `LogisticalTransporterBase.onUpdateServer`: pulls (every 3 ticks, or 10 after a success) and moves the stacks.
+fn tick_transporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, pull: u32) {
+    let now = game.world.game_time.max(0) as u64;
+    let mut stacks = load_transit(&entity.nbt);
+    let mut changed = false;
+    let delay = get_int(&entity.nbt, "delay");
+    if delay > 0 {
+        put_int(&mut entity.nbt, "delay", delay - 1);
+    } else {
+        put_int(&mut entity.nbt, "delay", 3);
+        changed |= try_pull(game, pos, entity, pull, &mut stacks, now);
+    }
+    if !stacks.is_empty() {
+        let speed = transporter_speed(&entity.id);
+        let id = entity.id.clone();
+        let nbt = entity.nbt.clone();
+        let mut i = 0;
+        while i < stacks.len() {
+            let before = (stacks[i].sync_t, stacks[i].path.len());
+            if step(game, pos, &id, &nbt, speed, &mut stacks, i, now) {
+                changed |= before != (stacks[i].sync_t, stacks[i].path.len());
+                i += 1;
+            } else {
+                stacks.remove(i);
+                changed = true;
+            }
+        }
+        // The progress lives in the saved data; the clients count it on their own.
+        save_transit(&mut entity.nbt, &stacks);
+    }
+    if changed || game.ticks % 40 == 0 {
+        store_transit(game, pos, entity, &stacks);
+    }
+}
+
+/// `LogisticalTransporterBase.insert` for a block beside a transporter: a sorter hands `item` over. Returns what
+/// went nowhere.
+fn insert_into_transporter(game: &mut Game<'_>, at: P3, source: P3, item: ItemStack, round_robin: bool, rr: &mut Option<(P3, usize)>) -> Option<ItemStack> {
+    let id = block_name(game, at).to_owned();
+    let now = game.world.game_time.max(0) as u64;
+    let Some((nbt, mut stacks)) = game.native_with_mod_block_entity(at, |m| (m.nbt.clone(), load_transit(&m.nbt))) else {
+        return Some(item);
+    };
+    let node = node_from(game, at, &id, &nbt);
+    let Some(from) = tnet::side_between(at, source) else {
+        return Some(item);
+    };
+    let color = node.color;
+    if !node.can_receive_from(from) {
+        return Some(item);
+    }
+    let snap = snapshot(game, at, &nbt, &stacks, None);
+    let plans = plan_routes(game, &snap, at, &item, color, Some(source), 1);
+    let Some(i) = choose_plan(&plans, round_robin, rr) else {
+        return Some(item);
+    };
+    let plan = &plans[i];
+    let sending = plan.sending.min(item.count);
+    let mut moved = item.clone();
+    moved.count = sending;
+    let left = (sending < item.count).then(|| {
+        let mut rest = item.clone();
+        rest.count = item.count - sending;
+        rest
+    });
+    let id_no = get_int(&nbt, "next_id");
+    let mut s = Transit { id: id_no, item: moved, progress: 0, color, path: plan.path.clone(), ptype: PATH_DEST, orig: source, home: Some(source), idle: None, init: true, sync_t: 0, sync_pr: 0 };
+    s.touch(now);
+    stacks.push(s);
+    store_transit_other(game, at, &stacks, id_no + 1);
+    left
+}
+
+// --- The Configurator on a transporter ---
+
+/// A right click with the Configurator on a transporter: the plain one shows the colour (a diversion transporter
+/// changes the mode of the face instead); sneaking on the core, not on an arm, bumps the colour. False when the
+/// click is not for the transporter itself (a sneak on an arm changes that face's connection).
+fn configure_transporter(game: &mut Game<'_>, pos: P3, face: P3, sneaking: bool) -> bool {
+    let id = block_name(game, pos).to_owned();
+    if !is_transporter(&id) {
+        return false;
+    }
+    let f = face_index(face);
+    let logistical = id.ends_with("_logistical_transporter");
+    if sneaking {
+        let arm = game.native_block_property(pos, DIRECTIONS[f].0).as_deref() == Some("false");
+        let connected = game.native_with_mod_block_entity(pos, |m| conn_of(&m.nbt, f) != 3).unwrap_or(false);
+        if arm || !connected || !logistical {
+            return false;
+        }
+        let next = game
+            .native_with_mod_block_entity(pos, |m| {
+                let next = tnet::next_color(color_of(&m.nbt));
+                put_int(&mut m.nbt, "color", next.map_or(0, |c| u32::from(c) + 1));
+                put_int(&mut m.nbt, "shape_ticker", 0);
+                next
+            })
+            .flatten();
+        announce_color(game, "configurator.mekanism.toggle_color", next);
+        return true;
+    }
+    if logistical {
+        let color = game.native_with_mod_block_entity(pos, |m| color_of(&m.nbt)).flatten();
+        announce_color(game, "configurator.mekanism.view_color", color);
+    } else if id == "mekanism:diversion_transporter" {
+        let mode = game.native_with_mod_block_entity(pos, |m| {
+            let all = get_int(&m.nbt, "div");
+            let next = tnet::Diversion::from_id((all >> (2 * f)) & 3).next();
+            let code = match next {
+                tnet::Diversion::Disabled => 0,
+                tnet::Diversion::High => 1,
+                tnet::Diversion::Low => 2,
+            };
+            put_int(&mut m.nbt, "div", (all & !(3 << (2 * f))) | (code << (2 * f)));
+            put_int(&mut m.nbt, "shape_ticker", 0);
+            next
+        });
+        if let (Some(mode), Some(player)) = (mode, game.native_acting_player()) {
+            let key = match mode {
+                tnet::Diversion::Disabled => "transmitter.mekanism.control.disabled.desc",
+                tnet::Diversion::High => "transmitter.mekanism.control.high.desc",
+                tnet::Diversion::Low => "transmitter.mekanism.control.low.desc",
+            };
+            let label = horizon_client::text::Text::colored(lang_text(key), enum_color::RED);
+            let text = horizon_client::text::Text::translate("transmitter.mekanism.configurator.toggle_diverter", &[label]);
+            game.native_action_bar(player.uuid, text);
+        }
+    }
+    true
+}
+
+fn announce_color(game: &mut Game<'_>, key: &str, color: Option<u8>) {
+    let Some(player) = game.native_acting_player() else {
+        return;
+    };
+    let name = match color {
+        Some(c) => horizon_client::text::Text::colored(tnet::COLORS[usize::from(c)].0, tnet::COLORS[usize::from(c)].1),
+        None => horizon_client::text::Text::colored(lang_text("gui.mekanism.none"), 0xFFFFFF),
+    };
+    game.native_action_bar(player.uuid, horizon_client::text::Text::translate(key, &[name]));
+}
+
+/// The items moving along the transporters (hook point `native_world_items`): each stack a transporter's clients
+/// know of is drawn where `TransporterUtils.getStackPosition` puts it: along the side it is nearest, by its progress.
+fn transit_items(game: &Game<'_>, items: &mut Vec<super::native_hooks::NativeWorldItem>) {
+    let time = game.ticks as f32 + game.clock.fraction() as f32;
+    let mut alive = std::collections::HashSet::new();
+    TRANSPORTERS.with_borrow(|set| {
+        for pos in set {
+            let Some((id, client)) = game.native_client_block_entity(*pos) else {
+                continue;
+            };
+            let Some(Tag::List(list)) = client.get(&JavaString::from("transit")) else {
+                continue;
+            };
+            let speed = transporter_speed(&id) as f32;
+            for tag in list {
+                let Tag::Compound(c) = tag else {
+                    continue;
+                };
+                let Some(item) = get_string(c, "i") else {
+                    continue;
+                };
+                let key = (*pos, get_int(c, "id"), get_long(c, "t"));
+                alive.insert(key);
+                let seen = TRANSIT_SEEN.with_borrow_mut(|m| *m.entry(key).or_insert(time));
+                let progress = (get_int(c, "pr") as f32 + (time - seen) * speed).clamp(0.0, 100.0);
+                let side = if progress < 50.0 {
+                    get_pos(c, "pv").and_then(|p| tnet::side_between(p, *pos))
+                } else {
+                    get_pos(c, "nx").and_then(|n| tnet::side_between(*pos, n))
+                }
+                .unwrap_or(0);
+                let d = tnet::DIRS[side];
+                let k = f64::from(progress) / 100.0 - 0.5;
+                let at = [f64::from(pos[0]) + 0.5 + f64::from(d[0]) * k, f64::from(pos[1]) + 0.25 + f64::from(d[1]) * k, f64::from(pos[2]) + 0.5 + f64::from(d[2]) * k];
+                let matrix = glam::DMat4::from_translation(glam::DVec3::from_array(at)) * glam::DMat4::from_scale(glam::DVec3::splat(0.5));
+                items.push(super::native_hooks::NativeWorldItem {
+                    item,
+                    matrix: matrix.to_cols_array(),
+                    light_at: *pos,
+                    seed: key.1 as i32,
+                    ground: true,
+                });
+            }
+        }
+    });
+    TRANSIT_SEEN.with_borrow_mut(|m| m.retain(|k, _| alive.contains(k)));
+}
+
+thread_local! {
+    /// The logistical transporters this client has heard of, and when it first saw each stack's latest state
+    /// (by transporter, stack, sync time).
+    static TRANSPORTERS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+    static TRANSIT_SEEN: std::cell::RefCell<std::collections::HashMap<([i32; 3], u32, u64), f32>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 fn load_sorter(nbt: &Compound) -> Sorter {
@@ -5196,7 +6044,18 @@ fn tick_sorter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
             continue;
         }
         let left = if is_transporter(block_name(game, front)) {
-            route_items(game, front, pos, stack)
+            let mut rr = get_pos(&entity.nbt, "rr").map(|p| (p, get_int(&entity.nbt, "rr_side") as usize));
+            let left = insert_into_transporter(game, front, pos, stack, settings.round_robin, &mut rr);
+            match rr {
+                Some((p, side)) => {
+                    entity.nbt.insert("rr".into(), pos_tag(p));
+                    put_int(&mut entity.nbt, "rr_side", side as u32);
+                }
+                None => {
+                    entity.nbt.remove(&JavaString::from("rr"));
+                }
+            }
+            left
         } else {
             game.native_insert_item(front, front_face, stack)
         };
@@ -5246,154 +6105,6 @@ pub(super) fn use_sorter(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     }
     tell(game, line);
     true
-}
-
-/// Walks the transporters joined to `start`, nearest first, offering `stack` to every container beside
-/// them except `source`. Returns what no container took. What a container took is shown travelling along the
-/// transporters that led to it (`transit_seen`).
-fn route_items(game: &mut Game<'_>, start: [i32; 3], source: [i32; 3], stack: ItemStack) -> Option<ItemStack> {
-    let mut seen = std::collections::HashSet::from([start]);
-    let mut queue = std::collections::VecDeque::from([start]);
-    let mut parent: std::collections::HashMap<[i32; 3], [i32; 3]> = std::collections::HashMap::new();
-    let mut stack = Some(stack);
-    while let Some(node) = queue.pop_front() {
-        for (_, d) in DIRECTIONS {
-            let at = [node[0] + d[0], node[1] + d[1], node[2] + d[2]];
-            if at == source || seen.contains(&at) {
-                continue;
-            }
-            if is_transporter(block_name(game, at)) {
-                if seen.len() < 512 {
-                    seen.insert(at);
-                    parent.insert(at, node);
-                    queue.push_back(at);
-                }
-                continue;
-            }
-            let face = horizon_core::geometry::Direction::ALL[face_index([-d[0], -d[1], -d[2]])];
-            let offered = stack.take()?;
-            let (item, before) = (offered.item.to_string(), offered.count);
-            stack = game.native_insert_item(at, face, offered);
-            let taken = before - stack.as_ref().map_or(0, |s| s.count);
-            if taken > 0 {
-                let mut path = vec![node];
-                while let Some(&p) = parent.get(path.last().unwrap()) {
-                    path.push(p);
-                }
-                path.reverse();
-                record_transit(game, start, &item, source, &path, at);
-            }
-            if stack.is_none() {
-                return None;
-            }
-        }
-    }
-    stack
-}
-
-/// What a transporter shows of the stacks that travel through it (`TransporterStack` on the client): the item, the
-/// transporters it passes (from `start`), the container it ends in and when it left, in its `client` compound.
-fn record_transit(game: &mut Game<'_>, start: [i32; 3], item: &str, source: [i32; 3], path: &[[i32; 3]], dest: [i32; 3]) {
-    let now = game.world.game_time.max(0) as u64;
-    let speed = transporter_speed(block_name(game, start));
-    let ticks_per_block = (100 / speed.max(1)).max(1);
-    let mut e = Compound::new();
-    e.insert("i".into(), Tag::String(item.into()));
-    e.insert("s".into(), Tag::IntArray(source.to_vec()));
-    e.insert("p".into(), Tag::IntArray(path.iter().flatten().copied().collect()));
-    e.insert("d".into(), Tag::IntArray(dest.to_vec()));
-    put_long(&mut e, "t", now);
-    put_int(&mut e, "tpb", ticks_per_block);
-    game.native_with_mod_block_entity(start, |m| {
-        let mut client = match m.nbt.get(&JavaString::from("client")) {
-            Some(Tag::Compound(c)) => c.clone(),
-            _ => Compound::new(),
-        };
-        let mut list: Vec<Tag> = match client.get(&JavaString::from("transit")) {
-            Some(Tag::List(l)) => l.clone(),
-            _ => vec![],
-        };
-        // Drop what has arrived; the latest few are enough to draw.
-        list.retain(|t| matches!(t, Tag::Compound(c) if now.saturating_sub(get_long(c, "t")) < 20 * 20));
-        if list.len() < 16 {
-            list.push(Tag::Compound(e));
-        }
-        client.insert("transit".into(), Tag::List(list));
-        m.nbt.insert("client".into(), Tag::Compound(client));
-    });
-    game.native_sync_block_entity(start);
-}
-
-/// `TierConfig` `<tier>Speed` of a logistical transporter: progress a tick (100 is a block).
-fn transporter_speed(id: &str) -> u32 {
-    let name = id.strip_prefix("mekanism:").unwrap_or(id);
-    let (tier, default) = [("basic", 5), ("advanced", 10), ("elite", 20), ("ultimate", 50)].into_iter().find(|(t, _)| name.starts_with(t)).unwrap_or(("basic", 5));
-    mekanism_core::config_files::active_int("tiers", "transmitters.items", &format!("{tier}Speed"), default).max(1) as u32
-}
-
-thread_local! {
-    /// The logistical transporters this client has heard of, and when it first saw each stack travel (by transporter, stack).
-    static TRANSPORTERS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
-    static TRANSIT_SEEN: std::cell::RefCell<std::collections::HashMap<([i32; 3], u64), f32>> = std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// The items moving along the transporters (hook point `native_world_items`): each travels from the face of its
-/// source through the block centres of the transporters to the face of the container that took it, at the tier's speed.
-fn transit_items(game: &Game<'_>, items: &mut Vec<super::native_hooks::NativeWorldItem>) {
-    let time = game.ticks as f32 + game.clock.fraction() as f32;
-    let points = |c: &Compound| -> Option<Vec<[f64; 3]>> {
-        let center = |p: &[i32]| [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
-        let (Some(Tag::IntArray(src)), Some(Tag::IntArray(path)), Some(Tag::IntArray(dest))) = (c.get(&JavaString::from("s")), c.get(&JavaString::from("p")), c.get(&JavaString::from("d"))) else {
-            return None;
-        };
-        let nodes: Vec<[f64; 3]> = path.chunks(3).filter(|p| p.len() == 3).map(center).collect();
-        let (first, last) = (*nodes.first()?, *nodes.last()?);
-        let mid = |a: [f64; 3], b: [f64; 3]| [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0, (a[2] + b[2]) / 2.0];
-        let mut out = vec![mid(center(src), first)];
-        out.extend(nodes);
-        out.push(mid(last, center(dest)));
-        Some(out)
-    };
-    TRANSPORTERS.with_borrow(|set| {
-        for pos in set {
-            let Some((_, client)) = game.native_client_block_entity(*pos) else {
-                continue;
-            };
-            let Some(Tag::List(list)) = client.get(&JavaString::from("transit")) else {
-                continue;
-            };
-            for tag in list {
-                let Tag::Compound(c) = tag else {
-                    continue;
-                };
-                let (Some(item), Some(line)) = (get_string(c, "i"), points(c)) else {
-                    continue;
-                };
-                let key = (*pos, get_long(c, "t"));
-                let start = TRANSIT_SEEN.with_borrow_mut(|m| *m.entry(key).or_insert(time));
-                let per_block = get_int(c, "tpb").max(1) as f32;
-                let travelled = (time - start) / per_block;
-                let length = (line.len() - 1) as f32;
-                if travelled >= length || travelled < 0.0 {
-                    continue;
-                }
-                let segment = (travelled.floor() as usize).min(line.len() - 2);
-                let f = f64::from(travelled - segment as f32);
-                let (a, b) = (line[segment], line[segment + 1]);
-                let at = [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f - 0.2, a[2] + (b[2] - a[2]) * f];
-                let matrix = glam::DMat4::from_translation(glam::DVec3::from_array(at)) * glam::DMat4::from_scale(glam::DVec3::splat(0.5));
-                items.push(super::native_hooks::NativeWorldItem {
-                    item,
-                    matrix: matrix.to_cols_array(),
-                    light_at: *pos,
-                    seed: key.1 as i32,
-                    ground: true,
-                });
-            }
-        }
-    });
-    // Forget the ones long over.
-    TRANSIT_SEEN.with_borrow_mut(|m| m.retain(|_, start| time - *start < 20.0 * 20.0));
 }
 
 // --- Induction Matrix --------------------------------------------------------------------------------
