@@ -7403,18 +7403,12 @@ fn tooltip_body(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_cli
     if !game.native_on(MOD_ID) || !stack.item.starts_with("mekanism") {
         return;
     }
-    if &*stack.item == CONFIGURATOR {
-        let line = format!("Configuring: {}", configurator_conf(stack).label());
-        lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
-    }
-    if FREE_RUNNERS.contains(&&*stack.item) {
-        let line = format!("Mode: {}", free_runner_mode(stack).label());
-        lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
-    }
+    // The configurator's and the Free Runners' modes are HUD lines only (`addHUDStrings`), not tooltip components.
     if &*stack.item == DISASSEMBLER {
+        // `DisassemblerMode.addToTooltip`: the mode, then its efficiency, both in INDIGO.
         let mode = disassembler_mode(stack);
-        let line = format!("Mode: {} (efficiency {})", mode.label(), mode.efficiency());
-        lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+        lines.push(colored_line("tooltip.mekanism.mode", enum_color::INDIGO, enum_color::INDIGO, &[mode.label()]));
+        lines.push(colored_line("disassembler.mekanism.efficiency", enum_color::INDIGO, enum_color::INDIGO, &[&mode.efficiency().to_string()]));
     }
     upgrades_tooltip(stack, lines);
     if let Some(name) = stack.item.strip_prefix("mekanism:") {
@@ -7458,14 +7452,11 @@ fn tooltip_body(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_cli
         let line = bin_line(t, &bin_of(c));
         lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
     }
-    let installed = modules_of(stack);
-    for (id, n) in &installed {
-        let line = format!("{} x{n}", module_name(id));
-        lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0x55, 0x55, 0xFF, 0xFF)));
-    }
+    module_container_tooltip(game, stack, lines);
     if let Some(d) = drive_of(stack) {
-        let line = format!("Stored: {} / {} items, {} / {} types", d.total(), d.count_limit, d.items.len(), d.type_limit);
-        lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+        // `DriveMetadata.addToTooltip`: both lines GRAY with INDIGO numbers.
+        lines.push(colored_line("qio.mekanism.items_detail", enum_color::GRAY, enum_color::INDIGO, &[&thousands(d.total() as u64), &thousands(d.count_limit as u64)]));
+        lines.push(colored_line("qio.mekanism.types_detail", enum_color::GRAY, enum_color::INDIGO, &[&thousands(d.items.len() as u64), &thousands(d.type_limit as u64)]));
     }
     if let Some(Tag::Compound(c)) = custom_data(stack).and_then(|c| c.get(&JavaString::from(PERSONAL_KEY)))
         && let Some(name) = get_string(c, "owner_name")
@@ -7481,8 +7472,45 @@ fn tooltip_body(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_cli
     lines.push(colored_line("tooltip.mekanism.stored_energy", enum_color::BRIGHT_GREEN, enum_color::GRAY, &[&mekanism_core::energy::format_fe(energy)]));
 }
 
+/// The display name of a module (`module.<namespace>.<path>`), falling back to the title-cased id.
+fn module_display(id: &str) -> String {
+    let key = id.replacen(':', ".", 1);
+    let key = format!("module.{key}");
+    if horizon_client::lang::has(&key) { horizon_client::lang::get(&key) } else { module_name(id) }
+}
+
+/// The `module_container` appender: under the details key the installed modules (with `n/max` when stacked), else the hint.
+fn module_container_tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    use horizon_client::text::Text;
+    if !modules::is_container(&stack.item) {
+        return;
+    }
+    if !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+        lines.push((Text::translate("tooltip.mekanism.hold_for_modules", &[Text::colored("Left Shift", enum_color::INDIGO)]), tooltip_rgba(enum_color::GRAY)));
+        return;
+    }
+    let installed = installed_modules(stack);
+    if installed.is_empty() {
+        lines.push((Text::translate("module.mekanism.installed.none", &[]), tooltip_rgba(enum_color::DARK_RED)));
+        return;
+    }
+    lines.push((Text::translate("module.mekanism.installed.list", &[]), tooltip_rgba(enum_color::BRIGHT_GREEN)));
+    let white = horizon_client::hud::rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    for (id, n) in &installed {
+        let name = Text::literal(module_display(id));
+        let line = if *n > 1 {
+            let amount = Text::translate("generic.mekanism.fraction", &[Text::literal(n.to_string()), Text::literal(modules::max_installed(&stack.item, id).to_string())]);
+            Text::translate("generic.mekanism.transfer", &[name, amount])
+        } else {
+            Text::translate("generic.mekanism.list", &[name])
+        };
+        lines.push((line, white));
+    }
+}
+
 /// `EnumColor` rgb values (`mekanism.api.text.EnumColor`).
 mod enum_color {
+    pub const DARK_RED: u32 = 0xC9071F;
     pub const DARK_GRAY: u32 = 0x7A7A7A;
     pub const GRAY: u32 = 0xCFCFCF;
     pub const INDIGO: u32 = 0x559EFF;
