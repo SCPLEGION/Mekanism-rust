@@ -23093,7 +23093,7 @@ fn sec_denied(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         let owner = get_string(&m.nbt, "owner")?;
         let (mode, _) = sec_effective_of(&m.nbt);
         let data = sec_data(&owner);
-        (!sec::can_access(mode, &owner, &me, data.as_ref())).then(|| get_string(&m.nbt, "owner_name").unwrap_or_default())
+        (!sec_allowed(mode, &owner, &me, player.permission, data.as_ref())).then(|| get_string(&m.nbt, "owner_name").unwrap_or_default())
     });
     match verdict.flatten() {
         Some(_) => {
@@ -25575,13 +25575,14 @@ struct RobitPlayer {
     name: String,
     uuid: u128,
     at: [f64; 3],
+    permission: u8,
 }
 
 fn robit_players(game: &Game<'_>) -> Vec<RobitPlayer> {
-    let mut out: Vec<RobitPlayer> = game.native_server_players().into_iter().map(|p| RobitPlayer { name: p.name, uuid: p.uuid, at: p.position }).collect();
+    let mut out: Vec<RobitPlayer> = game.native_server_players().into_iter().map(|p| RobitPlayer { name: p.name, uuid: p.uuid, at: p.position, permission: p.permission }).collect();
     if let (Some(p), Some(u)) = (game.native_player(), game.level.player_uuid) {
         let uuid = u.iter().fold(0u128, |acc, part| acc << 32 | u128::from(*part as u32));
-        out.push(RobitPlayer { name: game.options.player_name().to_string(), uuid, at: [p.x, p.y, p.z] });
+        out.push(RobitPlayer { name: game.options.player_name().to_string(), uuid, at: [p.x, p.y, p.z], permission: 0 });
     }
     out
 }
@@ -25853,7 +25854,7 @@ fn send_robit_states(game: &mut Game<'_>, players: &[RobitPlayer]) {
         let owner_name = get_string(&data, "owner_name").unwrap_or_default();
         for p in players {
             // `canAccess` for this viewer: the client does not open the screen for one who is shut out.
-            let allowed = owner.as_ref().is_none_or(|o| sec::can_access(mode, o, &uuid_text(p.uuid), sec_data(o).as_ref()));
+            let allowed = owner.as_ref().is_none_or(|o| sec_allowed(mode, o, &uuid_text(p.uuid), p.permission, sec_data(o).as_ref()));
             let mut one = out.clone();
             one.push(u8::from(allowed));
             one.extend(owner_name.bytes());
@@ -25906,6 +25907,18 @@ fn robit_state_payload(data: &[u8]) {
     });
 }
 
+/// `SecurityUtils.canAccess` for a player: everyone with `allowProtection` off, an operator with `opsBypassRestrictions`
+/// (`MekanismPermissions.BYPASS_SECURITY` defaults to being an op), else the owner's mode and trusted list.
+fn sec_allowed(mode: sec::Mode, owner: &str, player: &str, permission: u8, data: Option<&sec::Data>) -> bool {
+    if mekanism_core::config_files::active_int("general", "security", "allowProtection", 1) == 0 {
+        return true;
+    }
+    if permission >= 1 && mekanism_core::config_files::active_int("general", "security", "opsBypassRestrictions", 0) != 0 {
+        return true;
+    }
+    sec::can_access(mode, owner, player, data)
+}
+
 /// A button on the Robit's screen, on the server: go home, toggle pickup, toggle following
 /// (`GuiInteractionEntity.GO_HOME`, `PICKUP_DROPS`, `FOLLOW`).
 /// `IEntitySecurityUtils.canAccess`: whether the acting player may use the Robit (a Robit with no owner
@@ -25921,7 +25934,7 @@ fn robit_allowed(game: &mut Game<'_>, id: u32) -> bool {
             return true;
         };
         let (mode, _) = sec_effective_of(&data);
-        sec::can_access(mode, &owner, &me, sec_data(&owner).as_ref())
+        sec_allowed(mode, &owner, &me, player.permission, sec_data(&owner).as_ref())
     })
     .unwrap_or(false)
 }
