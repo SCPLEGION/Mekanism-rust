@@ -15145,12 +15145,23 @@ fn wrap(game: &Game<'_>, text: &str, width: f32, scale: f32) -> Vec<String> {
     lines
 }
 
-/// The upgrade's effect line (`IUpgradeTile.getUpgradeWindowInfo`): the max multiplier to the
-/// power of installed / max, to two places.
-fn upgrade_effect(u: Upgrade, installed: u32) -> Option<String> {
+/// The upgrade's effect line (`IUpgradeTile.getUpgradeWindowInfo`): the max multiplier to the power of
+/// installed / max, to two places, as a Java float (`1.0`, not `1`). The chemical machines' speed upgrade
+/// is exponential (`upgradeInfoIsExponential`: 2 to the installed, a double); the QIO importer and exporter
+/// show `1 + installed / 2`.
+fn upgrade_effect(block: &str, u: Upgrade, installed: u32) -> Option<String> {
+    let java = |v: f64| if v.fract() == 0.0 { format!("{v:.1}") } else { format!("{}", v as f32) };
+    let speed = u == Upgrade::Speed;
+    let kind = kind(block);
     (u.max() > 1).then(|| {
-        let effect = mekanism_core::upgrades::max_upgrade_multiplier().powf(f64::from(installed) / f64::from(u.max()));
-        format!("Effect: {}x", (effect * 100.0).round() / 100.0)
+        let effect = if speed && matches!(kind, Some(Kind::Washer | Kind::Centrifuge | Kind::PigmentMixer | Kind::ChemicalInfuser | Kind::Rotary | Kind::Separator)) {
+            2f64.powf(f64::from(installed))
+        } else if speed && matches!(kind, Some(Kind::QioImporter | Kind::QioExporter)) {
+            f64::from(1.0 + installed as f32 / 2.0)
+        } else {
+            f64::from(((mekanism_core::upgrades::max_upgrade_multiplier().powf(f64::from(installed) / f64::from(u.max())) * 100.0).round() / 100.0) as f32)
+        };
+        format!("Effect: {}x", java(effect))
     })
 }
 
@@ -15209,7 +15220,7 @@ fn draw_upgrade_window(game: &Game<'_>, block: &str, data: &[i32], batch: &mut h
             let mut ty = s[1] + 4.0 + 6.0 * lines.len() as f32;
             let max = upgrade.map_or(1, Upgrade::max);
             game.native_text_scaled(batch, &format!("Amount: {n}/{max}"), [s[0] + 2.0, ty], 0x3C_FE9A, 0.6);
-            if let Some(effect) = upgrade.and_then(|u| upgrade_effect(u, *n)) {
+            if let Some(effect) = upgrade.and_then(|u| upgrade_effect(block, u, *n)) {
                 ty += 6.0;
                 game.native_text_scaled(batch, &effect, [s[0] + 2.0, ty], 0x3C_FE9A, 0.6);
             }
