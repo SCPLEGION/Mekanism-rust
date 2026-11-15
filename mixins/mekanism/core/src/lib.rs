@@ -46,6 +46,7 @@ pub mod oredictionificator;
 pub mod plenisher;
 pub mod radiation;
 pub mod qio;
+pub mod qio_search;
 pub mod recipe_table;
 pub mod recipes;
 pub mod redstone;
