@@ -23478,6 +23478,23 @@ fn sec_data(owner: &str) -> Option<sec::Data> {
     SEC_DATA.lock().ok()?.get(owner).cloned()
 }
 
+/// The owner's data for a block (or Robit): the live data of their desk, else the copy the block kept the last time
+/// it saw it (`SecurityFrequency` lives in the world's saved data in the original, which no desk's chunk has to be
+/// loaded for; here the data is kept in each secured block as well).
+fn sec_data_of(owner: &str, nbt: &Compound) -> Option<sec::Data> {
+    sec_data(owner).or_else(|| get_string(nbt, "sec_copy").map(|t| sec::Data::load(&t)))
+}
+
+/// Keeps the live data in the block's own copy.
+fn sec_keep_copy(nbt: &mut Compound) {
+    if let Some(data) = get_string(nbt, "owner").and_then(|o| sec_data(&o)) {
+        let text = data.save();
+        if get_string(nbt, "sec_copy").as_deref() != Some(text.as_str()) {
+            nbt.insert("sec_copy".into(), Tag::String(text.as_str().into()));
+        }
+    }
+}
+
 /// Whether a block carries security: its screen has the tab, or it is the desk.
 fn has_security(block: &str) -> bool {
     tabs(block) & TAB_SECURITY != 0 || block == sec::DESK
@@ -23489,7 +23506,7 @@ fn sec_mode_of(nbt: &Compound) -> sec::Mode {
 
 /// A block's mode as `SecurityUtils.getEffectiveSecurityMode` has it, and whether its owner's override set it.
 fn sec_effective_of(nbt: &Compound) -> (sec::Mode, bool) {
-    let data = get_string(nbt, "owner").and_then(|o| sec_data(&o));
+    let data = get_string(nbt, "owner").and_then(|o| sec_data_of(&o, nbt));
     sec::effective(sec_mode_of(nbt), data.as_ref())
 }
 
@@ -23571,8 +23588,9 @@ fn sec_denied(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     let me = uuid_text(player.uuid);
     let verdict = game.native_with_mod_block_entity(pos, |m| {
         let owner = get_string(&m.nbt, "owner")?;
+        sec_keep_copy(&mut m.nbt);
         let (mode, _) = sec_effective_of(&m.nbt);
-        let data = sec_data(&owner);
+        let data = sec_data_of(&owner, &m.nbt);
         (!sec_allowed(mode, &owner, &me, player.permission, data.as_ref())).then(|| get_string(&m.nbt, "owner_name").unwrap_or_default())
     });
     match verdict.flatten() {
@@ -23608,6 +23626,7 @@ fn security_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     if !has_security(&entity.id) {
         return;
     }
+    sec_keep_copy(&mut entity.nbt);
     let mut client = Compound::new();
     if let Some(name) = get_string(&entity.nbt, "owner_name") {
         client.insert("sec_name".into(), Tag::String(name.as_str().into()));
@@ -23627,7 +23646,8 @@ fn security_sync(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
 }
 
 fn is_secure_item(item: &str) -> bool {
-    has_security(item) || matches!(kind(item), Some(Kind::EnergyCube(_)))
+    // `ItemBlockTooltip` (the blocks with a security tile) and `ItemRobit` register the item security capability.
+    has_security(item) || item == robit::ITEM || matches!(kind(item), Some(Kind::EnergyCube(_)))
 }
 
 /// The desk every tick (`TileEntitySecurityDesk.onUpdateServer`): its owner's data is kept (made when there is
@@ -26802,7 +26822,7 @@ fn send_robit_states(game: &mut Game<'_>, players: &[RobitPlayer]) {
         let owner_name = get_string(&data, "owner_name").unwrap_or_default();
         for p in players {
             // `canAccess` for this viewer: the client does not open the screen for one who is shut out.
-            let allowed = owner.as_ref().is_none_or(|o| sec_allowed(mode, o, &uuid_text(p.uuid), p.permission, sec_data(o).as_ref()));
+            let allowed = owner.as_ref().is_none_or(|o| sec_allowed(mode, o, &uuid_text(p.uuid), p.permission, sec_data_of(o, &data).as_ref()));
             let mut one = out.clone();
             one.push(u8::from(allowed));
             one.extend(owner_name.bytes());
@@ -26882,7 +26902,7 @@ fn robit_allowed(game: &mut Game<'_>, id: u32) -> bool {
             return true;
         };
         let (mode, _) = sec_effective_of(&data);
-        sec_allowed(mode, &owner, &me, player.permission, sec_data(&owner).as_ref())
+        sec_allowed(mode, &owner, &me, player.permission, sec_data_of(&owner, &data).as_ref())
     })
     .unwrap_or(false)
 }
