@@ -8068,6 +8068,64 @@ thread_local! {
     static HUD_LAG: std::cell::Cell<Option<(f32, f32)>> = const { std::cell::Cell::new(None) };
 }
 
+/// The client config of the MekaSuit helmet's HUD (`ClientConfig`: `opacity`, `color`, `warningColor`, `dangerColor`,
+/// `jitter`, `mekaSuitHelmetCompass`), kept as the mod's settings of this player.
+#[derive(Clone, Copy, PartialEq)]
+struct HudCfg {
+    opacity: f32,
+    color: u32,
+    warning: u32,
+    danger: u32,
+    jitter: f32,
+    compass: bool,
+}
+
+impl HudCfg {
+    const DEFAULT: Self = Self { opacity: 0.4, color: 0x40F5F0, warning: 0xFFDD4F, danger: 0xFF383C, jitter: 6.0, compass: true };
+
+    /// `HUDColor.FADED`: the regular colour darkened by half.
+    fn faded(&self) -> u32 {
+        let [_, r, g, b] = self.color.to_be_bytes();
+        u32::from_be_bytes([0, r / 2, g / 2, b / 2])
+    }
+}
+
+thread_local! {
+    static HUD_CFG: std::cell::Cell<Option<HudCfg>> = const { std::cell::Cell::new(None) };
+}
+
+fn hud_cfg(game: &Game<'_>) -> HudCfg {
+    if let Some(c) = HUD_CFG.get() {
+        return c;
+    }
+    let num = |key: &str| game.native_setting(MOD_ID, &format!("hud_{key}")).and_then(|v| v.parse::<f64>().ok());
+    let d = HudCfg::DEFAULT;
+    let color = |key: &str, default: u32| num(key).map_or(default, |v| (v as i64).clamp(0, 0xFF_FFFF) as u32);
+    let c = HudCfg {
+        opacity: num("opacity").map_or(d.opacity, |v| (v as f32).clamp(0.0, 1.0)),
+        color: color("color", d.color),
+        warning: color("warning", d.warning),
+        danger: color("danger", d.danger),
+        jitter: num("jitter").map_or(d.jitter, |v| (v as f32).clamp(1.0, 100.0)),
+        compass: game.native_setting(MOD_ID, "hud_compass").is_none_or(|v| v != "false"),
+    };
+    HUD_CFG.set(Some(c));
+    c
+}
+
+fn hud_cfg_set(game: &Game<'_>, change: impl FnOnce(&mut HudCfg)) {
+    let mut c = hud_cfg(game);
+    change(&mut c);
+    HUD_CFG.set(Some(c));
+    let save = |key: &str, v: String| game.native_set_setting(MOD_ID, &format!("hud_{key}"), &v);
+    save("opacity", c.opacity.to_string());
+    save("color", c.color.to_string());
+    save("warning", c.warning.to_string());
+    save("danger", c.danger.to_string());
+    save("jitter", c.jitter.to_string());
+    save("compass", c.compass.to_string());
+}
+
 /// `MekanismHUD.render`: the text of the items worn and held (bottom left, at the HUD scale 0.6), then, with a
 /// MekaSuit helmet, `HUDRenderer.renderHUD`: compass, energy of the suit, icons of its modules, all lagging the
 /// head's turn a little. Colours: `ClientConfig` defaults (opacity 0.4, `0x40F5F0`).
@@ -8300,13 +8358,18 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch
     };
     // `HUDRenderer.update`, then the jitter: the HUD slips against a turning head by the root of the lag.
     let (prev_yaw, prev_pitch) = HUD_LAG.get().unwrap_or((me.yaw, me.pitch));
-    let jitter = 6.0;
+    let cfg = hud_cfg(game);
+    // `HUDRenderer.renderHUD`: nothing drawn at an opacity under 0.05.
+    if cfg.opacity < 0.05 {
+        return;
+    }
+    let jitter = cfg.jitter;
     let (prev_yaw, prev_pitch) = (prev_yaw + (me.yaw - prev_yaw) / jitter, prev_pitch + (me.pitch - prev_pitch) / jitter);
     HUD_LAG.set(Some((prev_yaw, prev_pitch)));
     let abs_sqrt = |v: f32| if v < 0.0 { -v.abs().sqrt() } else { v.sqrt() };
     let (jx, jy) = (-abs_sqrt(me.yaw - prev_yaw), -abs_sqrt(me.pitch - prev_pitch));
-    let alpha = 0x66u32;
-    let regular = 0x40F5F0u32;
+    let alpha = (cfg.opacity * 255.0).round() as u32;
+    let regular = cfg.color;
     let colour = |rgb: u32| {
         let [_, r, g, b] = rgb.to_be_bytes();
         horizon_client::hud::rgba(r, g, b, alpha as u8)
@@ -8316,16 +8379,18 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch
     let angle = std::f32::consts::PI - me.yaw.to_radians();
     let (sin, cos) = angle.sin_cos();
     let tilt = |u: f32, v: f32| [cx + u * cos - v * sin, cy + 0.5 * (u * sin + v * cos)];
-    if let Some(r) = game.gui.atlas.sprites.get("mekanism:gui/hud_compass").copied() {
+    if cfg.compass && let Some(r) = game.gui.atlas.sprites.get("mekanism:gui/hud_compass").copied() {
         let corners = [tilt(-50.0, -50.0), tilt(-50.0, 50.0), tilt(50.0, 50.0), tilt(50.0, -50.0)];
         batch.quad(corners, [[r.u0, r.v0], [r.u0, r.v1], [r.u1, r.v1], [r.u1, r.v0]], colour(regular));
     }
     let coords = format!("{}, {}, {}", me.x.floor() as i32, me.y.floor() as i32, me.z.floor() as i32);
     let first = batch.vertices.len();
     let w = game.native_text_width(&coords);
-    batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(&coords), cx - w / 2.0, cy - 4.0, colour(regular), false);
-    batch.scale_since(first, cx, cy, 0.7, 0.7);
-    for (letter, shift) in [("N", 0.0f32), ("E", std::f32::consts::FRAC_PI_2), ("S", std::f32::consts::PI), ("W", -std::f32::consts::FRAC_PI_2)] {
+    if cfg.compass {
+        batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(&coords), cx - w / 2.0, cy - 4.0, colour(regular), false);
+        batch.scale_since(first, cx, cy, 0.7, 0.7);
+    }
+    for (letter, shift) in [("N", 0.0f32), ("E", std::f32::consts::FRAC_PI_2), ("S", std::f32::consts::PI), ("W", -std::f32::consts::FRAC_PI_2)].into_iter().filter(|_| cfg.compass) {
         let (s, c) = (angle + shift).sin_cos();
         let (ax, ay) = (cx + 50.0 * s, cy - 50.0 * c);
         let first = batch.vertices.len();
@@ -8351,20 +8416,22 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch
         })
         .collect();
     for (n, (icon, ratio)) in shown.into_iter().enumerate() {
-        let rgb: u32 = if ratio > 0.2 { regular } else if ratio > 0.1 { 0xFFDD4F } else { 0xFF383C };
+        let rgb: u32 = if ratio > 0.2 { regular } else if ratio > 0.1 { cfg.warning } else { cfg.danger };
         let x = 10.0 + 48.0 * n as f32 + jx;
         game.native_sprite_tinted(batch, &format!("mekanism:gui/hud_{icon}"), [0.0, 0.0, 16.0, 16.0], [x, 10.0 + jy, 16.0, 16.0], (alpha << 24) | rgb);
         let text = horizon_client::text::Text::literal(&format!("{}%", (ratio * 100.0).round() as i64));
         batch.text_styled(&game.gui.atlas, &text, x + 18.0, 15.0 + jy, colour(rgb), false);
     }
-    module_icons(game, batch, jx, jy);
+    module_icons(game, batch, jx, jy, cfg);
 }
 
 /// `HUDRenderer.renderMekaSuitModuleIcons`: the elements of the modules in the worn suit and held Meka-Tools, stacked up
 /// from the bottom right (text, then icon). Shown: the Jetpack Unit (mode and hydrogen), the Gravitational Modulating
 /// Unit and the Vision Enhancement Unit (on or off); the radiation readouts need the radiation system.
-fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, jx: f32, jy: f32) {
-    const REGULAR: u32 = 0x40F5F0;
+fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, jx: f32, jy: f32, cfg: HudCfg) {
+    let regular = cfg.color;
+    let faded = cfg.faded();
+    let opacity = (cfg.opacity * 255.0).round() as u32;
     let stacks: Vec<ItemStack> = [game.armor[0].clone(), game.armor[1].clone(), game.armor[2].clone(), game.armor[3].clone(), game.inventory.get(game.selected).cloned().flatten(), game.offhand.clone()]
         .into_iter()
         .flatten()
@@ -8382,20 +8449,20 @@ fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
                 let capacity = jetpack_capacity(stack);
                 let ratio = if capacity == 0 { 1.0 } else { jetpack_fuel(stack) as f64 / capacity as f64 };
                 let icon = ["jetpack_normal", "jetpack_hover", "jetpack_vector", "jetpack_off"][mode.min(3) as usize];
-                let color = if ratio > 0.2 { REGULAR } else if ratio > 0.1 { 0xFFDD4F } else { 0xFF383C };
+                let color = if ratio > 0.2 { regular } else if ratio > 0.1 { cfg.warning } else { cfg.danger };
                 elements.push((icon, format!("{}%", (ratio * 100.0).round() as i64), color));
             }
         }
         // `ModuleNutritionalInjectionUnit.addHUDElements`: the paste in the suit, as a percentage.
         if flag(stack, NUTRITION_UNIT, "enabled") == Some(1) {
             let ratio = (suit_paste(stack) as f64 / suit_paste_capacity() as f64).min(1.0);
-            let color = if ratio > 0.2 { REGULAR } else if ratio > 0.1 { 0xFFDD4F } else { 0xFF383C };
+            let color = if ratio > 0.2 { regular } else if ratio > 0.1 { cfg.warning } else { cfg.danger };
             elements.push(("nutritional_injection_unit", format!("{}%", (ratio * 100.0).round() as i64), color));
         }
         for (module, icon) in [("mekanism:gravitational_modulating_unit", "gravitational_modulation_unit"), ("mekanism:vision_enhancement_unit", "vision_enhancement_unit")] {
             if installed_modules(stack).get(module).copied().unwrap_or(0) > 0 && flag(stack, module, "render_hud") != Some(0) {
                 let on = flag(stack, module, "enabled") == Some(1);
-                elements.push((icon, if on { "On" } else { "Off" }.to_owned(), if on { REGULAR } else { 0x207A78 }));
+                elements.push((icon, if on { "On" } else { "Off" }.to_owned(), if on { regular } else { faded }));
             }
         }
     }
@@ -8407,7 +8474,7 @@ fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
         };
         let tone = |warn_from_baseline: bool, magnitude: f64| {
             let calm = if warn_from_baseline { magnitude <= radiation::BASELINE } else { magnitude < radiation::MIN_MAGNITUDE };
-            if calm { REGULAR } else if magnitude < 0.1 { 0xFFDD4F } else { 0xFF383C }
+            if calm { regular } else if magnitude < 0.1 { cfg.warning } else { cfg.danger }
         };
         if on("mekanism:geiger_unit") {
             let text = decay_text(radiation::display(level, "Sv", 2), level > radiation::BASELINE, max, radiation::source_decay_rate());
@@ -8424,9 +8491,9 @@ fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
         y -= 18.0;
         let text_width = game.native_text_width(&text);
         let x = width - 10.0 - (24.0 + text_width) + jx;
-        let argb = (0x66u32 << 24) | rgb;
+        let argb = (opacity << 24) | rgb;
         let [_, r, g, b] = rgb.to_be_bytes();
-        batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(&text), x, y + 5.0, horizon_client::hud::rgba(r, g, b, 0x66), false);
+        batch.text_styled(&game.gui.atlas, &horizon_client::text::Text::literal(&text), x, y + 5.0, horizon_client::hud::rgba(r, g, b, opacity as u8), false);
         game.native_sprite_tinted(batch, &format!("mekanism:gui/hud_{icon}"), [0.0, 0.0, 16.0, 16.0], [x + text_width + 2.0, y, 16.0, 16.0], argb);
     }
 }
@@ -23853,6 +23920,12 @@ struct TwUi {
     setting_scroll: usize,
     /// Where the window was drawn last, for the clicks.
     origin: [f32; 2],
+    /// `GuiMekaSuitHelmetOptions` is open, where it was moved to, where the cursor took hold of it, and what is held:
+    /// 1 the opacity slider, 2 the jitter slider, 3 the window.
+    hud: bool,
+    hud_offset: [f32; 2],
+    hud_grab: [f32; 2],
+    hud_drag: u8,
 }
 
 thread_local! {
@@ -24002,6 +24075,10 @@ fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
             ui.slot = None;
             ui.module = None;
         }
+        // `addGuiElements`: the first tweakable item starts selected.
+        if ui.slot.is_none() {
+            ui.slot = slots.first().copied();
+        }
         for (i, slot) in slots.iter().take(11).enumerate() {
             let r = tw_item_cell(i, o);
             let base = if ui.slot == Some(*slot) {
@@ -24018,6 +24095,13 @@ fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         }
         let frame = [o[0] + 8.0, o[1] + 39.0, 88.0, 14.0 + 12.0 * (TW_ROWS as f32 - 1.0) + 2.0];
         nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, frame, 0xFFFF_FFFF);
+        // `optionsButton`: only a MekaSuit helmet (`MEKASUIT_HUD_RENDERER`) has options.
+        let helmet = ui.slot.and_then(|s| tw_stack(game, s)).is_some_and(|s| &*s.item == modules::HELMET);
+        let holder = [o[0] + 8.0, o[1] + 120.0, 88.0, 18.0];
+        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, holder, 0xFFFF_FFFF);
+        let button = [holder[0] + 1.0, holder[1] + 1.0, 86.0, 16.0];
+        draw_button(game, batch, button, helmet && inside(cursor, button), helmet, 0xFFFF_FFFF, None);
+        centred(game, batch, "Options", button[0], button[2], button[1] + 4.0, if helmet { 0xFF_FFFF } else { 0xA0_A0A0 });
         let Some(stack) = ui.slot.and_then(|s| tw_stack(game, s)) else {
             game.native_text(batch, "Pick an item", [o[0] + 12.0, o[1] + 44.0], 0x60_6060, false);
             return;
@@ -24081,9 +24165,10 @@ fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
             centred(game, batch, &value, b[0], b[2], b[1] + 3.0, 0xFF_FFFF);
         }
     });
+    tw_hud_draw(game, batch, o);
     tw_color_draw(game, batch, o);
     // `GuiModuleScrollList.updateTooltip`: a module in the list tells how many of the most it can take are installed.
-    if TW_COLOR.with_borrow(Option::is_none) {
+    if TW_COLOR.with_borrow(Option::is_none) && !TW_UI.with_borrow(|ui| ui.hud) {
         let cursor = game.native_cursor();
         let line = TW_UI.with_borrow(|ui| {
             let stack = tw_stack(game, ui.slot?)?;
@@ -24105,7 +24190,20 @@ fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
         tw_color_click(game, o, at, button, pressed);
         return;
     }
+    if TW_UI.with_borrow(|ui| ui.hud) {
+        tw_hud_click(game, o, at, button, pressed);
+        return;
+    }
     if !pressed || button > 1 {
+        return;
+    }
+    // `optionsButton`.
+    if inside(at, [o[0] + 9.0, o[1] + 121.0, 86.0, 16.0]) && button == 0 {
+        let helmet = TW_UI.with_borrow(|ui| ui.slot).and_then(|s| tw_stack(game, s)).is_some_and(|s| &*s.item == modules::HELMET);
+        if helmet {
+            TW_UI.with_borrow_mut(|ui| (ui.hud, ui.hud_offset, ui.hud_drag) = (true, [0.0; 2], 0));
+            game.audio.play_unshared("mekanism:gui.beep_on", None, 1.0, 1.0);
+        }
         return;
     }
     let slots = tw_slots(game);
@@ -24143,7 +24241,7 @@ fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
                 // `ColorSelection.click`: only the swatch opens the picker window.
                 if inside(at, tw_swatch(tw_setting_row(i, o))) {
                     let slot = ui.slot.unwrap_or(0);
-                    let mut window = TwColor::new(slot, &module, s.key, now);
+                    let mut window = TwColor::new(slot, &module, s.key, now, true);
                     // Worn armour shows on the model beside the pickers (`ColorSelection` offers the preview for the unit's colour).
                     if slot < 4 && module == "mekanism:color_modulation_unit" {
                         window.preview = Some((slot, stack.clone()));
@@ -24169,6 +24267,141 @@ fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
     }
 }
 
+/// `GuiModuleTweaker.keyPressed`: up and left select the previous tweakable item, down and right the next (wrapping);
+/// Escape closes the helmet's options window first.
+fn tw_key(game: &mut Game<'_>, key: &str) {
+    if TW_UI.with_borrow(|ui| ui.hud) {
+        if key == "key.keyboard.escape" {
+            TW_UI.with_borrow_mut(|ui| (ui.hud, ui.hud_drag) = (false, 0));
+        }
+        return;
+    }
+    let step: isize = match key {
+        "key.keyboard.up" | "key.keyboard.left" => -1,
+        "key.keyboard.down" | "key.keyboard.right" => 1,
+        _ => return,
+    };
+    let slots = tw_slots(game);
+    TW_UI.with_borrow_mut(|ui| {
+        let Some(cur) = ui.slot.and_then(|s| slots.iter().position(|x| *x == s)) else {
+            return;
+        };
+        let next = (cur as isize + step).rem_euclid(slots.len() as isize) as usize;
+        ui.slot = Some(slots[next]);
+        ui.module = None;
+        ui.scroll = 0;
+    });
+}
+
+// --- The helmet's options window (GuiMekaSuitHelmetOptions) -------------------------------------------------
+
+const HUD_WINDOW: [f32; 2] = [140.0, 140.0];
+
+fn tw_hud_corner(o: [f32; 2]) -> [f32; 2] {
+    let off = TW_UI.with_borrow(|ui| ui.hud_offset);
+    [o[0] + ((TW_WINDOW[0] - HUD_WINDOW[0]) / 2.0).floor() + off[0], o[1] + ((TW_WINDOW[1] - HUD_WINDOW[1]) / 2.0).floor() + off[1]]
+}
+
+/// The window's parts from its corner: the three colour slots, the two sliders and the compass switch.
+fn tw_hud_parts(w: [f32; 2]) -> ([[f32; 4]; 3], [[f32; 4]; 2], [f32; 4]) {
+    let at = |x: f32, y: f32, ww: f32, h: f32| [w[0] + x, w[1] + y, ww, h];
+    ([at(12.0, 32.0, 18.0, 18.0), at(61.0, 32.0, 18.0, 18.0), at(110.0, 32.0, 18.0, 18.0)], [at(10.0, 62.0, 120.0, 12.0), at(10.0, 87.0, 120.0, 12.0)], at(7.0, 112.0, 126.0, 22.0))
+}
+
+fn tw_hud_slider_value(c: HudCfg, i: usize) -> f32 {
+    if i == 0 { c.opacity } else { (c.jitter - 1.0) / 99.0 }
+}
+
+fn tw_hud_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2]) {
+    let (open, drag, grab) = TW_UI.with_borrow(|ui| (ui.hud, ui.hud_drag, ui.hud_grab));
+    if !open {
+        return;
+    }
+    let cursor = game.native_cursor();
+    let cfg = hud_cfg(game);
+    // Held controls go on setting while the button is down (`GuiSlider.onDrag`, `GuiWindow.onDrag`).
+    if drag != 0 {
+        if !game.native_mouse_down() {
+            TW_UI.with_borrow_mut(|ui| ui.hud_drag = 0);
+        } else if drag == 3 {
+            let home = [o[0] + ((TW_WINDOW[0] - HUD_WINDOW[0]) / 2.0).floor(), o[1] + ((TW_WINDOW[1] - HUD_WINDOW[1]) / 2.0).floor()];
+            let x = (cursor[0] - grab[0]).clamp(0.0, (batch.width - HUD_WINDOW[0]).max(0.0));
+            let y = (cursor[1] - grab[1]).clamp(0.0, (batch.height - HUD_WINDOW[1]).max(0.0));
+            TW_UI.with_borrow_mut(|ui| ui.hud_offset = [x - home[0], y - home[1]]);
+        } else {
+            let slider = tw_hud_parts(tw_hud_corner(o)).1[drag as usize - 1];
+            let value = ((f64::from(cursor[0]) - f64::from(slider[0]) - 2.0) / f64::from(slider[2] - 6.0)).clamp(0.0, 1.0);
+            hud_cfg_set(game, |c| if drag == 1 { c.opacity = value as f32 } else { c.jitter = (99.0 * value + 1.0) as f32 });
+        }
+    }
+    let cfg = if drag != 0 { hud_cfg(game) } else { cfg };
+    let w = tw_hud_corner(o);
+    robit_window_plate(game, batch, [w[0], w[1], HUD_WINDOW[0], HUD_WINDOW[1]], "Helmet Options");
+    game.native_text(batch, "HUD Overlay:", [w[0] + 7.0, w[1] + 20.0], 0x40_4040, false);
+    let (slots, sliders, switch) = tw_hud_parts(w);
+    for (i, (slot, rgb)) in slots.iter().zip([cfg.color, cfg.warning, cfg.danger]).enumerate() {
+        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, *slot, 0xFFFF_FFFF);
+        game.native_fill(batch, [slot[0] + 1.0, slot[1] + 1.0, 16.0, 16.0], 0xFF00_0000 | rgb);
+        let label = ["Default", "Warning", "Danger"][i];
+        let x = w[0] + [6.0, 55.0, 104.0][i];
+        let text_w = game.native_text_width(label) * 0.8;
+        game.native_text_scaled(batch, label, [x + (32.0 - text_w) / 2.0, w[1] + 52.0], 0x40_4040, 0.8);
+    }
+    for (i, r) in sliders.iter().enumerate() {
+        game.native_fill(batch, [r[0] + 2.0, r[1] + 3.0, r[2] - 4.0, 6.0], 0xFF55_5555);
+        let pos = (tw_hud_slider_value(cfg, i) * (r[2] - 6.0)).trunc();
+        sprite(game, batch, "slider/smooth", [0.0, 0.0, 7.0, 12.0], [r[0] + pos, r[1], 7.0, 12.0]);
+        let label = if i == 0 { format!("Opacity: {}%", (cfg.opacity * 100.0).round() as i32) } else { format!("Jitter: {}%", cfg.jitter as i32) };
+        let text_w = game.native_text_width(&label) * 0.8;
+        game.native_text_scaled(batch, &label, [w[0] + (HUD_WINDOW[0] - text_w) / 2.0, w[1] + if i == 0 { 75.0 } else { 100.0 }], 0x40_4040, 0.8);
+    }
+    // `GuiScreenSwitch`.
+    nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, switch, 0xFFFF_FFFF);
+    game.native_text_scaled(batch, "Compass", [switch[0] + 4.0, switch[1] + 4.0], 0x3C_FE9A, 0.8);
+    let (tx, ty) = (switch[0] + switch[2] - 17.0, switch[1] + 2.0);
+    let on = cfg.compass;
+    sprite(game, batch, if on { "switch/selected" } else { "switch/unselected" }, [0.0, 0.0, 15.0, 8.0], [tx, ty, 15.0, 8.0]);
+    sprite(game, batch, if on { "switch/unselected" } else { "switch/selected" }, [0.0, 0.0, 15.0, 8.0], [tx, ty + 9.0, 15.0, 8.0]);
+    game.native_text_scaled(batch, "On", [tx + (15.0 - game.native_text_width("On") * 0.6) / 2.0, ty + 1.0], 0x10_1010, 0.6);
+    game.native_text_scaled(batch, "Off", [tx + (15.0 - game.native_text_width("Off") * 0.6) / 2.0, ty + 10.0], 0x10_1010, 0.6);
+    // `GuiColorPickerSlot.updateTooltip`: the colour as hex.
+    if TW_COLOR.with_borrow(Option::is_none)
+        && let Some(i) = slots.iter().position(|r| inside(cursor, *r))
+    {
+        let rgb = [cfg.color, cfg.warning, cfg.danger][i];
+        horizon_client::ui::tooltip(batch, &game.gui.atlas, &[horizon_client::text::Text::legacy(&format!("\u{a7}7#{rgb:06X}"))], (cursor[0], cursor[1]));
+    }
+}
+
+fn tw_hud_click(game: &mut Game<'_>, o: [f32; 2], at: [f32; 2], button: u8, pressed: bool) {
+    if !pressed {
+        TW_UI.with_borrow_mut(|ui| ui.hud_drag = 0);
+        return;
+    }
+    if button != 0 {
+        return;
+    }
+    let w = tw_hud_corner(o);
+    let (slots, sliders, switch) = tw_hud_parts(w);
+    let cfg = hud_cfg(game);
+    if let Some(i) = slots.iter().position(|r| inside(at, *r)) {
+        let (key, rgb) = [("color", cfg.color), ("warning", cfg.warning), ("danger", cfg.danger)][i];
+        // `GuiColorPickerSlot.onClick`: a plain RGB picker, opened at ((width - 160) / 2, (height - 120) / 2).
+        let mut window = TwColor::new(0, "__hud", key, 0xFF00_0000 | rgb, false);
+        window.offset = [0.0; 2];
+        TW_COLOR.with_borrow_mut(|c| *c = Some(window));
+    } else if let Some(i) = sliders.iter().position(|r| inside(at, *r)) {
+        TW_UI.with_borrow_mut(|ui| ui.hud_drag = i as u8 + 1);
+        let value = ((f64::from(at[0]) - f64::from(sliders[i][0]) - 2.0) / f64::from(sliders[i][2] - 6.0)).clamp(0.0, 1.0);
+        hud_cfg_set(game, |c| if i == 0 { c.opacity = value as f32 } else { c.jitter = (99.0 * value + 1.0) as f32 });
+    } else if inside(at, [switch[0] + switch[2] - 17.0, switch[1] + 2.0, 15.0, 17.0]) {
+        hud_cfg_set(game, |c| c.compass = !c.compass);
+        game.audio.play_unshared(if cfg.compass { "mekanism:gui.digital_beep_off" } else { "mekanism:gui.digital_beep_on" }, None, 1.0, 1.0);
+    } else if inside(at, [w[0], w[1], HUD_WINDOW[0], 18.0]) {
+        TW_UI.with_borrow_mut(|ui| (ui.hud_drag, ui.hud_grab) = (3, [at[0] - w[0], at[1] - w[1]]));
+    }
+}
+
 // --- The colour picker window of a colour setting (GuiColorWindow, ColorSelection) ---------------------------
 
 /// `GuiColorWindow` with alpha: 184 x 152, placed like `ColorSelection.click` does, ((160 - 220) / 2 and (120 - 150) / 2 off).
@@ -24183,7 +24416,11 @@ impl TwColor {
     }
 
     fn width(&self) -> f32 {
-        COLOR_WINDOW[0] + if self.preview.is_some() { COLOR_PREVIEW_WIDTH } else { 0.0 }
+        (if self.alpha_on { COLOR_WINDOW[0] } else { 158.0 }) + if self.preview.is_some() { COLOR_PREVIEW_WIDTH } else { 0.0 }
+    }
+
+    fn height(&self) -> f32 {
+        if self.alpha_on { COLOR_WINDOW[1] } else { 140.0 }
     }
 }
 
@@ -24203,6 +24440,8 @@ struct TwColor {
     grab: [f32; 2],
     /// The armour piece being coloured shows beside the pickers (`GuiEntityPreview`): the worn armour slot, or none.
     preview: Option<(usize, ItemStack)>,
+    /// `handlesAlpha`: the HUD colours are plain RGB (a 158 x 140 window), the modules' colours RGBA.
+    alpha_on: bool,
 }
 
 thread_local! {
@@ -24210,13 +24449,13 @@ thread_local! {
 }
 
 impl TwColor {
-    fn new(slot: usize, module: &str, key: &str, argb: u32) -> Self {
+    fn new(slot: usize, module: &str, key: &str, argb: u32, alpha_on: bool) -> Self {
         let mut edit = horizon_client::ui::EditBox::new(0.0, 0.0, 79.0, 12.0);
         edit.bordered = false;
-        edit.max_length = 15;
+        edit.max_length = if alpha_on { 15 } else { 11 };
         edit.text_color = u32::MAX;
         edit.focused = true;
-        let mut c = Self { slot, module: module.to_owned(), key: key.to_owned(), hue: 0.0, sat: 0.5, val: 0.5, alpha: 1.0, edit, drag: 0, offset: [0.0; 2], grab: [0.0; 2], preview: None };
+        let mut c = Self { slot, module: module.to_owned(), key: key.to_owned(), hue: 0.0, sat: 0.5, val: 0.5, alpha: 1.0, edit, drag: 0, offset: [0.0; 2], grab: [0.0; 2], preview: None, alpha_on };
         c.set_color(argb);
         c
     }
@@ -24239,13 +24478,13 @@ impl TwColor {
     }
 
     fn update_text(&mut self) {
-        self.edit.set_value(&mekanism_core::color::text(self.argb(), true));
+        self.edit.set_value(&mekanism_core::color::text(self.argb(), self.alpha_on));
         self.edit.move_cursor_to_end(false);
     }
 
     /// `updateColorFromText`.
     fn update_from_text(&mut self) {
-        if let Some(argb) = mekanism_core::color::parse(&self.edit.value, true) {
+        if let Some(argb) = mekanism_core::color::parse(&self.edit.value, self.alpha_on) {
             self.set_from(argb);
         }
     }
@@ -24277,9 +24516,24 @@ fn tw_grid(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, r: [f32; 
 
 /// The window's parts, relative to its corner: (view holder, view, shade holder, shade, hue holder, hue, alpha holder,
 /// alpha, text field, confirm).
-fn tw_color_rects(w: [f32; 2]) -> [[f32; 4]; 10] {
+fn tw_color_rects(w: [f32; 2], alpha_on: bool) -> [[f32; 4]; 10] {
     let (x, y) = (w[0], w[1]);
     let at = |r: [f32; 4]| [x + r[0], y + r[1], r[2], r[3]];
+    if !alpha_on {
+        let none = [0.0; 4];
+        return [
+            at([6.0, 17.0, 41.0, 82.0]),
+            at([7.0, 18.0, 39.0, 80.0]),
+            at([50.0, 17.0, 102.0, 82.0]),
+            at([51.0, 18.0, 100.0, 80.0]),
+            at([6.0, 103.0, 146.0, 10.0]),
+            at([7.0, 104.0, 144.0, 8.0]),
+            none,
+            none,
+            at([30.0, 120.0, 63.0, 12.0]),
+            at([98.0, 119.0, 54.0, 14.0]),
+        ];
+    }
     [
         at([6.0, 17.0, 47.0, 82.0]),
         at([7.0, 18.0, 45.0, 80.0]),
@@ -24305,14 +24559,14 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
             if game.native_mouse_down() {
                 let home = [o[0] + 30.0, o[1] + 15.0];
                 let x = (cursor[0] - c.grab[0]).clamp(0.0, (batch.width - c.width()).max(0.0));
-                let y = (cursor[1] - c.grab[1]).clamp(0.0, (batch.height - COLOR_WINDOW[1]).max(0.0));
+                let y = (cursor[1] - c.grab[1]).clamp(0.0, (batch.height - c.height()).max(0.0));
                 c.offset = [x - home[0], y - home[1]];
             } else {
                 c.drag = 0;
             }
         }
         let corner = c.corner(o);
-        let [view_holder, view, shade_holder, shade, hue_holder, hue, alpha_holder, alpha, field, confirm] = tw_color_rects(corner);
+        let [view_holder, view, shade_holder, shade, hue_holder, hue, alpha_holder, alpha, field, confirm] = tw_color_rects(corner, c.alpha_on);
         // A held button keeps setting what it was pressed on (`GuiPicker.onDrag`).
         if (1..=3).contains(&c.drag) {
             if game.native_mouse_down() {
@@ -24335,12 +24589,14 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
                 c.drag = 0;
             }
         }
-        let w = [corner[0], corner[1], c.width(), COLOR_WINDOW[1]];
+        let w = [corner[0], corner[1], c.width(), c.height()];
         robit_window_plate(game, batch, w, "Color Picker");
         let argb = c.argb();
         let mut holder = |r: [f32; 4]| nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, r, 0xFFFF_FFFF);
         for r in [view_holder, shade_holder, hue_holder, alpha_holder] {
-            holder(r);
+            if r[2] > 0.0 {
+                holder(r);
+            }
         }
         // `GuiColorView`.
         tw_grid(game, batch, view);
@@ -24368,6 +24624,7 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
         sprite(game, batch, "slider/color_picker", [0.0, 0.0, 7.0, 12.0], [hue[0] - 2.0 + pos, hue[1] - 2.0, 7.0, 12.0]);
         game.native_fill(batch, [hue[0] + pos, hue[1], 3.0, 8.0], mekanism_core::color::argb(mekanism_core::color::hsv_to_rgb(c.hue, 1.0, 1.0), 255));
         // `GuiAlphaPicker`.
+        if c.alpha_on {
         tw_grid(game, batch, alpha);
         let rgb = mekanism_core::color::hsv_to_rgb(c.hue, c.sat, c.val);
         for i in 0..alpha[2] as i32 {
@@ -24377,6 +24634,7 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
         sprite(game, batch, "slider/color_picker", [0.0, 0.0, 7.0, 12.0], [alpha[0] - 2.0 + pos, alpha[1] - 2.0, 7.0, 12.0]);
         tw_grid(game, batch, [alpha[0] + pos, alpha[1], 3.0, 8.0]);
         game.native_fill(batch, [alpha[0] + pos, alpha[1], 3.0, 8.0], argb);
+        }
         // `GuiEntityPreview`: the player model wearing the piece in the colour being picked.
         if let Some((slot, stack)) = c.preview.clone() {
             let (px, py, pw, ph) = (corner[0] + 155.0 + 26.0, corner[1] + 17.0, 80.0, COLOR_WINDOW[1] - 24.0);
@@ -24390,8 +24648,8 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
             game.native_gui_player(batch, [px + 1.0, py + 1.0, px + pw - 1.0, py + ph - 1.0], 50.0, 0.0, &armor);
         }
         // The "RGBA:" label, right aligned to the field, the field and Confirm.
-        let label = "RGBA:";
-        game.native_text(batch, label, [w[0] + 34.0 - game.native_text_width(label), w[1] + 134.0], 0x40_4040, false);
+        let label = if c.alpha_on { "RGBA:" } else { "RGB:" };
+        game.native_text(batch, label, [field[0] - 2.0 - game.native_text_width(label), w[1] + c.height() - 18.0], 0x40_4040, false);
         nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, field, 0xFFFF_FFFF);
         [c.edit.x, c.edit.y, c.edit.width, c.edit.height] = [field[0] + 2.0, field[1], field[2] - 4.0, 12.0];
         c.edit.focused = true;
@@ -24403,7 +24661,8 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
 
 fn tw_color_click(game: &mut Game<'_>, o: [f32; 2], at: [f32; 2], button: u8, pressed: bool) {
     let corner = TW_COLOR.with_borrow(|c| c.as_ref().map_or([o[0] + 30.0, o[1] + 15.0], |c| c.corner(o)));
-    let [_, _, _, shade, _, hue, _, alpha, field, confirm] = tw_color_rects(corner);
+    let alpha_on = TW_COLOR.with_borrow(|c| c.as_ref().is_none_or(|c| c.alpha_on));
+    let [_, _, _, shade, _, hue, _, alpha, field, confirm] = tw_color_rects(corner, alpha_on);
     let mut send = None;
     TW_COLOR.with_borrow_mut(|slot| {
         let Some(c) = slot.as_mut() else {
@@ -24421,7 +24680,7 @@ fn tw_color_click(game: &mut Game<'_>, o: [f32; 2], at: [f32; 2], button: u8, pr
             c.drag = 1;
         } else if inside(at, hue) {
             c.drag = 2;
-        } else if inside(at, alpha) {
+        } else if c.alpha_on && inside(at, alpha) {
             c.drag = 3;
         } else if inside(at, field) {
             c.edit.click(&game.gui.atlas, at[0], false, false);
@@ -24431,12 +24690,23 @@ fn tw_color_click(game: &mut Game<'_>, o: [f32; 2], at: [f32; 2], button: u8, pr
             c.drag = 5;
             c.grab = [at[0] - corner[0], at[1] - corner[1]];
         } else if inside(at, confirm) {
-            send = Some(format!("{}|{}|{}|{}", c.slot, c.module, c.key, c.argb()));
+            send = Some(format!("{}|{}|{}|{}", c.slot, c.module, c.key, if c.alpha_on { c.argb() } else { c.argb() & 0xFF_FFFF }));
         }
     });
     if let Some(text) = send {
-        game.native_send_to_server(TW_CHANNEL, text.as_bytes());
         TW_COLOR.with_borrow_mut(|c| *c = None);
+        // The helmet options' colours are the player's own client config: kept here, not sent.
+        if let [_, "__hud", key, value] = text.split('|').collect::<Vec<_>>()[..]
+            && let Ok(value) = value.parse::<u32>()
+        {
+            hud_cfg_set(game, |c| match key {
+                "color" => c.color = value,
+                "warning" => c.warning = value,
+                _ => c.danger = value,
+            });
+        } else {
+            game.native_send_to_server(TW_CHANNEL, text.as_bytes());
+        }
     }
 }
 
@@ -24579,6 +24849,10 @@ pub(super) fn ui_key(game: &mut Game<'_>, id: &str, key: &str, text: Option<&str
     }
     if id == TW_ID && pressed && TW_COLOR.with_borrow(Option::is_some) {
         tw_color_key(game, key, text);
+        return;
+    }
+    if id == TW_ID && pressed {
+        tw_key(game, key);
         return;
     }
     if id == ROBIT_SCREEN && pressed && ROBIT_WIN.with(std::cell::Cell::get) == 1 {
