@@ -25012,9 +25012,9 @@ fn seismic_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
             let id = ui.column[l].clone();
             let count = ui.column.iter().filter(|b| **b == id).count();
             let name = pretty_id(&id);
-            let fit = (63.0 / (game.native_text_width(&name) * 0.8)).min(1.0) * 0.8;
-            game.native_text_scaled(batch, &name, [o[0] + 8.0, o[1] + 14.0], 0x3C_FE9A, fit);
-            game.native_text_scaled(batch, &format!("Abundancy: {count}"), [o[0] + 8.0, o[1] + 14.0 + 11.0], 0x3C_FE9A, 0.8);
+            // `GuiInnerScreen(5, 11, 69, 50)` with padding 3, full size text, nine pixels a line, scrolled when too long.
+            scrolling_text(game, batch, &name, [o[0] + 8.0, o[1] + 14.0, o[0] + 71.0, o[1] + 23.0], 0, 0x3C_FE9A, 1.0);
+            scrolling_text(game, batch, &format!("Abundancy: {count}"), [o[0] + 8.0, o[1] + 23.0, o[0] + 71.0, o[1] + 32.0], 0, 0x3C_FE9A, 1.0);
         }
         // The scroll bar (`GuiScrollBar`): an element holder, the handle riding in it.
         let bar = [o[0] + SEISMIC_BAR[0], o[1] + SEISMIC_BAR[1], 14.0, SEISMIC_BAR[3]];
