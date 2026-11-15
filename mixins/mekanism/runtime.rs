@@ -14824,11 +14824,11 @@ fn window_click(block: &str, data: &[i32], at: [f32; 2], right: bool, button: &m
 }
 
 /// The open window's tooltip: true when the cursor is on the window.
-fn window_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
+fn window_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
     let shown = match window(block) {
         Some(Window::Sides(shown)) => shown,
         Some(Window::Upgrades(_)) => return upgrade_window_tooltip(block, data, at, lines),
-        Some(Window::Transporter) => return transporter_window_tooltip(block, data, at, lines),
+        Some(Window::Transporter) => return transporter_window_tooltip(game, block, data, at, lines),
         None => return false,
     };
     let Some(l) = layout(block) else {
@@ -18150,7 +18150,7 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
     let Some(l) = layout(block) else {
         return;
     };
-    if window_tooltip(block, data, window_at(block, at), lines) || tab_tooltip(block, &l, data, at, lines) {
+    if window_tooltip(game, block, data, window_at(block, at), lines) || tab_tooltip(block, &l, data, at, lines) {
         return;
     }
     if kind(block) == Some(Kind::DigitalMiner) {
@@ -24724,7 +24724,7 @@ fn transporter_window_click(block: &str, data: &[i32], at: [f32; 2], right: bool
     true
 }
 
-fn transporter_window_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
+fn transporter_window_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
     if !inside(at, TRANSPORTER_WINDOW) {
         return false;
     }
@@ -24733,13 +24733,27 @@ fn transporter_window_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &m
     };
     let on = |r: [f32; 4]| inside(at, in_transporter(r));
     let (out, ins, _) = ejector_of(data, &l);
-    let name = |c: Option<u8>| c.map_or("None", |c| freq::COLORS[usize::from(c) % 16].0);
+    // `EnumColor.getColoredName`: the colour's code (its ordinal in hex) then its name.
+    let coloured = |c: u8| format!("\u{a7}{:x}{}", c % 16, freq::COLORS[usize::from(c) % 16].0);
     if on(TRANSPORTER_STRICT) {
         lines.push("Strict Input".into());
     } else if on(TRANSPORTER_COLOR) {
-        lines.push(name(out).into());
+        // `ColorButton.updateTooltip`: no tooltip at all for no colour.
+        if let Some(c) = out {
+            lines.push(coloured(c));
+        }
     } else if let Some(side) = TRANSPORTER_SIDES.iter().position(|[x, y]| on([*x, *y, 22.0, 22.0])) {
-        lines.push(name(ins[side]).into());
+        // `SideDataButton.updateTooltip`: the side, the colour (or None), then the block beside it.
+        lines.push(side_config::RELATIVE[side].into());
+        lines.push(ins[side].map_or_else(|| "None".to_owned(), coloured));
+        let facing = game.container.and_then(|(x, y, z)| game.native_block_property([x, y, z], "facing")).and_then(|f| direction(&f)).map_or(2, face_index);
+        if let Some((x, y, z)) = game.container {
+            let d = DIRECTIONS[side_config::relative_face(facing, side)].1;
+            let beside = game.native_block([x + d[0], y + d[1], z + d[2]]);
+            if !beside.ends_with(":air") {
+                lines.push(horizon_client::lang::get(&block_description_key(&beside)));
+            }
+        }
     }
     true
 }
