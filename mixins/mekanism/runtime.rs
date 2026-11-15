@@ -7361,6 +7361,7 @@ pub(super) fn tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horiz
 }
 
 fn tooltip_body(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    owner_security_tooltip(game, stack, lines);
     if !game.native_on(MOD_ID) || !stack.item.starts_with("mekanism") {
         return;
     }
@@ -7377,6 +7378,7 @@ fn tooltip_body(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_cli
         let line = format!("Mode: {} (efficiency {})", mode.label(), mode.efficiency());
         lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
     }
+    upgrades_tooltip(stack, lines);
     if let Some(name) = stack.item.strip_prefix("mekanism:") {
         tier_tooltip(name, lines);
     }
@@ -7565,6 +7567,68 @@ fn tier_tooltip(name: &str, lines: &mut Vec<(horizon_client::text::Text, u32)>) 
             }
         }
         _ => {}
+    }
+}
+
+/// `OwnerDisplay` and the SECURITY appender: who owns the item and its security mode (nothing for the Security Desk, whose
+/// mode is always private; a public mode when the protection config is off).
+fn owner_security_tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    use enum_color::*;
+    use horizon_client::text::Text;
+    if !has_security(&stack.item) {
+        return;
+    }
+    let kept = item_security(stack);
+    if let Some((owner, name, _)) = &kept {
+        let me = game.native_acting_player().map(|p| uuid_text(p.uuid));
+        let color = if me.as_deref() == Some(owner.as_str()) { BRIGHT_GREEN } else { 0xFF383C };
+        lines.push((Text::translate("owner.mekanism.format", &[Text::colored(name.clone(), color)]), tooltip_rgba(0xFFFFFF)));
+    }
+    if &*stack.item == sec::DESK {
+        return;
+    }
+    let allowed = mekanism_core::config_files::active_int("general", "security", "allowProtection", 1) != 0;
+    let mode = if allowed { kept.map_or(0, |(_, _, mode)| mode.ordinal()) } else { 0 };
+    let (key, color) = match mode {
+        0 => ("security.mekanism.public", BRIGHT_GREEN),
+        1 => ("security.mekanism.private", 0xFF383C),
+        _ => ("security.mekanism.trusted", INDIGO),
+    };
+    lines.push((Text::translate("tooltip.mekanism.security", &[Text::colored(lang_text(key), color)]), tooltip_rgba(GRAY)));
+}
+
+/// `UpgradeDisplay.getTextComponent` for each upgrade a machine item carries (`UPGRADES` appender).
+fn upgrades_tooltip(stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    use enum_color::GRAY;
+    use horizon_client::text::Text;
+    let Some(Tag::Compound(c)) = custom_data(stack)
+        .and_then(|c| c.get(&JavaString::from(MACHINE_STATE_KEY)))
+        .and_then(|t| if let Tag::Compound(m) = t { m.get(&JavaString::from("upgrades")) } else { None })
+    else {
+        return;
+    };
+    // The `color` of each upgrade's data file, as `EnumColor`.
+    let color = |u: Upgrade| match u {
+        Upgrade::Speed => 0xFF383C,
+        Upgrade::Energy => 0x75FF89,
+        Upgrade::Filter => 0x00F3D0,
+        Upgrade::Anchor => 0x59C15F,
+        Upgrade::Chemical => 0xFFDD4F,
+        Upgrade::Muffling => 0x559EFF,
+        Upgrade::StoneGenerator => 0xFFA160,
+    };
+    for kind in Upgrade::ALL {
+        let level = get_int(c, kind.name());
+        if level == 0 {
+            continue;
+        }
+        let name = Text::colored(lang_text(&format!("upgrade.mekanism.{}", kind.name())), color(kind));
+        let line = if kind.max() > 1 {
+            Text::translate("upgrade.mekanism.display.level", &[name, Text::colored(level.to_string(), GRAY)])
+        } else {
+            Text::translate("generic.mekanism.list", &[name])
+        };
+        lines.push((line, tooltip_rgba(color(kind))));
     }
 }
 
