@@ -10434,8 +10434,105 @@ fn obsidian_tnt_payload(data: &[u8]) {
 
 // --- Balloons -----------------------------------------------------------------------------------------
 
+/// `ItemBalloon.DispenserBehavior`: a balloon is latched to each living thing in front of the dispenser that has
+/// none yet (mobs and players), else let go below the dispenser's side; one balloon is spent.
+pub(super) fn dispense(game: &mut Game<'_>, pos: [i32; 3], facing: [i32; 3], stack: &mut ItemStack, handled: &mut bool) {
+    if *handled || !game.native_on(MOD_ID) {
+        return;
+    }
+    let Some(color) = balloon_color(&stack.item) else {
+        return;
+    };
+    let cell = [pos[0] + facing[0], pos[1] + facing[1], pos[2] + facing[2]];
+    let (lo, hi) = ([f64::from(cell[0]), f64::from(cell[1]), f64::from(cell[2])], [f64::from(cell[0] + 1), f64::from(cell[1] + 1), f64::from(cell[2] + 1)]);
+    // The living things whose box touches the cell: position, height, and who they are.
+    let inside = |at: [f64; 3], width: f64, height: f64| {
+        (0..3).all(|i| {
+            let (min, max) = if i == 1 { (at[1], at[1] + height) } else { (at[i] - width / 2.0, at[i] + width / 2.0) };
+            max > lo[i] && min < hi[i]
+        })
+    };
+    let mut targets: Vec<(Latch, [f64; 3], f64)> = Vec::new();
+    for m in game.mobs.iter().filter(|m| m.alive()) {
+        let at = [m.position.x, m.position.y, m.position.z];
+        if inside(at, f64::from(m.width()), f64::from(m.kind.height)) {
+            targets.push((Latch::Mob(m.id), at, f64::from(m.kind.height)));
+        }
+    }
+    for p in game.native_server_players().into_iter().filter(|p| p.health > 0.0) {
+        if inside(p.position, 0.6, PLAYER_HEIGHT) {
+            targets.push((Latch::Player(p.uuid), p.position, PLAYER_HEIGHT));
+        }
+    }
+    let mut latched = false;
+    for (latch, at, height) in targets {
+        // The balloons within the entity's column (0.2 around, from 0.5 below to 4 above) that hold it.
+        let has = BALLOONS.with_borrow(|v| v.iter().any(|b| b.latch == latch));
+        let _ = height;
+        if !has {
+            make_balloon([at[0], at[1] + height + 1.7, at[2]], color, latch);
+        }
+        latched = true;
+    }
+    if !latched {
+        // `Vec3.atLowerCornerOf(source).add(0, -0.5, 0)`, moved by the side, then `create`: + (0.5, 3, 0.5).
+        let side = match facing {
+            [0, -1, 0] => [0.0, -3.5, 0.0],
+            [0, 0, -1] => [0.0, -1.0, -0.5],
+            [0, 0, 1] => [0.0, -1.0, 0.5],
+            [-1, 0, 0] => [-0.5, -1.0, 0.0],
+            [1, 0, 0] => [0.5, -1.0, 0.0],
+            _ => [0.0; 3],
+        };
+        make_balloon(
+            [f64::from(pos[0]) + side[0] + 0.5, f64::from(pos[1]) - 0.5 + side[1] + 3.0, f64::from(pos[2]) + side[2] + 0.5],
+            color,
+            Latch::Free,
+        );
+    }
+    stack.count = stack.count.saturating_sub(1);
+    *handled = true;
+}
+
+/// An arrow, a trident, a snowball... that flew through a balloon hurts it, and it pops: the projectile is spent.
+pub(super) fn projectile_moved(game: &mut Game<'_>, from: [f64; 3], to: [f64; 3], absorbed: &mut bool) {
+    if *absorbed || !game.native_on(MOD_ID) || BALLOONS.with_borrow(|v| v.is_empty()) {
+        return;
+    }
+    // The projectile's own box is 0.5 wide.
+    let margin = 0.25;
+    let hit = BALLOONS.with_borrow(|v| {
+        v.iter().position(|b| {
+            let lo = [b.pos[0] - BALLOON_WIDTH / 2.0 - margin, b.pos[1] - BALLOON_OFFSET - margin, b.pos[2] - BALLOON_WIDTH / 2.0 - margin];
+            let hi = [b.pos[0] + BALLOON_WIDTH / 2.0 + margin, b.pos[1] - BALLOON_OFFSET + BALLOON_HEIGHT + margin, b.pos[2] + BALLOON_WIDTH / 2.0 + margin];
+            let (mut near, mut far) = (0.0f64, 1.0f64);
+            for i in 0..3 {
+                let d = to[i] - from[i];
+                if d.abs() < 1e-9 {
+                    if from[i] < lo[i] || from[i] > hi[i] {
+                        return false;
+                    }
+                    continue;
+                }
+                let (a, c) = ((lo[i] - from[i]) / d, (hi[i] - from[i]) / d);
+                near = near.max(a.min(c));
+                far = far.min(a.max(c));
+            }
+            near <= far
+        })
+    });
+    if let Some(at) = hit {
+        let b = BALLOONS.with_borrow_mut(|v| v.remove(at));
+        pop_balloon(game, &b);
+        *absorbed = true;
+    }
+}
+
 const BALLOON_CHANNEL: &str = "mekanismadditions:balloon";
 const BALLOON_POP_CHANNEL: &str = "mekanismadditions:balloon_pop";
+const BALLOON_LIFT_CHANNEL: &str = "mekanismadditions:balloon_lift";
+/// `Player.getBbHeight` standing.
+const PLAYER_HEIGHT: f64 = 1.8;
 /// `EntityBalloon.OFFSET`: the box sits this far below the entity's position.
 const BALLOON_OFFSET: f64 = -0.275;
 const BALLOON_WIDTH: f64 = 0.4;
@@ -10446,6 +10543,8 @@ enum Latch {
     Free,
     Block([i32; 3]),
     Mob(u32),
+    /// A player (by profile), whose client is told to lift them.
+    Player(u128),
 }
 
 /// One balloon, kept by the server (`EntityBalloon`).
@@ -10562,8 +10661,22 @@ pub(super) fn balloon_mob_click(game: &mut Game<'_>, id: u32, claimed: &mut bool
         return;
     }
     if game.inventory.get(game.selected).and_then(|s| s.as_ref()).is_some_and(|s| balloon_color(&s.item).is_some()) {
-        let mut out = vec![1];
-        out.extend(id.to_be_bytes());
+        // Another player is a mob to this client: the player whose feet are where it stands.
+        let at = game.native_with_mob(id, |m| m.position);
+        let who = at.and_then(|at| {
+            game.native_remote_players()
+                .into_iter()
+                .find(|(_, p)| (p[0] - at.x).abs() < 0.5 && (p[1] - at.y).abs() < 1.0 && (p[2] - at.z).abs() < 0.5)
+                .map(|(uuid, _)| uuid)
+        });
+        let mut out;
+        if let Some(uuid) = who {
+            out = vec![3];
+            out.extend(uuid.to_be_bytes());
+        } else {
+            out = vec![1];
+            out.extend(id.to_be_bytes());
+        }
         game.native_send_to_server(BALLOON_CHANNEL, &out);
         *claimed = true;
     }
@@ -10590,6 +10703,26 @@ fn balloon_payload(game: &mut Game<'_>, data: &[u8]) {
                 return;
             };
             make_balloon([at.x, at.y + height + 1.7, at.z], color, Latch::Mob(id));
+            balloon_consume(game);
+        }
+        // Latch a balloon to the player.
+        3 => {
+            let Some(uuid) = data.get(1..17).map(|b| u128::from_be_bytes(b.try_into().unwrap_or([0; 16]))) else {
+                return;
+            };
+            let Some(held) = game.inventory.get(game.selected).cloned().flatten() else {
+                return;
+            };
+            let Some(color) = balloon_color(&held.item) else {
+                return;
+            };
+            if BALLOONS.with_borrow(|v| v.iter().any(|b| b.latch == Latch::Player(uuid))) {
+                return;
+            }
+            let Some(at) = game.native_server_players().into_iter().find(|p| p.uuid == uuid && p.health > 0.0).map(|p| p.position) else {
+                return;
+            };
+            make_balloon([at[0], at[1] + PLAYER_HEIGHT + 1.7, at[2]], color, Latch::Player(uuid));
             balloon_consume(game);
         }
         // A punch: pop it, when the player is near.
@@ -10635,6 +10768,41 @@ fn balloon_target_elevation(game: &Game<'_>, at: [f64; 3]) -> f64 {
         y -= 1;
     }
     0.0
+}
+
+thread_local! {
+    /// The balloons lifting this player (the server's last word on it) and the ticks it still stands for.
+    static BALLOON_LIFT: std::cell::Cell<(u8, u8)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// `EntityBalloon.tick` on a latched entity, for the window's own player (their client moves them): each balloon
+/// pushes the vertical motion towards the height one block above the ground, unless they fly.
+fn balloon_lift(game: &mut Game<'_>) {
+    let (count, left) = BALLOON_LIFT.get();
+    if count == 0 || left == 0 {
+        return;
+    }
+    BALLOON_LIFT.set((count, left - 1));
+    let Some(p) = game.player.as_ref() else {
+        return;
+    };
+    if p.flying {
+        return;
+    }
+    let (at, mut vy) = ([p.position.x, p.position.y, p.position.z], p.velocity.y);
+    let target = balloon_target_elevation(game, at);
+    for _ in 0..count {
+        vy = if at[1] - 1e-5 < target {
+            (vy * 1.015).max(0.04)
+        } else if at[1] - 0.1 > target {
+            (vy * 1.015).min(-0.04)
+        } else {
+            0.0
+        };
+    }
+    if let Some(p) = game.player.as_mut() {
+        p.velocity.y = vy;
+    }
 }
 
 thread_local! {
@@ -10705,7 +10873,21 @@ fn balloon_tick(game: &mut Game<'_>) {
         return;
     }
     let mut popped = Vec::new();
+    let players = game.native_server_players();
+    let mut lifted: Vec<(u128, u8)> = Vec::new();
     list.retain_mut(|b| {
+        if let Latch::Player(uuid) = b.latch {
+            let Some(p) = players.iter().find(|p| p.uuid == uuid && p.health > 0.0) else {
+                b.latch = Latch::Free;
+                return true;
+            };
+            b.pos = [p.position[0], p.position[1] + PLAYER_HEIGHT + 0.8, p.position[2]];
+            match lifted.iter_mut().find(|l| l.0 == uuid) {
+                Some(l) => l.1 = l.1.saturating_add(1),
+                None => lifted.push((uuid, 1)),
+            }
+            return true;
+        }
         if b.pos[1] < -64.0 || b.pos[1] >= 320.0 {
             popped.push(b.clone());
             return false;
@@ -10764,6 +10946,10 @@ fn balloon_tick(game: &mut Game<'_>) {
     for b in &popped {
         pop_balloon(game, b);
     }
+    // `EntityBalloon.tick`: the lift of a latched player is theirs to apply (a player moves by their own client).
+    for (uuid, count) in lifted {
+        game.native_send_to_player(uuid, BALLOON_LIFT_CHANNEL, &[count]);
+    }
     // Tell the clients: `id, x, y, z, colour, latched`.
     let now = BALLOONS.with_borrow(|v| v.clone());
     let mut data = Vec::with_capacity(now.len() * 18);
@@ -10782,6 +10968,11 @@ fn balloon_tick(game: &mut Game<'_>) {
 }
 
 fn balloon_client_payload(channel: &str, data: &[u8]) {
+    if channel == BALLOON_LIFT_CHANNEL
+        && let Some(&count) = data.first()
+    {
+        BALLOON_LIFT.set((count, 3));
+    }
     if channel == BALLOON_POP_CHANNEL && data.len() >= 12 {
         let f = |i: usize| f64::from(f32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]));
         BALLOON_POPS.with_borrow_mut(|v| v.push(([f(0), f(4), f(8)], data.get(12).copied().unwrap_or(0))));
@@ -10801,6 +10992,7 @@ fn balloon_client_payload(channel: &str, data: &[u8]) {
 /// The window: the pop sounds, and a punch at a balloon (`EntityBalloon.skipAttackInteraction`).
 fn balloon_client(game: &mut Game<'_>) {
     use horizon_core::random::RandomSource;
+    balloon_lift(game);
     for (at, color) in BALLOON_POPS.with_borrow_mut(std::mem::take) {
         game.audio.play("mekanismadditions:entity.balloon.pop", Some(at), 1.0, 1.0);
         // `EntityBalloon.pop`: ten dust particles of the balloon's colour within 0.3 of the box's centre.

@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "3b02c60e364d508592417587397dc24e6e1470fb"
+horizon_revision = "3151c21b050d40995669e9915ec53de6b508c474"
 
 # All game logic: a plain crate staged into Horizon's workspace (horizon-mixins 0.6 bundle crates).
 [[crate]]
@@ -874,3 +874,29 @@ bindings = [
   { name = "entries", ty = "&mut Vec<(String, String, String)>", value = "&mut *entries" },
 ]
 
+[[injection]]
+id = "dispense"
+hook = "dispense"
+hook_version = 1
+kind = "HEAD"
+helper = "dispense.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "facing", ty = "[i32; 3]", value = "facing" },
+  { name = "stack", ty = "&mut horizon_client::items::ItemStack", value = "&mut *stack" },
+  { name = "handled", ty = "&mut bool", value = "&mut *handled" },
+]
+
+[[injection]]
+id = "projectile-moved"
+hook = "projectile_moved"
+hook_version = 1
+kind = "HEAD"
+helper = "projectile_moved.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "from", ty = "[f64; 3]", value = "from" },
+  { name = "to", ty = "[f64; 3]", value = "to" },
+  { name = "absorbed", ty = "&mut bool", value = "&mut *absorbed" },
+]
