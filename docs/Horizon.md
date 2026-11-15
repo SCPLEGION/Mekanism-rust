@@ -17,6 +17,7 @@ needs: [Plan: running Mekanism on Horizon](https://claude.ai/artifact/NG2CYKPray
 | `compatibility.json` | the Horizon and horizon-mixins revisions, and hashes of the files the hooks touch |
 | `tools/horizon.py` | stage the bundle with horizon-mixins, then `check`, `test` or `build` the game |
 | `tools/manual_stage.py` | type-check the glue without horizon-mixins |
+| `tools/check_manifest.py` | fails on an empty or out-of-step `horizon-mixin.toml` (run by `manual_stage.py` and `horizon.py`) |
 | `tools/package.py` | write `target/mekanism-<version>.hnmod` |
 
 Each milestone lives on its own branch (`milestone/m0-setup`, `milestone/m1-content`,

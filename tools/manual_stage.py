@@ -13,6 +13,11 @@ added before.
 """
 import sys, shutil, pathlib, re
 stage, bundle = map(pathlib.Path, sys.argv[1:3])
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import check_manifest
+problems = check_manifest.check(bundle)
+if problems:
+    sys.exit('manifest check failed:\n  ' + '\n  '.join(problems))
 dst = stage / 'native-crates/mekanism/core'
 shutil.rmtree(dst, ignore_errors=True); shutil.copytree(bundle / 'core', dst, ignore=shutil.ignore_patterns('target'))
 c = (stage / 'Cargo.toml').read_text()
