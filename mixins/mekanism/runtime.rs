@@ -19537,7 +19537,8 @@ fn draw_freq_selector(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
             None => ("\u{a7}4None".to_owned(), "\u{a7}4None".to_owned(), "\u{a7}4None"),
         };
         let label = |batch: &mut horizon_client::hud::HudBatch, text: String, y: f32| {
-            game.native_text(batch, &text, [ox + 27.0, oy + y], 0x40_4040, false);
+            // `drawScrollingString(.., 0, y, LEFT, .., textEnd = guiWidth - relativeX - 10, 0)`: scrolls where it is too long.
+            scrolling_text(game, batch, &text, [ox + 27.0, oy + y, ox + 27.0 + (176.0 - 27.0 - 10.0), oy + y + 9.0], 0, 0x40_4040, 1.0);
         };
         label(batch, format!("Frequency: {name}"), 81.0);
         label(batch, format!("Owner: {owner}"), 91.0);
