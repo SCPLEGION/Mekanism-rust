@@ -47,6 +47,7 @@ pub mod plenisher;
 pub mod radiation;
 pub mod qio;
 pub mod network_reader;
+pub mod distribution;
 pub mod qio_search;
 pub mod recipe_table;
 pub mod recipes;
