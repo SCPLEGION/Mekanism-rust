@@ -4922,8 +4922,8 @@ fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
         let filters = miner_filters(&entity.nbt);
         let inverse = get_int(&entity.nbt, "inverse") == 1;
         let inv_replace = get_string(&entity.nbt, "inv_replace").unwrap_or_default();
-        let item_tags = world_items!(game).item_tags.clone();
-        let in_tag = |tag: &str, block: &str| item_tags.get(tag).is_some_and(|t| t.contains(block));
+        let block_tags = world_items!(game).block_tags.clone();
+        let in_tag = |tag: &str, block: &str| tag_member(&block_tags, tag, block);
         let cursor = get_int(&entity.nbt, "cursor");
         let total = region.total_size();
         let end = cursor.saturating_add(miner::SCAN_LIMIT).min(total);
@@ -5050,8 +5050,8 @@ fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fo
     let facts = game.res.facts().get(state);
     let filters = miner_filters(&entity.nbt);
     let inverse = get_int(&entity.nbt, "inverse") == 1;
-    let item_tags = world_items!(game).item_tags.clone();
-    let in_tag = |tag: &str, block: &str| item_tags.get(tag).is_some_and(|t| t.contains(block));
+    let block_tags = world_items!(game).block_tags.clone();
+    let in_tag = |tag: &str, block: &str| tag_member(&block_tags, tag, block);
     let matched = miner::matching_filter(&filters, &facts.name, &in_tag);
     // The block changed since the search saw it: it is no longer a target.
     if miner_skips(&facts.name, facts.hardness) || inverse == matched.is_some() {
@@ -6420,7 +6420,7 @@ fn tick_sorter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
     let max = settings.max_move();
     let mut choices: Vec<Option<&str>> = settings.active().map(|f| Some(f.as_str())).collect();
     let item_tags = world_items!(game).item_tags.clone();
-    let in_tag = |tag: &str, item: &str| item_tags.get(tag).is_some_and(|t| t.contains(item));
+    let in_tag = |tag: &str, item: &str| tag_member(&item_tags, tag, item);
     if settings.auto_eject {
         choices.push(None);
     }
@@ -11094,6 +11094,60 @@ fn factory_type(id: &str) -> Option<&'static str> {
         Some(Kind::Machine(recipe, _)) if id == "mekanism:combiner" => Some(recipe),
         _ => None,
     }
+}
+
+/// Whether `member` is in a tag that `pattern` names: exactly, or by `WildcardMatcher` when it has
+/// wildcard characters (the tag and mod id filters).
+fn tag_member(tags: &std::collections::HashMap<String, std::collections::HashSet<String>>, pattern: &str, member: &str) -> bool {
+    if !mekanism_core::wildcard::is_pattern(pattern) {
+        return tags.get(pattern).is_some_and(|t| t.contains(member));
+    }
+    tags.iter().any(|(name, set)| mekanism_core::wildcard::matches(pattern, name) && set.contains(member))
+}
+
+/// A `GuiTextField.configureDigitalInput` over `rect`: the digital icon at the left, the text 0.8 scale 10 px in,
+/// the caret, and the checkmark in a digital button square at the right (inactive while empty).
+fn draw_digital_field(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, rect: [f32; 4], t: &freq::TextBox) {
+    let [x, y, w, h] = rect;
+    let cursor = game.native_cursor();
+    sprite(game, batch, "digital_text_input", [0.0, 0.0, 4.0, 7.0], [x + 2.0, y + h / 2.0 - 4.0, 4.0, 7.0]);
+    let color = 0x3C_FE9A_u32;
+    let text_at = [x + 10.0, y + 5.4];
+    game.native_text_scaled(batch, &t.value, text_at, color, 0.8);
+    if t.focused && (game.ticks / 6) % 2 == 0 {
+        let before: String = t.value.chars().take(t.cursor).collect();
+        game.native_text_scaled(batch, "_", [text_at[0] + game.native_text_width(&before) * 0.8, text_at[1]], color, 0.8);
+    }
+    let check = [x + w - h, y, h, h];
+    let active = !t.value.is_empty();
+    let base = match (active, active && inside(cursor, check)) {
+        (false, _) => "button_digital_inactive",
+        (true, true) => "button_digital_focus",
+        (true, false) => "button_digital",
+    };
+    nine_slice_tinted(game, batch, base, [3.0, 3.0], 1.0, check, 0xFFFF_FFFF);
+    sprite(game, batch, "button/checkmark_digital", [0.0, 0.0, 12.0, 12.0], check);
+}
+
+/// `GuiTextFilter.setText`: whether `text` may become the name of a tag (`tag`) or mod id filter that is
+/// `current` now; the lower-cased name, or what the window says. Tags are looked up among the block tags for
+/// the miner (`block`), the item tags otherwise; a mod id among the items' namespaces.
+fn text_filter_check(game: &Game<'_>, block: bool, tag: bool, current: &str, text: &str) -> Result<String, &'static str> {
+    let name = text.to_lowercase();
+    if name.is_empty() {
+        return Err(if tag { "No tag" } else { "No ID" });
+    }
+    if name == current {
+        return Err(if tag { "Same tag" } else { "Same ID" });
+    }
+    let items = world_items!(game);
+    let found = if tag {
+        let tags = if block { &items.block_tags } else { &items.item_tags };
+        tags.iter().any(|(n, members)| !members.is_empty() && mekanism_core::wildcard::matches(&name, n))
+    } else {
+        items.items.keys().any(|id| id.split_once(':').is_some_and(|(ns, _)| mekanism_core::wildcard::matches(&name, ns)))
+    };
+    if found { Ok(name) } else { Err("No matching targets") }
 }
 
 fn block_description_key(id: &str) -> String {
@@ -20363,7 +20417,7 @@ fn tick_importer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     }
     // The tags are copied out (only for tag filters to read) so the game stays free to move the items.
     let tags = if active.is_empty() { Default::default() } else { world_items!(game).item_tags.clone() };
-    let in_tag = |tag: &str, item: &str| tags.get(tag).is_some_and(|t| t.contains(item));
+    let in_tag = |tag: &str, item: &str| tag_member(&tags, tag, item);
     let wanted = |s: &ItemStack| active.is_empty() || active.iter().any(|f| qio_filter_takes(f, filters.opts_of(f).allow_default, &net_key(s), &in_tag));
     if let Some((back, face)) = qio_target(game, pos)
         && let Some(stack) = game.native_extract_item_where(back, face, qio::TRANSIT_COUNT, &wanted)
@@ -20401,7 +20455,7 @@ fn tick_exporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
         return;
     };
     let (mut net, at) = load_network(game, &frequency);
-    let in_tag = |tag: &str, item: &str| world_items!(game).item_tags.get(tag).is_some_and(|t| t.contains(item));
+    let in_tag = |tag: &str, item: &str| tag_member(&world_items!(game).item_tags, tag, item);
     let stored = net.list();
     let pick = |filter: Option<&String>| -> Option<String> {
         stored.iter().find(|(item, n)| *n > 0 && filter.is_none_or(|f| qio_filter_takes(f, settings.opts_of(f).allow_default, item, &in_tag))).map(|(item, _)| item.clone())
@@ -22644,7 +22698,7 @@ pub(super) fn screen_key(game: &mut Game<'_>, block: &str, key: &str, text: Opti
         return;
     }
     if !select && is_filter_screen(block) {
-        filter_key(key, text);
+        filter_key(game, key, text);
         return;
     }
     if is_od(block) {
@@ -23075,6 +23129,13 @@ fn sorter_payload(game: &mut Game<'_>, data: &[u8]) {
                     .filter(|f| !f.starts_with('{') || horizon_items::item_data::parse_stack(f).ok().flatten().is_some())
                 {
                     s.filters.push(f);
+                }
+            }
+            sorter::Op::Rename => {
+                if let Some(f) = sorter::Sorter::named_filter(r.value, &r.name)
+                    && f.as_bytes().first() == s.filters.get(index).and_then(|o| o.as_bytes().first())
+                {
+                    s.rename(index, f);
                 }
             }
             sorter::Op::SetColor if r.value <= 16 => {
@@ -23521,9 +23582,11 @@ fn qio_tooltip(game: &Game<'_>, block: &str, at: [f32; 2], lines: &mut Vec<Strin
 /// The window over the sorter's screen: 200 × 90, centred, 30 px down (`GuiFilterHolder.addWindow`).
 const FILTER_WINDOW: [f32; 4] = [38.0, 30.0, 200.0, 90.0];
 const FILTER_CLOSE: [f32; 4] = [6.0, 6.0, 8.0, 8.0];
+const FILTER_BACK: [f32; 4] = [6.0, 6.0, 11.0, 11.0];
 const FILTER_SCREEN: [f32; 4] = [29.0, 18.0, 116.0, 42.0];
 const FILTER_SLOT: [f32; 4] = [7.0, 18.0, 18.0, 18.0];
-const FILTER_NAME: [f32; 4] = [32.0, 46.0, 110.0, 11.0];
+/// `GuiTextFilter`'s digital field: (31, 4 + screen height), the screen's width less 4, 12 high.
+const FILTER_NAME: [f32; 4] = [31.0, 46.0, 112.0, 12.0];
 const FILTER_DELETE: [f32; 4] = [24.0, 62.0, 60.0, 20.0];
 const FILTER_SAVE: [f32; 4] = [86.0, 62.0, 60.0, 20.0];
 const FILTER_DEFAULT: [f32; 4] = [148.0, 18.0, 11.0, 11.0];
@@ -23565,6 +23628,10 @@ struct FilterEdit {
     index: Option<usize>,
     kind: u16,
     name: freq::TextBox,
+    /// The tag or mod id the filter names (what the field's checkmark set), without its prefix.
+    set: String,
+    /// What the last failed Save or check said, and the tick it clears (`filterSaveFailed`).
+    status: Option<(&'static str, u64)>,
     draft: sorter::Opts,
     min: freq::TextBox,
     max: freq::TextBox,
@@ -23591,14 +23658,15 @@ fn open_filter_window(view: &SorterView, pos: [i32; 3], index: usize) {
         _ => 0,
     };
     FILTER_EDIT.with_borrow_mut(|e| {
-        *e = Some(FilterEdit { pos, index: Some(index), kind, name: freq::TextBox::default(), draft: o, min: range_box(o.min), max: range_box(o.max) })
+        let set = if kind == 0 { String::new() } else { f[1..].to_owned() };
+        *e = Some(FilterEdit { pos, index: Some(index), kind, name: freq::TextBox { focused: kind != 0, ..Default::default() }, set, status: None, draft: o, min: range_box(o.min), max: range_box(o.max) })
     });
 }
 
 fn open_new_filter_window(pos: [i32; 3], kind: u16) {
     let o = sorter::Opts::default();
     FILTER_EDIT.with_borrow_mut(|e| {
-        *e = Some(FilterEdit { pos, index: None, kind, name: freq::TextBox { focused: kind != 0, ..Default::default() }, draft: o, min: range_box(o.min), max: range_box(o.max) })
+        *e = Some(FilterEdit { pos, index: None, kind, name: freq::TextBox { focused: kind != 0, ..Default::default() }, set: String::new(), status: None, draft: o, min: range_box(o.min), max: range_box(o.max) })
     });
 }
 
@@ -23663,38 +23731,43 @@ fn draw_filter_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
         let [x, y, w, h] = screen([0.0, 0.0, filter_window()[2], filter_window()[3]]);
         nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [x - 3.0, y - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
         nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [x, y, w, h], 0xFFFF_FFFF);
-        sprite(game, batch, "button/close", [0.0, 0.0, 12.0, 12.0], screen(FILTER_CLOSE));
+        // A new filter has a back button to the select window instead of a close button (`isNew && hasFilterSelect()`).
+        if e.index.is_none() {
+            draw_button(game, batch, screen(FILTER_BACK), hover(FILTER_BACK), true, 0xFFFF_FFFF, Some(("button/back", 14.0)));
+        } else {
+            sprite(game, batch, "button/close", [0.0, 0.0, 12.0, 12.0], screen(FILTER_CLOSE));
+        }
         let what = SELECT_NAMES[usize::from(e.kind.min(2))];
-        let title = if e.index.is_none() { format!("New {what}") } else { what.to_owned() };
-        centred(game, batch, &title, x, w, y + 5.0, 0x40_4040);
+        let title = format!("{}: {what}", if e.index.is_none() { "New" } else { "Edit" });
+        let pad = if e.index.is_none() { 3.0 } else { 0.0 };
+        centred(game, batch, &title, x + pad, w - pad, y + 6.0, 0x40_4040);
         // The slot (an item filter's item; a click with an item in hand sets it) and the inner screen.
         sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [x + 7.0, y + 18.0, 18.0, 18.0]);
-        let named = filter.clone().unwrap_or_else(|| sorter::Sorter::named_filter(e.kind, &e.name.value).unwrap_or_default());
+        let named = if e.kind == 0 {
+            filter.clone().unwrap_or_else(|| sorter::Sorter::named_filter(0, &e.name.value).unwrap_or_default())
+        } else {
+            sorter::Sorter::named_filter(e.kind, &e.set).unwrap_or_default()
+        };
         if e.kind == 0 && !named.is_empty() {
             game.native_item_stack(batch, &qio_stack(&named, 1), [x + 8.0, y + 19.0], 16.0);
         }
         let s = screen(FILTER_SCREEN);
         nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, s, 0xFFFF_FFFF);
-        game.native_text(batch, what, [s[0] + 3.0, s[1] + 3.0], 0x3C_FE9A, false);
-        if e.index.is_some() {
-            let shown = match e.kind {
-                0 => filter_name(&named),
-                _ => named[1..].to_owned(),
-            };
-            game.native_text_scaled(batch, &shown, [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8);
-        } else if e.kind == 0 {
-            game.native_text_scaled(batch, &if named.is_empty() { "Click the slot with an item".to_owned() } else { filter_name(&named) }, [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8);
-        } else {
+        // `GuiFilter.getScreenText`: the status, then what the filter names.
+        let status = match e.status {
+            Some((why, until)) if game.ticks as u64 <= until => format!("Status: \u{a7}4{why}"),
+            _ => "Status: \u{a7}2All OK".to_owned(),
+        };
+        game.native_text_scaled(batch, &status, [s[0] + 3.0, s[1] + 3.0], 0x3C_FE9A, 0.8);
+        match e.kind {
+            0 if !named.is_empty() => game.native_text_scaled(batch, &filter_name(&named), [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8),
+            0 => {}
+            1 => game.native_text_scaled(batch, &format!("Tag: {}", e.set), [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8),
+            _ => game.native_text_scaled(batch, &format!("ID: {}", e.set), [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8),
+        }
+        if e.kind != 0 {
             let b = screen(FILTER_NAME);
-            game.native_fill(batch, [b[0] - 1.0, b[1] - 1.0, b[2] + 2.0, b[3] + 2.0], if e.name.focused { 0xFFFF_FFFF } else { 0xFFA0_A0A0 });
-            game.native_fill(batch, b, 0xFF00_0000);
-            game.native_text_scaled(batch, &e.name.value, [b[0] + 2.0, b[1] + 2.0], 0xE0_E0E0, 0.8);
-            if e.name.focused && (game.ticks / 6) % 2 == 0 {
-                let before: String = e.name.value.chars().take(e.name.cursor).collect();
-                game.native_text_scaled(batch, "_", [b[0] + 2.0 + game.native_text_width(&before) * 0.8, b[1] + 2.0], 0xE0_E0E0, 0.8);
-            }
-            let hint = if e.kind == 1 { "Tag name:" } else { "Mod id:" };
-            game.native_text_scaled(batch, hint, [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8);
+            draw_digital_field(game, batch, b, &e.name);
         }
         if view.qio.is_some() {
             // An item filter's fuzzy switch (`GuiQIOItemStackFilter`), the only option a QIO filter has.
@@ -23777,8 +23850,14 @@ fn filter_window_click(game: &Game<'_>, pos: [i32; 3], view: &SorterView, at: [f
             }
         });
     };
-    if on(FILTER_CLOSE) {
+    let name_check = [FILTER_NAME[0] + FILTER_NAME[2] - FILTER_NAME[3], FILTER_NAME[1], FILTER_NAME[3], FILTER_NAME[3]];
+    if index.is_none() && on(FILTER_BACK) {
         close_filter_window();
+        FILTER_SELECT.set(Some(pos));
+    } else if index.is_some() && on(FILTER_CLOSE) {
+        close_filter_window();
+    } else if kind != 0 && on(name_check) {
+        filter_set_text(game, pos, view, index);
     } else if on(FILTER_SLOT) && kind == 0 && index.is_none() {
         // A click with an item in hand names it (`GuiItemStackFilter`'s slot).
         if let Some(h) = game.inventory.get(game.selected).cloned().flatten() {
@@ -23827,58 +23906,72 @@ fn filter_window_click(game: &Game<'_>, pos: [i32; 3], view: &SorterView, at: [f
 /// window open.
 fn filter_window_save(game: &Game<'_>, pos: [i32; 3], view: &SorterView, index: Option<usize>) {
     use sorter::Op;
-    if view.qio.is_some() {
-        // A QIO filter has a name and the fuzzy switch only (`GuiQIOFilterHelper`).
-        let saved = FILTER_EDIT.with_borrow(|e| e.as_ref().map(|e| (e.kind, e.name.value.clone(), e.draft)));
-        let Some((kind, name, draft)) = saved else {
-            return;
-        };
-        if index.is_none() {
-            if sorter::Sorter::named_filter(kind, &name).is_none() {
-                return;
+    let fail = |why: &'static str| {
+        FILTER_EDIT.with_borrow_mut(|e| {
+            if let Some(e) = e {
+                e.status = Some((why, game.ticks as u64 + 100));
             }
-            let at = view.filters.len();
-            let r = sorter::Request { op: Op::AddNamed, pos, index: kind, value: 0, name };
-            game.native_send_to_server(SORTER_CHANNEL, &r.encode());
-            if draft.allow_default && kind == 0 {
-                send_sorter(game, Op::AllowDefault, pos, at);
-            }
-        }
-        close_filter_window();
+        });
+    };
+    // `GuiTextFilter.validateAndSave`: a name typed but not yet set is set first.
+    let (kind, typed) = FILTER_EDIT.with_borrow(|e| e.as_ref().map(|e| (e.kind, !e.name.value.is_empty()))).unwrap_or((0, false));
+    if kind != 0 && typed && !filter_set_text(game, pos, view, index) {
         return;
     }
     let saved = FILTER_EDIT.with_borrow(|e| {
         let e = e.as_ref()?;
-        let num = |t: &freq::TextBox, empty: u16| if t.value.is_empty() { Some(empty) } else { t.value.parse::<u16>().ok() };
-        let (lo, hi) = (num(&e.min, 0)?, num(&e.max, 64)?);
-        sorter::Opts::valid_range(lo, hi).then(|| (lo, hi, e.kind, e.name.value.clone(), e.draft))
+        let name = if e.kind == 0 { e.name.value.clone() } else { e.set.clone() };
+        Some((e.kind, name, e.draft, e.min.value.clone(), e.max.value.clone()))
     });
-    let Some((lo, hi, kind, name, draft)) = saved else {
+    let Some((kind, name, draft, min, max)) = saved else {
         return;
     };
+    // `hasFilter`: an existing filter always names something.
+    if index.is_none() && sorter::Sorter::named_filter(kind, &name).is_none() {
+        return fail(["No item", "No tag", "No ID"][usize::from(kind.min(2))]);
+    }
+    let range = if view.qio.is_some() {
+        (0, 64)
+    } else {
+        // `validateAndSaveSorterFilter`.
+        if min.is_empty() || max.is_empty() {
+            return fail("Max/min");
+        }
+        let (Ok(lo), Ok(hi)) = (min.parse::<u16>(), max.parse::<u16>()) else {
+            return fail("Max/min");
+        };
+        if lo > hi {
+            return fail("Max < min");
+        }
+        if hi > 64 {
+            return fail("Max > 64");
+        }
+        (lo, hi)
+    };
+    let (lo, hi) = range;
     match index {
-        Some(i) => send_sorter_value(game, Op::Range, pos, i, lo << 8 | hi),
+        Some(i) if view.qio.is_none() => send_sorter_value(game, Op::Range, pos, i, lo << 8 | hi),
+        Some(_) => {}
         None => {
-            let Some(_) = sorter::Sorter::named_filter(kind, &name) else {
-                return;
-            };
             let at = view.filters.len();
             let r = sorter::Request { op: Op::AddNamed, pos, index: kind, value: 0, name };
             game.native_send_to_server(SORTER_CHANNEL, &r.encode());
-            if draft.allow_default {
+            if draft.allow_default && (kind == 0 || view.qio.is_none()) {
                 send_sorter(game, Op::AllowDefault, pos, at);
             }
-            if draft.size_mode {
-                send_sorter(game, Op::SizeMode, pos, at);
-            }
-            if draft.fuzzy && kind == 0 {
-                send_sorter(game, Op::Fuzzy, pos, at);
-            }
-            if let Some(c) = draft.color {
-                send_sorter_value(game, Op::SetColor, pos, at, u16::from(c) + 1);
-            }
-            if (lo, hi) != (0, 64) {
-                send_sorter_value(game, Op::Range, pos, at, lo << 8 | hi);
+            if view.qio.is_none() {
+                if draft.size_mode {
+                    send_sorter(game, Op::SizeMode, pos, at);
+                }
+                if draft.fuzzy && kind == 0 {
+                    send_sorter(game, Op::Fuzzy, pos, at);
+                }
+                if let Some(c) = draft.color {
+                    send_sorter_value(game, Op::SetColor, pos, at, u16::from(c) + 1);
+                }
+                if (lo, hi) != (0, 64) {
+                    send_sorter_value(game, Op::Range, pos, at, lo << 8 | hi);
+                }
             }
         }
     }
@@ -23919,22 +24012,60 @@ fn filter_covers(at: [f32; 2]) -> bool {
     (FILTER_EDIT.with_borrow(|e| e.is_some()) && inside(at, filter_window())) || (FILTER_SELECT.get().is_some() && inside(at, select_window()))
 }
 
-fn filter_typing(block: &str) -> bool {
-    is_filter_screen(block) && FILTER_EDIT.with_borrow(|e| e.as_ref().is_some_and(|e| e.min.focused || e.max.focused || e.name.focused))
-}
-
-fn filter_key(key: &str, text: Option<&str>) {
+/// Enter in the name field, or its checkmark (`GuiTextFilter.setText`): the typed tag or mod id becomes the
+/// filter's, or the status says why not. An existing filter is renamed on the server.
+fn filter_set_text(game: &Game<'_>, pos: [i32; 3], view: &SorterView, index: Option<usize>) -> bool {
+    let Some((kind, text, current)) = FILTER_EDIT.with_borrow(|e| e.as_ref().map(|e| (e.kind, e.name.value.clone(), e.set.clone()))) else {
+        return false;
+    };
+    if kind == 0 || text.is_empty() {
+        return false;
+    }
+    let result = text_filter_check(game, false, kind == 1, &current, &text);
+    let _ = view;
+    let ok = result.is_ok();
     FILTER_EDIT.with_borrow_mut(|e| {
         let Some(e) = e else {
             return;
         };
-        if e.name.focused {
-            e.name.key(key, text, |c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-./:#@".contains(c), 64);
-        } else {
-            let t = if e.min.focused { &mut e.min } else { &mut e.max };
-            t.key(key, text, |c| c.is_ascii_digit(), 2);
+        match &result {
+            Ok(name) => {
+                e.set.clone_from(name);
+                e.name = freq::TextBox { focused: true, ..Default::default() };
+                e.status = None;
+            }
+            Err(why) => e.status = Some((*why, game.ticks as u64 + 100)),
         }
     });
+    if let (Ok(name), Some(i)) = (result, index) {
+        let r = sorter::Request { op: sorter::Op::Rename, pos, index: i.min(usize::from(u16::MAX)) as u16, value: kind, name };
+        game.native_send_to_server(SORTER_CHANNEL, &r.encode());
+    }
+    ok
+}
+
+fn filter_typing(block: &str) -> bool {
+    is_filter_screen(block) && FILTER_EDIT.with_borrow(|e| e.as_ref().is_some_and(|e| e.min.focused || e.max.focused || e.name.focused))
+}
+
+fn filter_key(game: &Game<'_>, key: &str, text: Option<&str>) {
+    let entered = FILTER_EDIT.with_borrow_mut(|e| {
+        let e = e.as_mut()?;
+        if e.name.focused {
+            // Forced to lower case (`getInputTransformer`); resource location and wildcard characters.
+            let lower = text.map(str::to_lowercase);
+            let typed = e.name.key(key, lower.as_deref(), |c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-./:*?#".contains(c), 64);
+            return (typed == freq::Typed::Enter).then_some(e.index);
+        }
+        let t = if e.min.focused { &mut e.min } else { &mut e.max };
+        t.key(key, text, |c| c.is_ascii_digit(), 2);
+        None
+    });
+    if let Some(index) = entered
+        && let Some((pos, view)) = sorter_view(game)
+    {
+        filter_set_text(game, pos, &view, index);
+    }
 }
 
 // --- Digital Miner config screen (GuiDigitalMinerConfig, GuiMinerFilerSelect, GuiMinerItemStackFilter...) -----
@@ -24257,15 +24388,7 @@ fn draw_miner_windows(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
         match e.filter.kind {
             miner::FilterKind::Item => game.native_text_scaled(batch, &miner_item_name(&e.filter.name), [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8),
             _ => {
-                let b = win(FILTER_NAME);
-                let t = &e.name;
-                game.native_fill(batch, [b[0] - 1.0, b[1] - 1.0, b[2] + 2.0, b[3] + 2.0], if t.focused { 0xFFFF_FFFF } else { 0xFFA0_A0A0 });
-                game.native_fill(batch, b, 0xFF00_0000);
-                game.native_text_scaled(batch, &t.value, [b[0] + 2.0, b[1] + 2.0], 0xE0_E0E0, 0.8);
-                if t.focused && (game.ticks / 6) % 2 == 0 {
-                    let before: String = t.value.chars().take(t.cursor).collect();
-                    game.native_text_scaled(batch, "_", [b[0] + 2.0 + game.native_text_width(&before) * 0.8, b[1] + 2.0], 0xE0_E0E0, 0.8);
-                }
+                draw_digital_field(game, batch, win(FILTER_NAME), &e.name);
                 let hint = if e.filter.kind == miner::FilterKind::Tag { "Tag: " } else { "ID: " };
                 game.native_text_scaled(batch, &format!("{hint}{}", e.filter.name), [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8);
             }
@@ -24332,6 +24455,8 @@ fn miner_cfg_click(game: &Game<'_>, at: [f32; 2], right: bool) {
             });
         } else if index.is_some() && on(FILTER_CLOSE) {
             MINER_UI.with_borrow_mut(|ui| ui.edit = None);
+        } else if kind != miner::FilterKind::Item && on([FILTER_NAME[0] + FILTER_NAME[2] - FILTER_NAME[3], FILTER_NAME[1], FILTER_NAME[3], FILTER_NAME[3]]) {
+            miner_set_text(game);
         } else if on(FILTER_SLOT) && kind == miner::FilterKind::Item {
             if let Some(h) = held.filter(|h| is_block(h)) {
                 edit(&|e| e.filter.name = h.clone());
@@ -24431,11 +24556,15 @@ fn miner_set_field(game: &Game<'_>, pos: [i32; 3], field: usize) {
 
 /// Save (`validateAndSave`): a filter that names nothing keeps the window open with the reason.
 fn miner_save_filter(game: &Game<'_>, pos: [i32; 3]) {
-    let fail = MINER_UI.with_borrow_mut(|ui| {
-        let e = ui.edit.as_mut()?;
-        if e.filter.kind != miner::FilterKind::Item {
-            e.filter.name = e.name.value.clone();
-        }
+    // `GuiTextFilter.validateAndSave`: a name typed but not yet set is set first.
+    let typed = MINER_UI.with_borrow(|ui| ui.edit.as_ref().is_some_and(|e| e.filter.kind != miner::FilterKind::Item && !e.name.value.is_empty()));
+    if typed && !miner_set_text(game) {
+        return;
+    }
+    MINER_UI.with_borrow_mut(|ui| {
+        let Some(e) = ui.edit.as_mut() else {
+            return;
+        };
         if e.filter.name.is_empty() {
             e.status = match e.filter.kind {
                 miner::FilterKind::Item => "\u{a7}4No item",
@@ -24444,7 +24573,7 @@ fn miner_save_filter(game: &Game<'_>, pos: [i32; 3]) {
             }
             .to_owned();
             e.ticker = game.ticks as u64 + 100;
-            return Some(());
+            return;
         }
         let (index, line) = (e.index, e.filter.save());
         ui.edit = None;
@@ -24452,9 +24581,7 @@ fn miner_save_filter(game: &Game<'_>, pos: [i32; 3]) {
             Some(i) => send_miner(game, pos, 7, i as i32, &line),
             None => send_miner(game, pos, 6, 0, &line),
         }
-        None
     });
-    let _ = fail;
 }
 
 fn miner_cfg_tooltip(game: &Game<'_>, at: [f32; 2], lines: &mut Vec<String>) {
@@ -24508,9 +24635,13 @@ fn miner_cfg_key(game: &Game<'_>, key: &str, text: Option<&str>) {
     let Some(c) = miner_cfg(game) else {
         return;
     };
+    let mut enter = false;
     MINER_UI.with_borrow_mut(|ui| {
         if let Some(e) = ui.edit.as_mut().filter(|e| e.name.focused) {
-            e.name.key(key, text, |c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-./:#@".contains(c), 64);
+            let lower = text.map(str::to_lowercase);
+            if e.name.key(key, lower.as_deref(), |c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-./:*?#".contains(c), 64) == freq::Typed::Enter {
+                enter = true;
+            }
             return;
         }
         let Some(i) = ui.fields.iter().position(|f| f.focused) else {
@@ -24526,6 +24657,39 @@ fn miner_cfg_key(game: &Game<'_>, key: &str, text: Option<&str>) {
             }
         }
     });
+    if enter {
+        miner_set_text(game);
+    }
+}
+
+/// Enter in the name field, or its checkmark (`GuiTextFilter.setText`): the typed tag or mod id becomes the
+/// filter's, or the status says why not. True when it was set.
+fn miner_set_text(game: &Game<'_>) -> bool {
+    let Some((kind, text, current)) = MINER_UI.with_borrow(|ui| ui.edit.as_ref().map(|e| (e.filter.kind, e.name.value.clone(), e.filter.name.clone()))) else {
+        return false;
+    };
+    if kind == miner::FilterKind::Item || text.is_empty() {
+        return false;
+    }
+    let result = text_filter_check(game, true, kind == miner::FilterKind::Tag, &current, &text);
+    let ok = result.is_ok();
+    MINER_UI.with_borrow_mut(|ui| {
+        let Some(e) = ui.edit.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(name) => {
+                e.filter.name = name;
+                e.name = freq::TextBox { focused: true, ..Default::default() };
+                e.status.clear();
+            }
+            Err(why) => {
+                e.status = format!("\u{a7}4{why}");
+                e.ticker = game.ticks as u64 + 100;
+            }
+        }
+    });
+    ok
 }
 
 fn miner_cfg_escape(consumed: &mut bool) {
@@ -25469,7 +25633,11 @@ fn od_window_click(game: &Game<'_>, pos: [i32; 3], at: [f32; 2]) -> bool {
     };
     e.text.focused = on(OD_TEXT);
     let mut keep = true;
-    if on([6.0, 6.0, 8.0, 8.0]) {
+    if on([OD_TEXT[0] + OD_TEXT[2] - OD_TEXT[3], OD_TEXT[1], OD_TEXT[3], OD_TEXT[3]]) {
+        if !e.text.value.is_empty() {
+            od_set_text(game, e);
+        }
+    } else if on([6.0, 6.0, 8.0, 8.0]) {
         keep = false;
     } else if on(OD_LAST) || on(OD_NEXT) {
         if e.filter.has_filter() {
@@ -25542,14 +25710,7 @@ fn draw_od_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, or
             }
             game.native_text(batch, &e.filter.tag, [s[0] + 3.0, s[1] + 25.0], 0x3C_FE9A, false);
         }
-        let b = screen(OD_TEXT);
-        game.native_fill(batch, [b[0] - 1.0, b[1] - 1.0, b[2] + 2.0, b[3] + 2.0], if e.text.focused { 0xFFFF_FFFF } else { 0xFFA0_A0A0 });
-        game.native_fill(batch, b, 0xFF00_0000);
-        game.native_text(batch, &e.text.value, [b[0] + 2.0, b[1] + 2.0], 0xE0_E0E0, false);
-        if e.text.focused && (game.ticks / 6) % 2 == 0 {
-            let before: String = e.text.value.chars().take(e.text.cursor).collect();
-            game.native_text(batch, "_", [b[0] + 2.0 + game.native_text_width(&before), b[1] + 2.0], 0xE0_E0E0, false);
-        }
+        draw_digital_field(game, batch, screen(OD_TEXT), &e.text);
         draw_button(game, batch, screen(OD_LAST), hover(OD_LAST), true, 0xFFFF_FFFF, Some(("button/left", 12.0)));
         draw_button(game, batch, screen(OD_NEXT), hover(OD_NEXT), true, 0xFFFF_FFFF, Some(("button/right", 12.0)));
         for (r, label) in [(OD_DELETE, if e.index.is_some() { "Delete" } else { "Cancel" }), (OD_SAVE, "Save")] {

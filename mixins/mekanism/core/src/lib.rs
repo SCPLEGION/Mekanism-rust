@@ -7,6 +7,7 @@
 pub mod color;
 pub mod config;
 pub mod config_files;
+pub mod wildcard;
 pub mod worldgen;
 pub mod bin;
 pub mod bounding;
