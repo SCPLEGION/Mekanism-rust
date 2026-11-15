@@ -13283,7 +13283,7 @@ fn layout(block: &str) -> Option<Layout> {
             progress: None,
         },
         // GuiLaserTractorBeam: no elements but its 27 slots (`dynamicSlots`) and the security tab.
-        Kind::TractorBeam => Layout { slots: [None; 3], gauges: vec![], power: None, progress: None },
+        Kind::TractorBeam | Kind::PersonalStorage => Layout { slots: [None; 3], gauges: vec![], power: None, progress: None },
         // GuiLaserAmplifier: the standard energy gauge at (6, 10); the thresholds ride in a never-drawn gauge
         // (the lower one in the amount, the upper one in the capacity).
         Kind::LaserAmplifier => Layout {
@@ -13680,6 +13680,8 @@ fn screen_height(block: &str) -> f32 {
         Some(Kind::FissionPort) => 255.0,
         // `DEFAULT_IMAGE_HEIGHT + 76`.
         Some(Kind::DigitalMiner) => 242.0,
+        // `DEFAULT_IMAGE_HEIGHT + 56`.
+        Some(Kind::PersonalStorage) => 222.0,
         // `DEFAULT_IMAGE_HEIGHT + 64`.
         Some(Kind::Assemblicator) => 230.0,
         // `DEFAULT_IMAGE_HEIGHT + 64`.
@@ -13861,7 +13863,7 @@ fn tabs(block: &str) -> u8 {
         Some(Kind::EnergyCube(_) | Kind::ChemicalTank(_)) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
         Some(Kind::Vibrator | Kind::Heater | Kind::FuelwoodHeater | Kind::LaserAmplifier) => TAB_REDSTONE | TAB_SECURITY,
         Some(Kind::Oredictionificator) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
-        Some(Kind::TractorBeam) => TAB_SECURITY,
+        Some(Kind::TractorBeam | Kind::PersonalStorage) => TAB_SECURITY,
         Some(Kind::FissionLogic | Kind::FusionLogic) => TAB_REDSTONE,
         Some(Kind::FluidTank(_)) => TAB_SECURITY | TAB_EDIT_MODE,
         Some(Kind::DynamicValve) => TAB_EDIT_MODE,
@@ -16079,7 +16081,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
     // `GuiPersonalStorageTile`: six rows of nine over the inventory, 56 px taller than a machine's.
     if kind(block) == Some(Kind::PersonalStorage) {
         let slots = (0..bin::PERSONAL_SLOTS).map(|i| Some([8.0 + 18.0 * (i % 9) as f32, 18.0 + 18.0 * (i / 9) as f32])).collect();
-        *screen = Some(super::native_hooks::NativeScreen { width: 176.0, height: 222.0, slots, inventory_y: 140.0, inventory_x: 8.0, own_labels: true, alt: None, ..Default::default() });
+        *screen = Some(super::native_hooks::NativeScreen { width: 176.0, height: 222.0, slots, inventory_y: 140.0, inventory_x: 8.0, own_labels: false, alt: None, ..Default::default() });
         return;
     }
     // `GuiQIODriveArray` and `GuiQIODashboard`.
@@ -17472,10 +17474,6 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         draw_qio_screen(game, batch, block, origin);
         return;
     }
-    if kind(block) == Some(Kind::PersonalStorage) {
-        draw_storage_screen(game, batch, origin);
-        return;
-    }
     if kind(block) == Some(Kind::QioRedstoneAdapter) {
         draw_adapter_screen(game, batch, origin);
         return;
@@ -17511,6 +17509,13 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
     // `GuiElementHolder` (141, 16, 26, 56) behind the dynamic tank's two container slots.
     if matches!(kind(block), Some(Kind::DynamicValve | Kind::InductionPort)) {
         nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, [ox + 141.0, oy + 16.0, 26.0, 56.0], 0xFFFF_FFFF);
+    }
+    if kind(block) == Some(Kind::PersonalStorage) {
+        for row in 0..6 {
+            for col in 0..9 {
+                sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + 18.0 * col as f32, oy + 17.0 + 18.0 * row as f32, 18.0, 18.0]);
+            }
+        }
     }
     if kind(block) == Some(Kind::TractorBeam) {
         for x in 0..9 {
@@ -24696,26 +24701,6 @@ fn transporter_button(entity: &mut ModBlockEntity, id: i32) -> bool {
         step(&mut entity.nbt, &format!("ej_in{side}"), how);
     }
     true
-}
-
-/// The personal chest's and barrel's screen (`GuiPersonalStorageTile`): the panel, its title, six rows of
-/// slots, then the inventory.
-fn draw_storage_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, origin: [f32; 2]) {
-    let [ox, oy] = origin;
-    nine_slice(game, batch, "base", 16.0, 4.0, [ox, oy, 176.0, 222.0]);
-    game.native_text(batch, &game.native_screen_title().unwrap_or_default(), [ox + 8.0, oy + 6.0], 0x40_4040, false);
-    for row in 0..6 {
-        for col in 0..9 {
-            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + 18.0 * col as f32, oy + 17.0 + 18.0 * row as f32, 18.0, 18.0]);
-        }
-    }
-    game.native_text(batch, "Inventory", [ox + 8.0, oy + 129.0], 0x40_4040, false);
-    for row in 0..4 {
-        let y = if row < 3 { 140.0 + 18.0 * row as f32 } else { 198.0 };
-        for col in 0..9 {
-            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 7.0 + 18.0 * col as f32, oy + y - 1.0, 18.0, 18.0]);
-        }
-    }
 }
 
 // --- QIO Redstone Adapter screen (GuiQIORedstoneAdapter) -------------------------------------------------
