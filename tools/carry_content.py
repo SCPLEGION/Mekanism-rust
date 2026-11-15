@@ -503,6 +503,15 @@ def build_module(ns, out):
                         if (d / ns / "textures/block/models/obsidian_tnt.png").is_file()), None)
         if tnt is not None and texture is not None:
             worn_models.build_element_world_model(ns, "obsidian_tnt", json.loads(tnt.read_text()), texture, out, report)
+            # The flash of a fuse tick (`TntRenderer`'s white overlay): the same model in all-white texture.
+            import tempfile
+            from PIL import Image
+            with tempfile.TemporaryDirectory() as tmp:
+                white = Path(tmp) / "obsidian_tnt_flash.png"
+                image = Image.open(texture).convert("RGBA")
+                image.putdata([(255, 255, 255, a) for (_, _, _, a) in image.getdata()])
+                image.save(white)
+                worn_models.build_element_world_model(ns, "obsidian_tnt_flash", json.loads(tnt.read_text()), white, out, report)
         # Balloons (`BalloonRenderer`): the latched and the free model, each as the tinted body and the string
         # apart, since a part tree has one texture.
         for variant in ("latched", "free"):

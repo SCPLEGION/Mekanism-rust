@@ -714,6 +714,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             Kind::ObsidianTnt => {
                 if game.native_has_neighbor_signal(pos) {
                     prime_obsidian_tnt(game, pos, false);
+                } else if obsidian_tnt_burns(game, pos) {
+                    prime_obsidian_tnt(game, pos, false);
                 }
                 None
             }
@@ -2775,7 +2777,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
         let lit = f >= 0.0 && (f / 5.0) as i32 % 2 == 0;
         let cell = [at[0].floor() as i32, (at[1] + 0.5).floor() as i32, at[2].floor() as i32];
         models.push(super::native_hooks::NativeWorldModel {
-            model: "mekanismadditions:obsidian_tnt".into(),
+            model: (if lit { "mekanismadditions:obsidian_tnt_flash" } else { "mekanismadditions:obsidian_tnt" }).into(),
             position: [at[0], at[1] + 0.49, at[2]],
             yaw: 0.0,
             pitch: 0.0,
@@ -2783,7 +2785,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
             light_at: cell,
             color: 0xFFFF_FFFF,
             rotation: None,
-            full_bright: lit,
+            full_bright: false,
             scale,
             parts: Vec::new(),
         });
@@ -9764,6 +9766,10 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     }
     if game.native_window() && game.native_on(MOD_ID) {
         balloon_client(game);
+        // `EntityObsidianTNT.tick`: a lava spark at the middle of the block every tick.
+        for (_, at, _, _) in CLIENT_TNT.with_borrow(|v| v.clone()) {
+            game.native_add_particle("minecraft:lava", [at[0], at[1] + 0.5, at[2]], [0.0; 3]);
+        }
         for at in TNT_SOUNDS.with_borrow_mut(std::mem::take) {
             game.audio.play("minecraft:entity.tnt.primed", Some(at), 1.0, 1.0);
         }
@@ -10190,6 +10196,28 @@ fn prime_obsidian_tnt(game: &mut Game<'_>, pos: [i32; 3], short: bool) {
             sound: !short,
         });
     });
+}
+
+/// `FireBlock.checkBurnOut` on the TNT (`BlockObsidianTNT.getFlammability` 75, `onCaughtFire` primes it): a fire
+/// next to it catches it. A fire ticks every 30 to 40 ticks, so each tick has about a thirty-fifth of its chance:
+/// `nextInt(300 or 250 above and below) < 75` and, rain apart, `nextInt(age + 10) < 5`, with the fire's age taken as 0.
+fn obsidian_tnt_burns(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    use horizon_core::random::RandomSource;
+    let mut near = Vec::new();
+    for (d, bound) in [([1, 0, 0], 300), ([-1, 0, 0], 300), ([0, 0, 1], 300), ([0, 0, -1], 300), ([0, 1, 0], 250), ([0, -1, 0], 250)] {
+        if matches!(block_name(game, [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]]), "minecraft:fire" | "minecraft:soul_fire") {
+            near.push(bound);
+        }
+    }
+    for bound in near {
+        if game.world.random.next_int_bound(35).unwrap_or(1) == 0
+            && game.world.random.next_int_bound(bound).unwrap_or(bound) < 75
+            && game.world.random.next_int_bound(10).unwrap_or(10) < 5
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// A block player-broken by this click does not light when the break reports it gone.
