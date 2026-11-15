@@ -15685,6 +15685,21 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
             let d = DATA_GAUGES + i * GAUGE_SLOTS;
             let amount = read_wide(data, d);
             let name = usize::try_from(data.get(d + 8).copied().unwrap_or(-1)).ok().and_then(|c| CHEMICALS.get(c)).map(|c| c.1);
+            // `GuiTankGauge.setLabel`: the fission reactor's and the boiler's gauges name their tank on the first line.
+            let label = match (kind(block), g.key) {
+                (Some(Kind::FissionPort), "water") => Some(("§b", "Coolant Tank")),
+                (Some(Kind::FissionPort), "fuel") => Some(("§2", "Fuel Tank")),
+                (Some(Kind::FissionPort), "steam") => Some(("§6", "Heated Coolant Tank")),
+                (Some(Kind::FissionPort), "waste") => Some(("§6", "Waste Tank")),
+                (Some(Kind::BoilerValve), "heated_coolant") => Some(("§6", "Heated Coolant Tank")),
+                (Some(Kind::BoilerValve), "water") => Some(("§9", "Water Tank")),
+                (Some(Kind::BoilerValve), "steam") => Some(("§7", "Steam Tank")),
+                (Some(Kind::BoilerValve), "cooled_coolant") => Some(("§b", "Coolant Tank")),
+                _ => None,
+            };
+            if let Some((code, text)) = label {
+                lines.push(format!("{code}{text}"));
+            }
             lines.push(match (amount, name) {
                 (0, _) => "Empty".to_owned(),
                 (_, Some(name)) => format!("{name}: {amount} mB"),
