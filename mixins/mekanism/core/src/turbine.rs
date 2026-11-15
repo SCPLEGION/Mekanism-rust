@@ -5,9 +5,8 @@
 
 pub const MIN_SIZE: i32 = 3;
 pub const MAX_SIZE: i32 = 17;
-/// `TurbineValidator.MAX_BLADES`; a rotor here carries its two blades.
+/// `TurbineValidator.MAX_BLADES`.
 pub const MAX_BLADES: u64 = 28;
-pub const BLADES_PER_ROTOR: u64 = 2;
 /// GeneratorsConfig: `bladesPerCoil`, `ventChemicalFlow`, `disperserChemicalFlow`, `condenserRate`,
 /// `chemicalPerTank`, `energyCapacityPerVolume`, `joulesPerSteam`, `steamDivisor`.
 pub const BLADES_PER_COIL: u64 = 4;
@@ -33,6 +32,8 @@ pub fn is_frame(name: &str) -> bool {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Turbine {
     pub rotors: u64,
+    /// The blades housed in the rotors (`TurbineMultiblockData.blades`, counted by the validator).
+    pub blades: u64,
     pub dispersers: u64,
     pub coils: u64,
     pub condensers: u64,
@@ -57,7 +58,7 @@ impl Turbine {
     }
 
     pub fn blades(&self) -> u64 {
-        (self.rotors * BLADES_PER_ROTOR).min(MAX_BLADES)
+        self.blades
     }
 
     pub fn steam_capacity(&self) -> u64 {
@@ -109,6 +110,7 @@ mod tests {
     fn a_full_turbine_turns_steam_into_energy() {
         let t = Turbine {
             rotors: 2,
+            blades: 4,
             dispersers: 8,
             coils: 1,
             condensers: 1,
