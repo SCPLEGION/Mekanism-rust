@@ -33,7 +33,11 @@ pub struct GearConfig {
 pub const GEAR_FLAGS: [(&str, &str, bool); 3] = [("mekatool", "extendedMining", true), ("mekasuit", "gravitationalVibrations", true), ("flamethrower", "destroyItems", true)];
 
 /// The gear decimals: (section, key, default, min, max).
-pub const GEAR_DOUBLES: [(&str, &str, f64, f64, f64); 2] = [("mekatool", "baseEfficiency", 4.0, 0.1, 100.0), ("mekatool", "attackSpeed", -2.4, -4.0, 100.0)];
+pub const GEAR_DOUBLES: [(&str, &str, f64, f64, f64); 3] = [
+    ("mekatool", "baseEfficiency", 4.0, 0.1, 100.0),
+    ("mekatool", "attackSpeed", -2.4, -4.0, 100.0),
+    ("mekasuit.damage_absorption", "heatDamageReductionRatio", 0.8, 0.0, 1.0),
+];
 
 /// A gear switch of the active config (`"mekatool.extendedMining"`), else `default`.
 pub fn gear_flag(full_key: &str, default: bool) -> bool {
@@ -79,7 +83,7 @@ pub fn gear_ratio(full_key: &str) -> f64 {
 
 /// The other whole-number gear keys: (section, key, default), `defineInRange(key, default, 0, Integer.MAX_VALUE)`
 /// unless the range says otherwise. The Meka-Tool's and MekaSuit's usages sit in their `energy_usage` section.
-pub const GEAR_INTS: [(&str, &str, u64); 48] = [
+pub const GEAR_INTS: [(&str, &str, u64); 49] = [
     // `fillRate` of the tank items (mB a tick a machine's slot moves) and the paste transfer rates.
     ("flamethrower", "fillRate", 16),
     ("jetpack", "fillRate", 16),
@@ -118,6 +122,7 @@ pub const GEAR_INTS: [(&str, &str, u64); 48] = [
     ("mekatool.energy_usage", "teleport", 1_000),
     ("mekasuit", "inventoryChargeRate", 10_000),
     ("mekasuit", "solarRechargingRate", 500),
+    ("mekasuit", "geothermalChargingRate", 10),
     ("mekasuit.energy_usage", "damage", 100_000),
     ("mekasuit.energy_usage", "magicReduce", 1_000),
     ("mekasuit.energy_usage", "fall", 50),
