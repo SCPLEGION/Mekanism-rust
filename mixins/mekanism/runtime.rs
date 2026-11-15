@@ -12550,6 +12550,40 @@ fn upgrade_stack(game: &Game<'_>, id: &str) -> Option<ItemStack> {
     found
 }
 
+thread_local! {
+    static MODULE_STACKS: std::cell::RefCell<std::collections::HashMap<String, Option<ItemStack>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A module's item, as its crafting recipe makes it (the model its `custom_model_data` picks: the icon of its own
+/// texture, `item/module/<name>`).
+fn module_stack(game: &Game<'_>, id: &str) -> Option<ItemStack> {
+    if let Some(found) = MODULE_STACKS.with_borrow(|c| c.get(id).cloned()) {
+        return found;
+    }
+    let found = world_recipes!(game).crafting.iter().find_map(|(_, r)| {
+        let result = match r {
+            horizon_client::crafting::Recipe::Shaped { result, .. } | horizon_client::crafting::Recipe::Shapeless { result, .. } => result,
+            _ => return None,
+        };
+        let stack = ItemStack { item: result.item.clone()?, count: 1, damage: result.damage, extra: result.extra.clone() };
+        (module_type(&stack).as_deref() == Some(id)).then_some(stack)
+    });
+    MODULE_STACKS.with_borrow_mut(|c| c.insert(id.to_owned(), found.clone()));
+    found
+}
+
+/// A module's icon at `at`, `size` square: its own item, else the base module's.
+fn draw_module_icon(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, id: &str, at: [f32; 2], size: f32) {
+    match module_stack(game, id) {
+        Some(stack) => {
+            game.native_item_stack(batch, &stack, at, size);
+        }
+        None => {
+            game.native_item(batch, modules::MODULE_ITEM, at, size);
+        }
+    }
+}
+
 /// `GuiUpgradeWindow`: 198 wide, centred, 15 down; one row of supported upgrades makes it 94 tall.
 const UPGRADE_WINDOW: [f32; 4] = [-11.0, 15.0, 198.0, 94.0];
 const UPGRADE_LIST: [f32; 4] = [6.0, 18.0, 108.0, 50.0];
@@ -23839,7 +23873,7 @@ fn draw_station(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, heig
             };
             nine_slice_tinted(game, batch, base, [12.0, 12.0], 1.0, at(row), 0xFFFF_FFFF);
             sprite(game, batch, slot, [0.0, 0.0, 10.0, 10.0], [ox + row[0] + 1.0, oy + row[1] + 1.0, 10.0, 10.0]);
-            game.native_item(batch, modules::MODULE_ITEM, [ox + row[0] + 2.0, oy + row[1] + 2.0], 8.0);
+            draw_module_icon(game, batch, id, [ox + row[0] + 2.0, oy + row[1] + 2.0], 8.0);
             if installed.contains_key(*id) {
                 // `GuiModuleScrollList.drawName`: exclusive modules are blue, disabled ones darker (red when not exclusive).
                 let (exclusive, enabled) = (EXCLUSIVE_MODULES.contains(id), !disabled.iter().any(|d| d == id));
@@ -24199,7 +24233,13 @@ fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
             let cell = [o[0] + p[0] - 1.0, o[1] + p[1] - 1.0, 18.0, 18.0];
             sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], cell);
             if let Some(stack) = tw_raw(game, i) {
-                game.native_item(batch, &stack.item, [o[0] + p[0], o[1] + p[1]], 16.0);
+                game.native_item_stack(batch, stack, [o[0] + p[0], o[1] + p[1]], 16.0);
+                // `GuiGraphicsExtractor.itemDecorations`: the count, bottom right, with a shadow.
+                if stack.count > 1 {
+                    let text = stack.count.to_string();
+                    let width = game.native_text_width(&text);
+                    game.native_text(batch, &text, [o[0] + p[0] + 17.0 - width, o[1] + p[1] + 9.0], 0xFF_FFFF, true);
+                }
             }
             if !valid.contains(&i) {
                 game.native_fill(batch, [cell[0] + 1.0, cell[1] + 1.0, 16.0, 16.0], 0xCC33_3333);
@@ -24245,7 +24285,7 @@ fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
             };
             nine_slice_tinted(game, batch, base, [12.0, 12.0], 1.0, r, 0xFFFF_FFFF);
             sprite(game, batch, slot, [0.0, 0.0, 10.0, 10.0], [r[0] + 1.0, r[1] + 1.0, 10.0, 10.0]);
-            game.native_item(batch, modules::MODULE_ITEM, [r[0] + 2.0, r[1] + 2.0], 8.0);
+            draw_module_icon(game, batch, id, [r[0] + 2.0, r[1] + 2.0], 8.0);
             // `GuiModuleScrollList.drawName`.
             let on = stack.is_some_and(|s| module_enabled(s, id));
             let exclusive = module_config::data(id).is_some_and(|d| d.exclusive);
@@ -24360,6 +24400,17 @@ fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
     centred(game, batch, "Options", button[0], button[2], button[1] + 4.0, if helmet { 0xFF_FFFF } else { 0xA0_A0A0 });
     tw_hud_draw(game, batch, o);
     tw_color_draw(game, batch, o);
+    // A slot's item tooltip, as any container screen shows it.
+    if TW_COLOR.with_borrow(Option::is_none)
+        && !TW_UI.with_borrow(|ui| ui.hud)
+        && let Some(stack) = (0..14).find(|i| {
+            let p = tw_slot_pos(*i);
+            inside(cursor, [o[0] + p[0] - 1.0, o[1] + p[1] - 1.0, 18.0, 18.0])
+        }).and_then(|i| tw_raw(game, i))
+    {
+        let lines = game.stack_tooltip(stack);
+        game.draw_tooltip_lines(batch, &lines, cursor[0], cursor[1]);
+    }
     // `GuiModuleScrollList.updateTooltip`: a module in the list tells how many of the most it can take are installed.
     if TW_COLOR.with_borrow(Option::is_none) && !TW_UI.with_borrow(|ui| ui.hud) {
         let list = at(TW_LIST);
