@@ -10030,6 +10030,7 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
             BREATHING_CHANNEL => return mekasuit_breathe(game, data.first().copied().unwrap_or(1)),
             CHARGE_CHANNEL => return mekasuit_distribute(game),
             SOLAR_CHANNEL => return mekasuit_solar(game),
+            GEOTHERMAL_CHANNEL => return mekasuit_geothermal(game),
             _ => {}
         }
     }
@@ -11385,6 +11386,15 @@ fn module_on(stack: &ItemStack, module: &str) -> bool {
 pub(super) fn player_damage_rules(game: &mut Game<'_>, absorbed: f32, rules: &mut Vec<(String, f32)>) {
     if !game.native_on(MOD_ID) {
         return;
+    }
+    // `ModuleGeothermalGeneratorUnit.getDamageAbsorbInfo`: fire damage reduced by `heatDamageReductionRatio` in the share
+    // of the units installed out of 8, at no energy.
+    if let Some(legs) = game.armor[2].as_ref().filter(|s| &*s.item == modules::PANTS) {
+        let units = installed_modules(legs).get(GEOTHERMAL_UNIT).copied().unwrap_or(0);
+        if units > 0 && module_on(legs, GEOTHERMAL_UNIT) {
+            let ratio = mekanism_core::config::gear_double("mekasuit.damage_absorption.heatDamageReductionRatio", modules::HEAT_REDUCTION);
+            rules.push(("#minecraft:is_fire".to_owned(), (ratio * f64::from(units.min(8)) / 8.0) as f32));
+        }
     }
     const UNIT: &str = "mekanism:inhalation_purification_unit";
     let holders: Vec<usize> = (0..4).filter(|&i| game.armor[i].as_ref().is_some_and(|s| modules::is_container(&s.item) && module_on(s, UNIT))).collect();
@@ -20835,6 +20845,8 @@ pub(super) fn meka_tool_area(game: &mut Game<'_>, pos: [i32; 3]) {
 const BREATHING_CHANNEL: &str = "mekanism:mekasuit_breathing";
 const CHARGE_CHANNEL: &str = "mekanism:mekasuit_charge";
 const SOLAR_CHANNEL: &str = "mekanism:mekasuit_solar";
+const GEOTHERMAL_CHANNEL: &str = "mekanism:mekasuit_geothermal";
+const GEOTHERMAL_UNIT: &str = "mekanismgenerators:geothermal_generator_unit";
 /// `Player.getMaxAirSupply`.
 const MAX_AIR: i32 = 300;
 
@@ -20873,6 +20885,57 @@ fn mekasuit_client(game: &mut Game<'_>) {
     }
     if worn_module(game, 0, modules::HELMET, "mekanismgenerators:solar_recharging_unit") {
         game.native_send_to_server(SOLAR_CHANNEL, &[1]);
+    }
+    if worn_module(game, 2, modules::PANTS, GEOTHERMAL_UNIT) {
+        game.native_send_to_server(GEOTHERMAL_CHANNEL, &[1]);
+    }
+}
+
+/// `ModuleGeothermalGeneratorUnit.tickServer` (once a second here): the leggings charge from the heat of the lava the
+/// legs stand in, scaled by how much of them is submerged, or from being on fire (treated as 200 K above ambient).
+fn mekasuit_geothermal(game: &mut Game<'_>) {
+    let Some(legs) = game.armor[2].as_ref().filter(|s| &*s.item == modules::PANTS) else {
+        return;
+    };
+    let units = modules_of(legs).get(GEOTHERMAL_UNIT).copied().unwrap_or(0);
+    let capacity = item_energy_of(legs).map_or(0, |e| e.capacity);
+    let stored = stored_energy(legs);
+    if units == 0 || stored >= capacity {
+        return;
+    }
+    let Some(p) = game.player.as_ref() else {
+        return;
+    };
+    let (pos, fire, sneaking) = (p.position, p.fire_ticks > 0, p.shift_key_down);
+    let leg_height = if sneaking { 0.6 } else { 0.7 };
+    let at = [pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32];
+    let mut degrees = 0.0_f64;
+    // Lava heats to 1300 K, 1000 above the ambient 300 K; water is not above it. Only the feet's block and the one the
+    // legs reach into are sampled, the lava's surface at its level (`FluidState.getHeight`).
+    let mut submerged = 0.0_f64;
+    for dy in 0..2 {
+        let cell = [at[0], at[1] + dy, at[2]];
+        if block_name(game, cell) == "minecraft:lava" {
+            let level: f64 = game.native_block_property(cell, "level").and_then(|l| l.parse().ok()).unwrap_or(0.0);
+            let top = f64::from(cell[1]) + if level >= 8.0 { 1.0 } else { (8.0 - level) / 9.0 };
+            let above_lava = block_name(game, [cell[0], cell[1] + 1, cell[2]]) == "minecraft:lava";
+            let top = if above_lava { f64::from(cell[1]) + 1.0 } else { top };
+            submerged = submerged.max((top.min(pos.y + leg_height) - pos.y.max(f64::from(cell[1]))).max(0.0));
+        }
+    }
+    if submerged >= 0.25 {
+        degrees = (1300.0 - 300.0) * submerged / leg_height;
+    }
+    if degrees < 200.0 && fire {
+        degrees = 200.0;
+    }
+    if degrees <= 0.0 {
+        return;
+    }
+    let rate = (f64::from(units) * mekanism_core::config::gear_int("mekasuit.geothermalChargingRate", modules::GEOTHERMAL_RATE) as f64 * degrees).min(f64::from(i32::MAX));
+    let made = rate as u64 * 20;
+    if let Some(legs) = game.armor[2].as_mut() {
+        set_energy(legs, (stored + made).min(capacity));
     }
 }
 
