@@ -24236,16 +24236,33 @@ const TW_ID: &str = "mekanism:module_tweaker";
 const TW_CHANNEL: &str = "mekanism:module_tweaker";
 /// Where an item's module settings are kept (`ModuleConfig`s of the `module_container`): module -> key -> value.
 const MODULE_CONFIG_KEY: &str = "mekanism:module_config";
-const TW_WINDOW: [f32; 2] = [220.0, 150.0];
-const TW_ROWS: usize = 6;
-const TW_SETTING_ROWS: usize = 4;
+/// `GuiModuleTweaker`: `DEFAULT_IMAGE_WIDTH + 90` by `DEFAULT_IMAGE_HEIGHT + 20`.
+const TW_WINDOW: [f32; 2] = [266.0, 186.0];
+/// The module list (`GuiModuleScrollList`), the settings screen (`GuiModuleScreen`) and the Options button with its holder.
+const TW_LIST: [f32; 4] = [30.0, 20.0, 120.0, 116.0];
+const TW_SCREEN: [f32; 4] = [150.0, 20.0, 108.0, 134.0];
+const TW_HOLDER: [f32; 4] = [30.0, 136.0, 120.0, 18.0];
+const TW_BUTTON: [f32; 4] = [31.0, 137.0, 118.0, 16.0];
+/// `GuiScrollList.elementHeight` and the rows the list shows, `(height - 2) / 12`.
+const TW_ROW: f32 = 12.0;
+const TW_ROWS: i32 = 9;
+const TW_SCREEN_FOCUSED: i32 = 132;
+const TW_ELEMENT_SPACER: i32 = 4;
+/// Where windows open from the tweaker's corner: `((width - 160) / 2, (height - 120) / 2)`.
+const TW_POPUP: [f32; 2] = [53.0, 33.0];
 
 #[derive(Default)]
 struct TwUi {
     slot: Option<usize>,
     module: Option<String>,
-    scroll: usize,
-    setting_scroll: usize,
+    /// `GuiScrollableElement.scroll` (0 to 1) of the module list and of the settings screen.
+    list_scroll: f32,
+    screen_scroll: f32,
+    /// What the button is held on: 1 the list's bar, 2 the screen's bar, 3 an enum slider (`drag_key`).
+    drag: u8,
+    drag_off: f32,
+    drag_key: String,
+    drag_last: u32,
     /// Where the window was drawn last, for the clicks.
     origin: [f32; 2],
     /// `GuiMekaSuitHelmetOptions` is open, where it was moved to, where the cursor took hold of it, and what is held:
@@ -24295,7 +24312,7 @@ fn radial_stack<'a>(game: &'a Game<'_>, slot: usize) -> Option<&'a ItemStack> {
 }
 
 fn tw_slots(game: &Game<'_>) -> Vec<usize> {
-    (0..14).filter(|i| tw_stack(game, *i).is_some_and(|s| !installed_modules(s).is_empty())).collect()
+    (0..14).filter(|i| tw_stack(game, *i).is_some()).collect()
 }
 
 /// A stored setting of `module` on `stack`, or the default.
@@ -24373,138 +24390,305 @@ fn tw_geometry(batch_w: f32, batch_h: f32) -> [f32; 2] {
     [((batch_w - TW_WINDOW[0]) / 2.0).floor(), ((batch_h - TW_WINDOW[1]) / 2.0).floor()]
 }
 
-fn tw_item_cell(i: usize, o: [f32; 2]) -> [f32; 4] {
-    [o[0] + 8.0 + 18.0 * i as f32, o[1] + 17.0, 18.0, 18.0]
+/// `ModuleTweakerContainer`'s slots: the worn armour, the hotbar, the off hand.
+fn tw_slot_pos(i: usize) -> [f32; 2] {
+    match i {
+        0..=3 => [8.0, 8.0 + 18.0 * i as f32],
+        4..=12 => [58.0 + 18.0 * (i - 4) as f32, 161.0],
+        _ => [8.0, 16.0 + 18.0 * 4.0],
+    }
 }
 
-fn tw_module_row(i: usize, o: [f32; 2]) -> [f32; 4] {
-    [o[0] + 9.0, o[1] + 40.0 + 12.0 * i as f32, 86.0, 12.0]
+/// The stack in a slot of the container, whatever it is.
+fn tw_raw<'a>(game: &'a Game<'_>, slot: usize) -> Option<&'a ItemStack> {
+    match slot {
+        0..=3 => game.armor.get(slot)?.as_ref(),
+        4..=12 => game.inventory.get(slot - 4)?.as_ref(),
+        13 => game.offhand.as_ref(),
+        _ => None,
+    }
 }
 
-fn tw_setting_row(i: usize, o: [f32; 2]) -> [f32; 4] {
-    [o[0] + 104.0, o[1] + 39.0 + 27.0 * i as f32, 108.0, 26.0]
+/// `GuiScrollableElement.getCurrentSelection`: the first element shown.
+fn tw_first(scroll: f32, max: i32, focused: i32) -> i32 {
+    if max > focused { (((max - focused) as f32 + 0.5) * scroll) as i32 } else { 0 }
 }
 
-fn tw_button(row: [f32; 4]) -> [f32; 4] {
-    [row[0], row[1] + 10.0, row[2], 14.0]
+/// `GuiScrollableElement.getScroll`: the thumb's place along the bar (`bar_max` the track's height, the thumb 4).
+fn tw_thumb(scroll: f32, bar_max: i32) -> i32 {
+    ((scroll * (bar_max - 4) as f32) as i32).clamp(0, bar_max - 4)
+}
+
+/// `adjustScroll`: one notch of the wheel.
+fn tw_notch(scroll: &mut f32, up: bool, max: i32, focused: i32, scaler: i32) {
+    if max > focused {
+        let steps = ((max - focused) as f32 / scaler as f32).ceil();
+        if steps > 0.0 {
+            *scroll = (*scroll - if up { 1.0 } else { -1.0 } / steps).clamp(0.0, 1.0);
+        }
+    }
+}
+
+/// `GuiScrollableElement.drawScrollBar`: the track and the thumb, from the bar's corner.
+fn tw_bar(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, x: f32, y: f32, bar_max: i32, scroll: f32) {
+    nine_slice_tinted(game, batch, "scroll/list_border", [6.0, 6.0], 2.0, [x - 1.0, y - 1.0, 6.0, bar_max as f32 + 2.0], 0xFFFF_FFFF);
+    sprite(game, batch, "scroll/list_bar", [0.0, 0.0, 4.0, 4.0], [x, y + tw_thumb(scroll, bar_max) as f32, 4.0, 4.0]);
+}
+
+/// A setting's description: `module.<namespace>.<key>` of the lang file, else the words the table has.
+fn tw_label(s: &module_config::Setting) -> String {
+    let key = format!("module.mekanism.{}", s.key);
+    if horizon_client::lang::has(&key) { horizon_client::lang::get(&key) } else { s.label.to_owned() }
+}
+
+/// What `GuiModuleScreen.setModule` lays out for a module: each shown setting with its top and height, and the whole
+/// height (`maxElements`).
+struct TwLayout {
+    exclusive: bool,
+    max_stack: u32,
+    elements: Vec<(module_config::Setting, i32, i32)>,
+    height: i32,
+}
+
+fn tw_layout(item: &str, module: &str, installed: u32) -> TwLayout {
+    let exclusive = module_config::data(module).is_some_and(|d| d.exclusive);
+    let max_stack = modules::max_installed(item, module);
+    let mut y = TW_ELEMENT_SPACER + 1;
+    if exclusive {
+        y += 13;
+    }
+    if max_stack > 1 {
+        y += 13;
+    }
+    let mut elements = vec![];
+    for s in module_config::settings(module, installed) {
+        let h = match s.kind {
+            module_config::Kind::Enum { .. } if s.key == "jetpack_mode" => 31,
+            module_config::Kind::Enum { .. } => 28,
+            _ => 20,
+        };
+        elements.push((s, y, h));
+        y += h + TW_ELEMENT_SPACER;
+    }
+    let height = if elements.is_empty() { y } else { y - TW_ELEMENT_SPACER };
+    TwLayout { exclusive, max_stack, elements, height }
+}
+
+/// `EnumToggle`'s bar: its length, and the distance between two options.
+fn tw_enum_bar(count: usize) -> (f32, f32) {
+    let length = (TW_SCREEN[2] - 6.0 - 24.0).floor();
+    (length, (length / (count.max(2) - 1) as f32).floor())
+}
+
+/// `EnumToggle.setDataFromPosition`.
+fn tw_enum_at(x: f32, sx: f32, count: usize) -> u32 {
+    let (length, _) = tw_enum_bar(count);
+    let size = count.max(1) - 1;
+    (((x - (sx + 2.0) - 10.0) / length * size as f32).round().clamp(0.0, size as f32)) as u32
 }
 
 fn tweaker_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
     let o = tw_geometry(batch.width, batch.height);
     TW_UI.with_borrow_mut(|ui| ui.origin = o);
-    let (w, h) = (TW_WINDOW[0], TW_WINDOW[1]);
     let cursor = game.native_cursor();
-    nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [o[0] - 3.0, o[1] - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
-    nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [o[0], o[1], w, h], 0xFFFF_FFFF);
-    centred(game, batch, "Module Tweaker", o[0], w, o[1] + 5.0, 0x40_4040);
-    let slots = tw_slots(game);
+    let at = |r: [f32; 4]| [o[0] + r[0], o[1] + r[1], r[2], r[3]];
+    nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [o[0] - 3.0, o[1] - 3.0, TW_WINDOW[0] + 6.0, TW_WINDOW[1] + 6.0], 0xBFFF_FFFF);
+    nine_slice_tinted(game, batch, "base", [16.0, 16.0], 4.0, [o[0], o[1], TW_WINDOW[0], TW_WINDOW[1]], 0xFFFF_FFFF);
+    // `renderTitleTextWithOffset(guiGraphics, 24)`.
+    centred(game, batch, "Module Tweaker", o[0] + 24.0, TW_WINDOW[0] - 24.0, o[1] + 6.0, 0x40_4040);
+    let valid = tw_slots(game);
     TW_UI.with_borrow_mut(|ui| {
-        if ui.slot.is_some_and(|s| !slots.contains(&s)) {
+        if ui.slot.is_some_and(|s| !valid.contains(&s)) {
             ui.slot = None;
             ui.module = None;
         }
         // `addGuiElements`: the first tweakable item starts selected.
         if ui.slot.is_none() {
-            ui.slot = slots.first().copied();
+            ui.slot = valid.first().copied();
         }
-        for (i, slot) in slots.iter().take(11).enumerate() {
-            let r = tw_item_cell(i, o);
-            let base = if ui.slot == Some(*slot) {
-                "list/selected"
-            } else if inside(cursor, r) {
-                "list/hovered"
-            } else {
-                "list/base"
-            };
-            nine_slice_tinted(game, batch, base, [12.0, 12.0], 1.0, r, 0xFFFF_FFFF);
-            if let Some(stack) = tw_stack(game, *slot) {
-                game.native_item(batch, &stack.item, [r[0] + 1.0, r[1] + 1.0], 16.0);
+        // The slots (`GuiSlot` over each container slot): the item, grey over what can't be tweaked, the mark on the pick.
+        for i in 0..14 {
+            let p = tw_slot_pos(i);
+            let cell = [o[0] + p[0] - 1.0, o[1] + p[1] - 1.0, 18.0, 18.0];
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], cell);
+            if let Some(stack) = tw_raw(game, i) {
+                game.native_item(batch, &stack.item, [o[0] + p[0], o[1] + p[1]], 16.0);
+            }
+            if !valid.contains(&i) {
+                game.native_fill(batch, [cell[0] + 1.0, cell[1] + 1.0, 16.0, 16.0], 0xCC33_3333);
+            }
+            if ui.slot == Some(i) {
+                sprite(game, batch, "slot/overlay/select", [0.0, 0.0, 18.0, 18.0], cell);
             }
         }
-        let frame = [o[0] + 8.0, o[1] + 39.0, 88.0, 14.0 + 12.0 * (TW_ROWS as f32 - 1.0) + 2.0];
-        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, frame, 0xFFFF_FFFF);
-        // `optionsButton`: only a MekaSuit helmet (`MEKASUIT_HUD_RENDERER`) has options.
-        let helmet = ui.slot.and_then(|s| tw_stack(game, s)).is_some_and(|s| &*s.item == modules::HELMET);
-        let holder = [o[0] + 8.0, o[1] + 120.0, 88.0, 18.0];
-        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, holder, 0xFFFF_FFFF);
-        let button = [holder[0] + 1.0, holder[1] + 1.0, 86.0, 16.0];
-        draw_button(game, batch, button, helmet && inside(cursor, button), helmet, 0xFFFF_FFFF, None);
-        centred(game, batch, "Options", button[0], button[2], button[1] + 4.0, if helmet { 0xFF_FFFF } else { 0xA0_A0A0 });
-        let Some(stack) = ui.slot.and_then(|s| tw_stack(game, s)) else {
-            game.native_text(batch, "Pick an item", [o[0] + 12.0, o[1] + 44.0], 0x60_6060, false);
-            return;
-        };
-        let installed = installed_modules(stack);
+        let stack = ui.slot.and_then(|s| tw_stack(game, s));
+        let installed = stack.map(installed_modules).unwrap_or_default();
         let ids: Vec<&String> = installed.keys().collect();
-        ui.scroll = ui.scroll.min(ids.len().saturating_sub(TW_ROWS));
         if ui.module.as_ref().is_some_and(|m| !installed.contains_key(m)) {
             ui.module = None;
         }
-        // `GuiScrollBar` of the module list: a thumb in a bordered track once more modules are installed than rows show.
-        if ids.len() > TW_ROWS {
-            let hidden = ids.len() - TW_ROWS;
-            let (bar_x, bar_y, bar_h) = (frame[0] + frame[2] - 7.0, frame[1] + 2.0, frame[3] - 4.0);
-            nine_slice_tinted(game, batch, "scroll/list_border", [6.0, 6.0], 2.0, [bar_x - 1.0, bar_y - 1.0, 6.0, bar_h + 2.0], 0xFFFF_FFFF);
-            let thumb = (ui.scroll as f32 / hidden as f32 * (bar_h - 4.0)).round();
-            sprite(game, batch, "scroll/list_bar", [0.0, 0.0, 4.0, 4.0], [bar_x, bar_y + thumb, 4.0, 4.0]);
+        // Held bars and sliders go on setting while the button is down.
+        if ui.drag != 0 && !game.native_mouse_down() {
+            ui.drag = 0;
         }
-        for (i, id) in ids.iter().skip(ui.scroll).take(TW_ROWS).enumerate() {
-            let r = tw_module_row(i, o);
-            let base = if ui.module.as_deref() == Some(id.as_str()) {
-                "list/selected"
-            } else if inside(cursor, r) {
-                "list/hovered"
+        let list = at(TW_LIST);
+        let screen = at(TW_SCREEN);
+        let layout = stack.zip(ui.module.as_deref()).map(|(s, m)| tw_layout(&s.item, m, installed.get(m).copied().unwrap_or(0)));
+        let screen_max = layout.as_ref().map_or(0, |l| l.height);
+        match ui.drag {
+            1 | 2 => {
+                let (top, bar_max) = if ui.drag == 1 { (list[1] + 2.0, 112) } else { (screen[1] + 2.0, 130) };
+                let value = ((cursor[1] - top - ui.drag_off) / (bar_max - 4) as f32).clamp(0.0, 1.0);
+                if ui.drag == 1 { ui.list_scroll = value } else { ui.screen_scroll = value }
+            }
+            _ => {}
+        }
+        // The module list.
+        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, list, 0xFFFF_FFFF);
+        tw_bar(game, batch, list[0] + 114.0, list[1] + 2.0, 112, ui.list_scroll);
+        let first = tw_first(ui.list_scroll, ids.len() as i32, TW_ROWS) as usize;
+        for (i, id) in ids.iter().skip(first).take(TW_ROWS as usize).enumerate() {
+            let r = [list[0] + 1.0, list[1] + 1.0 + TW_ROW * i as f32, 112.0, TW_ROW];
+            let (base, slot) = if ui.module.as_deref() == Some(id.as_str()) {
+                ("list/selected", "list/slot_selected")
+            } else if cursor[0] >= r[0] && cursor[0] < r[0] + 111.0 && cursor[1] >= r[1] && cursor[1] < r[1] + TW_ROW {
+                ("list/hovered", "list/slot_hovered")
             } else {
-                "list/base"
+                ("list/base", "list/slot")
             };
             nine_slice_tinted(game, batch, base, [12.0, 12.0], 1.0, r, 0xFFFF_FFFF);
-            let on = module_enabled(stack, id);
-            game.native_text_scaled(batch, &module_name(id), [r[0] + 3.0, r[1] + 3.0], if on { 0x40_4040 } else { 0xA0_4040 }, 0.7);
+            sprite(game, batch, slot, [0.0, 0.0, 10.0, 10.0], [r[0] + 1.0, r[1] + 1.0, 10.0, 10.0]);
+            game.native_item(batch, modules::MODULE_ITEM, [r[0] + 2.0, r[1] + 2.0], 8.0);
+            // `GuiModuleScrollList.drawName`.
+            let on = stack.is_some_and(|s| module_enabled(s, id));
+            let exclusive = module_config::data(id).is_some_and(|d| d.exclusive);
+            let color = match (exclusive, on) {
+                (true, true) => 0x63_5BD4,
+                (true, false) => 0x2E_2A69,
+                (false, true) => 0x40_4040,
+                (false, false) => 0x5E_1D1D,
+            };
+            let name = module_display(id);
+            let first_vertex = batch.vertices.len();
+            game.native_text_scaled(batch, &name, [list[0] + 13.0, list[1] + 3.0 + TW_ROW * i as f32], color, 0.7);
+            batch.clip_since(first_vertex, list[0] + 13.0, r[1], list[0] + 13.0 + 98.0, r[1] + TW_ROW);
         }
-        let Some(module) = ui.module.clone() else {
+        // The settings screen: `GuiInnerScreen`, its bar, then what the module offers, scissored to the screen.
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, screen, 0xFFFF_FFFF);
+        tw_bar(game, batch, screen[0] + 102.0, screen[1] + 2.0, 130, ui.screen_scroll);
+        let (Some(stack), Some(module), Some(layout)) = (stack, ui.module.clone(), layout) else {
             return;
         };
         let n = installed.get(&module).copied().unwrap_or(0);
-        let settings = module_config::settings(&module, n);
-        ui.setting_scroll = ui.setting_scroll.min(settings.len().saturating_sub(TW_SETTING_ROWS));
-        if settings.len() > TW_SETTING_ROWS {
-            let hidden = settings.len() - TW_SETTING_ROWS;
-            let (bar_x, bar_y, bar_h) = (o[0] + 212.0, o[1] + 39.0, 27.0 * TW_SETTING_ROWS as f32 - 2.0);
-            nine_slice_tinted(game, batch, "scroll/list_border", [6.0, 6.0], 2.0, [bar_x - 1.0, bar_y - 1.0, 6.0, bar_h + 2.0], 0xFFFF_FFFF);
-            let thumb = (ui.setting_scroll as f32 / hidden as f32 * (bar_h - 4.0)).round();
-            sprite(game, batch, "scroll/list_bar", [0.0, 0.0, 4.0, 4.0], [bar_x, bar_y + thumb, 4.0, 4.0]);
+        let shift = tw_first(ui.screen_scroll, screen_max, TW_SCREEN_FOCUSED);
+        let top = |y: i32| screen[1] + (y - shift) as f32;
+        let started = batch.vertices.len();
+        let mut y = TW_ELEMENT_SPACER + 1;
+        if layout.exclusive {
+            game.native_text_scaled(batch, "(Exclusive Module)", [screen[0] + 2.0, top(y)], 0x63_5BD4, 0.8);
+            y += 13;
         }
-        for (i, s) in settings.iter().skip(ui.setting_scroll).take(TW_SETTING_ROWS).enumerate() {
-            let row = tw_setting_row(i, o);
-            game.native_text_scaled(batch, s.label, [row[0], row[1] + 1.0], 0x40_4040, 0.75);
-            if matches!(s.kind, module_config::Kind::Color(_)) {
-                // `ColorSelection`: the hex under the name, the colour in an outlined swatch over the transparency grid.
-                let color = module_setting(stack, &module, s, n);
-                game.native_text(batch, &format!("#{color:08X}"), [row[0], row[1] + 11.0], 0x40_4040, false);
-                let sw = tw_swatch(row);
-                tw_outline(game, batch, sw, 0xFF3C_FE9A);
-                tw_grid(game, batch, [sw[0] + 1.0, sw[1] + 1.0, 16.0, 16.0]);
-                game.native_fill(batch, [sw[0] + 1.0, sw[1] + 1.0, 16.0, 16.0], color);
-                continue;
+        if layout.max_stack > 1 {
+            game.native_text_scaled(batch, &format!("Installed: {n}"), [screen[0] + 2.0, top(y)], 0x3C_FE9A, 0.8);
+        }
+        let mouse = [cursor[0] - screen[0] - 2.0, cursor[1] - screen[1] + shift as f32];
+        for (s, ey, _) in &layout.elements {
+            let ex = screen[0] + 2.0;
+            let ey_abs = top(*ey);
+            let value = module_setting(stack, &module, s, n);
+            let label = tw_label(s);
+            let over = |rx: f32, ry: f32, w: f32, h: f32| mouse[0] >= rx && mouse[0] < rx + w && mouse[1] >= *ey as f32 + ry && mouse[1] < *ey as f32 + ry + h;
+            match s.kind {
+                module_config::Kind::Bool(_) => {
+                    // `BooleanToggle`: a radio each for True and False.
+                    for (selected, rx, name_on, name_off) in [(value == 1, 4.0, "button/radio/selected", ""), (value == 0, 50.0, "button/radio/no_selected", "")] {
+                        let _ = name_off;
+                        let name = if selected {
+                            name_on
+                        } else if over(rx, 11.0, 8.0, 8.0) {
+                            "button/radio/hovered"
+                        } else {
+                            "button/radio/base"
+                        };
+                        sprite(game, batch, name, [0.0, 0.0, 8.0, 8.0], [ex + rx, ey_abs + 11.0, 8.0, 8.0]);
+                    }
+                    game.native_text_scaled(batch, &label, [ex, ey_abs], 0x3C_FE9A, 0.8);
+                    game.native_text_scaled(batch, "True", [ex + 12.0, ey_abs + 11.0], 0x3C_FE9A, 0.8);
+                    game.native_text_scaled(batch, "False", [ex + 58.0, ey_abs + 11.0], 0x3C_FE9A, 0.8);
+                }
+                module_config::Kind::Enum { options, .. } => {
+                    // `EnumToggle`: an arrow along a bar, the options under their ticks.
+                    let count = module_config::choices(s.kind, n);
+                    let (length, distance) = tw_enum_bar(count);
+                    let centre = distance * value as f32;
+                    sprite(game, batch, "slider/arrow", [0.0, 0.0, 5.0, 5.0], [ex + 10.0 + centre - 2.0, ey_abs + 11.0, 5.0, 6.0]);
+                    sprite(game, batch, "slider/bar", [0.0, 0.0, 2.0, 2.0], [ex + 10.0, ey_abs + 17.0, length, 2.0]);
+                    let jetpack = s.key == "jetpack_mode";
+                    let mode_color = |i: usize| [0x00AA00, 0x00AAAA, 0xFFAA00, 0xAA0000].get(i).copied();
+                    let head = if jetpack { format!("{label}: {}", options.get(value as usize).copied().unwrap_or("")) } else { label.clone() };
+                    game.native_text_scaled(batch, &head, [ex, ey_abs], 0x3C_FE9A, 0.8);
+                    for (i, text) in options.iter().take(count).enumerate() {
+                        let centre = 10.0 + distance * i as f32;
+                        let color = if jetpack { mode_color(i).unwrap_or(0x3C_FE9A) } else { 0x3C_FE9A };
+                        game.native_fill(batch, [ex + centre, ey_abs + 17.0, 1.0, 3.0], 0xFF00_0000 | color);
+                        if jetpack {
+                            let icon = ["jetpack_normal", "jetpack_hover", "jetpack_vector", "jetpack_off"][i.min(3)];
+                            sprite(game, batch, &format!("mode/{icon}"), [0.0, 0.0, 16.0, 16.0], [ex + centre - 8.0, ey_abs + 19.0, 16.0, 16.0]);
+                            continue;
+                        }
+                        let width = game.native_text_width(text) * 0.7;
+                        let start = if centre < width / 2.0 { 0.0 } else { centre - distance / 2.0 };
+                        let room = if centre < width / 2.0 { 10.0 + distance / 2.0 } else { distance };
+                        game.native_text_scaled(batch, text, [ex + start + ((room - width) / 2.0).max(0.0), ey_abs + 20.0], 0x3C_FE9A, 0.7);
+                    }
+                }
+                module_config::Kind::Color(_) => {
+                    // `ColorSelection`: the hex under the name, the colour in an outlined swatch over the transparency grid.
+                    game.native_text_scaled(batch, &label, [ex, ey_abs], 0x3C_FE9A, 0.8);
+                    game.native_text(batch, &format!("#{value:08X}"), [ex, ey_abs + 11.0], 0x3C_FE9A, false);
+                    let sw = [ex + 76.0, ey_abs + 1.0, 18.0, 18.0];
+                    tw_outline(game, batch, sw, 0xFF3C_FE9A);
+                    tw_grid(game, batch, [sw[0] + 1.0, sw[1] + 1.0, 16.0, 16.0]);
+                    game.native_fill(batch, [sw[0] + 1.0, sw[1] + 1.0, 16.0, 16.0], value);
+                }
             }
-            let b = tw_button(row);
-            let value = module_config::value_text(s.kind, module_setting(stack, &module, s, n));
-            draw_button(game, batch, b, inside(cursor, b), true, 0xFFFF_FFFF, None);
-            centred(game, batch, &value, b[0], b[2], b[1] + 3.0, 0xFF_FFFF);
+        }
+        batch.clip_since(started, screen[0], screen[1] + 1.0, batch.width, screen[1] + screen[3] - 1.0);
+        // A held enum slider keeps setting what it is dragged to (`EnumToggle.onDrag`); the server's reply moves the arrow.
+        if ui.drag == 3
+            && let Some((s, _, _)) = layout.elements.iter().find(|(s, _, _)| s.key == ui.drag_key)
+        {
+            let to = tw_enum_at(cursor[0], screen[0], module_config::choices(s.kind, n));
+            if to != ui.drag_last {
+                ui.drag_last = to;
+                game.native_send_to_server(TW_CHANNEL, format!("{}|{}|{}|{}", ui.slot.unwrap_or(0), module, s.key, to).as_bytes());
+            }
         }
     });
+    // `optionsButton`, in its holder: only a MekaSuit helmet (`MEKASUIT_HUD_RENDERER`) has options.
+    let helmet = TW_UI.with_borrow(|ui| ui.slot).and_then(|s| tw_stack(game, s)).is_some_and(|s| &*s.item == modules::HELMET);
+    nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, at(TW_HOLDER), 0xFFFF_FFFF);
+    let button = at(TW_BUTTON);
+    draw_button(game, batch, button, helmet && inside(cursor, button), helmet, 0xFFFF_FFFF, None);
+    centred(game, batch, "Options", button[0], button[2], button[1] + 4.0, if helmet { 0xFF_FFFF } else { 0xA0_A0A0 });
     tw_hud_draw(game, batch, o);
     tw_color_draw(game, batch, o);
     // `GuiModuleScrollList.updateTooltip`: a module in the list tells how many of the most it can take are installed.
     if TW_COLOR.with_borrow(Option::is_none) && !TW_UI.with_borrow(|ui| ui.hud) {
-        let cursor = game.native_cursor();
+        let list = at(TW_LIST);
         let line = TW_UI.with_borrow(|ui| {
             let stack = tw_stack(game, ui.slot?)?;
             let installed = installed_modules(stack);
-            (0..TW_ROWS).find(|i| inside(cursor, tw_module_row(*i, o))).and_then(|i| {
-                let id = installed.keys().nth(ui.scroll + i)?;
-                Some(format!("\u{a7}7Installed: {}/{}", installed[id], modules::max_installed(&stack.item, id)))
-            })
+            if !(cursor[0] >= list[0] + 1.0 && cursor[0] < list[0] + 113.0) {
+                return None;
+            }
+            let first = tw_first(ui.list_scroll, installed.len() as i32, TW_ROWS);
+            let row = ((cursor[1] - list[1] - 1.0) / TW_ROW).floor() as i32;
+            if !(0..TW_ROWS).contains(&row) || cursor[1] < list[1] + 1.0 {
+                return None;
+            }
+            let id = installed.keys().nth((first + row) as usize)?;
+            Some(format!("Installed: \u{a7}7{}/{}", installed[id], modules::max_installed(&stack.item, id)))
         });
         if let Some(line) = line {
             horizon_client::ui::tooltip(batch, &game.gui.atlas, &[horizon_client::text::Text::legacy(&line)], (cursor[0], cursor[1]));
@@ -24522,68 +24706,123 @@ fn tweaker_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
         tw_hud_click(game, o, at, button, pressed);
         return;
     }
-    if !pressed || button > 1 {
+    if !pressed {
+        // `GuiModuleScreen.onRelease`.
+        TW_UI.with_borrow_mut(|ui| ui.drag = 0);
         return;
     }
+    if button != 0 {
+        return;
+    }
+    let rect = |r: [f32; 4]| [o[0] + r[0], o[1] + r[1], r[2], r[3]];
+    // The container's slots (`select`): only a tweakable item can be picked.
+    let valid = tw_slots(game);
+    for i in 0..14 {
+        let p = tw_slot_pos(i);
+        if inside(at, [o[0] + p[0] - 1.0, o[1] + p[1] - 1.0, 18.0, 18.0]) {
+            if valid.contains(&i) {
+                game.audio.play_unshared("mekanism:gui.digital_beep_on", None, 1.0, 1.0);
+                TW_UI.with_borrow_mut(|ui| {
+                    ui.slot = Some(i);
+                    ui.module = None;
+                    ui.list_scroll = 0.0;
+                });
+            }
+            return;
+        }
+    }
     // `optionsButton`.
-    if inside(at, [o[0] + 9.0, o[1] + 121.0, 86.0, 16.0]) && button == 0 {
+    if inside(at, rect(TW_BUTTON)) {
         let helmet = TW_UI.with_borrow(|ui| ui.slot).and_then(|s| tw_stack(game, s)).is_some_and(|s| &*s.item == modules::HELMET);
         if helmet {
             TW_UI.with_borrow_mut(|ui| (ui.hud, ui.hud_offset, ui.hud_drag) = (true, [0.0; 2], 0));
-            game.audio.play_unshared("mekanism:gui.beep_on", None, 1.0, 1.0);
+            game.audio.play_unshared("mekanism:gui.digital_beep_on", None, 1.0, 1.0);
         }
         return;
     }
-    let slots = tw_slots(game);
+    let (list, screen) = (rect(TW_LIST), rect(TW_SCREEN));
     let mut send = None;
     let mut beep = None;
     TW_UI.with_borrow_mut(|ui| {
-        if let Some(i) = (0..slots.len().min(11)).find(|i| inside(at, tw_item_cell(*i, o))) {
-            ui.slot = Some(slots[i]);
-            ui.module = None;
-            ui.scroll = 0;
+        let Some(slot) = ui.slot else {
             return;
-        }
-        let Some(stack) = ui.slot.and_then(|s| tw_stack(game, s)) else {
+        };
+        let Some(stack) = tw_stack(game, slot) else {
             return;
         };
         let installed = installed_modules(stack);
         let ids: Vec<&String> = installed.keys().collect();
-        if let Some(i) = (0..TW_ROWS).find(|i| inside(at, tw_module_row(*i, o))) {
-            if let Some(id) = ids.get(ui.scroll + i) {
-                ui.module = Some((*id).clone());
-                ui.setting_scroll = 0;
-            }
+        // The module list: its bar, or a row (a click between rows clears the pick).
+        let thumb = tw_thumb(ui.list_scroll, 112) as f32;
+        if ids.len() as i32 > TW_ROWS && inside(at, [list[0] + 114.0, list[1] + 2.0 + thumb, 5.0, 5.0]) {
+            ui.drag = 1;
+            ui.drag_off = at[1] - (list[1] + 2.0 + thumb);
             return;
         }
-        let Some(module) = ui.module.clone() else {
+        if at[0] >= list[0] + 1.0 && at[0] < list[0] + 113.0 && at[1] >= list[1] + 1.0 && at[1] < list[1] + list[3] - 1.0 {
+            let first = tw_first(ui.list_scroll, ids.len() as i32, TW_ROWS);
+            let row = ((at[1] - list[1] - 1.0) / TW_ROW).floor() as i32;
+            ui.module = if row < TW_ROWS { ids.get((first + row) as usize).map(|id| (*id).clone()) } else { None };
+            return;
+        }
+        // The settings screen.
+        let module = ui.module.clone();
+        let layout = module.as_deref().map(|m| tw_layout(&stack.item, m, installed.get(m).copied().unwrap_or(0)));
+        let max = layout.as_ref().map_or(0, |l| l.height);
+        let thumb = tw_thumb(ui.screen_scroll, 130) as f32;
+        if max > TW_SCREEN_FOCUSED && inside(at, [screen[0] + 102.0, screen[1] + 2.0 + thumb, 5.0, 5.0]) {
+            ui.drag = 2;
+            ui.drag_off = at[1] - (screen[1] + 2.0 + thumb);
+            return;
+        }
+        let (Some(module), Some(layout)) = (module, layout) else {
             return;
         };
+        if !inside(at, screen) {
+            return;
+        }
         let n = installed.get(&module).copied().unwrap_or(0);
-        let settings = module_config::settings(&module, n);
-        if let Some(i) = (0..TW_SETTING_ROWS).find(|i| inside(at, tw_button(tw_setting_row(*i, o))))
-            && let Some(s) = settings.get(ui.setting_scroll + i)
-        {
+        let shift = tw_first(ui.screen_scroll, max, TW_SCREEN_FOCUSED);
+        let mouse = [at[0] - screen[0] - 2.0, at[1] - screen[1] + shift as f32];
+        for (s, ey, _) in &layout.elements {
+            let over = |rx: f32, ry: f32, w: f32, h: f32| mouse[0] >= rx && mouse[0] < rx + w && mouse[1] >= *ey as f32 + ry && mouse[1] < *ey as f32 + ry + h;
             let now = module_setting(stack, &module, s, n);
-            if let module_config::Kind::Color(_) = s.kind {
-                // `ColorSelection.click`: only the swatch opens the picker window.
-                if inside(at, tw_swatch(tw_setting_row(i, o))) {
-                    let slot = ui.slot.unwrap_or(0);
-                    let mut window = TwColor::new(slot, &module, s.key, now, true);
-                    // Worn armour shows on the model beside the pickers (`ColorSelection` offers the preview for the unit's colour).
-                    if slot < 4 && module == "mekanism:color_modulation_unit" {
-                        window.preview = Some((slot, stack.clone()));
+            match s.kind {
+                module_config::Kind::Bool(_) => {
+                    // `BooleanToggle.click`: the radio of the other value.
+                    let to = if now == 1 { over(50.0, 11.0, 8.0, 8.0).then_some(0) } else { over(4.0, 11.0, 8.0, 8.0).then_some(1) };
+                    if let Some(to) = to {
+                        beep = Some(to == 1);
+                        send = Some(format!("{slot}|{module}|{}|{to}", s.key));
                     }
-                    TW_COLOR.with_borrow_mut(|c| *c = Some(window));
                 }
-                return;
+                module_config::Kind::Enum { .. } => {
+                    // `EnumToggle.click`: take hold of the arrow, or jump to the option under the click.
+                    let count = module_config::choices(s.kind, n);
+                    let (length, distance) = tw_enum_bar(count);
+                    if over(10.0 + distance * now as f32 - 2.0, 11.0, 5.0, 6.0) {
+                        ui.drag = 3;
+                        ui.drag_key = s.key.to_owned();
+                        ui.drag_last = now;
+                    } else if over(10.0, 10.0, length, 12.0) {
+                        let to = tw_enum_at(at[0], screen[0], count);
+                        if to != now {
+                            send = Some(format!("{slot}|{module}|{}|{to}", s.key));
+                        }
+                    }
+                }
+                module_config::Kind::Color(_) => {
+                    // `ColorSelection.click`: only the swatch opens the picker window.
+                    if over(76.0, 1.0, 18.0, 18.0) {
+                        let mut window = TwColor::new(slot, &module, s.key, now, true);
+                        // Worn armour shows on the model beside the pickers (`ColorSelection` offers the preview for the unit's colour).
+                        if slot < 4 && module == "mekanism:color_modulation_unit" {
+                            window.preview = Some((slot, stack.clone()));
+                        }
+                        TW_COLOR.with_borrow_mut(|c| *c = Some(window));
+                    }
+                }
             }
-            let count = module_config::choices(s.kind, n) as u32;
-            let next = if button == 1 { (now + count - 1) % count } else { (now + 1) % count };
-            if matches!(s.kind, module_config::Kind::Bool(_)) {
-                beep = Some(next != 0);
-            }
-            send = ui.slot.map(|slot| format!("{slot}|{module}|{}|{next}", s.key));
         }
     });
     // `BooleanToggle.click`: the digital beep, on or off.
@@ -24617,7 +24856,7 @@ fn tw_key(game: &mut Game<'_>, key: &str) {
         let next = (cur as isize + step).rem_euclid(slots.len() as isize) as usize;
         ui.slot = Some(slots[next]);
         ui.module = None;
-        ui.scroll = 0;
+        ui.list_scroll = 0.0;
     });
 }
 
@@ -24740,7 +24979,7 @@ const COLOR_PREVIEW_WIDTH: f32 = 83.0;
 impl TwColor {
     /// Where the window's corner is: opened at (30, 15) of the tweaker, then moved.
     fn corner(&self, o: [f32; 2]) -> [f32; 2] {
-        [o[0] + 30.0 + self.offset[0], o[1] + 15.0 + self.offset[1]]
+        [o[0] + TW_POPUP[0] + self.offset[0], o[1] + TW_POPUP[1] + self.offset[1]]
     }
 
     fn width(&self) -> f32 {
@@ -24818,10 +25057,6 @@ impl TwColor {
     }
 }
 
-fn tw_swatch(row: [f32; 4]) -> [f32; 4] {
-    [row[0] + 88.0, row[1] + 1.0, 18.0, 18.0]
-}
-
 /// `GuiGraphicsExtractor.outline`: a one pixel frame.
 fn tw_outline(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, r: [f32; 4], argb: u32) {
     let [x, y, w, h] = r;
@@ -24885,7 +25120,7 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
         // The window follows the cursor while held by its title bar, inside the screen (`GuiWindow.onDrag`).
         if c.drag == 5 {
             if game.native_mouse_down() {
-                let home = [o[0] + 30.0, o[1] + 15.0];
+                let home = [o[0] + TW_POPUP[0], o[1] + TW_POPUP[1]];
                 let x = (cursor[0] - c.grab[0]).clamp(0.0, (batch.width - c.width()).max(0.0));
                 let y = (cursor[1] - c.grab[1]).clamp(0.0, (batch.height - c.height()).max(0.0));
                 c.offset = [x - home[0], y - home[1]];
@@ -24988,7 +25223,7 @@ fn tw_color_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: 
 }
 
 fn tw_color_click(game: &mut Game<'_>, o: [f32; 2], at: [f32; 2], button: u8, pressed: bool) {
-    let corner = TW_COLOR.with_borrow(|c| c.as_ref().map_or([o[0] + 30.0, o[1] + 15.0], |c| c.corner(o)));
+    let corner = TW_COLOR.with_borrow(|c| c.as_ref().map_or([o[0] + TW_POPUP[0], o[1] + TW_POPUP[1]], |c| c.corner(o)));
     let alpha_on = TW_COLOR.with_borrow(|c| c.as_ref().is_none_or(|c| c.alpha_on));
     let [_, _, _, shade, _, hue, _, alpha, field, confirm] = tw_color_rects(corner, alpha_on);
     let mut send = None;
@@ -25061,14 +25296,23 @@ fn tw_color_key(game: &mut Game<'_>, key: &str, text: Option<&str>) {
     TW_COLOR.with_borrow_mut(|c| *c = taken);
 }
 
-fn tweaker_wheel(at: [f32; 2], steps: f32) {
-    if TW_COLOR.with_borrow(Option::is_some) {
+fn tweaker_wheel(game: &Game<'_>, at: [f32; 2], steps: f32) {
+    if TW_COLOR.with_borrow(Option::is_some) || TW_UI.with_borrow(|ui| ui.hud) {
         return;
     }
-    let delta = if steps > 0.0 { -1 } else { 1 };
     TW_UI.with_borrow_mut(|ui| {
-        let field = if at[0] < ui.origin[0] + 100.0 { &mut ui.scroll } else { &mut ui.setting_scroll };
-        *field = (*field as i32 + delta).max(0) as usize;
+        let o = ui.origin;
+        let Some(stack) = ui.slot.and_then(|s| tw_stack(game, s)) else {
+            return;
+        };
+        let installed = installed_modules(stack);
+        // The screen takes the wheel over its own area, the list over its.
+        if inside(at, [o[0] + TW_SCREEN[0], o[1] + TW_SCREEN[1], TW_SCREEN[2], TW_SCREEN[3]]) {
+            let max = ui.module.as_deref().map_or(0, |m| tw_layout(&stack.item, m, installed.get(m).copied().unwrap_or(0)).height);
+            tw_notch(&mut ui.screen_scroll, steps > 0.0, max, TW_SCREEN_FOCUSED, 10);
+        } else if inside(at, [o[0] + TW_LIST[0], o[1] + TW_LIST[1], TW_LIST[2], TW_LIST[3]]) {
+            tw_notch(&mut ui.list_scroll, steps > 0.0, installed.len() as i32, TW_ROWS, 1);
+        }
     });
 }
 
@@ -25231,7 +25475,7 @@ pub(super) fn ui_wheel(game: &mut Game<'_>, id: &str, steps: f32) {
     } else if id == SEISMIC_ID {
         seismic_scroll(if steps > 0.0 { 1 } else { -1 });
     } else if id == TW_ID {
-        tweaker_wheel(game.native_cursor(), steps);
+        tweaker_wheel(game, game.native_cursor(), steps);
     } else if id == RADIAL_ID {
         radial_scroll(game, steps);
     } else if id == ROBIT_SCREEN && ROBIT_WIN.with(std::cell::Cell::get) == 2 {
