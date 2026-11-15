@@ -102,6 +102,8 @@ enum Kind {
     EnergyCube(BaseTier),
     /// A universal cable and what it carries in a tick.
     Cable(u64),
+    /// A thermodynamic conductor of a tier.
+    Conductor(BaseTier),
     /// A pressurized tube and the mB it carries in a tick.
     Tube(u64),
     Oxidizer,
@@ -313,6 +315,10 @@ fn kind(id: &str) -> Option<Kind> {
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_logistical_transporter")) {
         let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
         return tier::transporter_pull(tier).map(Kind::Transporter);
+    }
+    if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_thermodynamic_conductor")) {
+        let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
+        return tier::conductor(tier).map(|_| Kind::Conductor(tier));
     }
     if let Some(tier) = id.strip_prefix("mekanism:").and_then(|t| t.strip_suffix("_pressurized_tube")) {
         let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
@@ -677,6 +683,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
                 tick_cable(game, pos, entity, rate);
                 None
             }
+            Kind::Conductor(t) => {
+                tick_conductor(game, pos, entity, t);
+                None
+            }
             Kind::Oxidizer => tick_oxidizer(game, pos, entity, false),
             Kind::PigmentExtractor => tick_oxidizer(game, pos, entity, true),
             Kind::Liquifier => tick_liquifier(game, pos, entity),
@@ -820,7 +830,7 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
     miner_sync(game, pos, entity);
     security_sync(game, pos, entity);
     multiblock_data(game, pos, entity);
-    if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Pipe(_)) {
+    if matches!(k, Kind::Cable(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Pipe(_) | Kind::Conductor(_)) {
         show_connections(game, pos, entity);
     }
     if let Some(active) = active {
@@ -1410,6 +1420,7 @@ fn heat_params(k: Kind) -> Option<(f64, f64, f64)> {
     match k {
         Kind::HeatGenerator => Some((g::HEAT_CAPACITY, g::INVERSE_CONDUCTION_COEFFICIENT, g::INVERSE_INSULATION_COEFFICIENT)),
         Kind::Heater | Kind::FuelwoodHeater => Some((boiler::HEATER_HEAT_CAPACITY, boiler::HEATER_INVERSE_CONDUCTION, boiler::HEATER_INVERSE_INSULATION)),
+        Kind::Conductor(t) => tier::conductor(t),
         _ => None,
     }
 }
@@ -2993,6 +3004,44 @@ fn tick_cube(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, ti
 /// lets its energy run on to emptier cables (`tier::cable_share`), so a line of cables carries energy
 /// from generators to machines without it flowing back. Mekanism pools a whole cable network instead;
 /// the throughput per cable is the same.
+/// A thermodynamic conductor (`ThermodynamicConductor.simulate`): heat flows into the colder conductors and heat
+/// handlers beside it through the connections that are on, then it loses some to the air through all six sides.
+/// What it gave to acceptors (not to other conductors) and lost is kept for the Network Reader.
+fn tick_conductor(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, t: BaseTier) {
+    let Some((capacity, conduction, insulation)) = tier::conductor(t) else {
+        return;
+    };
+    let mut heat = mekanism_core::heat::HeatCapacitor::with_ambient(capacity, conduction, insulation, ambient_at(game, pos));
+    if let Some(stored) = get_double(&entity.nbt, "heat") {
+        heat.heat = stored;
+    }
+    let (mut conductors, mut acceptors) = (0u8, 0u8);
+    for (face, (_, d)) in DIRECTIONS.into_iter().enumerate() {
+        if conn_of(&entity.nbt, face) == 3 {
+            continue;
+        }
+        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        if pipe_family(block_name(game, at)) == Some("conductor") {
+            let back = face_index([-d[0], -d[1], -d[2]]);
+            if game.native_with_mod_block_entity(at, |m| conn_of(&m.nbt, back)).is_some_and(|c| c != 3) {
+                conductors |= 1 << face_index(d);
+            }
+        } else {
+            acceptors |= 1 << face_index(d);
+        }
+    }
+    // Heat between two conductors does not count as a transfer (`countsAsAdjacent`).
+    adjacent_heat_faces(game, pos, &mut heat, None, conductors);
+    let (moved, _) = adjacent_heat_faces(game, pos, &mut heat, None, acceptors);
+    let mut lost = 0.0;
+    for _ in 0..6 {
+        lost += heat.lose_to_air(insulation);
+    }
+    put_double(&mut entity.nbt, "heat", heat.heat);
+    put_double(&mut entity.nbt, "moved", moved);
+    put_double(&mut entity.nbt, "lost", lost);
+}
+
 fn tick_cable(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, rate: u64) {
     let mut energy = EnergyContainer::new(rate, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(rate);
@@ -3018,9 +3067,12 @@ fn tick_cable(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, r
         });
         energy.stored += taken.unwrap_or(0);
     }
+    // What goes into the acceptors this tick is the network's throughput (`prevTransferAmount`), read by the Network Reader.
+    let before = energy.stored;
     if energy.stored > 0 {
         push_energy(game, pos, &mut energy, None, true);
     }
+    put_long(&mut entity.nbt, "flow", before - energy.stored);
     for (face, (_, d)) in DIRECTIONS.into_iter().enumerate() {
         if energy.stored == 0 {
             break;
@@ -4950,6 +5002,7 @@ fn serves(family: &str, kind: Kind) -> bool {
         "cable" => !matches!(
             kind,
             Kind::Cable(_)
+                | Kind::Conductor(_)
                 | Kind::Tube(_)
                 | Kind::Transporter(_)
                 | Kind::ChemicalTank(_)
@@ -5003,6 +5056,8 @@ fn serves(family: &str, kind: Kind) -> bool {
                 | Kind::SpsPort
                 | Kind::DynamicValve
         ),
+        // Whatever holds heat (`heat_params`), and the entangloporter's shared heat.
+        "conductor" => heat_params(kind).is_some() || kind == Kind::Entangloporter,
         // The blocks with item slots (`block_entity_container`).
         "transporter" => matches!(
             kind,
@@ -6107,9 +6162,13 @@ fn tick_carrier(
         }
     }
     if tank.amount == 0 {
+        put_long(&mut entity.nbt, "flow", 0);
         return;
     }
+    // What goes into the acceptors this tick is the network's throughput (`prevTransferAmount`).
+    let before = tank.amount;
     push_chemical(game, pos, &mut tank, None, u64::MAX, true);
+    put_long(&mut entity.nbt, "flow", before - tank.amount);
     for (_, d) in DIRECTIONS {
         let Some(chemical) = tank.chemical.clone() else {
             break;
@@ -31820,6 +31879,12 @@ struct NetInfo {
     stored: u64,
     capacity: u64,
     resource: Option<String>,
+    /// What the transmitters gave to acceptors last tick (`prevTransferAmount`).
+    flow: u64,
+    /// A heat network: each conductor's temperature, what it gave to acceptors and what it lost to the air.
+    temps: Vec<f64>,
+    moved: f64,
+    lost: f64,
 }
 
 /// The network of the transmitter of `family` at `start`: every transmitter of the family joined to it through
@@ -31831,6 +31896,13 @@ fn read_network(game: &mut Game<'_>, start: [i32; 3], family: &str) -> NetInfo {
     while let Some(pos) = queue.pop() {
         let own = game.native_with_mod_block_entity(pos, |m| {
             let faces: Vec<u32> = (0..6).map(|f| conn_of(&m.nbt, f)).collect();
+            let heat = match kind(&m.id) {
+                Some(Kind::Conductor(t)) => tier::conductor(t).map(|(cap, ..)| {
+                    (get_double(&m.nbt, "heat").unwrap_or(cap * mekanism_core::heat::AMBIENT_TEMP) / cap, get_double(&m.nbt, "moved").unwrap_or(0.0), get_double(&m.nbt, "lost").unwrap_or(0.0))
+                }),
+                _ => None,
+            };
+            let flow = get_long(&m.nbt, "flow");
             let (stored, capacity, resource) = match kind(&m.id) {
                 Some(Kind::Cable(rate)) => (get_long(&m.nbt, "energy"), rate, None),
                 Some(Kind::Pipe(rate)) => {
@@ -31843,14 +31915,20 @@ fn read_network(game: &mut Game<'_>, start: [i32; 3], family: &str) -> NetInfo {
                 }
                 _ => (0, 0, None),
             };
-            (faces, stored, capacity, resource)
+            (faces, stored, capacity, resource, flow, heat)
         });
-        let Some((faces, stored, capacity, resource)) = own else {
+        let Some((faces, stored, capacity, resource, flow, heat)) = own else {
             continue;
         };
         info.transmitters.push(pos);
         info.stored += stored;
         info.capacity += capacity;
+        info.flow += flow;
+        if let Some((temp, moved, lost)) = heat {
+            info.temps.push(temp);
+            info.moved += moved;
+            info.lost += lost;
+        }
         if info.resource.is_none() {
             info.resource = resource;
         }
@@ -31892,6 +31970,27 @@ fn resource_name(id: &str) -> String {
     path.to_owned()
 }
 
+/// `UnitDisplayUtils.getDisplayShort` for a temperature in kelvin: two decimals with a metric prefix, as `300K`.
+fn temperature_text(kelvin: f64) -> String {
+    if kelvin == 0.0 {
+        return "0K".to_owned();
+    }
+    const PREFIXES: [(&str, f64); 14] = [
+        ("f", 1e-15), ("p", 1e-12), ("n", 1e-9), ("µ", 1e-6), ("m", 1e-3), ("", 1.0), ("k", 1e3), ("M", 1e6), ("G", 1e9), ("T", 1e12), ("P", 1e15), ("E", 1e18), ("Z", 1e21), ("Y", 1e24),
+    ];
+    let negative = kelvin < 0.0;
+    let value = kelvin.abs();
+    let at = (0..PREFIXES.len())
+        .find(|&i| (i == 0 && value < PREFIXES[0].1) || i + 1 >= PREFIXES.len() || (value >= PREFIXES[i].1 && value < PREFIXES[i + 1].1))
+        .unwrap_or(5);
+    let scaled = ((value / PREFIXES[at].1) * 100.0).trunc() / 100.0;
+    let mut text = java_double(if negative { -scaled } else { scaled });
+    if text.ends_with(".0") {
+        text.truncate(text.len() - 2);
+    }
+    format!("{text}{}K", PREFIXES[at].0)
+}
+
 /// `ItemNetworkReader.displayBorder`: `------------- [label] -------------`.
 fn reader_border(game: &mut Game<'_>, uuid: u128, label: &str, brackets: bool) {
     use horizon_client::text::Text;
@@ -31913,8 +32012,8 @@ fn reader_list(items: &[String]) -> String {
 }
 
 /// `ItemNetworkReader.useOn`: on a block entity, spends the reader's energy (outside creative) and tells the player
-/// about the transmitter network there, or the networks a block is connected to. The energy and chemical networks
-/// do not count the last tick's transfer here, so their throughput reads 0.
+/// about the transmitter network there, or the networks a block is connected to. Energy, fluid and chemical networks
+/// report what their transmitters moved into acceptors last tick, a heat network its mean temperature and transfers.
 pub(super) fn network_reader_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3], claimed: &mut bool) {
     if *claimed || &*stack.item != mekanism_core::network_reader::ITEM || !game.native_on(MOD_ID) {
         return;
@@ -31925,6 +32024,7 @@ pub(super) fn network_reader_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i
     let name = block_name(game, pos).to_owned();
     let family = pipe_family(&name);
     let is_tile = game.native_with_mod_block_entity(pos, |_| ()).is_some() || vanilla_container(&name);
+    let own_kind = game.native_with_mod_block_entity(pos, |m| kind(&m.id)).flatten();
     if !is_tile {
         return;
     }
@@ -31942,7 +32042,7 @@ pub(super) fn network_reader_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i
         set_energy(held, stored - usage);
     }
     reader_border(game, uuid, &lang_text("constants.mekanism.mod_name"), true);
-    match family.filter(|_| game.native_with_mod_block_entity(pos, |m| matches!(kind(&m.id), Some(Kind::Cable(_) | Kind::Pipe(_) | Kind::Tube(_) | Kind::Transporter(_)))) == Some(true)) {
+    match family.filter(|_| game.native_with_mod_block_entity(pos, |m| matches!(kind(&m.id), Some(Kind::Cable(_) | Kind::Pipe(_) | Kind::Tube(_) | Kind::Transporter(_) | Kind::Conductor(_)))) == Some(true)) {
         Some(family) => {
             let net = read_network(game, pos, family);
             reader_line(game, uuid, "network_reader.mekanism.transmitters", &net.transmitters.len().to_string());
@@ -31954,7 +32054,7 @@ pub(super) fn network_reader_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i
                     let fe = mekanism_core::energy::format_fe;
                     reader_line(game, uuid, "network_reader.mekanism.needed", &fe(needed));
                     reader_line(game, uuid, "network_reader.mekanism.buffer", &fe(net.stored));
-                    reader_line(game, uuid, "network_reader.mekanism.throughput", &format!("{}/t", fe(0)));
+                    reader_line(game, uuid, "network_reader.mekanism.throughput", &format!("{}/t", fe(net.flow)));
                     reader_line(game, uuid, "network_reader.mekanism.capacity", &net.capacity.to_string());
                 }
                 "pipe" | "tube" => {
@@ -31965,11 +32065,36 @@ pub(super) fn network_reader_use(game: &mut Game<'_>, stack: &ItemStack, pos: [i
                         None => lang_text("gui.mekanism.none"),
                     };
                     reader_line(game, uuid, "network_reader.mekanism.buffer", &stored);
-                    reader_line(game, uuid, "network_reader.mekanism.throughput", "0 mB/t");
+                    reader_line(game, uuid, "network_reader.mekanism.throughput", &format!("{} mB/t", net.flow));
                     reader_line(game, uuid, "network_reader.mekanism.capacity", &net.capacity.to_string());
+                }
+                "conductor" => {
+                    // `HeatNetwork`: the mean temperature, and what moved to acceptors and was lost to the environment.
+                    let mean = net.temps.iter().sum::<f64>() / net.temps.len().max(1) as f64;
+                    let stored = lang_text("network.mekanism.heat_stored").replace("%1$s", &temperature_text(mean));
+                    reader_line(game, uuid, "network_reader.mekanism.buffer", &stored);
+                    let (moved, lost) = (temperature_text(net.moved), temperature_text(net.lost));
+                    let flow = if net.moved + net.lost == 0.0 {
+                        lang_text("network.mekanism.heat_flow").replace("%1$s", &moved).replace("%2$s", &lost)
+                    } else {
+                        let percent = (net.moved / (net.moved + net.lost) * 10_000.0).round() as f32 / 100.0;
+                        lang_text("network.mekanism.heat_flow.efficiency").replace("%1$s", &moved).replace("%2$s", &lost).replace("%3$s", &format!("{percent:?}%"))
+                    };
+                    reader_line(game, uuid, "network_reader.mekanism.throughput", &flow);
+                    let own = game.native_with_mod_block_entity(pos, |m| get_double(&m.nbt, "heat")).flatten();
+                    if let Some((cap, ..)) = own_kind.and_then(heat_params) {
+                        let temp = own.unwrap_or(cap * mekanism_core::heat::AMBIENT_TEMP) / cap;
+                        reader_line(game, uuid, "network_reader.mekanism.temperature", &temperature_text(temp));
+                    }
                 }
                 _ => {}
             }
+        }
+        None if own_kind.and_then(heat_params).is_some() => {
+            // A block with a heat handler: its temperature.
+            let (cap, ..) = own_kind.and_then(heat_params).unwrap_or((1.0, 0.0, 0.0));
+            let heat = game.native_with_mod_block_entity(pos, |m| get_double(&m.nbt, "heat")).flatten();
+            reader_line(game, uuid, "network_reader.mekanism.temperature", &temperature_text(heat.unwrap_or(cap * mekanism_core::heat::AMBIENT_TEMP) / cap));
         }
         None => {
             // `displayConnectedNetworks`: each network around the block that has it as an acceptor.

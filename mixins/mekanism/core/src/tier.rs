@@ -96,6 +96,20 @@ pub fn universal_cable(tier: BaseTier) -> Option<u64> {
     Some(active("tiers", "transmitters.energy", &format!("{}Capacity", tier.name()), default))
 }
 
+/// `ConductorTier`: (heat capacity, inverse conduction, inverse insulation) of a thermodynamic conductor.
+pub fn conductor(tier: BaseTier) -> Option<(f64, f64, f64)> {
+    let insulation = match tier {
+        BaseTier::Basic => 10.0,
+        BaseTier::Advanced => 400.0,
+        BaseTier::Elite => 8_000.0,
+        BaseTier::Ultimate => 100_000.0,
+        BaseTier::Creative => return None,
+    };
+    let name = tier.name();
+    let heat = |key: &str, default: f64| crate::config_files::active_double("tiers", "transmitters.heat", &format!("{name}{key}"), default);
+    Some((heat("HeatCapacity", 1.0), heat("InverseConduction", 5.0), heat("Insulation", insulation)))
+}
+
 /// How much a cable holding `mine` hands a neighbouring cable holding `theirs`: half the difference,
 /// so energy runs down the cable line and never back and forth.
 pub fn cable_share(mine: u64, theirs: u64) -> u64 {
@@ -179,5 +193,18 @@ mod cable_tests {
         assert_eq!(fluid_tank(BaseTier::Ultimate), (256_000, 64_000));
         assert_eq!(mechanical_pipe(BaseTier::Elite), Some(8_000));
         assert_eq!(mechanical_pipe(BaseTier::Creative), None);
+    }
+}
+
+#[cfg(test)]
+mod conductor_tests {
+    use super::*;
+
+    #[test]
+    fn conductors_insulate_more_each_tier() {
+        let rows: Vec<_> = [BaseTier::Basic, BaseTier::Advanced, BaseTier::Elite, BaseTier::Ultimate].map(|t| conductor(t).unwrap()).into();
+        assert_eq!(rows[0], (1.0, 5.0, 10.0));
+        assert_eq!(rows[3].2, 100_000.0);
+        assert!(conductor(BaseTier::Creative).is_none());
     }
 }
