@@ -4581,6 +4581,23 @@ fn miner_skips(name: &str, hardness: f32) -> bool {
     hardness < 0.0 || matches!(name, "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air")
 }
 
+/// What `ThreadMinerSearch` skips besides air and unbreakable blocks: liquids, the foot of a bed, and the upper half of a door or
+/// a tall plant (the other half drops the item).
+fn miner_search_skips(game: &Game<'_>, at: [i32; 3], name: &str) -> bool {
+    if matches!(name, "minecraft:water" | "minecraft:lava") {
+        return true;
+    }
+    if name.ends_with("_bed") {
+        return game.native_block_property(at, "part").as_deref() == Some("foot");
+    }
+    let double = name.ends_with("_door")
+        || matches!(
+            name,
+            "minecraft:tall_grass" | "minecraft:large_fern" | "minecraft:sunflower" | "minecraft:lilac" | "minecraft:rose_bush" | "minecraft:peony" | "minecraft:tall_seagrass" | "minecraft:pitcher_plant"
+        );
+    double && game.native_block_property(at, "half").as_deref() == Some("upper")
+}
+
 /// The back of the miner (`getOppositeDirection`) as a step.
 fn miner_back(game: &Game<'_>, pos: [i32; 3]) -> [i32; 3] {
     let d = game.native_block_property(pos, "facing").and_then(|f| direction(&f)).unwrap_or([0, 0, 1]);
@@ -4606,6 +4623,7 @@ fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
     if state == MINER_SEARCHING {
         let filters = miner_filters(&entity.nbt);
         let inverse = get_int(&entity.nbt, "inverse") == 1;
+        let inv_replace = get_string(&entity.nbt, "inv_replace").unwrap_or_default();
         let item_tags = world_items!(game).item_tags.clone();
         let in_tag = |tag: &str, block: &str| item_tags.get(tag).is_some_and(|t| t.contains(block));
         let cursor = get_int(&entity.nbt, "cursor");
@@ -4618,10 +4636,19 @@ fn tick_miner(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -
             }
             let block = game.world.block(at[0], at[1], at[2]);
             let facts = game.res.facts().get(block);
-            if miner_skips(&facts.name, facts.hardness) {
+            if miner_skips(&facts.name, facts.hardness) || miner_search_skips(game, at, &facts.name) {
                 continue;
             }
-            let matched = miner::matching_filter(&filters, &facts.name, &in_tag).is_some();
+            // `isReplaceTarget`: what a filter (or the inverse mode) puts back is never mined.
+            let replace_target = if inverse {
+                !inv_replace.is_empty() && *inv_replace == *facts.name
+            } else {
+                filters.iter().any(|f| f.enabled && !f.replace.is_empty() && *f.replace == *facts.name)
+            };
+            let matched = !replace_target && miner::matching_filter(&filters, &facts.name, &in_tag).is_some();
+            if replace_target {
+                continue;
+            }
             if inverse != matched {
                 found.push(index as i32);
             }
@@ -13659,7 +13686,7 @@ fn screen_lines(block: &str, data: &[i32]) -> Vec<String> {
             let m = miner_view(block, data);
             vec![
                 if m.low_power { "Low Power" } else if m.running { "Running" } else { "Idle" }.to_owned(),
-                ["Not ready", "Searching", "Ready", "Paused"][m.state.min(2) as usize].to_owned(),
+                ["Not ready", "Searching", "Ready", "Paused"][m.state.min(3) as usize].to_owned(),
                 format!("To mine: {}", thousands(u64::from(m.to_mine))),
             ]
         }
