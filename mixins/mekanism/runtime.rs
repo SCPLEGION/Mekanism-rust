@@ -18388,7 +18388,14 @@ fn teleport_cost(from: [f64; 3], to: [i32; 3], same_dimension: bool) -> u64 {
 /// The energy it holds: four ticks of its base usage, or one tick of the current recipe's when that is
 /// more (`AttributeEnergy.getStorage`).
 fn reaction_capacity(nbt: &Compound) -> u64 {
-    (machine::STORAGE_MULTIPLIER * reaction_usage()).max(reaction_usage() + get_long(nbt, "recipe_energy"))
+    reaction_power(nbt).3
+}
+
+/// `PRCEnergyContainer`: the base usage grows by the recipe's energy, the upgrades scale that, and the buffer is
+/// `max(4, ticks)` ticks of it. The upgrades, the energy per tick, the ticks of the current recipe (0 with none) and the buffer.
+fn reaction_power(nbt: &Compound) -> (Upgrades, u64, u32, u64) {
+    let ticks = get_int(nbt, "recipe_ticks");
+    machine_power(nbt, reaction_usage() + get_long(nbt, "recipe_energy"), (ticks > 0).then_some(ticks))
 }
 
 /// A reaction chamber tick: while the first slot, the water and the chemical make a recipe and there is
@@ -18406,7 +18413,8 @@ fn tick_reaction(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
         mekanism_core::recipes::find_reaction(&s.item, s.count, fluid.chemical.as_deref(), input.chemical.as_deref(), &in_tag)
     });
     put_long(&mut entity.nbt, "recipe_energy", recipe.map_or(0, |r| r.energy));
-    let capacity = reaction_capacity(&entity.nbt);
+    put_int(&mut entity.nbt, "recipe_ticks", recipe.map_or(0, |r| r.duration.max(1)));
+    let (_, usage, speed_ticks, capacity) = reaction_power(&entity.nbt);
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
     let mut progress = get_int(&entity.nbt, "progress");
@@ -18415,7 +18423,7 @@ fn tick_reaction(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     let mut ticks = 0;
     match (recipe, stack) {
         (Some(r), Some(stack)) => {
-            ticks = r.duration.max(1);
+            ticks = speed_ticks.max(1);
             let item_fits = r.output.is_none_or(|(id, n)| {
                 let max = items.get(id).map_or(64, |i| i.max_stack);
                 out.as_ref().is_none_or(|o| &*o.item == id && o.count + n <= max)
@@ -18425,7 +18433,7 @@ fn tick_reaction(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
                 && gas_fits
                 && fluid.amount >= r.fluid_amount
                 && input.amount >= r.chemical_amount
-                && energy.consume(reaction_usage() + r.energy)
+                && energy.consume(usage)
             {
                 active = true;
                 progress += 1;
@@ -22195,8 +22203,8 @@ fn asm_organize(game: &Game<'_>, entity: &mut ModBlockEntity, f: &Formula) {
 }
 
 fn asm_capacity(nbt: &Compound) -> u64 {
-    let u = upgrades(nbt);
-    u.max_energy(usage_const("formulaicAssemblicator", fa::USAGE) * u64::from(fa::BASE_TICKS)).max(u.energy_per_tick(usage_const("formulaicAssemblicator", fa::USAGE)))
+    // Not a progress machine: `updateMaxEnergy` stores `STORAGE_MULTIPLIER` ticks of the upgraded usage.
+    machine_power(nbt, usage_const("formulaicAssemblicator", fa::USAGE), None).3
 }
 
 /// A player's button, on the server: kept for the machine's next tick, which has the recipes at hand.
