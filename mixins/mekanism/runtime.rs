@@ -28886,6 +28886,100 @@ pub(super) fn mob_types(types: &mut std::collections::HashMap<String, horizon_cl
     t.attributes = Arc::new(attributes);
     types.insert(robit::TYPE.to_owned(), t);
     horizon_client::mobs::register_mod_mob_base(robit::TYPE, robit::BASE);
+    baby_types(types);
+}
+
+/// `BabyType`: the parent, the height scale and the eye height scale of `AdditionsEntityTypes.baby`.
+const BABIES: [(&str, f64, f64); 7] = [
+    ("bogged", 0.5, 0.815),
+    ("creeper", 0.6, 0.9),
+    ("enderman", 0.625, 0.88),
+    ("parched", 0.5, 0.815),
+    ("skeleton", 0.5, 0.815),
+    ("stray", 0.5, 0.815),
+    ("wither_skeleton", 0.5, 0.815),
+];
+
+/// The mob types of Mekanism Additions' babies: each its parent's with `AdditionsEntityTypes.baby`'s dimensions and
+/// `setupBabyModifiers`' nerfs (half the speed and health, a quarter of the attack), sent as the parent.
+fn baby_types(types: &mut std::collections::HashMap<String, horizon_client::mobs::MobType>) {
+    for (name, height_scale, eye_scale) in BABIES {
+        let Some(mut t) = types.get(&format!("minecraft:{name}")).cloned() else {
+            continue;
+        };
+        let id = format!("mekanismadditions:baby_{name}");
+        t.id.clone_from(&id);
+        t.width *= 0.817;
+        t.height *= height_scale;
+        t.eye_height = t.height * eye_scale;
+        t.max_health *= 0.5;
+        t.speed *= 0.5;
+        t.attack_damage *= 0.25;
+        let mut attributes = (*t.attributes).clone();
+        for (key, factor) in [("minecraft:max_health", 0.5), ("minecraft:movement_speed", 0.5), ("minecraft:attack_damage", 0.25)] {
+            if let Some(v) = attributes.get_mut(key) {
+                *v *= factor;
+            }
+        }
+        t.attributes = Arc::new(attributes);
+        types.insert(id.clone(), t);
+        horizon_client::mobs::register_mod_mob_base(&id, &format!("minecraft:{name}"));
+    }
+}
+
+thread_local! {
+    /// The client's list of the mobs it sees that are babies, and their scale in hundredths.
+    static BABY_SCALES: std::cell::RefCell<std::collections::HashMap<u32, u8>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+const BABY_CHANNEL: &str = "mekanismadditions:babies";
+
+/// Every tick: the server tells the clients which mobs are babies; every client draws them at their scale.
+fn babies_tick(game: &mut Game<'_>) {
+    if !game.native_window() {
+        if game.ticks % 20 == 0 {
+            let mut list = Vec::new();
+            for (name, scale, _) in BABIES {
+                for id in game.native_mob_ids(&format!("mekanismadditions:baby_{name}")) {
+                    list.extend(id.to_be_bytes());
+                    list.push((scale * 100.0) as u8);
+                }
+            }
+            for to in game.native_online_players() {
+                game.native_send_to_player(to, BABY_CHANNEL, &list);
+            }
+        }
+        return;
+    }
+    for (id, scale) in BABY_SCALES.with_borrow(|m| m.iter().map(|(i, s)| (*i, *s)).collect::<Vec<_>>()) {
+        game.native_with_mob(id, |m| m.extra.mod_scale = f32::from(scale) / 100.0);
+    }
+}
+
+fn babies_payload(data: &[u8]) {
+    BABY_SCALES.with_borrow_mut(|m| {
+        *m = data.chunks_exact(5).map(|c| (u32::from_be_bytes([c[0], c[1], c[2], c[3]]), c[4])).collect();
+    });
+}
+
+/// A baby's spawn egg used on a block (`SpawnEggItem.useOn`): the baby stands beside the face clicked.
+pub(super) fn use_baby_egg(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) {
+        return false;
+    }
+    let Some(Some(held)) = game.inventory.get(game.selected).cloned() else {
+        return false;
+    };
+    let Some(name) = held.item.strip_prefix("mekanismadditions:baby_").and_then(|n| n.strip_suffix("_spawn_egg")) else {
+        return false;
+    };
+    if !BABIES.iter().any(|(b, _, _)| *b == name) {
+        return false;
+    }
+    let at = [f64::from(pos[0] + face[0]) + 0.5, f64::from(pos[1] + face[1]), f64::from(pos[2] + face[2]) + 0.5];
+    if game.spawn_mob(&format!("mekanismadditions:baby_{name}"), at, true).is_some() {
+        balloon_consume(game);
+    }
+    true
 }
 
 /// The Robit's data on its mob (`mod_data`): owner, energy, follow and pickup switches, home, items.
@@ -28993,6 +29087,7 @@ pub(super) fn mobs_tick(game: &mut Game<'_>) {
     register_game_events();
     flames_tick(game);
     tick_meltdowns(game);
+    babies_tick(game);
     let ids = game.native_mob_ids(robit::TYPE);
     if ids.is_empty() {
         return;
@@ -29189,6 +29284,9 @@ pub(super) fn mob_died(game: &mut Game<'_>, kind: &str, at: [f64; 3], data: Opti
 
 /// The window's client got the Robits' ids.
 pub(super) fn client_payload(channel: &str, data: &[u8]) {
+    if channel == BABY_CHANNEL {
+        babies_payload(data);
+    }
     balloon_client_payload(channel, data);
     if channel == TNT_CHANNEL {
         obsidian_tnt_payload(data);
