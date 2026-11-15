@@ -29284,6 +29284,172 @@ const BABIES: [(&str, f64, f64); 7] = [
     ("wither_skeleton", 0.5, 0.815),
 ];
 
+/// One box of a model part (`CubeListBuilder.addBox`): origin, size, `texOffs`, deformation and mirroring.
+#[derive(Clone, Copy)]
+struct Bx {
+    at: [f32; 3],
+    size: [f32; 3],
+    tex: [f32; 2],
+    grow: f32,
+    mirror: bool,
+}
+
+fn bx(at: [f32; 3], size: [f32; 3], tex: [f32; 2]) -> Bx {
+    Bx { at, size, tex, grow: 0.0, mirror: false }
+}
+
+/// `ModelPart.Cube`: the six faces (down, up, west, north, east, south) with their uv in `[0, 1]`.
+fn cube(b: Bx, tex_size: [f32; 2]) -> Vec<horizon_client::mobs::Polygon> {
+    let [x, y, z] = b.at;
+    let [w, h, d] = b.size;
+    let g = b.grow;
+    let (mut x0, y0, z0, mut x1, y1, z1) = (x - g, y - g, z - g, x + w + g, y + h + g, z + d + g);
+    if b.mirror {
+        std::mem::swap(&mut x0, &mut x1);
+    }
+    let v = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0), (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)];
+    let [u, vv] = b.tex;
+    let (f1, f2, f3, f4) = (u + d, u + d + w, u + 2.0 * d + w, u + 2.0 * d + 2.0 * w);
+    let (f5, f6, f7) = (vv, vv + d, vv + d + h);
+    let faces: [([usize; 4], f32, f32, f32, f32, [f32; 3]); 6] = [
+        ([5, 4, 0, 1], f1, f5, f2, f6, [0.0, -1.0, 0.0]),
+        ([2, 3, 7, 6], f2, f6, f3, f5, [0.0, 1.0, 0.0]),
+        ([0, 4, 7, 3], u, f6, f1, f7, [-1.0, 0.0, 0.0]),
+        ([1, 0, 3, 2], f1, f6, f2, f7, [0.0, 0.0, -1.0]),
+        ([5, 1, 2, 6], f2, f6, f3, f7, [1.0, 0.0, 0.0]),
+        ([4, 5, 6, 7], f3, f6, f4, f7, [0.0, 0.0, 1.0]),
+    ];
+    faces
+        .iter()
+        .map(|(idx, a, b0, c, e, normal)| {
+            let uv = [(*c, *b0), (*a, *b0), (*a, *e), (*c, *e)];
+            let mut vertices: [[f32; 5]; 4] = std::array::from_fn(|i| {
+                let p = v[idx[i]];
+                [p.0, p.1, p.2, uv[i].0 / tex_size[0], uv[i].1 / tex_size[1]]
+            });
+            let mut normal = *normal;
+            if b.mirror {
+                vertices.reverse();
+                normal[0] = -normal[0];
+            }
+            horizon_client::mobs::Polygon { normal, vertices }
+        })
+        .collect()
+}
+
+/// A model part: its offset and rotation (`PartPose`), boxes and children.
+fn model_part(name: &str, at: [f32; 3], turn: [f32; 3], boxes: &[Bx], tex_size: [f32; 2], children: Vec<horizon_client::mobs::Part>) -> horizon_client::mobs::Part {
+    let mut children = children;
+    children.sort_by(|a, b| a.name.cmp(&b.name));
+    horizon_client::mobs::Part {
+        name: name.to_owned(),
+        pose: [at[0], at[1], at[2], turn[0], turn[1], turn[2], 1.0, 1.0, 1.0],
+        polygons: boxes.iter().flat_map(|b| cube(*b, tex_size)).collect(),
+        children,
+    }
+}
+
+/// `MeshTransformer.scaling`: every offset and corner times `f`.
+fn scale_part(part: &horizon_client::mobs::Part, f: f32) -> horizon_client::mobs::Part {
+    let mut p = part.clone();
+    for i in 0..3 {
+        p.pose[i] *= f;
+    }
+    for poly in &mut p.polygons {
+        for v in &mut poly.vertices {
+            for c in v.iter_mut().take(3) {
+                *c *= f;
+            }
+        }
+    }
+    p.children = part.children.iter().map(|c| scale_part(c, f)).collect();
+    p
+}
+
+/// `BabySkeletonModel.createDefaultSkeletonMesh`, with the parts a variant adds to the head and body.
+fn baby_skeleton(head: Vec<horizon_client::mobs::Part>, body: Vec<horizon_client::mobs::Part>, tex: [f32; 2]) -> horizon_client::mobs::Part {
+    let mut head_parts = vec![model_part("hat", [0.0; 3], [0.0; 3], &[], tex, Vec::new())];
+    head_parts.extend(head);
+    let parts = vec![
+        model_part("head", [0.0, 17.0, 0.0], [0.0; 3], &[bx([-3.0, -8.0, -3.0], [6.0, 6.0, 6.0], [0.0, 0.0])], tex, head_parts),
+        model_part("body", [0.0, 15.0, 0.0], [0.0; 3], &[bx([-2.0, 0.0, -1.0], [4.0, 5.0, 2.0], [8.0, 12.0])], tex, body),
+        model_part("right_arm", [-3.0, 17.0, 0.0], [0.0; 3], &[bx([0.0, -2.0, -0.5], [1.0, 5.0, 1.0], [24.0, 12.0])], tex, Vec::new()),
+        model_part("left_arm", [3.0, 17.0, 0.0], [0.0; 3], &[bx([-1.0, -2.0, -0.5], [1.0, 5.0, 1.0], [20.0, 12.0])], tex, Vec::new()),
+        model_part("right_leg", [-1.0, 20.0, 0.0], [0.0; 3], &[bx([-0.5, 0.0, -0.5], [1.0, 4.0, 1.0], [0.0, 12.0])], tex, Vec::new()),
+        model_part("left_leg", [1.0, 20.0, 0.0], [0.0; 3], &[bx([-0.5, 0.0, -0.5], [1.0, 4.0, 1.0], [4.0, 12.0])], tex, Vec::new()),
+    ];
+    model_part("root", [0.0; 3], [0.0; 3], &[], tex, parts)
+}
+
+/// `BabyCreeperModel.createBodyLayer(g)`.
+fn baby_creeper(grow: f32) -> horizon_client::mobs::Part {
+    let tex = [32.0, 32.0];
+    let b = |at: [f32; 3], size: [f32; 3], t: [f32; 2]| Bx { grow, ..bx(at, size, t) };
+    let leg = |name: &str, at: [f32; 3], t: [f32; 2]| model_part(name, at, [0.0; 3], &[b([-2.0, 0.0, -2.0], [2.0, 4.0, 2.0], t)], tex, Vec::new());
+    let parts = vec![
+        model_part("head", [0.0, 16.0, 0.0], [0.0; 3], &[b([-3.0, -8.0, -3.0], [6.0, 6.0, 6.0], [0.0, 0.0])], tex, Vec::new()),
+        model_part("body", [2.0, 14.0, 1.0], [0.0; 3], &[b([-4.0, 0.0, -2.0], [4.0, 6.0, 2.0], [0.0, 12.0])], tex, Vec::new()),
+        leg("right_hind_leg", [0.0, 20.0, 3.0], [16.0, 18.0]),
+        leg("left_hind_leg", [2.0, 20.0, 3.0], [16.0, 12.0]),
+        leg("right_front_leg", [0.0, 20.0, -1.0], [0.0, 20.0]),
+        leg("left_front_leg", [2.0, 20.0, -1.0], [8.0, 20.0]),
+    ];
+    model_part("root", [0.0; 3], [0.0; 3], &[], tex, parts)
+}
+
+/// `BabyEndermanModel.createBodyLayer`.
+fn baby_enderman() -> horizon_client::mobs::Part {
+    let tex = [64.0, 32.0];
+    let hat = model_part("hat", [0.0; 3], [0.0; 3], &[Bx { grow: -0.5, ..bx([-4.0, -8.0, -4.0], [6.0, 6.0, 6.0], [24.0, 0.0]) }], tex, Vec::new());
+    let limb = |name: &str, at: [f32; 3], t: [f32; 2], mirror: bool| {
+        model_part(name, at, [0.0; 3], &[Bx { mirror, ..bx([-1.0, 0.0, -1.0], [2.0, 15.0, 2.0], t) }], tex, Vec::new())
+    };
+    let parts = vec![
+        model_part("head", [1.0, 4.0, 1.0], [0.0; 3], &[bx([-4.0, -8.0, -4.0], [6.0, 6.0, 6.0], [0.0, 0.0])], tex, vec![hat]),
+        model_part("body", [1.0, 1.0, 0.0], [0.0; 3], &[bx([-4.0, 0.0, -2.0], [6.0, 8.0, 4.0], [0.0, 12.0])], tex, Vec::new()),
+        limb("right_arm", [-4.0, 2.0, 0.0], [20.0, 12.0], false),
+        limb("left_arm", [4.0, 2.0, 0.0], [28.0, 12.0], true),
+        limb("right_leg", [-2.0, 9.0, 0.0], [36.0, 12.0], false),
+        limb("left_leg", [2.0, 9.0, 0.0], [44.0, 12.0], true),
+    ];
+    model_part("root", [0.0; 3], [0.0; 3], &[], tex, parts)
+}
+
+/// The model of baby `name` (`BabyModelLayers`' main layer).
+fn baby_model(name: &str) -> Option<horizon_client::mobs::Part> {
+    let tex32 = [32.0, 32.0];
+    let tex64 = [64.0, 32.0];
+    Some(match name {
+        "creeper" => baby_creeper(0.0),
+        "enderman" => baby_enderman(),
+        "skeleton" => baby_skeleton(Vec::new(), Vec::new(), tex32),
+        "wither_skeleton" => scale_part(&baby_skeleton(Vec::new(), Vec::new(), tex32), 1.2),
+        "stray" => baby_skeleton(
+            Vec::new(),
+            vec![model_part("skirt", [0.0, 9.0, 0.0], [0.0; 3], &[Bx { grow: 0.025, ..bx([-2.0, -4.0, -1.0], [4.0, 3.0, 2.0], [18.0, 1.0]) }], tex32, Vec::new())],
+            tex32,
+        ),
+        "parched" => baby_skeleton(
+            vec![model_part("wrap", [0.0, 7.0, 0.0], [0.0; 3], &[Bx { grow: 0.25, ..bx([-3.0, -15.0, -3.0], [6.0, 6.0, 6.0], [24.0, 0.0]) }], tex64, Vec::new())],
+            vec![model_part("wrap", [0.0, 9.0, 0.0], [0.0; 3], &[Bx { grow: 0.025, ..bx([-2.0, -4.0, -1.0], [4.0, 2.0, 2.0], [28.0, 12.0]) }], tex64, Vec::new())],
+            tex64,
+        ),
+        "bogged" => baby_skeleton(
+            vec![model_part(
+                "mushrooms",
+                [1.5, -9.25, 1.5],
+                [0.0, -0.7854, 0.0],
+                &[bx([-1.5, -1.5, 0.0], [3.0, 3.0, 0.0], [18.0, 0.0]), bx([0.0, -1.5, -1.5], [0.0, 3.0, 3.0], [18.0, -3.0])],
+                tex32,
+                Vec::new(),
+            )],
+            Vec::new(),
+            tex32,
+        ),
+        _ => return None,
+    })
+}
+
 /// The mob types of Mekanism Additions' babies: each its parent's with `AdditionsEntityTypes.baby`'s dimensions and
 /// `setupBabyModifiers`' nerfs (half the speed and health, a quarter of the attack), sent as the parent.
 fn baby_types(types: &mut std::collections::HashMap<String, horizon_client::mobs::MobType>) {
@@ -29306,6 +29472,36 @@ fn baby_types(types: &mut std::collections::HashMap<String, horizon_client::mobs
             }
         }
         t.attributes = Arc::new(attributes);
+        // Their own models and textures (`BabyModelLayers`, `textures/entity/baby`): the parent's layers are the
+        // base for the armour (the baby armour set), the overlays the model has built in are dropped.
+        if let Some(model) = baby_model(name) {
+            let base = t.model_key();
+            let baby_armor: Vec<(String, Arc<horizon_client::mobs::Part>)> = ["helmet", "chestplate", "leggings", "boots"]
+                .iter()
+                .filter_map(|slot| {
+                    let part = types.get("minecraft:zombie")?.layers.get(&format!("zombie_baby#{slot}"))?;
+                    let part = if name == "wither_skeleton" { Arc::new(scale_part(part, 1.2)) } else { part.clone() };
+                    Some((format!("{}#{slot}", base.split('#').next().unwrap_or(&base)), part))
+                })
+                .collect();
+            t.layers.retain(|k, _| !k.ends_with("#outer"));
+            t.layers.extend(baby_armor);
+            let model = Arc::new(model);
+            t.layers.insert(base.clone(), model.clone());
+            t.model = model;
+            if name == "creeper" {
+                t.layers.insert("creeper#armor".to_owned(), Arc::new(baby_creeper(1.0)));
+            }
+            let folder = if name == "creeper" || name == "enderman" { name } else { "skeleton" };
+            let file = if name == "creeper" || name == "enderman" { name } else { name };
+            t.texture = format!("mekanismadditions:entity/equipment/baby/{folder}/{file}");
+            if name == "enderman" {
+                horizon_client::mobs::register_mod_layer_texture(&id, "entity/enderman/enderman_eyes", "mekanismadditions:entity/equipment/baby/enderman/enderman_eyes");
+            }
+            if name == "creeper" {
+                horizon_client::mobs::register_mod_layer_texture(&id, "entity/creeper/creeper_armor", "mekanismadditions:entity/equipment/baby/creeper/creeper_armor");
+            }
+        }
         types.insert(id.clone(), t);
         horizon_client::mobs::register_mod_mob_base(&id, &format!("minecraft:{name}"));
     }
@@ -29316,15 +29512,30 @@ thread_local! {
     static BABY_SCALES: std::cell::RefCell<std::collections::HashMap<u32, u8>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 const BABY_CHANNEL: &str = "mekanismadditions:babies";
+thread_local! {
+    /// `babyArrowDamageMultiplier`, read from its file once a second.
+    static ARROW_FACTOR: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+}
 
 /// Every tick: the server tells the clients which mobs are babies; every client draws them at their scale.
 fn babies_tick(game: &mut Game<'_>) {
     if !game.native_window() {
+        let arrow_factor = if game.ticks % 20 == 0 || ARROW_FACTOR.get() == 0.0 {
+            let f = baby_number("arrow_damage_multiplier", 0.25, 0.1, 10.0) as f32;
+            ARROW_FACTOR.set(f);
+            f
+        } else {
+            ARROW_FACTOR.get()
+        };
         // `EntityBabyCreeper`, `xpReward * 2.5` on all of them: the factors Horizon applies to a mob's reward and blast.
         for (name, _, _) in BABIES {
             for id in game.native_mob_ids(&format!("mekanismadditions:baby_{name}")) {
                 game.native_with_mob(id, |m| {
                     m.extra.mod_xp = 2.5;
+                    // `babyArrowDamageMultiplier` for the skeletons that shoot.
+                    if matches!(name, "skeleton" | "stray" | "bogged" | "parched") {
+                        m.extra.mod_arrow = arrow_factor;
+                    }
                     if name == "creeper" {
                         // `explodeCreeper`: half the radius, and a charged one the radius of an uncharged vanilla creeper.
                         m.extra.mod_blast = 0.5;
@@ -29334,10 +29545,10 @@ fn babies_tick(game: &mut Game<'_>) {
         }
         if game.ticks % 20 == 0 {
             let mut list = Vec::new();
-            for (name, scale, _) in BABIES {
+            for (index, (name, _, _)) in BABIES.iter().enumerate() {
                 for id in game.native_mob_ids(&format!("mekanismadditions:baby_{name}")) {
                     list.extend(id.to_be_bytes());
-                    list.push((scale * 100.0) as u8);
+                    list.push(index as u8);
                 }
             }
             for to in game.native_online_players() {
@@ -29346,9 +29557,33 @@ fn babies_tick(game: &mut Game<'_>) {
         }
         return;
     }
-    for (id, scale) in BABY_SCALES.with_borrow(|m| m.iter().map(|(i, s)| (*i, *s)).collect::<Vec<_>>()) {
-        game.native_with_mob(id, |m| m.extra.mod_scale = f32::from(scale) / 100.0);
+    // The window sees the base type: the baby's own (its box and its model) goes on the mobs the server named.
+    for (id, index) in BABY_SCALES.with_borrow(|m| m.iter().map(|(i, s)| (*i, *s)).collect::<Vec<_>>()) {
+        let Some((name, _, _)) = BABIES.get(usize::from(index)) else {
+            continue;
+        };
+        let want = format!("mekanismadditions:baby_{name}");
+        let Some(kind) = game.res.mob_types().get(&want).cloned() else {
+            continue;
+        };
+        game.native_with_mob(id, |m| {
+            if *m.kind.id != *want {
+                m.kind = kind;
+            }
+        });
     }
+}
+
+/// A baby setting (`additions-server.toml`'s `baby_mobs`), one file per key in the mod's data folder
+/// (`horizon-mods/.horizon-mod-data/mekanismadditions/<key>`): `baby_<name>_should_spawn`, `_weight`, `_size`,
+/// `arrow_damage_multiplier`. The defaults are the config's.
+fn baby_setting(key: &str) -> Option<String> {
+    let dir = Game::options_path().with_file_name(horizon_client::mod_list::DIR).join(".horizon-mod-data").join("mekanismadditions");
+    std::fs::read_to_string(dir.join(key)).ok().map(|v| v.trim().to_owned())
+}
+
+fn baby_number(key: &str, default: f64, min: f64, max: f64) -> f64 {
+    baby_setting(key).and_then(|v| v.parse::<f64>().ok()).map_or(default, |v| v.clamp(min, max))
 }
 
 /// `BabyEntitySpawnBiomeModifier` with the config's defaults (`weightPercentage` 0.05, `sizePercentage` 0.5, one
@@ -29359,6 +29594,12 @@ pub(super) fn biome_spawns(biomes: &mut horizon_client::biome::Biomes) {
         for (name, _, _) in BABIES {
             let parent = format!("minecraft:{name}");
             let baby = format!("mekanismadditions:baby_{name}");
+            // `SpawnConfig`: `shouldSpawn`, `weightPercentage` (0 to 100), `sizePercentage` (0 to 10).
+            if baby_setting(&format!("baby_{name}_should_spawn")).is_some_and(|v| v == "false") {
+                continue;
+            }
+            let weight_scale = baby_number(&format!("baby_{name}_weight"), 0.05, 0.0, 100.0);
+            let size_scale = baby_number(&format!("baby_{name}_size"), 0.5, 0.0, 10.0);
             let added: Vec<horizon_client::biome::SpawnEntry> = info
                 .spawns
                 .get("monster")
@@ -29367,9 +29608,9 @@ pub(super) fn biome_spawns(biomes: &mut horizon_client::biome::Biomes) {
                 .filter(|e| e.entity == parent)
                 .map(|e| horizon_client::biome::SpawnEntry {
                     entity: baby.clone(),
-                    weight: (f64::from(e.weight) * 0.05).ceil() as u32,
-                    min: (f64::from(e.min) * 0.5).ceil() as u32,
-                    max: (f64::from(e.max) * 0.5).ceil() as u32,
+                    weight: (f64::from(e.weight) * weight_scale).ceil() as u32,
+                    min: (f64::from(e.min) * size_scale).ceil() as u32,
+                    max: (f64::from(e.max) * size_scale).ceil() as u32,
                     constant: e.constant,
                 })
                 .collect();

@@ -512,6 +512,14 @@ def build_module(ns, out):
                 image.putdata([(255, 255, 255, a) for (_, _, _, a) in image.getdata()])
                 image.save(white)
                 worn_models.build_element_world_model(ns, "obsidian_tnt_flash", json.loads(tnt.read_text()), white, out, report)
+        # The baby mobs' own skins (`textures/entity/baby`), where the game packs a mod's entity textures:
+        # `textures/entity/equipment`, named in the types' `texture` as `mekanismadditions:entity/equipment/baby/...`.
+        baby_root = next((d / ns / "textures/entity/baby" for d in search if (d / ns / "textures/entity/baby").is_dir()), None)
+        if baby_root is not None:
+            for png in sorted(baby_root.rglob("*.png")):
+                dest = out / "assets" / ns / "textures/entity/equipment/baby" / png.relative_to(baby_root)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(png, dest)
         # Balloons (`BalloonRenderer`): the latched and the free model, each as the tinted body and the string
         # apart, since a part tree has one texture.
         for variant in ("latched", "free"):
