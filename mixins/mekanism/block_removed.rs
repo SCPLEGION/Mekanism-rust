@@ -7,6 +7,7 @@ fn on_block_removed(
     old_properties: &std::collections::BTreeMap<String, String>,
     new: &str,
 ) {
+    crate::game::mekanism::network_changed_at(old, new);
     crate::game::mekanism::radiation_spill(game, pos);
     crate::game::mekanism::transporter_spill(game, pos, old, new);
     crate::game::mekanism::turbine_rotor_spill(game, pos, old, new);
