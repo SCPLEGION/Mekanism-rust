@@ -6434,7 +6434,7 @@ fn tick_sorter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
             // An item filter that is not fuzzy takes only a plain stack of its item (`itemType.equals(toCheck)`).
             Some(f) => {
                 Sorter::matches_item(f, &s.item, &in_tag)
-                    && (f.starts_with(['#', '@']) || settings.opts_of(f).fuzzy || (s.damage == 0 && s.extra.is_none()))
+                    && (f.starts_with(['#', '@']) || settings.opts_of(f).fuzzy || if f.starts_with('{') { net_key(s) == *f } else { plain(s) })
             }
             None => settings.auto_eject_allows(&s.item, &in_tag),
         };
@@ -20024,6 +20024,15 @@ fn qio_stack(key: &str, count: u32) -> ItemStack {
     ItemStack { count, ..proto }
 }
 
+/// `GuiQIOItemStackFilter.fuzzyMode`: whether the QIO filter `f` takes the network key `key`. An item filter takes
+/// that exact item (id and components), or with fuzzy mode any stack of its item; tag and mod filters by id.
+fn qio_filter_takes(f: &str, fuzzy: bool, key: &str, in_tag: &dyn Fn(&str, &str) -> bool) -> bool {
+    if f.starts_with(['#', '@']) || fuzzy {
+        return Sorter::matches_item(f, &qio_id(key), in_tag);
+    }
+    key == f
+}
+
 /// The item id behind a network key.
 fn qio_id(key: &str) -> String {
     if key.starts_with('{') { qio_stack(key, 1).item.to_string() } else { key.to_owned() }
@@ -20326,7 +20335,7 @@ fn tick_importer(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     // The tags are copied out (only for tag filters to read) so the game stays free to move the items.
     let tags = if active.is_empty() { Default::default() } else { world_items!(game).item_tags.clone() };
     let in_tag = |tag: &str, item: &str| tags.get(tag).is_some_and(|t| t.contains(item));
-    let wanted = |s: &ItemStack| active.is_empty() || active.iter().any(|f| Sorter::matches_item(f, &s.item, &in_tag));
+    let wanted = |s: &ItemStack| active.is_empty() || active.iter().any(|f| qio_filter_takes(f, filters.opts_of(f).allow_default, &net_key(s), &in_tag));
     if let Some((back, face)) = qio_target(game, pos)
         && let Some(stack) = game.native_extract_item_where(back, face, qio::TRANSIT_COUNT, &wanted)
     {
@@ -20366,7 +20375,7 @@ fn tick_exporter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity
     let in_tag = |tag: &str, item: &str| world_items!(game).item_tags.get(tag).is_some_and(|t| t.contains(item));
     let stored = net.list();
     let pick = |filter: Option<&String>| -> Option<String> {
-        stored.iter().find(|(item, n)| *n > 0 && filter.is_none_or(|f| Sorter::matches_item(f, &qio_id(item), &in_tag))).map(|(item, _)| item.clone())
+        stored.iter().find(|(item, n)| *n > 0 && filter.is_none_or(|f| qio_filter_takes(f, settings.opts_of(f).allow_default, item, &in_tag))).map(|(item, _)| item.clone())
     };
     let count = active.len().max(1);
     let start = if settings.round_robin { get_int(&entity.nbt, "round_robin_at") as usize % count } else { 0 };
@@ -22984,7 +22993,7 @@ fn sorter_payload(game: &mut Game<'_>, data: &[u8]) {
     }
     let held = game.inventory.get(game.selected).cloned().flatten();
     let filter = held.as_ref().and_then(|h| match r.op {
-        sorter::Op::AddItem => Some(h.item.to_string()),
+        sorter::Op::AddItem => Some(net_key(&h)),
         sorter::Op::AddMod => h.item.split_once(':').map(|(ns, _)| format!("@{ns}")),
         sorter::Op::AddTag => {
             let items = world_items!(game);
@@ -23032,7 +23041,10 @@ fn sorter_payload(game: &mut Game<'_>, data: &[u8]) {
                 s.edit(index, |o| o.color = None);
             }
             sorter::Op::AddNamed => {
-                if let Some(f) = sorter::Sorter::named_filter(r.index, &r.name).filter(|f| !s.filters.contains(f)) {
+                if let Some(f) = sorter::Sorter::named_filter(r.index, &r.name)
+                    .filter(|f| !s.filters.contains(f))
+                    .filter(|f| !f.starts_with('{') || horizon_items::item_data::parse_stack(f).ok().flatten().is_some())
+                {
                     s.filters.push(f);
                 }
             }
@@ -23066,7 +23078,8 @@ fn filter_name(f: &str) -> String {
         Some(tag) => tag.to_owned(),
         None if f.starts_with('@') => f[1..].to_owned(),
         None => {
-            let path = f.split_once(':').map_or(f, |(_, p)| p);
+            let id = if f.starts_with('{') { sorter::snbt_id(f).unwrap_or("") } else { f };
+            let path = id.split_once(':').map_or(id, |(_, p)| p);
             path.split('_').map(|w| w.chars().next().map_or(String::new(), |c| c.to_uppercase().chain(w.chars().skip(1)).collect())).collect::<Vec<_>>().join(" ")
         }
     }
@@ -23196,7 +23209,7 @@ fn draw_sorter_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
         game.native_fill(batch, [rx, ry, 156.0, 29.0], tint);
         sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [rx + 2.0, ry + 2.0, 18.0, 18.0]);
         if !f.starts_with('#') {
-            game.native_item(batch, f, [rx + 3.0, ry + 3.0], 16.0);
+            game.native_item_stack(batch, &qio_stack(f, 1), [rx + 3.0, ry + 3.0], 16.0);
         }
         game.native_text(batch, &filter_name(f), [rx + 22.0, ry + 3.0], 0x40_4040, false);
         game.native_fill(batch, [rx + 22.0, ry + 13.0, 6.0, 1.0], 0xFF39_3939);
@@ -23629,7 +23642,7 @@ fn draw_filter_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
         sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [x + 7.0, y + 18.0, 18.0, 18.0]);
         let named = filter.clone().unwrap_or_else(|| sorter::Sorter::named_filter(e.kind, &e.name.value).unwrap_or_default());
         if e.kind == 0 && !named.is_empty() {
-            game.native_item_stack(batch, &stack_of(&named, 1), [x + 8.0, y + 19.0], 16.0);
+            game.native_item_stack(batch, &qio_stack(&named, 1), [x + 8.0, y + 19.0], 16.0);
         }
         let s = screen(FILTER_SCREEN);
         nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, s, 0xFFFF_FFFF);
@@ -23641,7 +23654,7 @@ fn draw_filter_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
             };
             game.native_text_scaled(batch, &shown, [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8);
         } else if e.kind == 0 {
-            game.native_text_scaled(batch, if named.is_empty() { "Click the slot with an item" } else { &named }, [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8);
+            game.native_text_scaled(batch, &if named.is_empty() { "Click the slot with an item".to_owned() } else { filter_name(&named) }, [s[0] + 3.0, s[1] + 14.0], 0x3C_FE9A, 0.8);
         } else {
             let b = screen(FILTER_NAME);
             game.native_fill(batch, [b[0] - 1.0, b[1] - 1.0, b[2] + 2.0, b[3] + 2.0], if e.name.focused { 0xFFFF_FFFF } else { 0xFFA0_A0A0 });
@@ -23742,7 +23755,8 @@ fn filter_window_click(game: &Game<'_>, pos: [i32; 3], view: &SorterView, at: [f
         if let Some(h) = game.inventory.get(game.selected).cloned().flatten() {
             FILTER_EDIT.with_borrow_mut(|e| {
                 if let Some(e) = e {
-                    e.name = freq::TextBox { value: h.item.to_string(), cursor: h.item.len(), focused: false };
+                    let key = net_key(&h);
+                    e.name = freq::TextBox { cursor: key.len(), value: key, focused: false };
                 }
             });
         }

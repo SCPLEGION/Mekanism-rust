@@ -178,6 +178,10 @@ impl Sorter {
     /// The filter a typed name makes: `kind` 0 an item id (`minecraft:` without a namespace), 1 a
     /// tag, 2 a mod id; none for a name that is empty, too long or has characters ids may not.
     pub fn named_filter(kind: u16, name: &str) -> Option<String> {
+        // A stack with components, from a click with an item in hand (the caller checks it parses).
+        if kind == 0 && name.starts_with('{') {
+            return (name.len() <= 4096 && !name.contains(['\n', '\t', '\r']) && snbt_id(name).is_some()).then(|| name.to_owned());
+        }
         let name = name.trim().trim_start_matches(['#', '@']);
         let ok = !name.is_empty()
             && name.len() <= 64
@@ -203,6 +207,9 @@ impl Sorter {
             Some(b'@') => item
                 .split_once(':')
                 .is_some_and(|(ns, _)| ns == &filter[1..]),
+            // An item with components (`{id:"..",count:1,components:{..}}`): any stack of that item here; the
+            // exact comparison is the caller's, who has the stack.
+            Some(b'{') => snbt_id(filter) == Some(item),
             _ => filter == item,
         }
     }
@@ -270,6 +277,12 @@ impl Sorter {
             None => filter == item,
         }
     }
+}
+
+/// The `id` of an item written as SNBT (`{id:"minecraft:stone",count:1,..}`).
+pub fn snbt_id(text: &str) -> Option<&str> {
+    let rest = text.split_once("id:\"")?.1;
+    Some(rest.split_once('"')?.0)
 }
 
 /// What the sorter's screen asks (`GuiInteraction`), with the filter it concerns.
@@ -370,6 +383,15 @@ impl Request {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn components_filter_matches_its_item() {
+        let f = "{count:1,id:\"minecraft:diamond_pickaxe\"}";
+        assert!(Sorter::matches_item(f, "minecraft:diamond_pickaxe", &|_, _| false));
+        assert!(!Sorter::matches_item(f, "minecraft:stone", &|_, _| false));
+        assert_eq!(Sorter::named_filter(0, f).as_deref(), Some(f));
+        assert_eq!(Sorter::named_filter(0, "{nope}"), None);
+    }
 
     #[test]
     fn fuzzy_mode_saves_and_old_saves_load() {
