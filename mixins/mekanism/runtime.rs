@@ -19476,8 +19476,23 @@ fn frequency_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
         client.insert("freq".into(), entry_tag(e));
     }
     client.insert("list".into(), Tag::List(list.iter().map(entry_tag).collect()));
+    // The players each owner of a trusted frequency trusts, for the selector's trusted list.
+    let mut owners: Vec<u128> = list.iter().filter(|e| e.security == freq::Security::Trusted).map(|e| e.owner).collect();
+    owners.sort_unstable();
+    owners.dedup();
+    let trust: Vec<Tag> = owners
+        .into_iter()
+        .map(|o| {
+            let mut c = Compound::new();
+            c.insert("o".into(), Tag::String(format!("{o:032x}").as_str().into()));
+            let users = sec_data(&format!("{o:032x}")).map(|d| d.trusted.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>().join(",")).unwrap_or_default();
+            c.insert("u".into(), Tag::String(users.as_str().into()));
+            Tag::Compound(c)
+        })
+        .collect();
+    client.insert("trust".into(), Tag::List(trust));
     put_int(&mut client, "status", get_int(&entity.nbt, "status"));
-    put_client(game, pos, entity, &["freq", "list", "status"], client);
+    put_client(game, pos, entity, &["freq", "list", "trust", "status"], client);
 }
 
 /// Merges what one part of the port tells the screens into the block entity's `client` compound: the
@@ -19528,7 +19543,12 @@ fn frequency_payload(game: &mut Game<'_>, data: &[u8]) {
     let Some(t) = freq_type(block_name(game, r.pos)).filter(|_| near) else {
         return;
     };
-    let owner = if r.security == freq::Security::Public && r.op != freq::Op::Set { r.owner } else { player.uuid };
+    // `getTrustedCache`: a trusted frequency of an owner who trusts the player can be joined (not made or deleted).
+    let trusted_other = r.security == freq::Security::Trusted
+        && r.op == freq::Op::Set
+        && r.owner != player.uuid
+        && sec_data(&uuid_text(r.owner)).is_some_and(|d| d.trusted.iter().any(|(u, _)| *u == uuid_text(player.uuid)));
+    let owner = if (r.security == freq::Security::Public && r.op != freq::Op::Set) || trusted_other { r.owner } else { player.uuid };
     let key = freq::key(&r.name, r.security, owner);
     let Ok(mut lists) = FREQ_LISTS.lock() else {
         return;
@@ -19539,6 +19559,9 @@ fn frequency_payload(game: &mut Game<'_>, data: &[u8]) {
             let entry = match list.iter().find(|e| e.key() == key) {
                 Some(e) => e.clone(),
                 None => {
+                    if owner != player.uuid {
+                        return;
+                    }
                     let e = freq::Entry {
                         name: r.name.clone(),
                         security: r.security,
@@ -19609,11 +19632,13 @@ struct FreqView {
     own: Option<freq::Entry>,
     list: Vec<freq::Entry>,
     status: u32,
+    /// For each owner of a trusted-mode frequency on the list, the players they trust (`getTrustedCache`).
+    trust: Vec<(u128, Vec<u128>)>,
 }
 
 fn freq_view(game: &Game<'_>) -> Option<([i32; 3], FreqView)> {
     if PT_OPEN.get() {
-        return PT_STATE.with_borrow(|s| s.as_ref().map(|s| (PT_POS, FreqView { own: s.view.own.clone(), list: s.view.list.clone(), status: s.view.status })));
+        return PT_STATE.with_borrow(|s| s.as_ref().map(|s| (PT_POS, FreqView { own: s.view.own.clone(), list: s.view.list.clone(), status: s.view.status, trust: vec![] })));
     }
     let (x, y, z) = game.container?;
     let pos = [x, y, z];
@@ -19623,7 +19648,17 @@ fn freq_view(game: &Game<'_>) -> Option<([i32; 3], FreqView)> {
         _ => vec![],
     };
     let own = client.get(&JavaString::from("freq")).and_then(entry_of);
-    Some((pos, FreqView { own, list, status: get_int(client, "status") }))
+    let trust = match client.get(&JavaString::from("trust")) {
+        Some(Tag::List(l)) => l
+            .iter()
+            .filter_map(|t| match t {
+                Tag::Compound(c) => Some((get_hex(c, "o"), get_string(c, "u").unwrap_or_default().split(',').filter_map(|u| u128::from_str_radix(u, 16).ok()).collect())),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
+    };
+    Some((pos, FreqView { own, list, status: get_int(client, "status"), trust }))
 }
 
 fn own_uuid(game: &Game<'_>) -> u128 {
@@ -19688,7 +19723,15 @@ fn freq_open(block: &str) -> bool {
 
 /// The listed frequencies in the selector's mode.
 fn freq_shown<'a>(game: &Game<'_>, view: &'a FreqView, mode: freq::Security) -> Vec<&'a freq::Entry> {
-    freq::visible(&view.list, mode, own_uuid(game))
+    let me = own_uuid(game);
+    let mut shown = freq::visible(&view.list, mode, me);
+    // `getTrustedCache`: the trusted frequencies of the owners who trust the viewer.
+    if mode == freq::Security::Trusted {
+        shown.extend(view.list.iter().filter(|e| {
+            e.security == freq::Security::Trusted && e.owner != me && view.trust.iter().any(|(owner, trusted)| *owner == e.owner && trusted.contains(&me))
+        }));
+    }
+    shown
 }
 
 fn send_frequency(game: &Game<'_>, op: freq::Op, pos: [i32; 3], e: &freq::Entry) {
@@ -25891,7 +25934,7 @@ fn pt_payload(data: &[u8]) {
     let Some(stored) = data.get(at..at + 8).map(|b| u64::from_be_bytes(b.try_into().unwrap_or([0; 8]))) else {
         return;
     };
-    PT_STATE.with_borrow_mut(|s| *s = Some(PtState { view: FreqView { own, list, status }, stored }));
+    PT_STATE.with_borrow_mut(|s| *s = Some(PtState { view: FreqView { own, list, status, trust: vec![] }, stored }));
     PT_FRESH.set(true);
 }
 
