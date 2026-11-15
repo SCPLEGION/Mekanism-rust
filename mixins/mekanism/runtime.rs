@@ -34757,7 +34757,7 @@ fn pq_tooltips(state: &PqState, ui: &PqUi, mouse: [f32; 2], w: f32, lines: &mut 
         lines.push(format!("\u{a7}7Types: \u{a7}9{}\u{a7}7 / \u{a7}9{}", state.types, state.type_cap));
     }
     if inside(mouse, pq_direction_rect()) {
-        lines.push(if ui.descending { "Descending" } else { "Ascending" }.to_owned());
+        // `GuiDigitalIconToggle` shows only the option's description, not its name.
         lines.push(if ui.descending { "Sort items in descending order." } else { "Sort items in ascending order." }.to_owned());
     }
     if ui.open {
