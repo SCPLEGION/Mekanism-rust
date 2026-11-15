@@ -23648,7 +23648,7 @@ fn draw_filter_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
             // An item filter's fuzzy switch (`GuiQIOItemStackFilter`), the only option a QIO filter has.
             if e.kind == 0 {
                 draw_button(game, batch, screen(FILTER_DEFAULT), hover(FILTER_DEFAULT), true, 0xFFFF_FFFF, Some(("button/fuzzy", 11.0)));
-                game.native_text(batch, if o.allow_default { "On" } else { "Off" }, [x + 159.0, y + 20.0], 0x40_4040, false);
+                game.native_text(batch, if o.allow_default { "on" } else { "off" }, [x + 159.0, y + 20.0], 0x40_4040, false);
             }
         } else {
             // The colour slot and button (`ColorButton`).
@@ -23657,9 +23657,9 @@ fn draw_filter_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
                 game.native_fill(batch, screen(FILTER_COLOR), 0xFF00_0000 | freq::COLORS[usize::from(c) % 16].1);
             }
             draw_button(game, batch, screen(FILTER_DEFAULT), hover(FILTER_DEFAULT), true, 0xFFFF_FFFF, Some(("button/default", 11.0)));
-            game.native_text(batch, if o.allow_default { "On" } else { "Off" }, [x + 159.0, y + 20.0], 0x40_4040, false);
+            game.native_text(batch, if o.allow_default { "on" } else { "off" }, [x + 159.0, y + 20.0], 0x40_4040, false);
             draw_button(game, batch, screen(FILTER_SIZE), hover(FILTER_SIZE), true, 0xFFFF_FFFF, Some(("button/silk_touch", 11.0)));
-            let size_text = if view.single && o.size_mode { "\u{a7}cOn" } else if o.size_mode { "On" } else { "Off" };
+            let size_text = if view.single && o.size_mode { "\u{a7}con!" } else if o.size_mode { "on" } else { "off" };
             game.native_text(batch, size_text, [x + 159.0, y + 58.0], 0x40_4040, false);
             game.native_text(batch, "Min:", [x + 146.0, y + 32.0], 0x40_4040, false);
             game.native_text(batch, "Max:", [x + 146.0, y + 44.0], 0x40_4040, false);
@@ -24979,8 +24979,8 @@ fn draw_qio_filter_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudB
         let t = at(qf_switch_toggle(i));
         sprite(game, batch, if on { "switch/selected" } else { "switch/unselected" }, [0.0, 0.0, 15.0, 8.0], [t[0], t[1], 15.0, 8.0]);
         sprite(game, batch, if on { "switch/unselected" } else { "switch/selected" }, [0.0, 0.0, 15.0, 8.0], [t[0], t[1] + 9.0, 15.0, 8.0]);
-        game.native_text_scaled(batch, "On", [t[0] + (15.0 - game.native_text_width("On") * 0.6) / 2.0, t[1] + 1.0], 0x10_1010, 0.6);
-        game.native_text_scaled(batch, "Off", [t[0] + (15.0 - game.native_text_width("Off") * 0.6) / 2.0, t[1] + 10.0], 0x10_1010, 0.6);
+        game.native_text_scaled(batch, "on", [t[0] + (15.0 - game.native_text_width("on") * 0.6) / 2.0, t[1] + 1.0], 0x10_1010, 0.6);
+        game.native_text_scaled(batch, "off", [t[0] + (15.0 - game.native_text_width("off") * 0.6) / 2.0, t[1] + 10.0], 0x10_1010, 0.6);
     }
 }
 
@@ -25991,7 +25991,8 @@ fn asm_tooltip(game: &Game<'_>, at: [f32; 2], lines: &mut Vec<String>) -> bool {
     let Some(v) = asm_view(game) else {
         return false;
     };
-    let on = |b: bool| if b { "\u{a7}aOn" } else { "\u{a7}cOff" };
+    // `MekanismLang.translate(OnOff.ON)`: the lang's plain "on" and "off".
+    let on = |b: bool| if b { "on" } else { "off" };
     for (r, op, _) in asm_buttons(&v) {
         if inside(at, r) {
             lines.push(
@@ -27810,8 +27811,8 @@ fn tw_hud_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f
     let on = cfg.compass;
     sprite(game, batch, if on { "switch/selected" } else { "switch/unselected" }, [0.0, 0.0, 15.0, 8.0], [tx, ty, 15.0, 8.0]);
     sprite(game, batch, if on { "switch/unselected" } else { "switch/selected" }, [0.0, 0.0, 15.0, 8.0], [tx, ty + 9.0, 15.0, 8.0]);
-    game.native_text_scaled(batch, "On", [tx + (15.0 - game.native_text_width("On") * 0.6) / 2.0, ty + 1.0], 0x10_1010, 0.6);
-    game.native_text_scaled(batch, "Off", [tx + (15.0 - game.native_text_width("Off") * 0.6) / 2.0, ty + 10.0], 0x10_1010, 0.6);
+    game.native_text_scaled(batch, "on", [tx + (15.0 - game.native_text_width("on") * 0.6) / 2.0, ty + 1.0], 0x10_1010, 0.6);
+    game.native_text_scaled(batch, "off", [tx + (15.0 - game.native_text_width("off") * 0.6) / 2.0, ty + 10.0], 0x10_1010, 0.6);
     // `GuiColorPickerSlot.updateTooltip`: the colour as hex.
     if TW_COLOR.with_borrow(Option::is_none)
         && let Some(i) = slots.iter().position(|r| inside(cursor, *r))
