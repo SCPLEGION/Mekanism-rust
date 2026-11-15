@@ -20676,6 +20676,14 @@ fn meka_tool_use(game: &mut Game<'_>, claimed: &mut bool) {
     // `player.teleportTo(x + 0.5, y + 1.5, z + 0.5)` and the teleport sound.
     place_player(game, [f64::from(p[0]) + 0.5, f64::from(p[1]) + 1.5, f64::from(p[2]) + 0.5]);
     game.audio.play_unshared("minecraft:entity.player.teleport", None, 1.0, 1.0);
+    // `PacketPortalFX(pos.above())`: 50 portal particles in each of the two blocks above the target (the teleporter sees them).
+    use horizon_core::random::RandomSource;
+    for _ in 0..50 {
+        for dy in [1, 2] {
+            let spot = [0, 1, 2].map(|k| f64::from(p[k] + if k == 1 { dy } else { 0 }) + game.world.random.next_double());
+            game.native_add_particle("minecraft:portal", spot, [0.0; 3]);
+        }
+    }
 }
 
 // --- MekaSuit ---------------------------------------------------------------------------------------
@@ -20891,6 +20899,15 @@ fn mekasuit_client(game: &mut Game<'_>) {
     }
 }
 
+/// `FluidType.getTemperature` of the fluid a block holds, in kelvin.
+fn fluid_temperature(block: &str) -> Option<f64> {
+    match block {
+        "minecraft:lava" => Some(1300.0),
+        "minecraft:water" | "minecraft:bubble_column" => Some(300.0),
+        _ => None,
+    }
+}
+
 /// `ModuleGeothermalGeneratorUnit.tickServer` (once a second here): the leggings charge from the heat of the lava the
 /// legs stand in, scaled by how much of them is submerged, or from being on fire (treated as 200 K above ambient).
 fn mekasuit_geothermal(game: &mut Game<'_>) {
@@ -20908,23 +20925,32 @@ fn mekasuit_geothermal(game: &mut Game<'_>) {
     };
     let (pos, fire, sneaking) = (p.position, p.fire_ticks > 0, p.shift_key_down);
     let leg_height = if sneaking { 0.6 } else { 0.7 };
-    let at = [pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32];
+    // `MekanismUtils.getFluidsIn` over the legs' box (0.6 wide): each fluid with its highest submerged height and the
+    // average `FluidType.getTemperature` of its blocks. Horizon's world has the vanilla fluids: lava is 1300 K, water
+    // 300 K (the ambient, so it never charges).
+    let (x0, x1) = ((pos.x - 0.3).floor() as i32, (pos.x + 0.3).floor() as i32);
+    let (z0, z1) = ((pos.z - 0.3).floor() as i32, (pos.z + 0.3).floor() as i32);
     let mut degrees = 0.0_f64;
-    // Lava heats to 1300 K, 1000 above the ambient 300 K; water is not above it. Only the feet's block and the one the
-    // legs reach into are sampled, the lava's surface at its level (`FluidState.getHeight`).
-    let mut submerged = 0.0_f64;
-    for dy in 0..2 {
-        let cell = [at[0], at[1] + dy, at[2]];
-        if block_name(game, cell) == "minecraft:lava" {
-            let level: f64 = game.native_block_property(cell, "level").and_then(|l| l.parse().ok()).unwrap_or(0.0);
-            let top = f64::from(cell[1]) + if level >= 8.0 { 1.0 } else { (8.0 - level) / 9.0 };
-            let above_lava = block_name(game, [cell[0], cell[1] + 1, cell[2]]) == "minecraft:lava";
-            let top = if above_lava { f64::from(cell[1]) + 1.0 } else { top };
-            submerged = submerged.max((top.min(pos.y + leg_height) - pos.y.max(f64::from(cell[1]))).max(0.0));
+    let (mut height, mut heat, mut cells) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for x in x0..=x1 {
+        for z in z0..=z1 {
+            for y in (pos.y.floor() as i32)..=((pos.y + leg_height).floor() as i32) {
+                let cell = [x, y, z];
+                let Some(temperature) = fluid_temperature(block_name(game, cell)) else {
+                    continue;
+                };
+                let level: f64 = game.native_block_property(cell, "level").and_then(|l| l.parse().ok()).unwrap_or(0.0);
+                let full = block_name(game, [x, y + 1, z]) == block_name(game, cell);
+                let top = f64::from(y) + if full || level >= 8.0 { 1.0 } else { (8.0 - level) / 9.0 };
+                let depth = (top.min(pos.y + leg_height) - pos.y.max(f64::from(y))).max(0.0);
+                height = height.max(depth);
+                heat += temperature;
+                cells += 1.0;
+            }
         }
     }
-    if submerged >= 0.25 {
-        degrees = (1300.0 - 300.0) * submerged / leg_height;
+    if cells > 0.0 && height >= 0.25 && heat / cells > 300.0 {
+        degrees = (heat / cells - 300.0) * height / leg_height;
     }
     if degrees < 200.0 && fire {
         degrees = 200.0;
