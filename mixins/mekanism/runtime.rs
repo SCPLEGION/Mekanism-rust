@@ -3061,17 +3061,71 @@ fn tick_conductor(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     put_double(&mut entity.nbt, "lost", lost);
 }
 
-fn tick_cable(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, rate: u64) {
-    let mut energy = EnergyContainer::new(rate, u64::MAX);
-    energy.stored = get_long(&entity.nbt, "energy").min(rate);
-    // A pull face takes energy out of the energy cube beside it (`ConnectionType.PULL`).
-    for (face, (_, d)) in DIRECTIONS.into_iter().enumerate() {
-        if conn_of(&entity.nbt, face) != 2 {
-            continue;
+fn tick_cable(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, _rate: u64) {
+    let mut me = Some((pos, entity));
+    let Some(net) = network_claim(game, &mut me, pos, "cable") else {
+        return;
+    };
+    energy_network_step(game, &mut me, net);
+}
+
+/// What the block at `at` takes of `amount` from a cable network through its face `back` (the one toward the
+/// network), and with `execute` takes it (`EnergyNetwork.tickEmit`'s `insert`).
+fn energy_accept(game: &mut Game<'_>, at: [i32; 3], back: [i32; 3], amount: u64, execute: bool) -> u64 {
+    let accepted = game.native_block_property(at, "facing").and_then(|f| direction(&f)).is_none_or(|front| front != back);
+    game.native_with_mod_block_entity(at, |m| {
+        if !takes_in(&m.nbt, back, Transmission::Energy) {
+            return 0;
         }
-        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        let Some((capacity, mut rate)) = receiver(&m.id, &m.nbt, accepted, true) else {
+            return 0;
+        };
+        // The matrix's first port counts every insert (`queuedInput`) and takes no more than what is left of
+        // the rate this tick.
+        let matrix = kind(&m.id) == Some(Kind::InductionPort) && get_long(&m.nbt, "master") == 1;
+        if matrix {
+            rate = rate.saturating_sub(get_long(&m.nbt, "acc_in"));
+        }
+        let mut to = EnergyContainer::new(capacity, rate);
+        to.stored = get_long(&m.nbt, "energy").min(capacity);
+        let refused = to.insert(amount, if execute { Action::Execute } else { Action::Simulate });
+        if execute {
+            put_long(&mut m.nbt, "energy", to.stored);
+            if matrix {
+                add_count(&mut m.nbt, "acc_in", amount - refused);
+            }
+        }
+        amount - refused
+    })
+    .unwrap_or(0)
+}
+
+/// One tick of a cable network (`EnergyNetwork.onUpdate`): the cables' energy is one buffer; the pulling faces
+/// fill it from the energy cubes beside them, then `EmitUtils` splits it among the acceptors, and what is left is
+/// shared back to the cables in proportion to what each holds at most (`updateSaveShares`).
+fn energy_network_step(game: &mut Game<'_>, me: &mut TickingMember<'_>, net: u64) {
+    let (members, targets) = NETS.with_borrow(|r| r.nets.get(&net).map(|n| (n.members.clone(), n.targets.clone()))).unwrap_or_default();
+    let mut rates: Vec<u64> = Vec::new();
+    let mut buffer = 0u64;
+    let mut pulls: Vec<([i32; 3], usize, usize)> = Vec::new();
+    for (i, p) in members.iter().enumerate() {
+        let got = member(game, me, *p, |m| {
+            let rate = if let Some(Kind::Cable(rate)) = kind(&m.id) { rate } else { 0 };
+            let pulling: Vec<usize> = (0..6).filter(|f| conn_of(&m.nbt, *f) == 2).collect();
+            (get_long(&m.nbt, "energy").min(rate), rate, pulling)
+        });
+        let (stored, rate, pulling) = got.unwrap_or((0, 0, Vec::new()));
+        buffer += stored;
+        rates.push(rate);
+        pulls.extend(pulling.into_iter().map(|f| (*p, f, i)));
+    }
+    let capacity: u64 = rates.iter().sum();
+    // A pull face takes energy out of the energy cube beside it (`ConnectionType.PULL`).
+    for (p, face, i) in pulls {
+        let d = DIRECTIONS[face].1;
+        let at = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
         let back = face_index([-d[0], -d[1], -d[2]]);
-        let room = rate.saturating_sub(energy.stored);
+        let room = rates[i].min(capacity.saturating_sub(buffer));
         let taken = game.native_with_mod_block_entity(at, |m| {
             let Some(Kind::EnergyCube(t)) = kind(&m.id) else {
                 return 0;
@@ -3084,42 +3138,122 @@ fn tick_cable(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, r
             put_long(&mut m.nbt, "energy", stored - give);
             give
         });
-        energy.stored += taken.unwrap_or(0);
+        buffer += taken.unwrap_or(0);
     }
-    // What goes into the acceptors this tick is the network's throughput (`prevTransferAmount`), read by the Network Reader.
-    let before = energy.stored;
-    if energy.stored > 0 {
-        push_energy(game, pos, &mut energy, None, true);
+    // `tickEmit`: an even split among the acceptors, those that want less leaving more for the rest.
+    let mut sent = 0;
+    if buffer > 0 && !targets.is_empty() {
+        let caps: Vec<u64> = targets.iter().map(|(at, back, _)| energy_accept(game, *at, *back, buffer, false)).collect();
+        let amounts = mekanism_core::distribution::split(&caps, buffer);
+        for ((at, back, _), amount) in targets.iter().zip(amounts) {
+            if amount > 0 {
+                sent += energy_accept(game, *at, *back, amount, true);
+            }
+        }
     }
-    put_long(&mut entity.nbt, "flow", before - energy.stored);
-    for (face, (_, d)) in DIRECTIONS.into_iter().enumerate() {
-        if energy.stored == 0 {
+    buffer -= sent.min(buffer);
+    // `updateSaveShares`: each cable keeps its part of what is left.
+    let shares = share_out(buffer, &rates);
+    for (p, share) in members.iter().zip(shares) {
+        member(game, me, *p, |m| {
+            put_long(&mut m.nbt, "energy", share);
+            put_long(&mut m.nbt, "flow", sent);
+        });
+    }
+}
+
+/// How `total` is shared among holders that can hold `caps` each, in proportion to those, the remainder going one
+/// unit at a time to the first that have room (`EmitUtils` on the save targets).
+fn share_out(total: u64, caps: &[u64]) -> Vec<u64> {
+    let sum: u64 = caps.iter().sum();
+    if sum == 0 {
+        return vec![0; caps.len()];
+    }
+    let total = total.min(sum);
+    let mut out: Vec<u64> = caps.iter().map(|c| (u128::from(total) * u128::from(*c) / u128::from(sum)) as u64).collect();
+    let mut left = total - out.iter().sum::<u64>();
+    for (o, c) in out.iter_mut().zip(caps) {
+        if left == 0 {
             break;
         }
-        // A disabled face passes nothing on, nor does the cable beside it when it is that one's.
-        if conn_of(&entity.nbt, face) == 3 {
-            continue;
-        }
-        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
-        let back = face_index([-d[0], -d[1], -d[2]]);
-        let mine = energy.stored;
-        let given = game.native_with_mod_block_entity(at, |m| {
-            let Some(Kind::Cable(their_rate)) = kind(&m.id) else {
-                return 0;
-            };
-            if conn_of(&m.nbt, back) == 3 {
-                return 0;
-            }
-            let theirs = get_long(&m.nbt, "energy");
-            let give = tier::cable_share(mine, theirs).min(their_rate.saturating_sub(theirs));
-            put_long(&mut m.nbt, "energy", theirs + give);
-            give
-        });
-        if let Some(given) = given {
-            energy.extract(given, Action::Execute);
+        if *o < *c {
+            *o += 1;
+            left -= 1;
         }
     }
-    put_long(&mut entity.nbt, "energy", energy.stored);
+    out
+}
+
+thread_local! {
+    /// The transmitter networks of the level this thread runs.
+    static NETS: std::cell::RefCell<NetRegistry> = std::cell::RefCell::new(NetRegistry::default());
+    /// Bumped whenever a block that may join or leave a network changes; a network built under an older number is rebuilt.
+    static TOPOLOGY: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// A transmitter network (`DynamicNetwork`): its transmitters, the acceptors it emits to, and when it last ran.
+struct Net {
+    built: u64,
+    last_tick: u64,
+    members: Vec<[i32; 3]>,
+    targets: Vec<([i32; 3], [i32; 3], [i32; 3])>,
+}
+
+#[derive(Default)]
+struct NetRegistry {
+    nets: std::collections::HashMap<u64, Net>,
+    by_pos: std::collections::HashMap<(String, [i32; 3]), u64>,
+    next: u64,
+}
+
+/// A transmitter or something it joins has been placed, broken or reconnected: networks form again from what is there
+/// (`TransmitterNetworkRegistry` merging and splitting on `onNeighborChange`).
+pub(super) fn network_changed() {
+    TOPOLOGY.set(TOPOLOGY.get() + 1);
+}
+
+/// A block became another: networks form again when either was a Mekanism block (a transmitter or what it joins).
+pub(super) fn network_changed_at(old: &str, new: &str) {
+    if old.starts_with("mekanism") || new.starts_with("mekanism") {
+        network_changed();
+    }
+}
+
+/// The network of the transmitter at `pos`, formed (or formed again) when the world around changed; `Some` only to
+/// the first of its transmitters to tick in a game tick, which runs the whole network that tick.
+fn network_claim(game: &mut Game<'_>, me: &mut TickingMember<'_>, pos: [i32; 3], family: &str) -> Option<u64> {
+    let version = TOPOLOGY.get();
+    let dim = game.dim.id().to_owned();
+    let known = NETS.with_borrow(|r| r.by_pos.get(&(dim.clone(), pos)).copied().filter(|id| r.nets.get(id).is_some_and(|n| n.built == version)));
+    let id = match known {
+        Some(id) => id,
+        None => {
+            let info = discover(game, me, pos, family);
+            NETS.with_borrow_mut(|r| {
+                // The networks these transmitters were in (and now merged with or split from) are gone.
+                for m in &info.transmitters {
+                    if let Some(old) = r.by_pos.remove(&(dim.clone(), *m)) {
+                        r.nets.remove(&old);
+                    }
+                }
+                r.next += 1;
+                let id = r.next;
+                for m in &info.transmitters {
+                    r.by_pos.insert((dim.clone(), *m), id);
+                }
+                r.nets.insert(id, Net { built: version, last_tick: 0, members: info.transmitters, targets: info.targets });
+                id
+            })
+        }
+    };
+    let now = game.ticks as u64 + 1;
+    NETS.with_borrow_mut(|r| {
+        let net = r.nets.get_mut(&id)?;
+        (net.last_tick != now).then(|| {
+            net.last_tick = now;
+            id
+        })
+    })
 }
 
 // --- Chemicals --------------------------------------------------------------------------------------
@@ -5120,6 +5254,7 @@ fn show_connections(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         return;
     };
     let mut shown = 0u32;
+    let mut joined_mask = 0u32;
     for (face, (side, d)) in DIRECTIONS.into_iter().enumerate() {
         let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
         let name = block_name(game, at).to_owned();
@@ -5157,7 +5292,13 @@ fn show_connections(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnt
         if joined && !transmitter && (mode == 1 || mode == 2) {
             shown |= mode << (2 * face);
         }
+        joined_mask |= u32::from(joined) << face;
         game.native_set_block_property(pos, side, if joined { "false" } else { "true" });
+    }
+    // A transmitter that joins something new or no longer joins what it did changes its network.
+    if get_int(&entity.nbt, "net_mask") != joined_mask || !entity.nbt.contains_key(&JavaString::from("net_mask")) {
+        put_int(&mut entity.nbt, "net_mask", joined_mask);
+        network_changed();
     }
     let mut client = Compound::new();
     if shown != 0 {
@@ -6920,48 +7061,62 @@ pub(super) fn use_waste_barrel(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     .unwrap_or(false)
 }
 
-/// A pressurized tube feeds the tanks, machines and generators beside it, then lets the rest run on
-/// to emptier tubes carrying the same chemical, as `tick_cable` does with energy.
-fn tick_tube(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, rate: u64) {
-    tick_carrier(game, pos, entity, rate, "chemical", |k| match k {
-        Kind::Tube(rate) => Some(rate),
-        _ => None,
-    });
+/// A pressurized tube network: the tubes' chemical is one buffer, pulled from tanks, split among the acceptors and
+/// shared back to the tubes (`carrier_network_step`).
+fn tick_tube(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, _rate: u64) {
+    let mut me = Some((pos, entity));
+    if let Some(net) = network_claim(game, &mut me, pos, "tube") {
+        carrier_network_step(game, &mut me, net, "chemical");
+    }
 }
 
 /// A mechanical pipe does with fluids what a pressurized tube does with chemicals.
-fn tick_pipe(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, rate: u64) {
-    tick_carrier(game, pos, entity, rate, "fluid", |k| match k {
-        Kind::Pipe(rate) => Some(rate),
-        _ => None,
-    });
+fn tick_pipe(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, _rate: u64) {
+    let mut me = Some((pos, entity));
+    if let Some(net) = network_claim(game, &mut me, pos, "pipe") {
+        carrier_network_step(game, &mut me, net, "fluid");
+    }
 }
 
-/// A tube or pipe holding `rate` in its `key` tank: it feeds the blocks beside it, then shares the rest
-/// with the emptier carriers of its own kind (`same` gives their rate).
-fn tick_carrier(
-    game: &mut Game<'_>,
-    pos: [i32; 3],
-    entity: &mut ModBlockEntity,
-    rate: u64,
-    key: &str,
-    same: fn(Kind) -> Option<u64>,
-) {
-    let mut tank = get_tank(&entity.nbt, key, rate);
-    // A pull face takes from the tank beside it (`ConnectionType.PULL`, as a cable does from an energy cube).
-    for (face, (_, d)) in DIRECTIONS.into_iter().enumerate() {
-        if conn_of(&entity.nbt, face) != 2 {
+/// One tick of a tube or pipe network (`ChemicalNetwork`, `FluidNetwork`): what the transmitters hold is one buffer
+/// of one chemical; pulling faces fill it from the tanks beside them, `EmitUtils` splits it among the acceptors, and
+/// what is left is shared back to the transmitters that hold nothing else.
+fn carrier_network_step(game: &mut Game<'_>, me: &mut TickingMember<'_>, net: u64, key: &'static str) {
+    let (members, targets) = NETS.with_borrow(|r| r.nets.get(&net).map(|n| (n.members.clone(), n.targets.clone()))).unwrap_or_default();
+    let mut rates: Vec<u64> = Vec::new();
+    let mut tanks: Vec<ChemicalTank> = Vec::new();
+    let mut pulls: Vec<([i32; 3], usize, usize)> = Vec::new();
+    for (i, p) in members.iter().enumerate() {
+        let got = member(game, me, *p, |m| {
+            let rate = match kind(&m.id) {
+                Some(Kind::Pipe(rate) | Kind::Tube(rate)) => rate,
+                _ => 0,
+            };
+            let pulling: Vec<usize> = (0..6).filter(|f| conn_of(&m.nbt, *f) == 2).collect();
+            (get_tank(&m.nbt, key, rate), rate, pulling)
+        });
+        let (tank, rate, pulling) = got.unwrap_or((ChemicalTank::new(0), 0, Vec::new()));
+        rates.push(rate);
+        tanks.push(tank);
+        pulls.extend(pulling.into_iter().map(|f| (*p, f, i)));
+    }
+    let capacity: u64 = rates.iter().sum();
+    // The network holds the chemical of the first transmitter that has one; a transmitter with another keeps it.
+    let mut chemical = tanks.iter().find(|t| t.amount > 0).and_then(|t| t.chemical.clone());
+    let holds = |t: &ChemicalTank, c: &Option<String>| t.amount > 0 && t.chemical == *c;
+    let mut buffer: u64 = tanks.iter().filter(|t| holds(t, &chemical)).map(|t| t.amount).sum();
+    // A pull face takes from the tank beside it (`ConnectionType.PULL`).
+    for (p, face, i) in pulls {
+        let d = DIRECTIONS[face].1;
+        let at = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
+        let back = face_index([-d[0], -d[1], -d[2]]);
+        let room = rates[i].min(capacity.saturating_sub(buffer));
+        if room == 0 {
             continue;
         }
-        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
-        let back = face_index([-d[0], -d[1], -d[2]]);
-        let room = rate.saturating_sub(tank.amount);
-        if room == 0 {
-            break;
-        }
-        let wanted = tank.chemical.clone();
+        let wanted = chemical.clone();
         let taken = game.native_with_mod_block_entity(at, |m| {
-            let capacity = match kind(&m.id)? {
+            let tank_capacity = match kind(&m.id)? {
                 Kind::ChemicalTank(t) if key == "chemical" => chem::chemical_tank(t).0,
                 Kind::FluidTank(t) if key == "fluid" => tier::fluid_tank(t).0,
                 _ => return None,
@@ -6969,51 +7124,72 @@ fn tick_carrier(
             if !sides_of(&m.nbt, Transmission::Chemical).get(back).gives_out() {
                 return None;
             }
-            let mut theirs = get_tank(&m.nbt, key, capacity);
-            let chemical = theirs.chemical.clone()?;
-            if wanted.as_ref().is_some_and(|w| *w != chemical) {
+            let mut theirs = get_tank(&m.nbt, key, tank_capacity);
+            let found = theirs.chemical.clone()?;
+            if wanted.as_ref().is_some_and(|w| *w != found) {
                 return None;
             }
             let n = theirs.extract(room);
             put_tank(&mut m.nbt, key, &theirs);
-            Some((chemical, n))
+            Some((found, n))
         });
-        if let Some(Some((chemical, n))) = taken {
-            tank.insert(&chemical, n);
+        if let Some(Some((found, n))) = taken {
+            chemical = Some(found);
+            buffer += n;
         }
     }
-    if tank.amount == 0 {
-        put_long(&mut entity.nbt, "flow", 0);
-        return;
-    }
-    // What goes into the acceptors this tick is the network's throughput (`prevTransferAmount`).
-    let before = tank.amount;
-    push_chemical(game, pos, &mut tank, None, u64::MAX, true);
-    put_long(&mut entity.nbt, "flow", before - tank.amount);
-    for (_, d) in DIRECTIONS {
-        let Some(chemical) = tank.chemical.clone() else {
-            break;
+    let mut sent = 0;
+    if let Some(chem_id) = chemical.clone()
+        && buffer > 0
+        && !targets.is_empty()
+    {
+        let kind_of = tank_transmission(&chem_id);
+        let accept = |game: &mut Game<'_>, at: [i32; 3], back: [i32; 3], d: [i32; 3], amount: u64, execute: bool| -> u64 {
+            game.native_with_mod_block_entity(at, |m| {
+                if !takes_in(&m.nbt, back, kind_of) {
+                    return 0;
+                }
+                let Some((slot, tank_capacity)) = chemical_receiver(&m.id, &m.nbt, &chem_id, true, d) else {
+                    return 0;
+                };
+                let mut to = get_tank(&m.nbt, slot, tank_capacity);
+                let n = to.insert(&chem_id, amount);
+                if execute {
+                    put_tank(&mut m.nbt, slot, &to);
+                }
+                n
+            })
+            .unwrap_or(0)
         };
-        let at = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
-        let mine = tank.amount;
-        let given = game.native_with_mod_block_entity(at, |m| {
-            let Some(their_rate) = kind(&m.id).and_then(same) else {
-                return 0;
-            };
-            let mut theirs = get_tank(&m.nbt, key, their_rate);
-            if !theirs.accepts(&chemical) {
-                return 0;
+        let caps: Vec<u64> = targets.iter().map(|(at, back, d)| accept(game, *at, *back, *d, buffer, false)).collect();
+        let amounts = mekanism_core::distribution::split(&caps, buffer);
+        for ((at, back, d), amount) in targets.iter().zip(amounts) {
+            if amount > 0 {
+                sent += accept(game, *at, *back, *d, amount, true);
             }
-            let give = tier::cable_share(mine, theirs.amount);
-            let n = theirs.insert(&chemical, give);
-            put_tank(&mut m.nbt, key, &theirs);
-            n
-        });
-        if let Some(n) = given {
-            tank.extract(n);
         }
     }
-    put_tank(&mut entity.nbt, key, &tank);
+    buffer -= sent.min(buffer);
+    // The transmitters that hold another chemical keep it and take no share.
+    let free: Vec<u64> = rates.iter().zip(&tanks).map(|(r, t)| if t.amount == 0 || holds(t, &chemical) { *r } else { 0 }).collect();
+    let shares = share_out(buffer, &free);
+    for ((p, share), skip) in members.iter().zip(shares).zip(free.iter().map(|f| *f == 0)) {
+        member(game, me, *p, |m| {
+            put_long(&mut m.nbt, "flow", sent);
+            if skip {
+                return;
+            }
+            let rate = match kind(&m.id) {
+                Some(Kind::Pipe(rate) | Kind::Tube(rate)) => rate,
+                _ => 0,
+            };
+            let mut tank = ChemicalTank::new(rate);
+            if let Some(c) = chemical.as_deref().filter(|_| share > 0) {
+                tank.insert(c, share);
+            }
+            put_tank(&mut m.nbt, key, &tank);
+        });
+    }
 }
 
 const EVAPORATION_VALVE: &str = "mekanism:thermal_evaporation_valve";
@@ -33207,6 +33383,8 @@ struct NetInfo {
     transmitters: Vec<[i32; 3]>,
     /// The acceptor blocks, each with the sides of it that touch a transmitter of the network.
     acceptors: std::collections::BTreeMap<[i32; 3], Vec<usize>>,
+    /// The acceptors a network emits to: the block, the direction from it to the transmitter, and from the transmitter to it.
+    targets: Vec<([i32; 3], [i32; 3], [i32; 3])>,
     stored: u64,
     capacity: u64,
     resource: Option<String>,
@@ -33221,11 +33399,29 @@ struct NetInfo {
 /// The network of the transmitter of `family` at `start`: every transmitter of the family joined to it through
 /// connections that neither side disabled, and the acceptors they reach (the rules of `show_connections`).
 fn read_network(game: &mut Game<'_>, start: [i32; 3], family: &str) -> NetInfo {
+    discover(game, &mut None, start, family)
+}
+
+/// The block entity the caller is ticking, which is out of the world (`native_with_mod_block_entity` cannot reach it).
+type TickingMember<'a> = Option<([i32; 3], &'a mut ModBlockEntity)>;
+
+/// `native_with_mod_block_entity`, but the ticking block entity `me` answers for its own position.
+fn member<R>(game: &mut Game<'_>, me: &mut TickingMember<'_>, pos: [i32; 3], f: impl FnOnce(&mut ModBlockEntity) -> R) -> Option<R> {
+    if let Some((at, entity)) = me
+        && *at == pos
+    {
+        return Some(f(&mut **entity));
+    }
+    game.native_with_mod_block_entity(pos, f)
+}
+
+/// `read_network` that also reaches the ticking block entity `me`.
+fn discover(game: &mut Game<'_>, me: &mut TickingMember<'_>, start: [i32; 3], family: &str) -> NetInfo {
     let mut info = NetInfo::default();
     let mut seen = std::collections::HashSet::from([start]);
     let mut queue = vec![start];
     while let Some(pos) = queue.pop() {
-        let own = game.native_with_mod_block_entity(pos, |m| {
+        let own = member(game, me, pos, |m| {
             let faces: Vec<u32> = (0..6).map(|f| conn_of(&m.nbt, f)).collect();
             let heat = match kind(&m.id) {
                 Some(Kind::Conductor(t)) => tier::conductor(t).map(|(cap, ..)| {
@@ -33254,7 +33450,7 @@ fn read_network(game: &mut Game<'_>, start: [i32; 3], family: &str) -> NetInfo {
         info.transmitters.push(pos);
         info.stored += stored;
         info.capacity += capacity;
-        info.flow += flow;
+        info.flow = info.flow.max(flow);
         if let Some((temp, moved, lost)) = heat {
             info.temps.push(temp);
             info.moved += moved;
@@ -33271,7 +33467,7 @@ fn read_network(game: &mut Game<'_>, start: [i32; 3], family: &str) -> NetInfo {
             let name = block_name(game, at).to_owned();
             if pipe_family(&name) == Some(family) {
                 let back = face_index([-d[0], -d[1], -d[2]]);
-                if !seen.contains(&at) && game.native_with_mod_block_entity(at, |m| conn_of(&m.nbt, back)) != Some(3) {
+                if !seen.contains(&at) && member(game, me, at, |m| conn_of(&m.nbt, back)) != Some(3) {
                     seen.insert(at);
                     queue.push(at);
                 }
@@ -33279,10 +33475,14 @@ fn read_network(game: &mut Game<'_>, start: [i32; 3], family: &str) -> NetInfo {
             }
             let joined = (family == "transporter" && vanilla_container(&name))
                 || (family == "pipe" && name == EVAPORATION_VALVE)
-                || game.native_with_mod_block_entity(at, |m| kind(&m.id)).flatten().is_some_and(|k| serves(family, k));
+                || member(game, me, at, |m| kind(&m.id)).flatten().is_some_and(|k| serves(family, k));
             if joined {
                 // `NetworkAcceptorCache`: the acceptor's side that faces the transmitter.
                 info.acceptors.entry(at).or_default().push(face_index([-d[0], -d[1], -d[2]]));
+                // A pulling face only takes from the acceptor; the others are emitted to.
+                if faces[face] != 2 {
+                    info.targets.push((at, [-d[0], -d[1], -d[2]], d));
+                }
             }
         }
     }
