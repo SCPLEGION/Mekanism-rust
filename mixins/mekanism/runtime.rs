@@ -13216,7 +13216,8 @@ fn layout(block: &str) -> Option<Layout> {
         },
         Kind::FluidTank(t) => Layout {
             slots: [Some(([146.0, 19.0], "slot/normal")), Some(([146.0, 51.0], "slot/output")), None],
-            gauges: vec![gauge("fluid", tier::fluid_tank(t).0, 79.0, 13.0, STANDARD)],
+            // `GuiFluidGauge(.., GaugeType.WIDE, this, 48, 18)`.
+            gauges: vec![gauge("fluid", tier::fluid_tank(t).0, 48.0, 18.0, WIDE)],
             power: None,
             progress: None,
         },
@@ -14019,9 +14020,10 @@ fn tab_button(tab: &Tab) -> [f32; 4] {
 /// A nine-slice sprite of `size` with a `border` px frame, tinted, drawn over `dst`.
 fn nine_slice_tinted(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, name: &str, size: [f32; 2], border: f32, dst: [f32; 4], argb: u32) {
     let [x, y, w, h] = dst;
-    let b = border;
-    let cols = [(0.0, b, x, b), (b, size[0] - 2.0 * b, x + b, w - 2.0 * b), (size[0] - b, b, x + w - b, b)];
-    let rows = [(0.0, b, y, b), (b, size[1] - 2.0 * b, y + b, h - 2.0 * b), (size[1] - b, b, y + h - b, b)];
+    // As vanilla's `GuiSpriteScaling.NineSlice`: a border wider than half the area is cut to half of it.
+    let (bx, by) = (border.min((w / 2.0).floor()), border.min((h / 2.0).floor()));
+    let cols = [(0.0, bx, x, bx), (border, size[0] - 2.0 * border, x + bx, w - 2.0 * bx), (size[0] - bx, bx, x + w - bx, bx)];
+    let rows = [(0.0, by, y, by), (border, size[1] - 2.0 * border, y + by, h - 2.0 * by), (size[1] - by, by, y + h - by, by)];
     for (su, sw, dx, dw) in cols {
         for (sv, sh, dy, dh) in rows {
             if dw > 0.0 && dh > 0.0 {
@@ -17953,7 +17955,9 @@ fn draw_tank_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
     let count = if amount == 0 { "0".to_owned() } else { thousands(amount) };
     let lines = [format!("Chemical: {name}"), if creative && amount > 0 { "Infinite".to_owned() } else { format!("{count}/{total}") }];
     for (i, line) in lines.iter().enumerate() {
-        game.native_text_scaled(batch, line, [ox + 47.0, oy + 41.0 + 11.0 * i as f32], 0x3C_FE9A, 0.8);
+        // `GuiInnerScreen.defaultFormat`: padding 5, spacing 2, scale 0.8, centred vertically (the text band is 9 high).
+        let y = oy + 41.0 + 11.0 * i as f32;
+        scrolling_text(game, batch, line, [ox + 47.0, y, ox + 42.0 + 118.0 - 5.0, y + 9.0], 0, 0x3C_FE9A, 0.8);
     }
     let mode = (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) >> 4) & 3;
     let (icon, text) = match mode {
