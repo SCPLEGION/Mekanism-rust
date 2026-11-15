@@ -7290,8 +7290,8 @@ fn description_tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(hori
             lines.push((Text::literal(line), horizon_client::hud::rgba(0xFF, 0xFF, 0xFF, 0xFF)));
         }
     } else {
-        let hold = Text::translate("tooltip.mekanism.hold_for_description", &[Text::colored("Shift + N", 0x55_FFFF)]);
-        lines.push((hold, horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+        let hold = Text::translate("tooltip.mekanism.hold_for_description", &[Text::colored("Shift + N", enum_color::AQUA)]);
+        lines.push((hold, tooltip_rgba(enum_color::GRAY)));
     }
 }
 
@@ -7320,6 +7320,9 @@ fn tooltip_body(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_cli
         let mode = disassembler_mode(stack);
         let line = format!("Mode: {} (efficiency {})", mode.label(), mode.efficiency());
         lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+    }
+    if let Some(name) = stack.item.strip_prefix("mekanism:") {
+        tier_tooltip(name, lines);
     }
     stored_tooltip(stack, lines);
     cardboard_tooltip(stack, lines);
@@ -7378,8 +7381,135 @@ fn tooltip_body(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_cli
     if energy == 0 {
         return;
     }
-    let line = format!("Stored Energy: {}", mekanism_core::energy::format_fe(energy));
-    lines.push((horizon_client::text::Text::literal(line), horizon_client::hud::rgba(0x55, 0xFF, 0xFF, 0xFF)));
+    // `MekanismLang.STORED_ENERGY.translateColored(BRIGHT_GREEN, GRAY, EnergyDisplay)`.
+    lines.push(colored_line("tooltip.mekanism.stored_energy", enum_color::BRIGHT_GREEN, enum_color::GRAY, &[&mekanism_core::energy::format_fe(energy)]));
+}
+
+/// `EnumColor` rgb values (`mekanism.api.text.EnumColor`).
+mod enum_color {
+    pub const DARK_GRAY: u32 = 0x7A7A7A;
+    pub const GRAY: u32 = 0xCFCFCF;
+    pub const INDIGO: u32 = 0x559EFF;
+    pub const PURPLE: u32 = 0xA460D9;
+    pub const AQUA: u32 = 0x30FFF9;
+    pub const BRIGHT_GREEN: u32 = 0x75FF89;
+}
+
+/// `BaseTier.getTextColor` of each tier, basic to creative.
+const TIER_TEXT_COLORS: [u32; 5] = [0x5FFFB8, 0xFF806A, 0x4BF8FF, 0xF787FF, 0x585858];
+
+fn tooltip_rgba(color: u32) -> u32 {
+    horizon_client::hud::rgba((color >> 16) as u8, (color >> 8) as u8, color as u8, 0xFF)
+}
+
+/// `ILangEntry.translateColored(color, argColor, args)`: the line in `color`, its arguments in `arg_color`.
+fn colored_line(key: &str, color: u32, arg_color: u32, args: &[&str]) -> (horizon_client::text::Text, u32) {
+    use horizon_client::text::Text;
+    let args: Vec<Text> = args.iter().map(|a| Text::colored(*a, arg_color)).collect();
+    (Text::translate(key, &args), tooltip_rgba(color))
+}
+
+fn lang_text(key: &str) -> String {
+    horizon_client::lang::get(key)
+}
+
+/// The tooltips of the tier components (`CableTier`, `PipeTier`... `addToTooltip`), read off the item's name.
+fn tier_tooltip(name: &str, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    use enum_color::*;
+    use mekanism_core::config_files::{active_double, active_int};
+    let Some((tier, kind)) = name.split_once('_') else {
+        return;
+    };
+    let Some(t) = ["basic", "advanced", "elite", "ultimate", "creative"].iter().position(|n| *n == tier) else {
+        return;
+    };
+    let tier_color = TIER_TEXT_COLORS[t];
+    let blank = || (horizon_client::text::Text::empty(), tooltip_rgba(GRAY));
+    let capable = || colored_line("transmitter.mekanism.capable_of_transferring", DARK_GRAY, DARK_GRAY, &[]);
+    const BUCKET: u64 = 1_000;
+    let cfg = |section: &str, key: &str, default: u64| active_int("tiers", section, &format!("{tier}{key}"), default);
+    let tiered = |rows: [u64; 5]| rows[t];
+    match kind {
+        "universal_cable" if t < 4 => {
+            let capacity = cfg("transmitters.energy", "Capacity", tiered([8_000, 128_000, 1_024_000, 8_192_000, 0]));
+            lines.push(colored_line("capacity.mekanism.per_tick", INDIGO, GRAY, &[&mekanism_core::energy::format_fe(capacity)]));
+            lines.push(blank());
+            lines.push(capable());
+            // `GENERIC_TRANSFER`: "- FE (NeoForge)", the energy in gray and the loader in purple.
+            let energy = lang_text("energy.mekanism.forge.short");
+            let transfer = horizon_client::text::Text::translate(
+                "generic.mekanism.transfer",
+                &[horizon_client::text::Text::colored(energy, GRAY), horizon_client::text::Text::colored(lang_text("constants.mekanism.forge"), PURPLE)],
+            );
+            lines.push((transfer, tooltip_rgba(GRAY)));
+        }
+        "mechanical_pipe" | "pressurized_tube" if t < 4 => {
+            let pipe = kind == "mechanical_pipe";
+            let section = if pipe { "transmitters.fluid" } else { "transmitters.chemical" };
+            let (capacity, pull) = if pipe {
+                (tiered([2 * BUCKET, 8 * BUCKET, 32 * BUCKET, 128 * BUCKET, 0]), tiered([BUCKET / 4, BUCKET, 8 * BUCKET, 32 * BUCKET, 0]))
+            } else {
+                (tiered([4 * BUCKET, 16 * BUCKET, 256 * BUCKET, 1_024 * BUCKET, 0]), tiered([750, 2 * BUCKET, 64 * BUCKET, 256 * BUCKET, 0]))
+            };
+            lines.push(colored_line("capacity.mekanism.mb.per_tick", INDIGO, GRAY, &[&thousands(cfg(section, "Capacity", capacity))]));
+            lines.push(colored_line("transmitter.mekanism.pump_rate.mb", INDIGO, GRAY, &[&thousands(cfg(section, "PullAmount", pull))]));
+            lines.push(blank());
+            lines.push(capable());
+            let (key, loader) = if pipe { ("transmitter.mekanism.fluids", "constants.mekanism.forge") } else { ("transmitter.mekanism.chemicals", "constants.mekanism.mod_name") };
+            lines.push(colored_line(key, GRAY, PURPLE, &[&lang_text(loader)]));
+        }
+        "logistical_transporter" if t < 4 => {
+            let pull = cfg("transmitters.items", "PullAmount", tiered([1, 16, 32, 64, 0])) as f64;
+            let speed = cfg("transmitters.items", "Speed", tiered([5, 10, 20, 50, 0])) as f64;
+            // The default tick rate of 20: `speed / (5 * 20 / 20)` and `pull * 20 / 10`, rounded to two decimals.
+            let round = |d: f64| ((d * 100.0) as i64) as f64 / 100.0;
+            lines.push(colored_line("transmitter.mekanism.speed", INDIGO, GRAY, &[&java_double(round(speed / 5.0))]));
+            lines.push(colored_line("transmitter.mekanism.pump_rate", INDIGO, GRAY, &[&java_double(round(pull * 20.0 / 10.0))]));
+            lines.push(blank());
+            lines.push(capable());
+            let universal = lang_text("transmitter.mekanism.universal");
+            lines.push(colored_line("transmitter.mekanism.items", GRAY, PURPLE, &[&universal]));
+            lines.push(colored_line("transmitter.mekanism.blocks", GRAY, PURPLE, &[&universal]));
+        }
+        "thermodynamic_conductor" if t < 4 => {
+            let heat = |key: &str, default: f64| active_double("tiers", "transmitters.heat", &format!("{tier}{key}"), default);
+            lines.push(colored_line("transmitter.mekanism.conduction", INDIGO, GRAY, &[&java_double(heat("InverseConduction", 5.0))]));
+            lines.push(colored_line("transmitter.mekanism.insulation", INDIGO, GRAY, &[&java_double(heat("Insulation", [10.0, 400.0, 8_000.0, 100_000.0, 0.0][t]))]));
+            lines.push(colored_line("transmitter.mekanism.heat_capacity", INDIGO, GRAY, &[&java_double(heat("HeatCapacity", 1.0))]));
+            lines.push(blank());
+            lines.push(capable());
+            lines.push(colored_line("transmitter.mekanism.heat", GRAY, PURPLE, &[&lang_text("constants.mekanism.mod_name")]));
+        }
+        "induction_cell" if t < 4 => {
+            let capacity = cfg("induction", "Capacity", tiered([8_000_000_000, 64_000_000_000, 512_000_000_000, 4_000_000_000_000, 0]));
+            lines.push(colored_line("capacity.mekanism.generic", tier_color, GRAY, &[&mekanism_core::energy::format_fe(capacity)]));
+        }
+        "induction_provider" if t < 4 => {
+            let output = cfg("induction", "Output", tiered([256_000, 2_048_000, 16_384_000, 131_072_000, 0]));
+            lines.push(colored_line("matrix.mekanism.induction_port.output_rate", tier_color, GRAY, &[&mekanism_core::energy::format_fe(output)]));
+        }
+        "energy_cube" => {
+            let value = if t == 4 {
+                lang_text("gui.mekanism.infinite")
+            } else {
+                mekanism_core::energy::format_fe(cfg("energy_cubes", "Capacity", tiered([4_000_000, 16_000_000, 64_000_000, 256_000_000, 0])))
+            };
+            lines.push(colored_line("capacity.mekanism.generic", tier_color, GRAY, &[&value]));
+        }
+        "bin" | "fluid_tank" | "chemical_tank" => {
+            let (section, key, defaults) = match kind {
+                "bin" => ("bins", "capacity.mekanism.items", [4_096, 8_192, 32_768, 262_144, 0]),
+                "fluid_tank" => ("fluid_tanks", "capacity.mekanism.mb", [32 * BUCKET, 64 * BUCKET, 128 * BUCKET, 256 * BUCKET, 0]),
+                _ => ("chemical_tanks", "capacity.mekanism.mb", [64 * BUCKET, 256 * BUCKET, 1_024 * BUCKET, 8_192 * BUCKET, 0]),
+            };
+            if t == 4 {
+                lines.push(colored_line("capacity.mekanism.generic", tier_color, GRAY, &[&lang_text("gui.mekanism.infinite")]));
+            } else {
+                lines.push(colored_line(key, tier_color, GRAY, &[&thousands(cfg(section, "Capacity", tiered(defaults)))]));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// `ItemTooltipUtils.shouldHideDetails` and the DETAILS appender: a block item with the details component shows what
@@ -7388,8 +7518,8 @@ fn finish_tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_c
     if DETAILS_ITEMS.contains(&&*stack.item) {
         if !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
             lines.truncate(keep);
-            let hold = horizon_client::text::Text::translate("tooltip.mekanism.hold_for_details", &[horizon_client::text::Text::colored("Left Shift", 0x5555FF)]);
-            lines.push((hold, horizon_client::hud::rgba(0xAA, 0xAA, 0xAA, 0xFF)));
+            let hold = horizon_client::text::Text::translate("tooltip.mekanism.hold_for_details", &[horizon_client::text::Text::colored("Left Shift", enum_color::INDIGO)]);
+            lines.push((hold, tooltip_rgba(enum_color::GRAY)));
         }
     }
     description_tooltip(game, stack, lines);
