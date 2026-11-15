@@ -10348,6 +10348,16 @@ fn obsidian_tnt_tick(game: &mut Game<'_>) {
     });
     for center in exploded {
         game.native_explode(center, TNT_RADIUS, false);
+        // An explosion hurts what is within twice its radius (`ServerExplosion.hurtEntities`), and an explosion is
+        // not one of the damages a balloon shrugs off: the balloons there pop (exposure is not taken into account).
+        let (hit, rest): (Vec<Balloon>, Vec<Balloon>) = BALLOONS.with_borrow_mut(std::mem::take).into_iter().partition(|b| {
+            let c = [b.pos[0], b.pos[1] + 0.5, b.pos[2]];
+            (0..3).map(|i| (c[i] - center[i]).powi(2)).sum::<f64>() <= (f64::from(TNT_RADIUS) * 2.0).powi(2)
+        });
+        BALLOONS.with_borrow_mut(|v| v.extend(rest));
+        for b in &hit {
+            pop_balloon(game, b);
+        }
     }
     // Tell the clients where they are (`id, x, y, z, fuse, sound`), every tick as a tracked entity moves.
     let now = PRIMED.with_borrow(|v| v.clone());
@@ -10415,7 +10425,7 @@ thread_local! {
     static BALLOON_SENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The client's view: id, position, colour, and whether it holds on to something.
     static CLIENT_BALLOONS: std::cell::RefCell<Vec<(u32, [f64; 3], u8, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
-    static BALLOON_POPS: std::cell::RefCell<Vec<[f64; 3]>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BALLOON_POPS: std::cell::RefCell<Vec<([f64; 3], u8)>> = const { std::cell::RefCell::new(Vec::new()) };
     static ATTACK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -10568,6 +10578,7 @@ fn pop_balloon(game: &mut Game<'_>, b: &Balloon) {
     for c in b.pos {
         data.extend_from_slice(&(c as f32).to_be_bytes());
     }
+    data.push(b.color);
     for to in game.native_online_players() {
         game.native_send_to_player(to, BALLOON_POP_CHANNEL, &data);
     }
@@ -10587,8 +10598,69 @@ fn balloon_target_elevation(game: &Game<'_>, at: [f64; 3]) -> f64 {
     0.0
 }
 
+thread_local! {
+    /// The world folder the balloons were loaded from, the text last written, and the ticks since.
+    static BALLOON_WORLD: std::cell::RefCell<(Option<std::path::PathBuf>, String, u32)> = const { std::cell::RefCell::new((None, String::new(), 0)) };
+}
+
+/// Balloons stay with the world (`EntityBalloon` is a saved entity): `<world>/mekanism_additions/balloons.txt`, a
+/// line per balloon (`x y z colour latch`, a block latch as `x,y,z`), read when a world opens and rewritten every
+/// five seconds when it changed. A balloon latched to a mob is saved free.
+fn balloon_persist(game: &Game<'_>) {
+    let Some(dir) = game.native_world_dir() else {
+        return;
+    };
+    let file = dir.join("mekanism_additions").join("balloons.txt");
+    let opened = BALLOON_WORLD.with_borrow(|w| w.0.as_deref() == Some(dir.as_path()));
+    if !opened {
+        BALLOONS.with_borrow_mut(Vec::clear);
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            let (Some(x), Some(y), Some(z), Some(color)) = (
+                f.first().and_then(|v| v.parse::<f64>().ok()),
+                f.get(1).and_then(|v| v.parse::<f64>().ok()),
+                f.get(2).and_then(|v| v.parse::<f64>().ok()),
+                f.get(3).and_then(|v| v.parse::<u8>().ok()),
+            ) else {
+                continue;
+            };
+            let latch = f
+                .get(4)
+                .map(|p| p.split(',').filter_map(|v| v.parse::<i32>().ok()).collect::<Vec<_>>())
+                .filter(|p| p.len() == 3)
+                .map_or(Latch::Free, |p| Latch::Block([p[0], p[1], p[2]]));
+            make_balloon([x, y, z], color, latch);
+        }
+        BALLOON_WORLD.with_borrow_mut(|w| *w = (Some(dir), text, 0));
+        return;
+    }
+    let due = BALLOON_WORLD.with_borrow_mut(|w| {
+        w.2 += 1;
+        w.2 % 100 == 0
+    });
+    if !due {
+        return;
+    }
+    let mut text = String::new();
+    for b in BALLOONS.with_borrow(|v| v.clone()) {
+        text.push_str(&format!("{} {} {} {}", b.pos[0], b.pos[1], b.pos[2], b.color));
+        if let Latch::Block(p) = b.latch {
+            text.push_str(&format!(" {},{},{}", p[0], p[1], p[2]));
+        }
+        text.push('\n');
+    }
+    if BALLOON_WORLD.with_borrow(|w| w.1 == text) {
+        return;
+    }
+    if std::fs::create_dir_all(file.parent().unwrap_or(&dir)).and_then(|()| std::fs::write(&file, &text)).is_ok() {
+        BALLOON_WORLD.with_borrow_mut(|w| w.1 = text);
+    }
+}
+
 /// `EntityBalloon.tick` for every balloon on the server.
 fn balloon_tick(game: &mut Game<'_>) {
+    balloon_persist(game);
     let mut list = BALLOONS.with_borrow_mut(std::mem::take);
     if list.is_empty() && !BALLOON_SENT.get() {
         return;
@@ -10673,7 +10745,7 @@ fn balloon_tick(game: &mut Game<'_>) {
 fn balloon_client_payload(channel: &str, data: &[u8]) {
     if channel == BALLOON_POP_CHANNEL && data.len() >= 12 {
         let f = |i: usize| f64::from(f32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]));
-        BALLOON_POPS.with_borrow_mut(|v| v.push([f(0), f(4), f(8)]));
+        BALLOON_POPS.with_borrow_mut(|v| v.push(([f(0), f(4), f(8)], data.get(12).copied().unwrap_or(0))));
     }
     if channel == BALLOON_CHANNEL {
         let seen = data
@@ -10689,8 +10761,19 @@ fn balloon_client_payload(channel: &str, data: &[u8]) {
 
 /// The window: the pop sounds, and a punch at a balloon (`EntityBalloon.skipAttackInteraction`).
 fn balloon_client(game: &mut Game<'_>) {
-    for at in BALLOON_POPS.with_borrow_mut(std::mem::take) {
+    use horizon_core::random::RandomSource;
+    for (at, color) in BALLOON_POPS.with_borrow_mut(std::mem::take) {
         game.audio.play("mekanismadditions:entity.balloon.pop", Some(at), 1.0, 1.0);
+        // `EntityBalloon.pop`: ten dust particles of the balloon's colour within 0.3 of the box's centre.
+        let rgb = tnet::COLORS.get(usize::from(color)).map_or(0xFFFFFF, |c| c.1);
+        let rgb = [16, 8, 0].map(|s| ((rgb >> s) & 255) as f32 / 255.0);
+        for _ in 0..10 {
+            let mut at3 = [at[0], at[1] + 0.5, at[2]];
+            for c in &mut at3 {
+                *c += 0.6 * game.world.random.next_double() - 0.3;
+            }
+            game.native_add_dust([rgb[0], rgb[1], rgb[2]], 1.0, at3, [0.0; 3]);
+        }
     }
     let down = game.native_mapping("key.attack").is_some_and(|(down, _)| down);
     let was = ATTACK_HELD.replace(down);
