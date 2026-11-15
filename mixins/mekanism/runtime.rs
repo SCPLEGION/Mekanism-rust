@@ -9102,7 +9102,9 @@ fn jetpack_capacity(stack: &ItemStack) -> u64 {
     } else if &*stack.item == flamethrower::ITEM {
         gear_int("flamethrower.capacity", flamethrower::CAPACITY)
     } else if &*stack.item == modules::BODYARMOR {
-        gear_int("mekasuit.jetpackMaxStorage", modules::SUIT_JETPACK_CAPACITY)
+        // `ItemMekaSuitArmor`: the tank holds `mekaSuitJetpackMaxStorage` per installed Jetpack Unit, none without one.
+        let count = u64::from(installed_modules(stack).get("mekanism:jetpack_unit").copied().unwrap_or(0));
+        gear_int("mekasuit.jetpackMaxStorage", modules::SUIT_JETPACK_CAPACITY) * count
     } else {
         gear_int("jetpack.capacity", gear::JETPACK_CAPACITY)
     }
@@ -10034,6 +10036,7 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
             BREATHING_CHANNEL => return mekasuit_breathe(game, data.first().copied().unwrap_or(1)),
             CHARGE_CHANNEL => return mekasuit_distribute(game),
             SOLAR_CHANNEL => return mekasuit_solar(game),
+            GEOTHERMAL_CHANNEL => return mekasuit_geothermal(game),
             _ => {}
         }
     }
@@ -11443,6 +11446,15 @@ fn module_on(stack: &ItemStack, module: &str) -> bool {
 pub(super) fn player_damage_rules(game: &mut Game<'_>, absorbed: f32, rules: &mut Vec<(String, f32)>) {
     if !game.native_on(MOD_ID) {
         return;
+    }
+    // `ModuleGeothermalGeneratorUnit.getDamageAbsorbInfo`: fire damage reduced by `heatDamageReductionRatio` in the share
+    // of the units installed out of 8, at no energy.
+    if let Some(legs) = game.armor[2].as_ref().filter(|s| &*s.item == modules::PANTS) {
+        let units = installed_modules(legs).get(GEOTHERMAL_UNIT).copied().unwrap_or(0);
+        if units > 0 && module_on(legs, GEOTHERMAL_UNIT) {
+            let ratio = mekanism_core::config::gear_double("mekasuit.damage_absorption.heatDamageReductionRatio", modules::HEAT_REDUCTION);
+            rules.push(("#minecraft:is_fire".to_owned(), (ratio * f64::from(units.min(8)) / 8.0) as f32));
+        }
     }
     const UNIT: &str = "mekanism:inhalation_purification_unit";
     let holders: Vec<usize> = (0..4).filter(|&i| game.armor[i].as_ref().is_some_and(|s| modules::is_container(&s.item) && module_on(s, UNIT))).collect();
@@ -14877,11 +14889,11 @@ fn window_click(block: &str, data: &[i32], at: [f32; 2], right: bool, button: &m
 }
 
 /// The open window's tooltip: true when the cursor is on the window.
-fn window_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
+fn window_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
     let shown = match window(block) {
         Some(Window::Sides(shown)) => shown,
         Some(Window::Upgrades(_)) => return upgrade_window_tooltip(block, data, at, lines),
-        Some(Window::Transporter) => return transporter_window_tooltip(block, data, at, lines),
+        Some(Window::Transporter) => return transporter_window_tooltip(game, block, data, at, lines),
         None => return false,
     };
     let Some(l) = layout(block) else {
@@ -18220,7 +18232,7 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
     let Some(l) = layout(block) else {
         return;
     };
-    if window_tooltip(block, data, window_at(block, at), lines) || tab_tooltip(block, &l, data, at, lines) {
+    if window_tooltip(game, block, data, window_at(block, at), lines) || tab_tooltip(block, &l, data, at, lines) {
         return;
     }
     if kind(block) == Some(Kind::DigitalMiner) {
@@ -20746,6 +20758,14 @@ fn meka_tool_use(game: &mut Game<'_>, claimed: &mut bool) {
     // `player.teleportTo(x + 0.5, y + 1.5, z + 0.5)` and the teleport sound.
     place_player(game, [f64::from(p[0]) + 0.5, f64::from(p[1]) + 1.5, f64::from(p[2]) + 0.5]);
     game.audio.play_unshared("minecraft:entity.player.teleport", None, 1.0, 1.0);
+    // `PacketPortalFX(pos.above())`: 50 portal particles in each of the two blocks above the target (the teleporter sees them).
+    use horizon_core::random::RandomSource;
+    for _ in 0..50 {
+        for dy in [1, 2] {
+            let spot = [0, 1, 2].map(|k| f64::from(p[k] + if k == 1 { dy } else { 0 }) + game.world.random.next_double());
+            game.native_add_particle("minecraft:portal", spot, [0.0; 3]);
+        }
+    }
 }
 
 // --- MekaSuit ---------------------------------------------------------------------------------------
@@ -20915,6 +20935,8 @@ pub(super) fn meka_tool_area(game: &mut Game<'_>, pos: [i32; 3]) {
 const BREATHING_CHANNEL: &str = "mekanism:mekasuit_breathing";
 const CHARGE_CHANNEL: &str = "mekanism:mekasuit_charge";
 const SOLAR_CHANNEL: &str = "mekanism:mekasuit_solar";
+const GEOTHERMAL_CHANNEL: &str = "mekanism:mekasuit_geothermal";
+const GEOTHERMAL_UNIT: &str = "mekanismgenerators:geothermal_generator_unit";
 /// `Player.getMaxAirSupply`.
 const MAX_AIR: i32 = 300;
 
@@ -20953,6 +20975,75 @@ fn mekasuit_client(game: &mut Game<'_>) {
     }
     if worn_module(game, 0, modules::HELMET, "mekanismgenerators:solar_recharging_unit") {
         game.native_send_to_server(SOLAR_CHANNEL, &[1]);
+    }
+    if worn_module(game, 2, modules::PANTS, GEOTHERMAL_UNIT) {
+        game.native_send_to_server(GEOTHERMAL_CHANNEL, &[1]);
+    }
+}
+
+/// `FluidType.getTemperature` of the fluid a block holds, in kelvin.
+fn fluid_temperature(block: &str) -> Option<f64> {
+    match block {
+        "minecraft:lava" => Some(1300.0),
+        "minecraft:water" | "minecraft:bubble_column" => Some(300.0),
+        _ => None,
+    }
+}
+
+/// `ModuleGeothermalGeneratorUnit.tickServer` (once a second here): the leggings charge from the heat of the lava the
+/// legs stand in, scaled by how much of them is submerged, or from being on fire (treated as 200 K above ambient).
+fn mekasuit_geothermal(game: &mut Game<'_>) {
+    let Some(legs) = game.armor[2].as_ref().filter(|s| &*s.item == modules::PANTS) else {
+        return;
+    };
+    let units = modules_of(legs).get(GEOTHERMAL_UNIT).copied().unwrap_or(0);
+    let capacity = item_energy_of(legs).map_or(0, |e| e.capacity);
+    let stored = stored_energy(legs);
+    if units == 0 || stored >= capacity {
+        return;
+    }
+    let Some(p) = game.player.as_ref() else {
+        return;
+    };
+    let (pos, fire, sneaking) = (p.position, p.fire_ticks > 0, p.shift_key_down);
+    let leg_height = if sneaking { 0.6 } else { 0.7 };
+    // `MekanismUtils.getFluidsIn` over the legs' box (0.6 wide): each fluid with its highest submerged height and the
+    // average `FluidType.getTemperature` of its blocks. Horizon's world has the vanilla fluids: lava is 1300 K, water
+    // 300 K (the ambient, so it never charges).
+    let (x0, x1) = ((pos.x - 0.3).floor() as i32, (pos.x + 0.3).floor() as i32);
+    let (z0, z1) = ((pos.z - 0.3).floor() as i32, (pos.z + 0.3).floor() as i32);
+    let mut degrees = 0.0_f64;
+    let (mut height, mut heat, mut cells) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for x in x0..=x1 {
+        for z in z0..=z1 {
+            for y in (pos.y.floor() as i32)..=((pos.y + leg_height).floor() as i32) {
+                let cell = [x, y, z];
+                let Some(temperature) = fluid_temperature(block_name(game, cell)) else {
+                    continue;
+                };
+                let level: f64 = game.native_block_property(cell, "level").and_then(|l| l.parse().ok()).unwrap_or(0.0);
+                let full = block_name(game, [x, y + 1, z]) == block_name(game, cell);
+                let top = f64::from(y) + if full || level >= 8.0 { 1.0 } else { (8.0 - level) / 9.0 };
+                let depth = (top.min(pos.y + leg_height) - pos.y.max(f64::from(y))).max(0.0);
+                height = height.max(depth);
+                heat += temperature;
+                cells += 1.0;
+            }
+        }
+    }
+    if cells > 0.0 && height >= 0.25 && heat / cells > 300.0 {
+        degrees = (heat / cells - 300.0) * height / leg_height;
+    }
+    if degrees < 200.0 && fire {
+        degrees = 200.0;
+    }
+    if degrees <= 0.0 {
+        return;
+    }
+    let rate = (f64::from(units) * mekanism_core::config::gear_int("mekasuit.geothermalChargingRate", modules::GEOTHERMAL_RATE) as f64 * degrees).min(f64::from(i32::MAX));
+    let made = rate as u64 * 20;
+    if let Some(legs) = game.armor[2].as_mut() {
+        set_energy(legs, (stored + made).min(capacity));
     }
 }
 
@@ -24847,7 +24938,7 @@ fn transporter_window_click(block: &str, data: &[i32], at: [f32; 2], right: bool
     true
 }
 
-fn transporter_window_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
+fn transporter_window_tooltip(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) -> bool {
     if !inside(at, TRANSPORTER_WINDOW) {
         return false;
     }
@@ -24856,13 +24947,27 @@ fn transporter_window_tooltip(block: &str, data: &[i32], at: [f32; 2], lines: &m
     };
     let on = |r: [f32; 4]| inside(at, in_transporter(r));
     let (out, ins, _) = ejector_of(data, &l);
-    let name = |c: Option<u8>| c.map_or("None", |c| freq::COLORS[usize::from(c) % 16].0);
+    // `EnumColor.getColoredName`: the colour's code (its ordinal in hex) then its name.
+    let coloured = |c: u8| format!("\u{a7}{:x}{}", c % 16, freq::COLORS[usize::from(c) % 16].0);
     if on(TRANSPORTER_STRICT) {
         lines.push("Strict Input".into());
     } else if on(TRANSPORTER_COLOR) {
-        lines.push(name(out).into());
+        // `ColorButton.updateTooltip`: no tooltip at all for no colour.
+        if let Some(c) = out {
+            lines.push(coloured(c));
+        }
     } else if let Some(side) = TRANSPORTER_SIDES.iter().position(|[x, y]| on([*x, *y, 22.0, 22.0])) {
-        lines.push(name(ins[side]).into());
+        // `SideDataButton.updateTooltip`: the side, the colour (or None), then the block beside it.
+        lines.push(side_config::RELATIVE[side].into());
+        lines.push(ins[side].map_or_else(|| "None".to_owned(), coloured));
+        let facing = game.container.and_then(|(x, y, z)| game.native_block_property([x, y, z], "facing")).and_then(|f| direction(&f)).map_or(2, face_index);
+        if let Some((x, y, z)) = game.container {
+            let d = DIRECTIONS[side_config::relative_face(facing, side)].1;
+            let beside = game.native_block([x + d[0], y + d[1], z + d[2]]);
+            if !beside.ends_with(":air") {
+                lines.push(horizon_client::lang::get(&block_description_key(&beside)));
+            }
+        }
     }
     true
 }
@@ -27192,6 +27297,14 @@ fn stn_payload(game: &mut Game<'_>, data: &[u8]) {
             kept.remove(&JavaString::from(id));
         }
         write_modules(held, &installed, kept);
+        // `IModule.onRemoved` (`ModuleEnergyUnit`, `ModuleJetpackUnit`): what no longer fits the smaller tanks is lost.
+        if let Some(e) = item_energy_of(held) {
+            set_energy(held, stored_energy(held).min(e.capacity));
+        }
+        if is_jetpack(held) {
+            let fuel = jetpack_fuel(held);
+            set_jetpack_fuel(held, fuel);
+        }
         Some(ItemStack { count: took, ..item })
     });
     if let Some(Some(stack)) = out {

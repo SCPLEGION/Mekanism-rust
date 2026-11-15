@@ -376,6 +376,10 @@ pub fn breathe(rate: u32, air_missing: u32, hydrogen_room: u64) -> (u32, u64, u6
 
 /// `GearConfig.mekaSuitSolarRechargingRate`: the Solar Recharging Unit's peak, times the installed units.
 pub const SOLAR_RATE: u64 = 500;
+
+/// `GeneratorsGearConfig.mekaSuitGeothermalChargingRate` and `mekaSuitHeatDamageReductionRatio`.
+pub const GEOTHERMAL_RATE: u64 = 10;
+pub const HEAT_REDUCTION: f64 = 0.8;
 /// `GearConfig.mekaSuitInventoryChargeRate`: what the Charge Distribution Unit gives the inventory a
 /// tick.
 pub const INVENTORY_CHARGE_RATE: u64 = 10_000;
