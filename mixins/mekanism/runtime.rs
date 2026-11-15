@@ -399,7 +399,6 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
     // and an importer's slot that hoppers fill.
     let qio_menu = match kind(block) {
         Some(Kind::QioDriveArray) => Some((18, "minecraft:generic_9x2")),
-        Some(Kind::QioDashboard) => Some((qio::DASHBOARD_SLOTS, "minecraft:generic_9x6")),
         _ => None,
     };
     if let Some((slots, menu)) = qio_menu {
@@ -17698,21 +17697,9 @@ fn tick_dashboard(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntit
     if at.is_empty() {
         return;
     }
-    let search = get_string(&entity.nbt, "search").unwrap_or_default();
+    // The screen is the viewer now (`pq_*`); what an older save left in the old rows goes back.
     let before = net.clone();
-    if entity.items.len() < qio::DASHBOARD_SLOTS {
-        entity.items.resize(qio::DASHBOARD_SLOTS, None);
-    }
     return_to_network(&mut net, &mut entity.items);
-    let mut list = net.list().into_iter().filter(|(item, _)| qio::matches_search(item, &search));
-    for slot in entity.items.iter_mut().filter(|s| s.is_none()) {
-        let Some((item, _)) = list.next() else {
-            break;
-        };
-        let max = max_stack(game, &item);
-        let n = net.extract(&item, u64::from(max)) as u32;
-        *slot = (n > 0).then(|| stack_of(&item, n));
-    }
     if net != before {
         save_network(game, &net, &at);
     }
@@ -17883,6 +17870,15 @@ pub(super) fn use_qio(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         return true;
     }
     let frequency = game.native_with_mod_block_entity(pos, |m| get_string(&m.nbt, "frequency")).flatten();
+    if name == qio::DASHBOARD {
+        // `GuiQIODashboard`: the same viewer as the portable one, on the block's frequency.
+        if let Some(player) = game.native_acting_player() {
+            PQ_SOURCES.with_borrow_mut(|m| m.insert(player.name, Some(pos)));
+            pq_push_frequency(game);
+            pq_push_items(game, true);
+        }
+        return true;
+    }
     if name == qio::EXPORTER || name == qio::IMPORTER {
         // Their screens hold the filters (`GuiQIOExporter`, `GuiQIOImporter`).
         return false;
@@ -19772,7 +19768,7 @@ struct FreqView {
 
 fn freq_view(game: &Game<'_>) -> Option<([i32; 3], FreqView)> {
     if PQ_OPEN.get() {
-        return PQ_STATE.with_borrow(|s| Some((PQ_POS, FreqView { own: s.own.clone(), list: s.entries.clone(), status: 0, trust: vec![] })));
+        return PQ_STATE.with_borrow(|s| Some((PQ_BLOCK.get().unwrap_or(PQ_POS), FreqView { own: s.own.clone(), list: s.entries.clone(), status: 0, trust: vec![] })));
     }
     if PT_OPEN.get() {
         return PT_STATE.with_borrow(|s| s.as_ref().map(|s| (PT_POS, FreqView { own: s.view.own.clone(), list: s.view.list.clone(), status: s.view.status, trust: vec![] })));
@@ -25718,7 +25714,7 @@ pub(super) fn ui_key(game: &mut Game<'_>, id: &str, key: &str, text: Option<&str
     }
     if id == PQ_ID {
         if pressed {
-            pq_key(game, key, text);
+            pq_typed(game, key, text);
         }
         return;
     }
@@ -30280,6 +30276,27 @@ thread_local! {
     static PQ_TAGS: std::cell::RefCell<std::collections::HashMap<String, Vec<String>>> = std::cell::RefCell::new(Default::default());
     /// On the server: what each viewing player holds on their cursor.
     static PQ_CURSORS: std::cell::RefCell<std::collections::HashMap<String, ItemStack>> = std::cell::RefCell::new(Default::default());
+    /// On the server: the dashboard block a player's viewer is on (None: the one in their hand).
+    static PQ_SOURCES: std::cell::RefCell<std::collections::HashMap<String, Option<[i32; 3]>>> = std::cell::RefCell::new(Default::default());
+    /// On the client: the dashboard block the open viewer is on.
+    static PQ_BLOCK: std::cell::Cell<Option<[i32; 3]>> = const { std::cell::Cell::new(None) };
+}
+
+/// The frequency key the player's viewer works on: None when the viewer is no longer valid (the item left the
+/// hand, the block is gone or out of reach), Some(None) when it has no frequency.
+fn pq_key(game: &mut Game<'_>) -> Option<Option<String>> {
+    let player = game.native_acting_player()?;
+    let source = PQ_SOURCES.with_borrow(|m| m.get(&player.name).copied()).unwrap_or(None);
+    match source {
+        None => pq_held(game).map(|h| custom_data(&h).and_then(|c| get_string(c, FREQUENCY_KEY))),
+        Some(pos) => {
+            let near = (0..3).map(|k| (player.position[k] - f64::from(pos[k]) - 0.5).powi(2)).sum::<f64>() <= 64.0;
+            if !near || block_name(game, pos) != qio::DASHBOARD {
+                return None;
+            }
+            Some(game.native_with_mod_block_entity(pos, |m| get_string(&m.nbt, "frequency")).flatten())
+        }
+    }
 }
 
 fn pq_held(game: &mut Game<'_>) -> Option<ItemStack> {
@@ -30290,6 +30307,9 @@ fn pq_held(game: &mut Game<'_>) -> Option<ItemStack> {
 fn portable_qio_use(game: &mut Game<'_>, claimed: &mut bool) {
     if pq_held(game).is_some() {
         *claimed = true;
+        if let Some(player) = game.native_acting_player() {
+            PQ_SOURCES.with_borrow_mut(|m| m.insert(player.name, None));
+        }
         pq_push_frequency(game);
         pq_push_items(game, true);
     }
@@ -30311,10 +30331,9 @@ fn pq_push_frequency(game: &mut Game<'_>) {
     let Some(player) = game.native_acting_player() else {
         return;
     };
-    let Some(held) = pq_held(game) else {
+    let Some(key) = pq_key(game) else {
         return;
     };
-    let key = custom_data(&held).and_then(|c| get_string(c, FREQUENCY_KEY));
     let list = FREQ_LISTS.lock().ok().and_then(|l| l.get(&2).cloned()).unwrap_or_default();
     let own = key.as_ref().and_then(|k| list.iter().find(|e| &e.key() == k)).cloned();
     let mut out = vec![0, u8::from(own.is_some())];
@@ -30330,10 +30349,9 @@ fn pq_push_frequency(game: &mut Game<'_>) {
 
 /// The network the held dashboard looks at.
 fn pq_network(game: &mut Game<'_>) -> Option<(String, qio::Network, Vec<([i32; 3], usize)>)> {
-    let held = pq_held(game)?;
-    let key = custom_data(&held).and_then(|c| get_string(c, FREQUENCY_KEY))?;
+    let key = pq_key(game)??;
     let list = FREQ_LISTS.lock().ok().and_then(|l| l.get(&2).cloned()).unwrap_or_default();
-    let label = list.iter().find(|e| e.key() == key).map(|e| e.name.clone())?;
+    let label = list.iter().find(|e| e.key() == key).map_or_else(|| key.clone(), |e| e.name.clone());
     let (net, at) = load_network(game, &key);
     Some((label, net, at))
 }
@@ -30343,12 +30361,16 @@ fn pq_push_items(game: &mut Game<'_>, fresh: bool) {
     let Some(player) = game.native_acting_player() else {
         return;
     };
-    if pq_held(game).is_none() {
+    if pq_key(game).is_none() {
         return;
     }
     let cursor = PQ_CURSORS.with_borrow(|c| c.get(&player.name).cloned());
     let net = pq_network(game);
-    let mut out = vec![1, u8::from(fresh)];
+    let block = PQ_SOURCES.with_borrow(|m| m.get(&player.name).copied()).unwrap_or(None);
+    let mut out = vec![1, u8::from(fresh), u8::from(block.is_some())];
+    for c in block.unwrap_or([0; 3]) {
+        out.extend(c.to_be_bytes());
+    }
     match &net {
         Some((label, _, _)) => {
             out.push(1);
@@ -30394,7 +30416,7 @@ fn pq_op_payload(game: &mut Game<'_>, data: &[u8]) {
         }
         return;
     }
-    if pq_held(game).is_none() {
+    if pq_key(game).is_none() {
         if let Some(s) = PQ_CURSORS.with_borrow_mut(|c| c.remove(&player.name)) {
             game.give_or_drop(s);
         }
@@ -30407,7 +30429,7 @@ fn pq_op_payload(game: &mut Game<'_>, data: &[u8]) {
     };
     let cursor = PQ_CURSORS.with_borrow(|c| c.get(&name).cloned());
     match op {
-        0 => {}
+        0 => pq_push_frequency(game),
         // `PacketQIOItemViewerSlotTake`: from the list onto the cursor.
         1 => {
             let (Some(&button), Some(item)) = (data.get(1), item_at(2)) else {
@@ -30564,10 +30586,15 @@ fn pq_payload(data: &[u8]) {
         }
         Some(1) => {
             let mut next = PqState::default();
-            let (Some(&fresh), Some(has)) = (data.get(1), data.get(2)) else {
+            let (Some(&fresh), Some(&block), Some(pos)) = (data.get(1), data.get(2), data.get(3..15)) else {
                 return;
             };
-            at = 3;
+            let int = |i: usize| i32::from_be_bytes([pos[i], pos[i + 1], pos[i + 2], pos[i + 3]]);
+            PQ_BLOCK.set((block == 1).then(|| [int(0), int(4), int(8)]));
+            let Some(has) = data.get(15) else {
+                return;
+            };
+            at = 16;
             if *has == 1 {
                 let Some(n) = data.get(at..at + 2).map(|b| usize::from(u16::from_be_bytes([b[0], b[1]]))) else {
                     return;
@@ -30833,7 +30860,7 @@ fn pq_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         nine_slice(game, batch, "base", 16.0, 4.0, [o[0], o[1], w, h]);
         // The tabs: the frequency (left, 6) and the search bar focus (right, 6).
         pq_draw_tabs(game, batch, o, mouse);
-        let title = "Portable QIO Dashboard";
+        let title = if PQ_BLOCK.get().is_some() { "QIO Dashboard" } else { "Portable QIO Dashboard" };
         let tw = game.native_text_width(title);
         game.native_text(batch, title, [o[0] + (w - tw) / 2.0, o[1] + 5.0], 0x40_4040, false);
         // `GuiInnerScreen(7, 15, imageWidth - 16, 12)`: the frequency.
@@ -31144,12 +31171,12 @@ fn pq_wheel(steps: f32) {
     });
 }
 
-fn pq_key(game: &mut Game<'_>, key: &str, text: Option<&str>) {
+fn pq_typed(game: &mut Game<'_>, key: &str, text: Option<&str>) {
     if PQ_SELECT.get() {
         let game = &*game;
         FREQ_UI.with_borrow_mut(|ui| {
             if ui.text.focused && ui.text.key(key, text, freq::valid_char, freq::MAX_FREQ_LENGTH) == freq::Typed::Enter {
-                submit_frequency_field(game, PQ_POS, ui);
+                submit_frequency_field(game, PQ_BLOCK.get().unwrap_or(PQ_POS), ui);
             }
         });
         return;
