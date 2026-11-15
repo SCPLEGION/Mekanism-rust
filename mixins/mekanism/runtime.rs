@@ -10201,7 +10201,7 @@ fn free_runners_use(game: &mut Game<'_>, claimed: &mut bool) {
 /// ports.
 #[allow(clippy::type_complexity)]
 fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, Vec<[i32; 3]>, [i32; 3], [i32; 3], Vec<[i32; 4]>)> {
-    let (lo, hi, seen) = find_box(game, start, fission::is_frame, fission::MIN_SIZE, fission::MAX_SIZE)?;
+    let (lo, hi, seen) = find_box_axes(game, start, fission::is_frame, [3; 3], [18; 3])?;
     let size = |k: usize| (hi[k] - lo[k] + 1) as u64;
     let mut reactor = fission::Reactor { volume: size(0) * size(1) * size(2), ..Default::default() };
     let mut ports = Vec::new();
@@ -10212,7 +10212,9 @@ fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, V
                 let shell = x == lo[0] || x == hi[0] || y == lo[1] || y == hi[1] || z == lo[2] || z == hi[2];
                 let name = block_name(game, at);
                 if shell {
-                    if !seen.contains(&at) {
+                    // The edges are casing or reactor glass; ports and logic adapters sit in the faces.
+                    let casing = matches!(name, "mekanismgenerators:fission_reactor_casing" | "mekanismgenerators:reactor_glass");
+                    if !seen.contains(&at) || (on_box_edge(lo, hi, at) && !casing) {
                         return None;
                     }
                     reactor.locations += 1;
@@ -10225,22 +10227,20 @@ fn find_reactor(game: &Game<'_>, start: [i32; 3]) -> Option<(fission::Reactor, V
             }
         }
     }
-    // Each column of fuel assemblies: its lowest block and how many are stacked (`FormedAssembly`).
+    // Each column holds fuel assemblies stacked from its lowest block and one control rod directly above them
+    // (`FuelAssembly.validate`); a column with the one and not the other, or a gap, does not form.
     let mut columns = Vec::new();
     for x in lo[0] + 1..hi[0] {
         for z in lo[2] + 1..hi[2] {
-            let mut y = lo[1] + 1;
-            while y < hi[1] {
-                if block_name(game, [x, y, z]) == "mekanismgenerators:fission_fuel_assembly" {
-                    let start = y;
-                    while y < hi[1] && block_name(game, [x, y, z]) == "mekanismgenerators:fission_fuel_assembly" {
-                        y += 1;
-                    }
-                    columns.push([x, start, z, y - start]);
-                } else {
-                    y += 1;
-                }
+            let fuel: Vec<i32> = (lo[1] + 1..hi[1]).filter(|&y| block_name(game, [x, y, z]) == "mekanismgenerators:fission_fuel_assembly").collect();
+            let rods: Vec<i32> = (lo[1] + 1..hi[1]).filter(|&y| block_name(game, [x, y, z]) == "mekanismgenerators:control_rod_assembly").collect();
+            if fuel.is_empty() && rods.is_empty() {
+                continue;
             }
+            if rods.len() != 1 || fuel.is_empty() || fuel.windows(2).any(|w| w[1] != w[0] + 1) || rods[0] != fuel[fuel.len() - 1] + 1 {
+                return None;
+            }
+            columns.push([x, fuel[0], z, fuel.len() as i32]);
         }
     }
     // `FissionReactorValidator.postcheck`: 6 faces per fuel assembly, 2 fewer for each neighbour it touches.
