@@ -30205,15 +30205,37 @@ const PQ_CHANNEL: &str = "mekanism:portable_qio_dashboard";
 /// The position a frequency request carries when it is for the held Portable QIO Dashboard.
 const PQ_POS: [i32; 3] = [i32::MIN, 1, 0];
 /// `qioItemViewerSlotsX` and `qioItemViewerSlotsY`, at their defaults.
-const PQ_SLOTS_X: usize = 8;
-const PQ_SLOTS_Y: usize = 4;
+const PQ_X_DEFAULT: usize = 8;
+const PQ_Y_DEFAULT: usize = 4;
+const PQ_X_RANGE: [usize; 2] = [8, 16];
+const PQ_Y_MIN: usize = 2;
+const PQ_Y_CAP: usize = 48;
 /// `QIOItemViewerContainer.SLOTS_START_Y`.
 const PQ_SLOTS_START_Y: f32 = 43.0;
 const PQ_SORTS: [&str; 4] = ["Name", "Count", "Mod", "Item ID"];
 const PQ_SORT_TIPS: [&str; 4] = ["Sort items by name.", "Sort items by count.", "Sort items by mod.", "Sort items by registry name."];
 
+thread_local! {
+    /// `qioItemViewerSlotsX` and `qioItemViewerSlotsY`, read when the screen opens.
+    static PQ_DIMS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([PQ_X_DEFAULT, PQ_Y_DEFAULT]) };
+    /// The tallest the grid can be for the window's height (`QIOItemViewerContainer.getSlotsYMax`).
+    static PQ_SCREEN_H: std::cell::Cell<f32> = const { std::cell::Cell::new(270.0) };
+}
+
+fn pq_x() -> usize {
+    PQ_DIMS.get()[0]
+}
+
+fn pq_y() -> usize {
+    PQ_DIMS.get()[1]
+}
+
+fn pq_y_max() -> usize {
+    (((PQ_SCREEN_H.get() * 0.05 - 8.0).ceil() as i32) + 1).clamp(PQ_Y_MIN as i32, PQ_Y_CAP as i32) as usize
+}
+
 fn pq_size() -> [f32; 2] {
-    [16.0 + 18.0 * PQ_SLOTS_X as f32 + 18.0, PQ_SLOTS_START_Y + 18.0 * PQ_SLOTS_Y as f32 + 96.0]
+    [16.0 + 18.0 * pq_x() as f32 + 18.0, PQ_SLOTS_START_Y + 18.0 * pq_y() as f32 + 96.0]
 }
 
 #[derive(Clone, Default)]
@@ -30676,6 +30698,11 @@ fn pq_open(game: &mut Game<'_>) {
         });
         let focus = game.native_setting(MOD_ID, "qio_auto_focus").is_none_or(|v| v != "false");
         PQ_AUTOFOCUS.set(focus);
+        PQ_REJECTS.set(game.native_setting(MOD_ID, "qio_rejects_to_inventory").as_deref() == Some("true"));
+        PQ_TARGET_FREQ.set(true);
+        let x = game.native_setting(MOD_ID, "qio_slots_x").and_then(|v| v.parse::<usize>().ok()).unwrap_or(PQ_X_DEFAULT).clamp(PQ_X_RANGE[0], PQ_X_RANGE[1]);
+        let y = game.native_setting(MOD_ID, "qio_slots_y").and_then(|v| v.parse::<usize>().ok()).unwrap_or(PQ_Y_DEFAULT).clamp(PQ_Y_MIN, pq_y_max());
+        PQ_DIMS.set([x, y]);
         let sort = game.native_setting(MOD_ID, "qio_sort_type").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(3);
         let descending = game.native_setting(MOD_ID, "qio_sort_descending").as_deref() == Some("true");
         PQ_UI.with_borrow_mut(|ui| {
@@ -30786,11 +30813,11 @@ fn pq_count_text(count: u64) -> String {
 }
 
 fn pq_grid_rect() -> [f32; 4] {
-    [7.0, PQ_SLOTS_START_Y, 18.0 * PQ_SLOTS_X as f32, 18.0 * PQ_SLOTS_Y as f32]
+    [7.0, PQ_SLOTS_START_Y, 18.0 * pq_x() as f32, 18.0 * pq_y() as f32]
 }
 
 fn pq_bar_rect() -> [f32; 4] {
-    [7.0 + 18.0 * PQ_SLOTS_X as f32 + 4.0, PQ_SLOTS_START_Y, 14.0, 18.0 * PQ_SLOTS_Y as f32]
+    [7.0 + 18.0 * pq_x() as f32 + 4.0, PQ_SLOTS_START_Y, 14.0, 18.0 * pq_y() as f32]
 }
 
 /// Where the player's slot `i` (0..36, hotbar last) is, its frame.
@@ -30803,12 +30830,12 @@ fn pq_inv_rect(i: usize) -> [f32; 4] {
 
 fn pq_dropdown_rect(open: bool) -> [f32; 4] {
     let [w, _] = pq_size();
-    [w - 63.0, PQ_SLOTS_START_Y + 18.0 * PQ_SLOTS_Y as f32 + 1.0, 41.0, if open { 12.0 + 10.0 * PQ_SORTS.len() as f32 + 1.0 } else { 12.0 }]
+    [w - 63.0, PQ_SLOTS_START_Y + 18.0 * pq_y() as f32 + 1.0, 41.0, if open { 12.0 + 10.0 * PQ_SORTS.len() as f32 + 1.0 } else { 12.0 }]
 }
 
 fn pq_direction_rect() -> [f32; 4] {
     let [w, _] = pq_size();
-    [w - 9.0 - 12.0, PQ_SLOTS_START_Y + 18.0 * PQ_SLOTS_Y as f32 + 1.0, 12.0, 12.0]
+    [w - 9.0 - 12.0, PQ_SLOTS_START_Y + 18.0 * pq_y() as f32 + 1.0, 12.0, 12.0]
 }
 
 fn pq_search_rect() -> [f32; 4] {
@@ -30817,8 +30844,8 @@ fn pq_search_rect() -> [f32; 4] {
 }
 
 fn pq_scroll_first(ui: &PqUi) -> usize {
-    let rows = ui.shown.len().div_ceil(PQ_SLOTS_X) as i32;
-    tw_first(ui.scroll, rows, PQ_SLOTS_Y as i32).max(0) as usize
+    let rows = ui.shown.len().div_ceil(pq_x()) as i32;
+    tw_first(ui.scroll, rows, pq_y() as i32).max(0) as usize
 }
 
 fn pq_slot_at(ui: &PqUi, at: [f32; 2]) -> Option<usize> {
@@ -30833,7 +30860,7 @@ fn pq_slot_at(ui: &PqUi, at: [f32; 2]) -> Option<usize> {
     if !(1.0..17.0).contains(&ix) || !(1.0..17.0).contains(&iy) {
         return None;
     }
-    let index = (cy + pq_scroll_first(ui)) * PQ_SLOTS_X + cx;
+    let index = (cy + pq_scroll_first(ui)) * pq_x() + cx;
     (index < ui.shown.len()).then_some(index)
 }
 
@@ -30843,6 +30870,12 @@ fn pq_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         return;
     }
     pq_refresh(game);
+    // `QIOItemViewerContainer.getSlotsYMax` follows the window: a grid too tall for it is cut down.
+    PQ_SCREEN_H.set(batch.height);
+    PQ_NOW.set(game.ticks as u64);
+    if pq_y() > pq_y_max() {
+        PQ_DIMS.set([pq_x(), pq_y_max()]);
+    }
     let [w, h] = pq_size();
     let o = [((batch.width - w) / 2.0).floor(), ((batch.height - h) / 2.0).floor()];
     let cursor = game.native_cursor();
@@ -30881,11 +30914,11 @@ fn pq_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         nine_slice_tinted(game, batch, if ui.shown.is_empty() { "slot/dark" } else { "slot/normal" }, [18.0, 18.0], 1.0, [o[0] + gx, o[1] + gy, gw, gh], 0xFFFF_FFFF);
         let first = pq_scroll_first(ui);
         let hovered = pq_slot_at(ui, cursor);
-        for i in 0..PQ_SLOTS_X * PQ_SLOTS_Y {
-            let Some((id, count)) = ui.shown.get(first * PQ_SLOTS_X + i) else {
+        for i in 0..pq_x() * pq_y() {
+            let Some((id, count)) = ui.shown.get(first * pq_x() + i) else {
                 break;
             };
-            let (sx, sy) = (o[0] + gx + 18.0 * (i % PQ_SLOTS_X) as f32, o[1] + gy + 18.0 * (i / PQ_SLOTS_X) as f32);
+            let (sx, sy) = (o[0] + gx + 18.0 * (i % pq_x()) as f32, o[1] + gy + 18.0 * (i / pq_x()) as f32);
             game.native_item(batch, id, [sx + 1.0, sy + 1.0], 16.0);
             let text = if *count == 0 { Some("0".to_owned()) } else if *count > 1 { Some(pq_count_text(*count)) } else { None };
             if let Some(text) = text {
@@ -30901,14 +30934,14 @@ fn pq_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
             }
         }
         if let Some(i) = hovered {
-            let k = i - first * PQ_SLOTS_X;
-            game.native_fill(batch, [o[0] + gx + 18.0 * (k % PQ_SLOTS_X) as f32 + 1.0, o[1] + gy + 18.0 * (k / PQ_SLOTS_X) as f32 + 1.0, 16.0, 16.0], 0x80_FFFFFF);
+            let k = i - first * pq_x();
+            game.native_fill(batch, [o[0] + gx + 18.0 * (k % pq_x()) as f32 + 1.0, o[1] + gy + 18.0 * (k / pq_x()) as f32 + 1.0, 16.0, 16.0], 0x80_FFFFFF);
         }
         // The bar (`GuiScrollBar`): a holder with the thumb riding in it.
         let [bx, by, _, bh] = pq_bar_rect();
         nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, [o[0] + bx, o[1] + by, 14.0, bh], 0xFFFF_FFFF);
-        let rows = ui.shown.len().div_ceil(PQ_SLOTS_X);
-        let scrolls = rows > PQ_SLOTS_Y;
+        let rows = ui.shown.len().div_ceil(pq_x());
+        let scrolls = rows > pq_y();
         let travel = bh - 2.0 - 15.0;
         let thumb = if scrolls { ((ui.scroll * travel) as i32).clamp(0, travel as i32) as f32 } else { 0.0 };
         sprite(game, batch, if scrolls { "scroll/bar" } else { "scroll/bar_inactive" }, [0.0, 0.0, 12.0, 15.0], [o[0] + bx + 1.0, o[1] + by + 1.0 + thumb, 12.0, 15.0]);
@@ -31000,8 +31033,18 @@ fn pq_tooltips(state: &PqState, ui: &PqUi, mouse: [f32; 2], w: f32, lines: &mut 
     if inside(mouse, PQ_TAB_FREQ) {
         lines.push("QIO Frequency Select".to_owned());
     }
-    if inside(mouse, [w, 6.0, 26.0, 18.0]) {
-        lines.push("Auto focus the QIO search bar when opening a dashboard.".to_owned());
+    if inside(mouse, [w + 7.0, 10.0, 18.0, 18.0]) {
+        lines.push(if PQ_AUTOFOCUS.get() { "Don't automatically focus the QIO search bar when opening a dashboard." } else { "Auto focus the QIO search bar when opening a dashboard." }.to_owned());
+    }
+    if inside(mouse, PQ_TAB_TARGET) {
+        lines.push(if PQ_TARGET_FREQ.get() { "Prioritize moving items to the crafting window when holding shift" } else { "Prioritize moving items to the frequency when holding shift" }.to_owned());
+    }
+    if inside(mouse, pq_tab_rejects(pq_size()[1])) {
+        lines.push(if PQ_REJECTS.get() { "Prioritize moving items left in the crafting grid to the player's inventory when overriding with a recipe viewer" } else { "Prioritize moving items left in the crafting grid to the frequency when overriding with a recipe viewer" }.to_owned());
+    }
+    let rz = pq_resize_rect(PQ_SCREEN_H.get(), ui.origin[1]);
+    if PQ_COMPENSATE.get() > PQ_NOW.get() && inside(mouse, [rz[0] + 4.0, rz[1] + 5.0, 19.0, 9.0]) && pq_y() >= pq_y_max() {
+        lines.push("What are you trying to compensate for?".to_owned());
     }
 }
 
@@ -31010,6 +31053,7 @@ const PQ_TAB_FREQ: [f32; 4] = [-22.0, 10.0, 18.0, 18.0];
 
 fn pq_draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2], mouse: [f32; 2]) {
     let [w, _] = pq_size();
+    let batch_h = batch.height;
     nine_slice_tinted(game, batch, "holder_left", [26.0, 9.0], 4.0, [o[0] - 26.0, o[1] + 6.0, 26.0, 26.0], 0xFFFF_FFFF);
     let b = [o[0] + PQ_TAB_FREQ[0] + 1.0, o[1] + PQ_TAB_FREQ[1], 18.0, 18.0];
     nine_slice_tinted(game, batch, if inside(mouse, PQ_TAB_FREQ) { "button_focus" } else { "button" }, [200.0, 20.0], 2.0, b, 0xFFFF_FFFF);
@@ -31020,10 +31064,63 @@ fn pq_draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [
     let r = [o[0] + w + 7.0, o[1] + 10.0, 18.0, 18.0];
     nine_slice_tinted(game, batch, if inside(mouse, [w + 7.0, 10.0, 18.0, 18.0]) { "button_focus" } else { "button" }, [200.0, 20.0], 2.0, r, 0xFFFF_FFFF);
     sprite(game, batch, if on { "button/searchbar_autofocus_on" } else { "button/searchbar_autofocus_off" }, [0.0, 0.0, 18.0, 18.0], r);
+    // `GuiTargetDirectionTab` (left, 60) and the rejects toggle (left, imageHeight - 35).
+    let [_, h] = pq_size();
+    for (top, rect, icon) in [
+        (60.0, PQ_TAB_TARGET, if PQ_TARGET_FREQ.get() { "button/crafting_out" } else { "button/crafting_in" }),
+        (h - 35.0, pq_tab_rejects(h), if PQ_REJECTS.get() { "button/recipe_viewer_frequency" } else { "button/recipe_viewer_inventory" }),
+    ] {
+        nine_slice_tinted(game, batch, "holder_left", [26.0, 9.0], 4.0, [o[0] - 26.0, o[1] + top, 26.0, 26.0], 0xFFFF_FFFF);
+        let b = [o[0] + rect[0] + 1.0, o[1] + rect[1], 18.0, 18.0];
+        nine_slice_tinted(game, batch, if inside(mouse, rect) { "button_focus" } else { "button" }, [200.0, 20.0], 2.0, b, 0xFFFF_FFFF);
+        sprite(game, batch, icon, [0.0, 0.0, 18.0, 18.0], b);
+    }
+    // `GuiResizeControls`: a 40 px holder with plus above minus and "Height" between.
+    let rz = pq_resize_rect(batch_h, o[1]);
+    nine_slice_tinted(game, batch, "holder_left", [26.0, 9.0], 4.0, [o[0] + rz[0], o[1] + rz[1], rz[2], rz[3]], 0xFFFF_FFFF);
+    for (dy, icon, active) in [(5.0, "button/plus", pq_y() < pq_y_max()), (26.0, "button/minus", pq_y() > PQ_Y_MIN)] {
+        let r = [rz[0] + 4.0, rz[1] + dy, 19.0, 9.0];
+        let abs = [o[0] + r[0], o[1] + r[1], r[2], r[3]];
+        nine_slice_tinted(game, batch, if !active { "button_inactive" } else if inside(mouse, r) { "button_focus" } else { "button" }, [200.0, 20.0], 2.0, abs, 0xFFFF_FFFF);
+        sprite(game, batch, icon, [0.0, 0.0, 19.0, 9.0], abs);
+    }
+    let hw = game.native_text_width("Height") * 0.6;
+    game.native_text_scaled(batch, "Height", [o[0] + rz[0] + 2.0 + (22.0 - hw) / 2.0, o[1] + rz[1] + 16.0], 0x40_4040, 0.6);
 }
 
 thread_local! {
     static PQ_AUTOFOCUS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// `qioRejectsToInventory`, and `shiftClickIntoFrequency` (the target direction tab).
+    static PQ_REJECTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PQ_TARGET_FREQ: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Ticks the resize tab's joke tooltip still shows.
+    static PQ_COMPENSATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PQ_NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `GuiResizeControls`: the left holder at the window's middle, the plus at its top and the minus at its bottom.
+fn pq_resize_rect(screen_h: f32, top: f32) -> [f32; 4] {
+    [-26.0, (screen_h / 2.0).floor() - top, 26.0, 40.0]
+}
+
+const PQ_TAB_TARGET: [f32; 4] = [-22.0, 64.0, 18.0, 18.0];
+
+fn pq_tab_rejects(h: f32) -> [f32; 4] {
+    [-22.0, h - 35.0 + 4.0, 18.0, 18.0]
+}
+
+fn pq_resize(game: &mut Game<'_>, grow: bool, to_limit: bool) {
+    let y = pq_y();
+    let max = pq_y_max();
+    let next = match (grow, to_limit) {
+        (true, true) => max,
+        (true, false) => (y + 1).min(max),
+        (false, true) => PQ_Y_MIN,
+        (false, false) => y.saturating_sub(1).max(PQ_Y_MIN),
+    };
+    PQ_DIMS.set([pq_x(), next]);
+    PQ_UI.with_borrow_mut(|ui| ui.scroll = 0.0);
+    game.native_set_setting(MOD_ID, "qio_slots_y", &next.to_string());
 }
 
 /// `GuiQIOItemFrequencySelect`: the selector over a 176 x 155 panel, the back button at (6, 6).
@@ -31070,6 +31167,7 @@ fn pq_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
     let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);
     let mut after: Option<Vec<u8>> = None;
     let mut select = false;
+    let mut resize: Option<(bool, bool)> = None;
     PQ_UI.with_borrow_mut(|ui| {
         let o = ui.origin;
         let m = [at[0] - o[0], at[1] - o[1]];
@@ -31100,6 +31198,32 @@ fn pq_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
             select = true;
             return;
         }
+        let [_, h] = pq_size();
+        if button == 0 && inside(m, PQ_TAB_TARGET) {
+            PQ_TARGET_FREQ.set(!PQ_TARGET_FREQ.get());
+            return;
+        }
+        if button == 0 && inside(m, pq_tab_rejects(h)) {
+            let on = !PQ_REJECTS.get();
+            PQ_REJECTS.set(on);
+            game.native_set_setting(MOD_ID, "qio_rejects_to_inventory", if on { "true" } else { "false" });
+            return;
+        }
+        let rz = pq_resize_rect(PQ_SCREEN_H.get(), o[1]);
+        if button == 0 && inside(m, [rz[0] + 4.0, rz[1] + 5.0, 19.0, 9.0]) {
+            if pq_y() < pq_y_max() {
+                resize = Some((true, shift));
+            } else {
+                PQ_COMPENSATE.set(game.ticks as u64 + 100);
+            }
+            return;
+        }
+        if button == 0 && inside(m, [rz[0] + 4.0, rz[1] + 26.0, 19.0, 9.0]) {
+            if pq_y() > PQ_Y_MIN {
+                resize = Some((false, shift));
+            }
+            return;
+        }
         if button == 0 && inside(m, [w + 7.0, 10.0, 18.0, 18.0]) {
             let on = !PQ_AUTOFOCUS.get();
             PQ_AUTOFOCUS.set(on);
@@ -31108,8 +31232,8 @@ fn pq_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
         }
         // The scroll bar: a press on the thumb starts dragging it.
         let bar = pq_bar_rect();
-        let rows = ui.shown.len().div_ceil(PQ_SLOTS_X);
-        if rows > PQ_SLOTS_Y && button == 0 {
+        let rows = ui.shown.len().div_ceil(pq_x());
+        if rows > pq_y() && button == 0 {
             let travel = bar[3] - 2.0 - 15.0;
             let thumb = ((ui.scroll * travel) as i32).clamp(0, travel as i32) as f32;
             let top = bar[1] + 1.0 + thumb;
@@ -31159,6 +31283,9 @@ fn pq_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
         FREQ_UI.with_borrow_mut(|ui| *ui = FreqUi::default());
         PQ_SELECT.set(true);
     }
+    if let Some((grow, limit)) = resize {
+        pq_resize(game, grow, limit);
+    }
     if let Some(d) = after {
         pq_send(game, &d);
     }
@@ -31166,8 +31293,8 @@ fn pq_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
 
 fn pq_wheel(steps: f32) {
     PQ_UI.with_borrow_mut(|ui| {
-        let rows = ui.shown.len().div_ceil(PQ_SLOTS_X) as i32;
-        tw_notch(&mut ui.scroll, steps > 0.0, rows, PQ_SLOTS_Y as i32, 1);
+        let rows = ui.shown.len().div_ceil(pq_x()) as i32;
+        tw_notch(&mut ui.scroll, steps > 0.0, rows, pq_y() as i32, 1);
     });
 }
 
