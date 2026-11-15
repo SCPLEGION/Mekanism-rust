@@ -1056,7 +1056,8 @@ fn tick_chem_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize,
     let mut f = Factory::new(n, usage, upgrades(&entity.nbt));
     f.machine.energy.stored = get_long(&entity.nbt, "energy").min(f.machine.energy.capacity);
     discharge_slot(entity, FACTORY_ENERGY, &mut f.machine.energy);
-    let chem_fraction = upgrades(&entity.nbt).fraction_of(Upgrade::Chemical);
+    let up = upgrades(&entity.nbt);
+    let chem_fraction = up.fraction_of(Upgrade::Chemical);
     let ticks = f.machine.ticks_required.max(1);
     let mut tank = get_tank(&entity.nbt, "chemical", factory::chemical_per_process(recipe_kind) * n as u64);
     let saved = |key: &str| match entity.nbt.get(&JavaString::from(key)) {
@@ -1110,7 +1111,17 @@ fn tick_chem_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize,
         let per_tick = recipe_kind != "infusing";
         // The chemical upgrade spares chemical (`UpgradeUtils.getChemicalUsageMultiplier`): 200 base ticks, `M^-chemical` of the amount.
         let total = (r.chemical_amount as f64 * f64::from(chem::ADVANCED_TICKS) * mekanism_core::upgrades::max_upgrade_multiplier().powf(-chem_fraction)).round() as u64;
-        let want = if per_tick { (total * u64::from(progress[i] + 1) / u64::from(ticks)).saturating_sub(used[i]) } else { 0 };
+        // The injecting and purifying factories draw it statistically (`randomizedConsumption`), the others spread the total.
+        let chemical_upgrades = matches!(recipe_kind, "injecting" | "purifying");
+        let statistical = chemical_upgrades && usage_const("randomizedConsumption", 1) != 0;
+        let want = if !per_tick {
+            0
+        } else if r.chemical_amount == 1 {
+            let roll = roll(entity);
+            chemical_need(&up, chem::ADVANCED_TICKS, ticks, progress[i], used[i].min(u64::from(u32::MAX)) as u32, statistical, chemical_upgrades, roll)
+        } else {
+            (total * u64::from(progress[i] + 1) / u64::from(ticks)).saturating_sub(used[i])
+        };
         let has_chemical = tank.chemical.as_deref() == Some(r.chemical) && tank.amount >= if per_tick { want } else { r.chemical_amount };
         let has_energy = f.machine.energy.stored >= f.machine.usage;
         warn[i] = i32::from(!has_energy) | i32::from(!has_chemical) << 1 | i32::from(!fits) << 2;
