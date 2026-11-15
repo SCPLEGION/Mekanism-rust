@@ -4793,7 +4793,7 @@ fn miner_found(nbt: &Compound) -> Vec<i32> {
 
 /// `TileEntityDigitalMiner.reset`: forgets the search and what it found; the miner stops.
 fn miner_reset(nbt: &mut Compound) {
-    for key in ["mstate", "cursor", "running", "delay", "to_mine", "full"] {
+    for key in ["mstate", "cursor", "running", "delay", "to_mine"] {
         put_int(nbt, key, 0);
     }
     nbt.remove(&JavaString::from("found"));
@@ -4999,7 +4999,6 @@ fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fo
     let Some(&index) = found.last() else {
         return false;
     };
-    put_int(&mut entity.nbt, "full", 0);
     let region = miner_region(&entity.nbt);
     let at = region.position(pos, index as u32);
     let state = game.world.block(at[0], at[1], at[2]);
@@ -5033,8 +5032,6 @@ fn mine_next(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, fo
     for stack in drops.into_iter().filter(|s| s.count > 0 && &*s.item != "minecraft:air") {
         // Nothing fits: it waits for room (`tryInsert` fails) and the block stays.
         if miner_insert(game, &mut slots, stack).is_some() {
-            // `hasOverflow`: the screen's `NO_SPACE_IN_OUTPUT_OVERFLOW` warning.
-            put_int(&mut entity.nbt, "full", 1);
             return false;
         }
     }
@@ -12878,7 +12875,7 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
 fn miner_flags(nbt: &Compound) -> u32 {
     let flag = |key: &str, bit: u32| u32::from(get_int(nbt, key) == 1) << bit;
     let low = u32::from(miner_usage(nbt) > mekanism_core::miner::STORAGE) << 10;
-    get_int(nbt, "warn") & 1 | u32::from(get_int(nbt, "full") == 1) << 2 | (get_int(nbt, "mstate") & 3) << 4 | flag("running", 6) | flag("eject", 7) | flag("pull", 8) | flag("silk", 9) | low
+    get_int(nbt, "warn") & 1 | (get_int(nbt, "mstate") & 3) << 4 | flag("running", 6) | flag("eject", 7) | flag("pull", 8) | flag("silk", 9) | low
 }
 
 /// What a machine takes a tick before upgrades (its `getEnergyPerTick`), for the machines whose bar warns.
@@ -17128,9 +17125,7 @@ fn warning_bits(block: &str, l: &Layout, data: &[i32]) -> u32 {
         });
     }
     if kind(block) == Some(Kind::DigitalMiner) {
-        // Bit 0 is the energy warning, bit 2 the overflow warning (bit 6 here, after the oredictionificator's 4 and 5).
-        let bits = (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4;
-        return bits & 1 | (bits >> 2 & 1) << 6;
+        return (data.get(redstone_slot(l)).copied().unwrap_or(0).max(0) as u32) >> 4 & 15;
     }
     // `WarningType.INVALID_OREDICTIONIFICATOR_FILTER`: bit 4 here.
     if is_od(block) {
@@ -17157,7 +17152,6 @@ fn warnings(block: &str, l: &Layout, data: &[i32]) -> Vec<&'static str> {
         (3, " - Input does not produce output"),
         (1, " - No matching recipe or not enough input"),
         (2, " - Not enough room in output"),
-        (6, " - Not enough room in output, overflow stored in internal buffer"),
         (0, " - Not enough energy to operate"),
         (4, " - Filter is no longer valid or supported"),
     ] {
