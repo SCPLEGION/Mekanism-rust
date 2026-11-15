@@ -11999,21 +11999,32 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
         }
         if kind(block) == Some(Kind::Assemblicator) {
             rules[fa::FORMULA_SLOT] = SlotRule::Items(vec![fa::FORMULA_ITEM.to_owned()]);
-            if let Ok(g) = ASM_RULES.lock()
-                && let Some(state) = g.as_ref()
-            {
-                for (i, allowed) in state.inputs.iter().enumerate() {
-                    if let (Some(items), Some(slot)) = (allowed, rules.get_mut(fa::INPUT_FIRST + i)) {
-                        *slot = SlotRule::Items(items.clone());
-                    }
-                }
-                // `FormulaicCraftingSlot`: in auto mode only the machine fills the grid.
-                if state.auto {
-                    for slot in rules.iter_mut().skip(fa::GRID_FIRST).take(fa::GRID) {
-                        *slot = SlotRule::Refuse;
-                    }
-                }
-            }
+        }
+    }
+}
+
+/// What the slots of the machine at `pos` take beyond what its kind says (hook point `native_slot_rules_at`): the
+/// Formulaic Assemblicator's input slots follow its formula and stock control, its grid is locked in auto mode.
+pub(super) fn slot_rules_at(pos: [i32; 3], block: &str, rules: &mut Vec<horizon_client::lan::menu::SlotRule>) {
+    use horizon_client::lan::menu::SlotRule;
+    if kind(block) != Some(Kind::Assemblicator) {
+        return;
+    }
+    let Ok(g) = ASM_RULES.lock() else {
+        return;
+    };
+    let Some(state) = g.as_ref().and_then(|m| m.get(&pos)) else {
+        return;
+    };
+    for (i, allowed) in state.inputs.iter().enumerate() {
+        if let (Some(items), Some(slot)) = (allowed, rules.get_mut(fa::INPUT_FIRST + i)) {
+            *slot = SlotRule::Items(items.clone());
+        }
+    }
+    // `FormulaicCraftingSlot`: in auto mode only the machine fills the grid.
+    if state.auto {
+        for slot in rules.iter_mut().skip(fa::GRID_FIRST).take(fa::GRID) {
+            *slot = SlotRule::Refuse;
         }
     }
 }
@@ -22453,11 +22464,12 @@ struct AsmRules {
     inputs: Vec<Option<Vec<String>>>,
 }
 
-static ASM_RULES: std::sync::Mutex<Option<AsmRules>> = std::sync::Mutex::new(None);
+/// Each assemblicator's, by position (`native_slot_rules_at`, Horizon API 77).
+static ASM_RULES: std::sync::Mutex<Option<std::collections::HashMap<[i32; 3], AsmRules>>> = std::sync::Mutex::new(None);
 /// The items a formula's recipe takes at some position, for the formula they were worked out for.
 static ASM_VALID: std::sync::Mutex<Option<(String, Vec<String>)>> = std::sync::Mutex::new(None);
 
-fn asm_publish_rules(game: &Game<'_>, entity: &ModBlockEntity, formula: Option<&Formula>, stock: bool, auto: bool) {
+fn asm_publish_rules(game: &Game<'_>, pos: [i32; 3], entity: &ModBlockEntity, formula: Option<&Formula>, stock: bool, auto: bool) {
     let present = entity
         .items
         .get(fa::FORMULA_SLOT)
@@ -22496,7 +22508,7 @@ fn asm_publish_rules(game: &Game<'_>, entity: &ModBlockEntity, formula: Option<&
         }
     }
     if let Ok(mut g) = ASM_RULES.lock() {
-        *g = Some(AsmRules { auto, inputs });
+        g.get_or_insert_with(Default::default).insert(pos, AsmRules { auto, inputs });
     }
 }
 
@@ -22652,7 +22664,7 @@ fn tick_assemblicator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
             }
         }
     }
-    asm_publish_rules(game, entity, formula.as_ref(), stock, auto);
+    asm_publish_rules(game, pos, entity, formula.as_ref(), stock, auto);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_int(&mut entity.nbt, "auto", u32::from(auto));
