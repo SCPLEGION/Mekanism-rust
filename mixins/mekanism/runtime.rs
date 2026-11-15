@@ -1801,6 +1801,11 @@ pub(super) fn rotor_seen(pos: [i32; 3], id: &str) {
             p.entry(pos).or_insert(false);
         });
     }
+    if is_transporter(id) {
+        TRANSPORTERS.with_borrow_mut(|t| {
+            t.insert(pos);
+        });
+    }
     if id == "mekanismgenerators:wind_generator" {
         ROTORS.with_borrow_mut(|r| {
             r.entry(pos).or_insert((0.0, 0));
@@ -2923,6 +2928,7 @@ pub(super) fn world_items(game: &Game<'_>, items: &mut Vec<super::native_hooks::
             });
         }
     });
+    transit_items(game, items);
     for f in bin_faces(game) {
         items.push(super::native_hooks::NativeWorldItem {
             item: f.item,
@@ -5244,10 +5250,12 @@ pub(super) fn use_sorter(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 }
 
 /// Walks the transporters joined to `start`, nearest first, offering `stack` to every container beside
-/// them except `source`. Returns what no container took.
+/// them except `source`. Returns what no container took. What a container took is shown travelling along the
+/// transporters that led to it (`transit_seen`).
 fn route_items(game: &mut Game<'_>, start: [i32; 3], source: [i32; 3], stack: ItemStack) -> Option<ItemStack> {
     let mut seen = std::collections::HashSet::from([start]);
     let mut queue = std::collections::VecDeque::from([start]);
+    let mut parent: std::collections::HashMap<[i32; 3], [i32; 3]> = std::collections::HashMap::new();
     let mut stack = Some(stack);
     while let Some(node) = queue.pop_front() {
         for (_, d) in DIRECTIONS {
@@ -5258,18 +5266,135 @@ fn route_items(game: &mut Game<'_>, start: [i32; 3], source: [i32; 3], stack: It
             if is_transporter(block_name(game, at)) {
                 if seen.len() < 512 {
                     seen.insert(at);
+                    parent.insert(at, node);
                     queue.push_back(at);
                 }
                 continue;
             }
             let face = horizon_core::geometry::Direction::ALL[face_index([-d[0], -d[1], -d[2]])];
-            stack = game.native_insert_item(at, face, stack.take()?);
+            let offered = stack.take()?;
+            let (item, before) = (offered.item.to_string(), offered.count);
+            stack = game.native_insert_item(at, face, offered);
+            let taken = before - stack.as_ref().map_or(0, |s| s.count);
+            if taken > 0 {
+                let mut path = vec![node];
+                while let Some(&p) = parent.get(path.last().unwrap()) {
+                    path.push(p);
+                }
+                path.reverse();
+                record_transit(game, start, &item, source, &path, at);
+            }
             if stack.is_none() {
                 return None;
             }
         }
     }
     stack
+}
+
+/// What a transporter shows of the stacks that travel through it (`TransporterStack` on the client): the item, the
+/// transporters it passes (from `start`), the container it ends in and when it left, in its `client` compound.
+fn record_transit(game: &mut Game<'_>, start: [i32; 3], item: &str, source: [i32; 3], path: &[[i32; 3]], dest: [i32; 3]) {
+    let now = game.world.game_time.max(0) as u64;
+    let speed = transporter_speed(block_name(game, start));
+    let ticks_per_block = (100 / speed.max(1)).max(1);
+    let mut e = Compound::new();
+    e.insert("i".into(), Tag::String(item.into()));
+    e.insert("s".into(), Tag::IntArray(source.to_vec()));
+    e.insert("p".into(), Tag::IntArray(path.iter().flatten().copied().collect()));
+    e.insert("d".into(), Tag::IntArray(dest.to_vec()));
+    put_long(&mut e, "t", now);
+    put_int(&mut e, "tpb", ticks_per_block);
+    game.native_with_mod_block_entity(start, |m| {
+        let mut client = match m.nbt.get(&JavaString::from("client")) {
+            Some(Tag::Compound(c)) => c.clone(),
+            _ => Compound::new(),
+        };
+        let mut list: Vec<Tag> = match client.get(&JavaString::from("transit")) {
+            Some(Tag::List(l)) => l.clone(),
+            _ => vec![],
+        };
+        // Drop what has arrived; the latest few are enough to draw.
+        list.retain(|t| matches!(t, Tag::Compound(c) if now.saturating_sub(get_long(c, "t")) < 20 * 20));
+        if list.len() < 16 {
+            list.push(Tag::Compound(e));
+        }
+        client.insert("transit".into(), Tag::List(list));
+        m.nbt.insert("client".into(), Tag::Compound(client));
+    });
+    game.native_sync_block_entity(start);
+}
+
+/// `TierConfig` `<tier>Speed` of a logistical transporter: progress a tick (100 is a block).
+fn transporter_speed(id: &str) -> u32 {
+    let name = id.strip_prefix("mekanism:").unwrap_or(id);
+    let (tier, default) = [("basic", 5), ("advanced", 10), ("elite", 20), ("ultimate", 50)].into_iter().find(|(t, _)| name.starts_with(t)).unwrap_or(("basic", 5));
+    mekanism_core::config_files::active_int("tiers", "transmitters.items", &format!("{tier}Speed"), default).max(1) as u32
+}
+
+thread_local! {
+    /// The logistical transporters this client has heard of, and when it first saw each stack travel (by transporter, stack).
+    static TRANSPORTERS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(std::collections::HashSet::new());
+    static TRANSIT_SEEN: std::cell::RefCell<std::collections::HashMap<([i32; 3], u64), f32>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The items moving along the transporters (hook point `native_world_items`): each travels from the face of its
+/// source through the block centres of the transporters to the face of the container that took it, at the tier's speed.
+fn transit_items(game: &Game<'_>, items: &mut Vec<super::native_hooks::NativeWorldItem>) {
+    let time = game.ticks as f32 + game.clock.fraction() as f32;
+    let points = |c: &Compound| -> Option<Vec<[f64; 3]>> {
+        let center = |p: &[i32]| [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
+        let (Some(Tag::IntArray(src)), Some(Tag::IntArray(path)), Some(Tag::IntArray(dest))) = (c.get(&JavaString::from("s")), c.get(&JavaString::from("p")), c.get(&JavaString::from("d"))) else {
+            return None;
+        };
+        let nodes: Vec<[f64; 3]> = path.chunks(3).filter(|p| p.len() == 3).map(center).collect();
+        let (first, last) = (*nodes.first()?, *nodes.last()?);
+        let mid = |a: [f64; 3], b: [f64; 3]| [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0, (a[2] + b[2]) / 2.0];
+        let mut out = vec![mid(center(src), first)];
+        out.extend(nodes);
+        out.push(mid(last, center(dest)));
+        Some(out)
+    };
+    TRANSPORTERS.with_borrow(|set| {
+        for pos in set {
+            let Some((_, client)) = game.native_client_block_entity(*pos) else {
+                continue;
+            };
+            let Some(Tag::List(list)) = client.get(&JavaString::from("transit")) else {
+                continue;
+            };
+            for tag in list {
+                let Tag::Compound(c) = tag else {
+                    continue;
+                };
+                let (Some(item), Some(line)) = (get_string(c, "i"), points(c)) else {
+                    continue;
+                };
+                let key = (*pos, get_long(c, "t"));
+                let start = TRANSIT_SEEN.with_borrow_mut(|m| *m.entry(key).or_insert(time));
+                let per_block = get_int(c, "tpb").max(1) as f32;
+                let travelled = (time - start) / per_block;
+                let length = (line.len() - 1) as f32;
+                if travelled >= length || travelled < 0.0 {
+                    continue;
+                }
+                let segment = (travelled.floor() as usize).min(line.len() - 2);
+                let f = f64::from(travelled - segment as f32);
+                let (a, b) = (line[segment], line[segment + 1]);
+                let at = [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f - 0.2, a[2] + (b[2] - a[2]) * f];
+                let matrix = glam::DMat4::from_translation(glam::DVec3::from_array(at)) * glam::DMat4::from_scale(glam::DVec3::splat(0.5));
+                items.push(super::native_hooks::NativeWorldItem {
+                    item,
+                    matrix: matrix.to_cols_array(),
+                    light_at: *pos,
+                    seed: key.1 as i32,
+                    ground: true,
+                });
+            }
+        }
+    });
+    // Forget the ones long over.
+    TRANSIT_SEEN.with_borrow_mut(|m| m.retain(|_, start| time - *start < 20.0 * 20.0));
 }
 
 // --- Induction Matrix --------------------------------------------------------------------------------
