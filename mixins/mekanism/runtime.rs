@@ -1056,7 +1056,8 @@ fn tick_chem_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize,
     let mut f = Factory::new(n, usage, upgrades(&entity.nbt));
     f.machine.energy.stored = get_long(&entity.nbt, "energy").min(f.machine.energy.capacity);
     discharge_slot(entity, FACTORY_ENERGY, &mut f.machine.energy);
-    let chem_fraction = upgrades(&entity.nbt).fraction_of(Upgrade::Chemical);
+    let up = upgrades(&entity.nbt);
+    let chem_fraction = up.fraction_of(Upgrade::Chemical);
     let ticks = f.machine.ticks_required.max(1);
     let mut tank = get_tank(&entity.nbt, "chemical", factory::chemical_per_process(recipe_kind) * n as u64);
     let saved = |key: &str| match entity.nbt.get(&JavaString::from(key)) {
@@ -1110,7 +1111,17 @@ fn tick_chem_factory(game: &mut Game<'_>, entity: &mut ModBlockEntity, n: usize,
         let per_tick = recipe_kind != "infusing";
         // The chemical upgrade spares chemical (`UpgradeUtils.getChemicalUsageMultiplier`): 200 base ticks, `M^-chemical` of the amount.
         let total = (r.chemical_amount as f64 * f64::from(chem::ADVANCED_TICKS) * mekanism_core::upgrades::max_upgrade_multiplier().powf(-chem_fraction)).round() as u64;
-        let want = if per_tick { (total * u64::from(progress[i] + 1) / u64::from(ticks)).saturating_sub(used[i]) } else { 0 };
+        // The injecting and purifying factories draw it statistically (`randomizedConsumption`), the others spread the total.
+        let chemical_upgrades = matches!(recipe_kind, "injecting" | "purifying");
+        let statistical = chemical_upgrades && usage_const("randomizedConsumption", 1) != 0;
+        let want = if !per_tick {
+            0
+        } else if r.chemical_amount == 1 {
+            let roll = roll(entity);
+            chemical_need(&up, chem::ADVANCED_TICKS, ticks, progress[i], used[i].min(u64::from(u32::MAX)) as u32, statistical, chemical_upgrades, roll)
+        } else {
+            (total * u64::from(progress[i] + 1) / u64::from(ticks)).saturating_sub(used[i])
+        };
         let has_chemical = tank.chemical.as_deref() == Some(r.chemical) && tank.amount >= if per_tick { want } else { r.chemical_amount };
         let has_energy = f.machine.energy.stored >= f.machine.usage;
         warn[i] = i32::from(!has_energy) | i32::from(!has_chemical) << 1 | i32::from(!fits) << 2;
@@ -10806,8 +10817,17 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
         entity.data.extend(wide(get_long(&entity.nbt, "energy").min(capacity)));
         entity.data.extend(wide(capacity));
         let u = upgrades(&entity.nbt);
-        entity.data.extend([u.get(Upgrade::Speed) as i32, u.get(Upgrade::Energy) as i32]);
-        entity.data.extend(wide(0));
+        // Speed in bits 0 to 13, then anchor, chemical (4 bits), muffling and stone generator (`installed_upgrades`).
+        entity.data.extend([(u.speed | u.anchor << 14 | u.chemical << 15 | u.muffling << 19 | u.stone_generator << 20) as i32, u.get(Upgrade::Energy) as i32]);
+        // What the machine uses a tick with its upgrades (the energy tab's "Using").
+        let usage = match kind(&entity.id) {
+            Some(Kind::DigitalMiner) => miner_usage(&entity.nbt),
+            Some(Kind::Reaction) => reaction_power(&entity.nbt).1,
+            Some(Kind::Assemblicator) => machine_power(&entity.nbt, usage_const("formulaicAssemblicator", fa::USAGE), None).1,
+            Some(k) => base_usage(k).map_or(0, |base| u.energy_per_tick(base)),
+            None => 0,
+        };
+        entity.data.extend(wide(usage));
         // The plenisher's screen says whether it has filled all it can (in the progress slot).
         if kind(&entity.id) == Some(Kind::Plenisher) {
             entity.data[2] = get_int(&entity.nbt, "finished") as i32;
@@ -13550,9 +13570,22 @@ fn draw_miner_widgets(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
             game.native_text_scaled(batch, text, [x + (15.0 - tw) / 2.0, y + 9.0 * j as f32 + 1.0], 0xFF10_1010, 0.6);
         }
     }
-    // The slot that shows a replacement block the miner is missing: always the check until filters exist.
+    // The slot that shows the replacement block the miner is missing, on dark red (`GuiSlot.validity`), else the check.
     sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [ox + 64.0, oy + 21.0, 18.0, 18.0]);
-    sprite(game, batch, "slot/overlay/check", [0.0, 0.0, 18.0, 18.0], [ox + 64.0, oy + 21.0, 18.0, 18.0]);
+    match miner_missing(game) {
+        Some(item) => {
+            game.native_fill(batch, [ox + 65.0, oy + 22.0, 16.0, 16.0], 0xCCAA_0000);
+            game.native_item_stack(batch, &stack_of(&item, 1), [ox + 65.0, oy + 22.0], 16.0);
+        }
+        None => sprite(game, batch, "slot/overlay/check", [0.0, 0.0, 18.0, 18.0], [ox + 64.0, oy + 21.0, 18.0, 18.0]),
+    }
+}
+
+/// The replacement block the open miner lacks (`missingStack`), from what its server sent.
+fn miner_missing(game: &Game<'_>) -> Option<String> {
+    let pos = game.container.map(|(x, y, z)| [x, y, z])?;
+    let (_, client) = game.native_client_block_entity(pos)?;
+    get_string(client, "missing").filter(|m| !m.is_empty())
 }
 
 /// What a screen draws beyond its `Layout`: progress arrows that fill while the machine is lit
@@ -15421,7 +15454,7 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
     }
     if kind(block) == Some(Kind::DigitalMiner) {
         if inside(at, [64.0, 21.0, 18.0, 18.0]) {
-            lines.push("All is well!".to_owned());
+            lines.push(if miner_missing(game).is_some() { "Missing block" } else { "All is well!" }.to_owned());
             return;
         }
         for (rect, name) in [([19.0, 56.0, 15.0, 31.0], "Auto-eject"), ([38.0, 56.0, 15.0, 31.0], "Auto-pull"), ([57.0, 56.0, 15.0, 31.0], "Silk touch")] {
@@ -15521,6 +15554,12 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         // `GuiEnergyTab` of the amplifier: just what it stores.
         let fe = mekanism_core::energy::format_fe;
         lines.push(format!("Storing: {}/{}", fe(read_wide(data, DATA_STORED)), fe(read_wide(data, DATA_CAPACITY))));
+    } else if kind(block) == Some(Kind::DigitalMiner) && inside(at, [-26.0, 137.0, 26.0, 26.0]) {
+        // `GuiDigitalMiner`'s energy tab: the buffer, what a tick needs and what is free.
+        let fe = mekanism_core::energy::format_fe;
+        lines.push(format!("Energy Capacity: {}", fe(read_wide(data, DATA_CAPACITY))));
+        lines.push(format!("Needed: {}/t", fe(read_wide(data, DATA_USAGE))));
+        lines.push(format!("Free Buffer: {}", fe(read_wide(data, DATA_CAPACITY).saturating_sub(read_wide(data, DATA_STORED)))));
     } else if l.power.is_some() && inside(at, [-26.0, 137.0, 26.0, 26.0]) {
         // `GuiEnergyTab` of a machine: what it uses a tick and what its buffer still needs.
         let fe = mekanism_core::energy::format_fe;
