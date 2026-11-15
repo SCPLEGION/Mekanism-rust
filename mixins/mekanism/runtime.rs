@@ -11999,6 +11999,21 @@ pub(super) fn slot_rules(block: &str, rules: &mut Vec<horizon_client::lan::menu:
         }
         if kind(block) == Some(Kind::Assemblicator) {
             rules[fa::FORMULA_SLOT] = SlotRule::Items(vec![fa::FORMULA_ITEM.to_owned()]);
+            if let Ok(g) = ASM_RULES.lock()
+                && let Some(state) = g.as_ref()
+            {
+                for (i, allowed) in state.inputs.iter().enumerate() {
+                    if let (Some(items), Some(slot)) = (allowed, rules.get_mut(fa::INPUT_FIRST + i)) {
+                        *slot = SlotRule::Items(items.clone());
+                    }
+                }
+                // `FormulaicCraftingSlot`: in auto mode only the machine fills the grid.
+                if state.auto {
+                    for slot in rules.iter_mut().skip(fa::GRID_FIRST).take(fa::GRID) {
+                        *slot = SlotRule::Refuse;
+                    }
+                }
+            }
         }
     }
 }
@@ -22429,6 +22444,62 @@ fn asm_organize(game: &Game<'_>, entity: &mut ModBlockEntity, f: &Formula) {
     }
 }
 
+/// What the Formulaic Assemblicator's slots take, as its last tick left it: the stock and grid slots depend on
+/// the formula, the stock control and the auto mode (`TileEntityFormulaicAssemblicator.getInitialInventory`), which the
+/// slot rules (they see no game) read from here.
+struct AsmRules {
+    auto: bool,
+    /// Per input slot: `None` takes anything, `Some` only these items.
+    inputs: Vec<Option<Vec<String>>>,
+}
+
+static ASM_RULES: std::sync::Mutex<Option<AsmRules>> = std::sync::Mutex::new(None);
+/// The items a formula's recipe takes at some position, for the formula they were worked out for.
+static ASM_VALID: std::sync::Mutex<Option<(String, Vec<String>)>> = std::sync::Mutex::new(None);
+
+fn asm_publish_rules(game: &Game<'_>, entity: &ModBlockEntity, formula: Option<&Formula>, stock: bool, auto: bool) {
+    let present = entity
+        .items
+        .get(fa::FORMULA_SLOT)
+        .and_then(|s| s.as_ref())
+        .filter(|s| *s.item == *fa::FORMULA_ITEM)
+        .and_then(|s| custom_data(s).and_then(|c| get_string(c, "formula")))
+        .is_some_and(|f| fa::decode(&f).iter().any(Option::is_some));
+    let mut inputs: Vec<Option<Vec<String>>> = vec![None; fa::INPUTS];
+    match formula {
+        // A formula that makes no recipe takes nothing (`!formula.valid()`).
+        None if present => inputs = vec![Some(vec![]); fa::INPUTS],
+        None => {}
+        Some(f) => {
+            let key = format!("{}|{}", f.recipe, f.cells.iter().map(|c| c.as_deref().unwrap_or("-")).collect::<Vec<_>>().join(","));
+            let cached = ASM_VALID.lock().ok().and_then(|g| g.as_ref().filter(|(k, _)| *k == key).map(|(_, v)| v.clone()));
+            let valid = cached.unwrap_or_else(|| {
+                let mut all: Vec<String> = world_items!(game)
+                    .items
+                    .iter()
+                    .filter(|(id, _)| (0..fa::GRID).any(|p| asm_in_pos(game, f, Some(id.as_ref()), p)))
+                    .map(|(id, _)| id.to_string())
+                    .collect();
+                all.sort();
+                if let Ok(mut g) = ASM_VALID.lock() {
+                    *g = Some((key, all.clone()));
+                }
+                all
+            });
+            let map = if stock { fa::stock_map(&f.cells) } else { vec![] };
+            inputs = (0..fa::INPUTS)
+                .map(|i| match map.get(i).cloned().flatten() {
+                    Some(item) => Some(vec![item]),
+                    None => Some(valid.clone()),
+                })
+                .collect();
+        }
+    }
+    if let Ok(mut g) = ASM_RULES.lock() {
+        *g = Some(AsmRules { auto, inputs });
+    }
+}
+
 fn asm_capacity(nbt: &Compound) -> u64 {
     // Not a progress machine: `updateMaxEnergy` stores `STORAGE_MULTIPLIER` ticks of the upgraded usage.
     machine_power(nbt, usage_const("formulaicAssemblicator", fa::USAGE), None).3
@@ -22581,6 +22652,7 @@ fn tick_assemblicator(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockE
             }
         }
     }
+    asm_publish_rules(game, entity, formula.as_ref(), stock, auto);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_int(&mut entity.nbt, "auto", u32::from(auto));
