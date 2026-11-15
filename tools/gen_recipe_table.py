@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Write mixins/mekanism/core/src/recipe_table.rs from this repository's generated recipes.
+
+The machines' item-to-item recipes (enriching, crushing) become static Rust tables, so the native mod
+needs no recipe loading at run time. Recipes that need another mod (`neoforge:conditions`) are left
+out. Run after the Java datagen output changes; the table is committed.
+"""
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+GENERATED = ROOT / "src/datagen/generated"
+OUT = ROOT / "mixins/mekanism/core/src/recipe_table.rs"
+KINDS = ["enriching", "crushing"]
+OTHER = ["sawing", "combining", "oxidizing", "purifying", "metallurgic_infusing", "chemical_conversion", "compressing", "chemical_infusing", "injecting", "rotary", "nucleosynthesizing", "reaction", "pigment_extracting", "pigment_mixing", "painting"]
+
+
+def ingredient(value):
+    if isinstance(value, str):
+        return f'Ingredient::Tag("{value[1:]}")' if value.startswith("#") else f'Ingredient::Item("{value}")'
+    if isinstance(value, list):
+        return "Ingredient::Any(&[" + ", ".join(ingredient(v) for v in value) + "])"
+    if isinstance(value, dict) and value.get("type") == "neoforge:or":
+        return ingredient(value["values"])
+    if isinstance(value, dict) and value.get("neoforge:ingredient_type") == "neoforge:intersection":
+        return "Ingredient::All(&[" + ", ".join(ingredient(v) for v in value["children"]) + "])"
+    if isinstance(value, dict) and value.get("neoforge:ingredient_type") == "neoforge:difference":
+        return f"Ingredient::Except(&{ingredient(value['base'])}, &{ingredient(value['subtracted'])})"
+    raise ValueError(f"unsupported ingredient {value!r}")
+
+
+def main():
+    tables = {k: [] for k in KINDS + OTHER}
+    for path in sorted(GENERATED.glob("*/data/*/recipe/**/*.json")):
+        recipe = json.loads(path.read_text())
+        kind = recipe.get("type", "").removeprefix("mekanism:")
+        if kind not in tables or "neoforge:conditions" in recipe:
+            continue
+        ns = path.relative_to(GENERATED).parts[2]
+        rid = f"{ns}:" + path.relative_to(GENERATED / path.relative_to(GENERATED).parts[0] / "data" / ns / "recipe").with_suffix("").as_posix()
+        if kind == "sawing":
+            inp = recipe["input"]
+            main = recipe.get("main_output")
+            sec = recipe.get("secondary_output")
+            opt = lambda o: f'Some(("{o["id"]}", {o.get("count", 1)}))' if o else "None"
+            tables[kind].append(
+                f'    SawingRecipe {{ id: "{rid}", input: {ingredient(inp["ingredient"])}, input_count: {inp.get("count", 1)}, '
+                f'main: {opt(main)}, secondary: {opt(sec)}, secondary_chance: {float(recipe.get("secondary_chance", 0))!r} }},')
+            continue
+        if kind in ("oxidizing", "chemical_conversion", "pigment_extracting"):
+            inp, out = recipe["input"], recipe["output"]
+            tables[kind].append(
+                f'    ChemicalRecipe {{ id: "{rid}", input: {ingredient(inp["ingredient"])}, input_count: {inp.get("count", 1)}, '
+                f'output: "{out["id"]}", amount: {out["amount"]} }},')
+            continue
+        if kind in ("purifying", "metallurgic_infusing", "compressing", "injecting", "painting"):
+            inp, gas, out = recipe["item_input"], recipe["chemical_input"], recipe["output"]
+            if not isinstance(gas.get("ingredient"), str):
+                continue
+            # Mekanism's chemical tags (`#mekanism:carbon`) each hold the one chemical of the same name.
+            gas = dict(gas, ingredient=gas["ingredient"].removeprefix("#"))
+            tables[kind].append(
+                f'    ItemChemicalRecipe {{ id: "{rid}", input: {ingredient(inp["ingredient"])}, input_count: {inp.get("count", 1)}, '
+                f'chemical: "{gas["ingredient"]}", chemical_amount: {gas.get("amount", 1)}, '
+                f'output: "{out["id"]}", output_count: {out.get("count", 1)} }},')
+            continue
+        if kind == "nucleosynthesizing":
+            inp, gas, out = recipe["item_input"], recipe["chemical_input"], recipe["output"]
+            tables[kind].append(
+                f'    NucleosynthesizingRecipe {{ recipe: ItemChemicalRecipe {{ id: "{rid}", input: {ingredient(inp["ingredient"])}, '
+                f'input_count: {inp.get("count", 1)}, chemical: "{gas["ingredient"].removeprefix("#")}", chemical_amount: {gas.get("amount", 1)}, '
+                f'output: "{out["id"]}", output_count: {out.get("count", 1)} }}, duration: {recipe.get("duration", 400)} }},')
+            continue
+        if kind == "reaction":
+            item, fluid, gas, out = recipe["item_input"], recipe["fluid_input"], recipe["chemical_input"], recipe["output"]
+            # The fluid tags hold one fluid each here: `#minecraft:water` water, `#c:ethene` Mekanism's ethene.
+            fluid_id = {"#minecraft:water": "minecraft:water", "#c:ethene": "mekanism:ethene"}[fluid["ingredient"]]
+            o_item, o_gas = out.get("item"), out.get("chemical")
+            tables[kind].append(
+                f'    ReactionRecipe {{ id: "{rid}", item: {ingredient(item["ingredient"])}, item_count: {item.get("count", 1)}, '
+                f'fluid: "{fluid_id}", fluid_amount: {fluid["amount"]}, chemical: "{gas["ingredient"]}", chemical_amount: {gas["amount"]}, '
+                f'duration: {recipe["duration"]}, energy: {recipe.get("energy_required", 0)}, '
+                f'output: {f"""Some(("{o_item["id"]}", {o_item.get("count", 1)}))""" if o_item else "None"}, '
+                f'output_chemical: {f"""Some(("{o_gas["id"]}", {o_gas["amount"]}))""" if o_gas else "None"} }},')
+            continue
+        if kind == "rotary":
+            fo, co = recipe.get("fluid_output"), recipe.get("chemical_output")
+            if fo and co:
+                tables[kind].append(f'    ("{fo["id"]}", "{co["id"]}"),')
+            continue
+        if kind in ("chemical_infusing", "pigment_mixing"):
+            left, right, out = recipe["left_input"], recipe["right_input"], recipe["output"]
+            if any(not isinstance(i["ingredient"], str) or i["ingredient"].startswith("#") for i in (left, right)):
+                continue
+            tables[kind].append(
+                f'    InfusingRecipe {{ id: "{rid}", left: "{left["ingredient"]}", left_amount: {left["amount"]}, '
+                f'right: "{right["ingredient"]}", right_amount: {right["amount"]}, output: "{out["id"]}", amount: {out["amount"]} }},')
+            continue
+        if kind == "combining":
+            m, e, out = recipe["main_input"], recipe["extra_input"], recipe["output"]
+            tables[kind].append(
+                f'    CombiningRecipe {{ id: "{rid}", main: {ingredient(m["ingredient"])}, main_count: {m.get("count", 1)}, '
+                f'extra: {ingredient(e["ingredient"])}, extra_count: {e.get("count", 1)}, '
+                f'output: "{out["id"]}", output_count: {out.get("count", 1)} }},')
+            continue
+        inp = recipe["input"]
+        out = recipe["output"]
+        tables[kind].append(
+            f'    ItemRecipe {{ id: "{rid}", input: {ingredient(inp.get("ingredient", inp.get("item")))}, '
+            f'input_count: {inp.get("count", 1)}, output: "{out["id"]}", output_count: {out.get("count", 1)} }},')
+    lines = ["// Generated by tools/gen_recipe_table.py from src/datagen/generated; do not edit.",
+             "", "use crate::recipes::{ChemicalRecipe, CombiningRecipe, Ingredient, InfusingRecipe, ItemChemicalRecipe, ItemRecipe, NucleosynthesizingRecipe, ReactionRecipe, SawingRecipe};", ""]
+    types = {"sawing": "SawingRecipe", "combining": "CombiningRecipe", "oxidizing": "ChemicalRecipe", "purifying": "ItemChemicalRecipe", "metallurgic_infusing": "ItemChemicalRecipe", "chemical_conversion": "ChemicalRecipe", "compressing": "ItemChemicalRecipe", "injecting": "ItemChemicalRecipe", "rotary": "(&str, &str)", "chemical_infusing": "InfusingRecipe", "nucleosynthesizing": "NucleosynthesizingRecipe", "reaction": "ReactionRecipe", "pigment_extracting": "ChemicalRecipe", "pigment_mixing": "InfusingRecipe", "painting": "ItemChemicalRecipe"}
+    for kind in KINDS + OTHER:
+        if kind == "rotary":
+            lines.append("/// `rotary`: a fluid and the chemical it turns into, 1 mB for 1 mB.")
+        lines.append(f"pub static {kind.upper()}: &[{types.get(kind, 'ItemRecipe')}] = &[")
+        lines.extend(tables[kind])
+        lines.append("];")
+        lines.append("")
+    OUT.write_text("\n".join(lines))
+    print({k: len(v) for k, v in tables.items()})
+
+
+if __name__ == "__main__":
+    main()

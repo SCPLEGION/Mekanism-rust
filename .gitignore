@@ -24,3 +24,6 @@ MDK.zip
 /logs
 /annotation-processor/bin
 libs/
+# Rust (the Horizon port)
+/target/
+__pycache__/

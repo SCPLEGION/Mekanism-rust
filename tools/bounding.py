@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Mekanism's bounding blocks: the cells a multi-block machine fills beyond its own (`AttributeHasBounding`).
+
+One table feeds both sides: `declarations()` gives the content mod its `bounding_<machine>_<n>` blocks (the machine's
+shape moved into that cell, as `BlockBounding.proxyShape` does), and `rust()` writes `mixins/mekanism/core/src/bounding.rs`
+(the same offsets, for the native code that places, removes and forwards them).
+
+A cell is (dx, dy, dz, right): `right` counts steps toward the machine's right (`MekanismUtils.getRight`, the
+counter-clockwise neighbour of its facing).  Run this file to rewrite the Rust table.
+"""
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+RIGHT = {"north": (-1, 0), "east": (0, -1), "south": (1, 0), "west": (0, 1)}
+FACING4 = ("north", "east", "south", "west")
+
+
+def cells(machine):
+    return MACHINES[machine][1]
+
+
+MACHINES = {
+    # block name -> (namespace, [cells])
+    "solar_neutron_activator": ("mekanism", [(0, 1, 0, 0)]),
+    "seismic_vibrator": ("mekanism", [(0, 1, 0, 0)]),
+    "security_desk": ("mekanism", [(0, 1, 0, 0)]),
+    "isotopic_centrifuge": ("mekanism", [(0, 1, 0, 0)]),
+    "pigment_mixer": ("mekanism", [(0, 1, 0, 0)]),
+    "modification_station": ("mekanism", [(0, 1, 0, 0), (0, 0, 0, 1), (0, 1, 0, 1)]),
+    "digital_miner": ("mekanism", [(x, y, z, 0) for x in (-1, 0, 1) for y in (0, 1) for z in (-1, 0, 1)
+                                   if (x, y, z) != (0, 0, 0)]),
+    "wind_generator": ("mekanismgenerators", [(0, i + 1, 0, 0) for i in range(4)]),
+    "advanced_solar_generator": ("mekanismgenerators", [(0, 1, 0, 0)] + [(x, 2, z, 0) for x in (-1, 0, 1) for z in (-1, 0, 1)]),
+}
+
+
+def offset(cell, facing):
+    dx, dy, dz, right = cell
+    rx, rz = RIGHT[facing]
+    return (dx + right * rx, dy, dz + right * rz)
+
+
+def name(machine, index):
+    return f"bounding_{machine}_{index}"
+
+
+def moved(boxes, o):
+    """`boxes` (in the machine's cell) seen from the cell at offset `o`, clipped to that cell."""
+    out = []
+    for b in boxes:
+        c = [b[0] - o[0], b[1] - o[1], b[2] - o[2], b[3] - o[0], b[4] - o[1], b[5] - o[2]]
+        c = [max(0.0, min(1.0, v)) for v in c]
+        if c[0] < c[3] and c[1] < c[4] and c[2] < c[5]:
+            out.append([round(v, 6) for v in c])
+    return out
+
+
+def declarations(shapes):
+    """{block name: declaration} for every bounding block; `shapes` is block_shapes' table for the namespace."""
+    out = {}
+    for machine, (ns, cs) in MACHINES.items():
+        shape = shapes.get(ns, {}).get(machine)
+        for i, cell in enumerate(cs):
+            decl = {"template": "minecraft:furnace", "item": False,
+                    "properties": {"occludes": False, "hardness": 3.5, "explosion_resistance": 4.8}}
+            if shape and "raw" in shape:
+                decl["shapes"] = {"property": "facing",
+                                  "values": {f: moved(shape["raw"][f], offset(cell, f)) for f in FACING4}}
+            elif shape and "raw_all" in shape:
+                decl["shape"] = moved(shape["raw_all"], offset(cell, "north"))
+            out[(ns, name(machine, i))] = decl
+    return out
+
+
+RUST_TAIL = """
+/// The offset of `cell` for a machine facing `facing` (north, east, south, west).
+pub fn offset(cell: [i32; 4], facing: &str) -> [i32; 3] {
+    let (rx, rz) = match facing {
+        "north" => (-1, 0),
+        "east" => (0, -1),
+        "south" => (1, 0),
+        _ => (0, 1),
+    };
+    [cell[0] + cell[3] * rx, cell[1], cell[2] + cell[3] * rz]
+}
+
+/// The cells of the machine `id` (`mekanism:digital_miner`).
+pub fn cells(id: &str) -> Option<&'static [[i32; 4]]> {
+    let (ns, name) = id.split_once(':')?;
+    MACHINES.iter().find(|m| m.0 == name && m.1 == ns).map(|m| m.2)
+}
+
+/// The id of cell `index` of the machine `id`.
+pub fn bounding_id(id: &str, index: usize) -> Option<String> {
+    let (ns, name) = id.split_once(':')?;
+    (index < cells(id)?.len()).then(|| format!("{ns}:bounding_{name}_{index}"))
+}
+
+/// The machine and the cell a bounding block `id` stands for.
+pub fn parse(id: &str) -> Option<(String, usize)> {
+    let (ns, rest) = id.split_once(':')?;
+    let rest = rest.strip_prefix("bounding_")?;
+    let (name, index) = rest.rsplit_once('_')?;
+    let index: usize = index.parse().ok()?;
+    let machine = format!("{ns}:{name}");
+    (index < cells(&machine)?.len()).then_some((machine, index))
+}
+
+/// Where the machine owning the bounding block `id` at `pos` stands, given the `facing` it was placed with.
+pub fn main_of(id: &str, facing: &str, pos: [i32; 3]) -> Option<([i32; 3], String)> {
+    let (machine, index) = parse(id)?;
+    let o = offset(cells(&machine)?[index], facing);
+    Some(([pos[0] - o[0], pos[1] - o[1], pos[2] - o[2]], machine))
+}
+
+/// Every cell of the machine `id` at `pos` facing `facing`: (position, bounding block id).
+pub fn fill(id: &str, facing: &str, pos: [i32; 3]) -> Vec<([i32; 3], String)> {
+    let Some(cs) = cells(id) else { return Vec::new() };
+    cs.iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let o = offset(*c, facing);
+            Some(([pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]], bounding_id(id, i)?))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_match_mekanism() {
+        assert_eq!(cells("mekanism:digital_miner").unwrap().len(), 17);
+        assert_eq!(cells("mekanism:modification_station").unwrap().len(), 3);
+        assert_eq!(cells("mekanismgenerators:wind_generator").unwrap().len(), 4);
+        assert_eq!(cells("mekanismgenerators:advanced_solar_generator").unwrap().len(), 10);
+    }
+
+    #[test]
+    fn the_right_of_a_station_is_counter_clockwise() {
+        let f = fill("mekanism:modification_station", "north", [0, 64, 0]);
+        assert!(f.contains(&([-1, 64, 0], "mekanism:bounding_modification_station_1".into())));
+        assert!(f.contains(&([-1, 65, 0], "mekanism:bounding_modification_station_2".into())));
+        let f = fill("mekanism:modification_station", "east", [0, 64, 0]);
+        assert!(f.iter().any(|c| c.0 == [0, 64, -1]));
+    }
+
+    #[test]
+    fn a_bounding_block_finds_its_machine() {
+        for facing in ["north", "east", "south", "west"] {
+            for (at, bounding) in fill("mekanism:digital_miner", facing, [5, 70, -3]) {
+                let (main, machine) = main_of(&bounding, facing, at).unwrap();
+                assert_eq!((main, machine.as_str()), ([5, 70, -3], "mekanism:digital_miner"));
+            }
+        }
+        assert!(parse("mekanism:digital_miner").is_none());
+        assert!(parse("mekanism:bounding_digital_miner_17").is_none());
+    }
+}
+"""
+
+
+def rust():
+    lines = ["// Generated by tools/bounding.py: the cells a multi-block machine fills beyond its own.",
+             "",
+             "/// (block, namespace, cells): a cell is [dx, dy, dz, right], `right` steps toward the machine's right.",
+             "pub const MACHINES: &[(&str, &str, &[[i32; 4]])] = &["]
+    for machine, (ns, cs) in MACHINES.items():
+        body = ", ".join("[%d, %d, %d, %d]" % c for c in cs)
+        lines.append(f'    ("{machine}", "{ns}", &[{body}]),')
+    lines += ["];"]
+    return "\n".join(lines) + "\n" + RUST_TAIL
+
+
+if __name__ == "__main__":
+    (ROOT / "mixins/mekanism/core/src/bounding.rs").write_text(rust())
