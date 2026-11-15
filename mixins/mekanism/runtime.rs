@@ -714,6 +714,8 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             Kind::ObsidianTnt => {
                 if game.native_has_neighbor_signal(pos) {
                     prime_obsidian_tnt(game, pos, false);
+                } else if obsidian_tnt_burns(game, pos) {
+                    prime_obsidian_tnt(game, pos, false);
                 }
                 None
             }
@@ -2775,7 +2777,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
         let lit = f >= 0.0 && (f / 5.0) as i32 % 2 == 0;
         let cell = [at[0].floor() as i32, (at[1] + 0.5).floor() as i32, at[2].floor() as i32];
         models.push(super::native_hooks::NativeWorldModel {
-            model: "mekanismadditions:obsidian_tnt".into(),
+            model: (if lit { "mekanismadditions:obsidian_tnt_flash" } else { "mekanismadditions:obsidian_tnt" }).into(),
             position: [at[0], at[1] + 0.49, at[2]],
             yaw: 0.0,
             pitch: 0.0,
@@ -2783,7 +2785,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
             light_at: cell,
             color: 0xFFFF_FFFF,
             rotation: None,
-            full_bright: lit,
+            full_bright: false,
             scale,
             parts: Vec::new(),
         });
@@ -9806,6 +9808,10 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     }
     if game.native_window() && game.native_on(MOD_ID) {
         balloon_client(game);
+        // `EntityObsidianTNT.tick`: a lava spark at the middle of the block every tick.
+        for (_, at, _, _) in CLIENT_TNT.with_borrow(|v| v.clone()) {
+            game.native_add_particle("minecraft:lava", [at[0], at[1] + 0.5, at[2]], [0.0; 3]);
+        }
         for at in TNT_SOUNDS.with_borrow_mut(std::mem::take) {
             game.audio.play("minecraft:entity.tnt.primed", Some(at), 1.0, 1.0);
         }
@@ -10234,6 +10240,28 @@ fn prime_obsidian_tnt(game: &mut Game<'_>, pos: [i32; 3], short: bool) {
     });
 }
 
+/// `FireBlock.checkBurnOut` on the TNT (`BlockObsidianTNT.getFlammability` 75, `onCaughtFire` primes it): a fire
+/// next to it catches it. A fire ticks every 30 to 40 ticks, so each tick has about a thirty-fifth of its chance:
+/// `nextInt(300 or 250 above and below) < 75` and, rain apart, `nextInt(age + 10) < 5`, with the fire's age taken as 0.
+fn obsidian_tnt_burns(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    use horizon_core::random::RandomSource;
+    let mut near = Vec::new();
+    for (d, bound) in [([1, 0, 0], 300), ([-1, 0, 0], 300), ([0, 0, 1], 300), ([0, 0, -1], 300), ([0, 1, 0], 250), ([0, -1, 0], 250)] {
+        if matches!(block_name(game, [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]]), "minecraft:fire" | "minecraft:soul_fire") {
+            near.push(bound);
+        }
+    }
+    for bound in near {
+        if game.world.random.next_int_bound(35).unwrap_or(1) == 0
+            && game.world.random.next_int_bound(bound).unwrap_or(bound) < 75
+            && game.world.random.next_int_bound(10).unwrap_or(10) < 5
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// A block player-broken by this click does not light when the break reports it gone.
 pub(super) fn obsidian_tnt_broken(game: &Game<'_>, pos: [i32; 3]) {
     if block_name(game, pos) == OBSIDIAN_TNT {
@@ -10359,6 +10387,16 @@ fn obsidian_tnt_tick(game: &mut Game<'_>) {
     });
     for center in exploded {
         game.native_explode(center, TNT_RADIUS, false);
+        // An explosion hurts what is within twice its radius (`ServerExplosion.hurtEntities`), and an explosion is
+        // not one of the damages a balloon shrugs off: the balloons there pop (exposure is not taken into account).
+        let (hit, rest): (Vec<Balloon>, Vec<Balloon>) = BALLOONS.with_borrow_mut(std::mem::take).into_iter().partition(|b| {
+            let c = [b.pos[0], b.pos[1] + 0.5, b.pos[2]];
+            (0..3).map(|i| (c[i] - center[i]).powi(2)).sum::<f64>() <= (f64::from(TNT_RADIUS) * 2.0).powi(2)
+        });
+        BALLOONS.with_borrow_mut(|v| v.extend(rest));
+        for b in &hit {
+            pop_balloon(game, b);
+        }
     }
     // Tell the clients where they are (`id, x, y, z, fuse, sound`), every tick as a tracked entity moves.
     let now = PRIMED.with_borrow(|v| v.clone());
@@ -10426,7 +10464,7 @@ thread_local! {
     static BALLOON_SENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The client's view: id, position, colour, and whether it holds on to something.
     static CLIENT_BALLOONS: std::cell::RefCell<Vec<(u32, [f64; 3], u8, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
-    static BALLOON_POPS: std::cell::RefCell<Vec<[f64; 3]>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BALLOON_POPS: std::cell::RefCell<Vec<([f64; 3], u8)>> = const { std::cell::RefCell::new(Vec::new()) };
     static ATTACK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -10579,6 +10617,7 @@ fn pop_balloon(game: &mut Game<'_>, b: &Balloon) {
     for c in b.pos {
         data.extend_from_slice(&(c as f32).to_be_bytes());
     }
+    data.push(b.color);
     for to in game.native_online_players() {
         game.native_send_to_player(to, BALLOON_POP_CHANNEL, &data);
     }
@@ -10598,8 +10637,69 @@ fn balloon_target_elevation(game: &Game<'_>, at: [f64; 3]) -> f64 {
     0.0
 }
 
+thread_local! {
+    /// The world folder the balloons were loaded from, the text last written, and the ticks since.
+    static BALLOON_WORLD: std::cell::RefCell<(Option<std::path::PathBuf>, String, u32)> = const { std::cell::RefCell::new((None, String::new(), 0)) };
+}
+
+/// Balloons stay with the world (`EntityBalloon` is a saved entity): `<world>/mekanism_additions/balloons.txt`, a
+/// line per balloon (`x y z colour latch`, a block latch as `x,y,z`), read when a world opens and rewritten every
+/// five seconds when it changed. A balloon latched to a mob is saved free.
+fn balloon_persist(game: &Game<'_>) {
+    let Some(dir) = game.native_world_dir() else {
+        return;
+    };
+    let file = dir.join("mekanism_additions").join("balloons.txt");
+    let opened = BALLOON_WORLD.with_borrow(|w| w.0.as_deref() == Some(dir.as_path()));
+    if !opened {
+        BALLOONS.with_borrow_mut(Vec::clear);
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            let (Some(x), Some(y), Some(z), Some(color)) = (
+                f.first().and_then(|v| v.parse::<f64>().ok()),
+                f.get(1).and_then(|v| v.parse::<f64>().ok()),
+                f.get(2).and_then(|v| v.parse::<f64>().ok()),
+                f.get(3).and_then(|v| v.parse::<u8>().ok()),
+            ) else {
+                continue;
+            };
+            let latch = f
+                .get(4)
+                .map(|p| p.split(',').filter_map(|v| v.parse::<i32>().ok()).collect::<Vec<_>>())
+                .filter(|p| p.len() == 3)
+                .map_or(Latch::Free, |p| Latch::Block([p[0], p[1], p[2]]));
+            make_balloon([x, y, z], color, latch);
+        }
+        BALLOON_WORLD.with_borrow_mut(|w| *w = (Some(dir), text, 0));
+        return;
+    }
+    let due = BALLOON_WORLD.with_borrow_mut(|w| {
+        w.2 += 1;
+        w.2 % 100 == 0
+    });
+    if !due {
+        return;
+    }
+    let mut text = String::new();
+    for b in BALLOONS.with_borrow(|v| v.clone()) {
+        text.push_str(&format!("{} {} {} {}", b.pos[0], b.pos[1], b.pos[2], b.color));
+        if let Latch::Block(p) = b.latch {
+            text.push_str(&format!(" {},{},{}", p[0], p[1], p[2]));
+        }
+        text.push('\n');
+    }
+    if BALLOON_WORLD.with_borrow(|w| w.1 == text) {
+        return;
+    }
+    if std::fs::create_dir_all(file.parent().unwrap_or(&dir)).and_then(|()| std::fs::write(&file, &text)).is_ok() {
+        BALLOON_WORLD.with_borrow_mut(|w| w.1 = text);
+    }
+}
+
 /// `EntityBalloon.tick` for every balloon on the server.
 fn balloon_tick(game: &mut Game<'_>) {
+    balloon_persist(game);
     let mut list = BALLOONS.with_borrow_mut(std::mem::take);
     if list.is_empty() && !BALLOON_SENT.get() {
         return;
@@ -10684,7 +10784,7 @@ fn balloon_tick(game: &mut Game<'_>) {
 fn balloon_client_payload(channel: &str, data: &[u8]) {
     if channel == BALLOON_POP_CHANNEL && data.len() >= 12 {
         let f = |i: usize| f64::from(f32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]));
-        BALLOON_POPS.with_borrow_mut(|v| v.push([f(0), f(4), f(8)]));
+        BALLOON_POPS.with_borrow_mut(|v| v.push(([f(0), f(4), f(8)], data.get(12).copied().unwrap_or(0))));
     }
     if channel == BALLOON_CHANNEL {
         let seen = data
@@ -10700,8 +10800,19 @@ fn balloon_client_payload(channel: &str, data: &[u8]) {
 
 /// The window: the pop sounds, and a punch at a balloon (`EntityBalloon.skipAttackInteraction`).
 fn balloon_client(game: &mut Game<'_>) {
-    for at in BALLOON_POPS.with_borrow_mut(std::mem::take) {
+    use horizon_core::random::RandomSource;
+    for (at, color) in BALLOON_POPS.with_borrow_mut(std::mem::take) {
         game.audio.play("mekanismadditions:entity.balloon.pop", Some(at), 1.0, 1.0);
+        // `EntityBalloon.pop`: ten dust particles of the balloon's colour within 0.3 of the box's centre.
+        let rgb = tnet::COLORS.get(usize::from(color)).map_or(0xFFFFFF, |c| c.1);
+        let rgb = [16, 8, 0].map(|s| ((rgb >> s) & 255) as f32 / 255.0);
+        for _ in 0..10 {
+            let mut at3 = [at[0], at[1] + 0.5, at[2]];
+            for c in &mut at3 {
+                *c += 0.6 * game.world.random.next_double() - 0.3;
+            }
+            game.native_add_dust([rgb[0], rgb[1], rgb[2]], 1.0, at3, [0.0; 3]);
+        }
     }
     let down = game.native_mapping("key.attack").is_some_and(|(down, _)| down);
     let was = ATTACK_HELD.replace(down);
