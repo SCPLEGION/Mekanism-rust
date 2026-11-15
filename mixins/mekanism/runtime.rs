@@ -7750,6 +7750,14 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
         }
         return;
     }
+    if !*claimed && &*stack.item == CONFIG_CARD && game.native_on(MOD_ID) {
+        config_card_clear(game, claimed);
+        return;
+    }
+    if !*claimed && &*stack.item == WALKIE && game.native_on(MOD_ID) {
+        walkie_use(game, claimed);
+        return;
+    }
     if !*claimed && &*stack.item == CONFIGURATOR {
         configurator_use(game, claimed);
         return;
@@ -8375,6 +8383,8 @@ fn tooltip_body(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(horizon_cli
         tier_tooltip(name, lines);
     }
     waste_barrel_tooltip(stack, lines);
+    walkie_tooltip(stack, lines);
+    config_card_tooltip(stack, lines);
     stored_tooltip(stack, lines);
     cardboard_tooltip(stack, lines);
     // `FormulaComponent.addToTooltip`: the distinct ingredients in order of first use, with how many times each is used.
@@ -9680,6 +9690,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
         scuba_breathe(game);
         return;
     }
+    if channel == WALKIE_CHANNEL && game.native_on(MOD_ID) {
+        walkie_change_channel(game, data.first().map_or(1, |b| *b as i8));
+        return;
+    }
     if channel == SCUBA_MODE_CHANNEL && game.native_on(MOD_ID) {
         scuba_toggle(game);
         return;
@@ -9826,6 +9840,200 @@ fn set_custom_long(stack: &mut ItemStack, key: &str, value: u64) {
     });
     if let Tag::Compound(c) = &mut extra.other[at].1 {
         put_long(c, key, value);
+    }
+}
+
+// --- Configuration Card -----------------------------------------------------------------------------
+
+const CONFIG_CARD: &str = "mekanism:configuration_card";
+/// The card's `ConfigurationData`: `data_name`, `data_type` (the block) and `config`.
+const CONFIG_CARD_KEY: &str = "mekanism:configuration_data";
+/// What of a block entity `writeConfigurationData` takes: its sustained data (upgrades, sides, ejector, redstone), the
+/// Resistive Heater's usage and the frequencies it is set to.
+const CONFIG_CARD_EXTRA_KEYS: [&str; 7] = ["usage_set", "usage", "frequency", "freq_name", "freq_security", "freq_owner", "freq_color"];
+
+/// `TileEntityFactory.isConfigurationDataCompatible` and the Combiner's: factories of one type take each other's data.
+fn factory_type(id: &str) -> Option<&'static str> {
+    match kind(id) {
+        Some(Kind::Factory(_, recipe, _)) => Some(recipe),
+        Some(Kind::Machine(recipe, _)) if id == "mekanism:combiner" => Some(recipe),
+        _ => None,
+    }
+}
+
+fn block_description_key(id: &str) -> String {
+    let (ns, name) = id.split_once(':').unwrap_or(("mekanism", id));
+    format!("block.{ns}.{name}")
+}
+
+/// `ItemConfigurationCard.useOn`: sneaking copies the block's settings into the card; otherwise the card's
+/// settings go into a block of the same type.
+pub(super) fn use_config_card(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) {
+        return false;
+    }
+    let selected = game.selected;
+    let Some(Some(held)) = game.inventory.get(selected).cloned() else {
+        return false;
+    };
+    if &*held.item != CONFIG_CARD {
+        return false;
+    }
+    let block = block_name(game, pos).to_owned();
+    if kind(&block).is_none() {
+        return false;
+    }
+    let sneaking = shift_down(game);
+    if sneaking {
+        let config = game
+            .native_with_mod_block_entity(pos, |m| {
+                let mut config = machine_state(&m.nbt).unwrap_or_default();
+                for key in CONFIG_CARD_EXTRA_KEYS {
+                    if let Some(v) = m.nbt.get(&JavaString::from(key)) {
+                        config.insert(key.into(), v.clone());
+                    }
+                }
+                config
+            });
+        let Some(config) = config else {
+            return false;
+        };
+        let mut data = Compound::new();
+        data.insert("name".into(), Tag::String(block_description_key(&block).as_str().into()));
+        data.insert("type".into(), Tag::String(block.as_str().into()));
+        if !config.is_empty() {
+            data.insert("config".into(), Tag::Compound(config));
+        }
+        let mut stack = held;
+        set_custom_compound(&mut stack, CONFIG_CARD_KEY, data);
+        game.inventory[selected] = Some(stack);
+        let name = horizon_client::lang::get(&block_description_key(&block));
+        tell(game, format!("Retrieved configuration data from {name}"));
+        return true;
+    }
+    let Some(Tag::Compound(data)) = custom_data(&held).and_then(|c| c.get(&JavaString::from(CONFIG_CARD_KEY))).cloned() else {
+        return false;
+    };
+    let Some(stored) = get_string(&data, "type") else {
+        return false;
+    };
+    let compatible = stored == block || factory_type(&stored).is_some_and(|t| factory_type(&block) == Some(t));
+    if !compatible {
+        tell(game, "Unequal configuration data formats.".to_owned());
+        return true;
+    }
+    if let Some(Tag::Compound(config)) = data.get(&JavaString::from("config")) {
+        game.native_with_mod_block_entity(pos, |m| {
+            // `read` of the components starts from the defaults: what the card does not carry is cleared.
+            for key in MACHINE_STATE_KEYS.iter().chain(CONFIG_CARD_EXTRA_KEYS.iter()) {
+                m.nbt.remove(&JavaString::from(*key));
+            }
+            for (k, v) in config.iter() {
+                m.nbt.insert(k.clone(), v.clone());
+            }
+        });
+    }
+    let name = horizon_client::lang::get(&get_string(&data, "name").unwrap_or_default());
+    tell(game, format!("Injected configuration data of type {name}"));
+    true
+}
+
+/// `ItemConfigurationCard.use`: sneaking in the air clears the card.
+fn config_card_clear(game: &mut Game<'_>, claimed: &mut bool) {
+    if !shift_down(game) {
+        return;
+    }
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == CONFIG_CARD) else {
+        return;
+    };
+    if let Some(extra) = held.extra.as_mut() {
+        for (key, data) in extra.other.iter_mut() {
+            if key == "minecraft:custom_data"
+                && let Tag::Compound(c) = data
+            {
+                c.remove(&JavaString::from(CONFIG_CARD_KEY));
+            }
+        }
+        extra.other.retain(|(key, data)| key != "minecraft:custom_data" || !matches!(data, Tag::Compound(c) if c.is_empty()));
+    }
+    *claimed = true;
+    tell(game, "Cleared Configuration Card".to_owned());
+}
+
+/// `ConfigurationData.addToTooltip`: the stored block's name, or None.
+fn config_card_tooltip(stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    use horizon_client::text::Text;
+    if &*stack.item != CONFIG_CARD {
+        return;
+    }
+    let name = match custom_data(stack).and_then(|c| c.get(&JavaString::from(CONFIG_CARD_KEY))) {
+        Some(Tag::Compound(d)) => get_string(d, "name").map(|key| horizon_client::lang::get(&key)),
+        _ => None,
+    };
+    let name = name.unwrap_or_else(|| "None".to_owned());
+    lines.push((Text::translate("configuration_card.mekanism.has_data", &[Text::colored(name.as_str(), enum_color::INDIGO)]), tooltip_rgba(enum_color::GRAY)));
+}
+
+// --- Walkie-Talkie ----------------------------------------------------------------------------------
+
+const WALKIE: &str = "mekanismadditions:walkie_talkie";
+const WALKIE_CHANNEL: &str = "mekanismadditions:walkie_channel";
+/// `WalkieData`: the channel (1 to `MAX_CHANNEL` - 1 by the wheel, 1 to 9 stored) and whether it runs.
+const WALKIE_KEY: &str = "mekanismadditions:walkie_channel";
+const WALKIE_RUNNING_KEY: &str = "mekanismadditions:walkie_running";
+const WALKIE_MAX_CHANNEL: i64 = 9;
+
+fn walkie_data(stack: &ItemStack) -> (i64, bool) {
+    let c = custom_data(stack);
+    let channel = c.map_or(0, |c| get_long(c, WALKIE_KEY) as i64);
+    (if channel == 0 { 1 } else { channel }, c.is_some_and(|c| get_long(c, WALKIE_RUNNING_KEY) == 1))
+}
+
+/// `ItemWalkieTalkie.use`: sneaking turns the radio on or off (the voice itself needs `MekanismAdditions`'
+/// own voice server, which a Horizon mod has no socket for).
+fn walkie_use(game: &mut Game<'_>, claimed: &mut bool) {
+    if !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+        return;
+    }
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == WALKIE) else {
+        return;
+    };
+    let (channel, running) = walkie_data(held);
+    set_custom_long(held, WALKIE_KEY, channel as u64);
+    set_custom_long(held, WALKIE_RUNNING_KEY, u64::from(!running));
+    *claimed = true;
+}
+
+/// `ItemWalkieTalkie.changeMode` on the server: the channel steps within 1..8 (`floorMod(channel + shift - 1, 8) + 1`).
+fn walkie_change_channel(game: &mut Game<'_>, shift: i8) {
+    let Some(held) = game.held_mut().as_mut().filter(|s| &*s.item == WALKIE) else {
+        return;
+    };
+    let (channel, running) = walkie_data(held);
+    if !running {
+        return;
+    }
+    let new = (channel + i64::from(shift) - 1).rem_euclid(WALKIE_MAX_CHANNEL - 1) + 1;
+    if new == channel {
+        return;
+    }
+    set_custom_long(held, WALKIE_KEY, new as u64);
+    if let Some(player) = game.native_acting_player() {
+        game.native_action_bar(player.uuid, horizon_client::text::Text::literal(format!("Channel changed to: {new}")));
+    }
+}
+
+/// `WalkieData.addToTooltip`: On or Off, the channel, and a warning while the voice server is off.
+fn walkie_tooltip(stack: &ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    if &*stack.item != WALKIE {
+        return;
+    }
+    let (channel, running) = walkie_data(stack);
+    let on = |on: bool| (horizon_client::text::Text::literal(if on { "On" } else { "Off" }.to_owned()), tooltip_rgba(if on { enum_color::BRIGHT_GREEN } else { enum_color::RED }));
+    lines.push(on(running));
+    lines.push(colored_line("walkie.mekanismadditions.channel", 0x00F3D0, enum_color::GRAY, &[&channel.to_string()]));
+    if !config_flag("additions", "voice_server", "enabled", false) {
+        lines.push(colored_line("walkie.mekanismadditions.disabled", enum_color::DARK_RED, enum_color::DARK_RED, &[]));
     }
 }
 
@@ -10083,6 +10291,13 @@ pub(super) fn wheel(game: &mut Game<'_>, steps: f32, claimed: &mut bool) {
         *claimed = true;
         game.native_send_to_server(JETPACK_MODE_CHANNEL, &[(steps.round().signum() as i8) as u8]);
         // `MekanismKeyHandler.handlePotentialModeItem`: the hydraulic sound with the mode change.
+        game.audio.play_unshared("mekanism:item.hydraulic", None, 1.0, 1.0);
+        return;
+    }
+    // `ItemWalkieTalkie.changeMode`: a running radio in hand changes channel.
+    if steps.round() != 0.0 && game.inventory.get(game.selected).and_then(|s| s.as_ref()).is_some_and(|s| &*s.item == WALKIE && walkie_data(s).1) {
+        *claimed = true;
+        game.native_send_to_server(WALKIE_CHANNEL, &[(steps.round().signum() as i8) as u8]);
         game.audio.play_unshared("mekanism:item.hydraulic", None, 1.0, 1.0);
         return;
     }
