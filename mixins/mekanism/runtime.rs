@@ -2155,7 +2155,7 @@ fn configurator_overlay(game: &Game<'_>, quads: &mut Vec<super::native_hooks::Na
     let (Some(eye), Some(player)) = (game.native_eye(), game.player.as_ref()) else {
         return;
     };
-    let (yaw, pitch) = (f64::from(player.yaw).to_radians(), f64::from(player.pitch).to_radians());
+    let (yaw, pitch) = (f64::from(game.yaw).to_radians(), f64::from(game.pitch).to_radians());
     let look = [-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos()];
     let reach = 4.5;
     let Some((_, block, face)) = game.native_clip(eye, [0, 1, 2].map(|i| eye[i] + look[i] * reach)) else {
@@ -3280,9 +3280,9 @@ pub(super) fn configure_side(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3])
         return true;
     }
     if sneaking {
+        let face_at = looking_arm(game, pos).unwrap_or_else(|| face_index(face));
         let changed = game.native_with_mod_block_entity(pos, |m| {
             pipe_family(&m.id)?;
-            let face_at = face_index(face);
             let next = (conn_of(&m.nbt, face_at) + 1) & 3;
             let all = (get_int(&m.nbt, "conn") & !(3 << (2 * face_at))) | (next << (2 * face_at));
             put_int(&mut m.nbt, "conn", all);
@@ -5853,10 +5853,10 @@ fn configure_transporter(game: &mut Game<'_>, pos: P3, face: P3, sneaking: bool)
     }
     let f = face_index(face);
     let logistical = id.ends_with("_logistical_transporter");
+    let arm = looking_arm(game, pos);
     if sneaking {
-        let arm = game.native_block_property(pos, DIRECTIONS[f].0).as_deref() == Some("false");
         let connected = game.native_with_mod_block_entity(pos, |m| conn_of(&m.nbt, f) != 3).unwrap_or(false);
-        if arm || !connected || !logistical {
+        if arm.is_some() || !connected || !logistical {
             return false;
         }
         let next = game
@@ -5874,6 +5874,7 @@ fn configure_transporter(game: &mut Game<'_>, pos: P3, face: P3, sneaking: bool)
         let color = game.native_with_mod_block_entity(pos, |m| color_of(&m.nbt)).flatten();
         announce_color(game, "configurator.mekanism.view_color", color);
     } else if id == "mekanism:diversion_transporter" {
+        let f = arm.unwrap_or(f);
         let mode = game.native_with_mod_block_entity(pos, |m| {
             let all = get_int(&m.nbt, "div");
             let next = tnet::Diversion::from_id((all >> (2 * f)) & 3).next();
@@ -5909,6 +5910,107 @@ fn announce_color(game: &mut Game<'_>, key: &str, color: Option<u8>) {
         None => horizon_client::text::Text::colored(lang_text("gui.mekanism.none"), 0xFFFFFF),
     };
     game.native_action_bar(player.uuid, horizon_client::text::Text::translate(key, &[name]));
+}
+
+
+/// `TileEntityTransmitter.getCollisionBoxes`: the parts of the transmitter at `pos` the player can point at: the arm
+/// of each connected face (its shape by connection type) and the core. `large` transmitters (pipes, transporters)
+/// have the 8-pixel core, the others the 6-pixel one.
+fn transmitter_parts(game: &Game<'_>, pos: P3, nbt_conn: u32, large: bool) -> Vec<(Option<usize>, [f64; 3], [f64; 3])> {
+    // (lateral low, lateral high, along low, along high) pixels of a shape pointing down, as `rotateAllInitialDown` turns it.
+    let shapes = |mode: u32| -> &'static [(f64, f64, f64, f64)] {
+        match (large, mode) {
+            (true, 1) => &[(4.0, 12.0, 3.0, 4.0), (5.0, 11.0, 1.0, 3.0), (6.0, 10.0, 0.0, 1.0)],
+            (true, 2) => &[(4.0, 12.0, 3.0, 4.0), (5.0, 11.0, 2.0, 3.0), (3.0, 13.0, 0.0, 2.0)],
+            (true, _) => &[(4.0, 12.0, 0.0, 4.0)],
+            (false, 1) => &[(5.0, 11.0, 3.0, 5.0), (6.0, 10.0, 1.0, 3.0), (7.0, 9.0, 0.0, 1.0)],
+            (false, 2) => &[(5.0, 11.0, 4.0, 5.0), (6.0, 10.0, 2.0, 4.0), (4.0, 12.0, 0.0, 2.0)],
+            (false, _) => &[(5.0, 11.0, 0.0, 5.0)],
+        }
+    };
+    let mut out = Vec::new();
+    let origin = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
+    for (d, (name, v)) in DIRECTIONS.iter().enumerate() {
+        if game.native_block_property(pos, name).as_deref() != Some("false") {
+            continue;
+        }
+        let neighbor = [pos[0] + v[0], pos[1] + v[1], pos[2] + v[2]];
+        let mode = if pipe_family(block_name(game, neighbor)).is_some() { 0 } else { (nbt_conn >> (2 * d)) & 3 };
+        let axis = [1, 1, 2, 2, 0, 0][d];
+        let positive = d % 2 == 1;
+        for &(lo, hi, a0, a1) in shapes(mode) {
+            let (a0, a1) = if positive { (16.0 - a1, 16.0 - a0) } else { (a0, a1) };
+            let (mut min, mut max) = ([lo; 3], [hi; 3]);
+            min[axis] = a0;
+            max[axis] = a1;
+            out.push((Some(d), std::array::from_fn(|k| origin[k] + min[k] / 16.0), std::array::from_fn(|k| origin[k] + max[k] / 16.0)));
+        }
+    }
+    let (lo, hi) = if large { (4.0, 12.0) } else { (5.0, 11.0) };
+    out.push((None, std::array::from_fn(|k| origin[k] + lo / 16.0), std::array::from_fn(|k| origin[k] + hi / 16.0)));
+    out
+}
+
+/// `getSideLookingAt` (`MultipartUtils.collisionRayTrace`): the arm of the transmitter at `pos` the acting player points
+/// at, none for the core (or when nothing is hit).
+fn looking_arm(game: &mut Game<'_>, pos: P3) -> Option<usize> {
+    let player = game.native_acting_player()?;
+    let sneaking = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+    let eye = [player.position[0], player.position[1] + if sneaking { 1.27 } else { 1.62 }, player.position[2]];
+    let (yaw, pitch) = (f64::from(game.yaw).to_radians(), f64::from(game.pitch).to_radians());
+    let dir = [-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos()];
+    let id = block_name(game, pos).to_owned();
+    let conn = game.native_with_mod_block_entity(pos, |m| get_int(&m.nbt, "conn")).unwrap_or(0);
+    let large = matches!(pipe_family(&id), Some("pipe" | "transporter"));
+    let mut best: Option<(f64, Option<usize>)> = None;
+    for (part, min, max) in transmitter_parts(game, pos, conn, large) {
+        let (mut near, mut far) = (0.0f64, 6.0f64);
+        let mut hit = true;
+        for k in 0..3 {
+            if dir[k].abs() < 1e-9 {
+                if eye[k] < min[k] || eye[k] > max[k] {
+                    hit = false;
+                    break;
+                }
+            } else {
+                let (a, b) = ((min[k] - eye[k]) / dir[k], (max[k] - eye[k]) / dir[k]);
+                near = near.max(a.min(b));
+                far = far.min(a.max(b));
+            }
+        }
+        if hit && near <= far && best.is_none_or(|(t, _)| near < t) {
+            best = Some((near, part));
+        }
+    }
+    best.and_then(|(_, part)| part)
+}
+
+/// The colour of a coloured transporter, drawn over its core and arms (the model's colour layer).
+fn transporter_tint(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    TRANSPORTERS.with_borrow(|set| {
+        for pos in set {
+            let Some((_, client)) = game.native_client_block_entity(*pos) else {
+                continue;
+            };
+            let Some(color) = (match get_int(&client, "color") {
+                0 => None,
+                c => tnet::COLORS.get(c as usize - 1),
+            }) else {
+                continue;
+            };
+            let argb = 0x99_00_00_00 | color.1;
+            let conn = get_int(&client, "conn_show");
+            for (_, min, max) in transmitter_parts(game, *pos, conn, true) {
+                let grow = 0.004;
+                boxes.push(super::native_hooks::NativeWorldBox {
+                    min: min.map(|v| v - grow),
+                    max: max.map(|v| v + grow),
+                    colors: [argb; 6],
+                    sprite: None,
+                });
+            }
+        }
+    });
 }
 
 /// The items moving along the transporters (hook point `native_world_items`): each stack a transporter's clients
@@ -22090,6 +22192,7 @@ fn miner_toggle_visuals(game: &Game<'_>) {
 /// The regions of the miners that show them (hook point `native_world_boxes`, API 41): one translucent box
 /// each, 0.01 inside the region (`RenderDigitalMiner`), white at the faces' brightness. Only within 64.
 pub(super) fn world_boxes(game: &Game<'_>, boxes: &mut Vec<super::native_hooks::NativeWorldBox>) {
+    transporter_tint(game, boxes);
     let shown: Vec<[i32; 3]> = MINER_VISUALS.with_borrow(|v| v.iter().copied().collect());
     for pos in shown {
         let Some((id, c)) = game.native_client_block_entity(pos) else {
