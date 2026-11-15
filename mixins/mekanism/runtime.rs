@@ -194,6 +194,9 @@ enum Kind {
     QioImporter,
     QioExporter,
     QioRedstoneAdapter,
+    /// A Fission or Fusion Reactor Logic Adapter: redstone output (and for the fission reactor, activation) from the reactor's state.
+    FissionLogic,
+    FusionLogic,
     /// A laser, laser amplifier or tractor beam: fires its energy along its facing.
     Laser,
     LaserAmplifier,
@@ -244,6 +247,8 @@ fn kind(id: &str) -> Option<Kind> {
         qio::IMPORTER => return Some(Kind::QioImporter),
         qio::EXPORTER => return Some(Kind::QioExporter),
         qio::REDSTONE_ADAPTER => return Some(Kind::QioRedstoneAdapter),
+        FISSION_LOGIC => return Some(Kind::FissionLogic),
+        FUSION_LOGIC => return Some(Kind::FusionLogic),
         laser::LASER => return Some(Kind::Laser),
         laser::AMPLIFIER => return Some(Kind::LaserAmplifier),
         laser::TRACTOR_BEAM => return Some(Kind::TractorBeam),
@@ -565,6 +570,8 @@ pub(super) fn block_entity_container(block: &str, container: &mut Option<ModCont
             | Kind::Entangloporter
             | Kind::Teleporter
             | Kind::QioRedstoneAdapter
+            | Kind::FissionLogic
+            | Kind::FusionLogic
             | Kind::Alarm
             | Kind::QioExporter
             ,
@@ -784,6 +791,10 @@ pub(super) fn block_entity_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut
             }
             Kind::QioRedstoneAdapter => {
                 tick_redstone_adapter(game, pos, entity);
+                None
+            }
+            Kind::FissionLogic | Kind::FusionLogic => {
+                tick_reactor_logic(game, pos, entity);
                 None
             }
             Kind::Alarm => {
@@ -7532,6 +7543,7 @@ fn module_container_tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<
 /// `EnumColor` rgb values (`mekanism.api.text.EnumColor`).
 mod enum_color {
     pub const DARK_RED: u32 = 0xC9071F;
+    pub const RED: u32 = 0xFF383C;
     pub const DARK_GRAY: u32 = 0x7A7A7A;
     pub const GRAY: u32 = 0xCFCFCF;
     pub const INDIGO: u32 = 0x559EFF;
@@ -10764,6 +10776,8 @@ fn layout(block: &str) -> Option<Layout> {
             power: None,
             progress: None,
         },
+        // `GuiFissionReactorLogicAdapter` / `GuiFusionReactorLogicAdapter`: no slots, gauges or bars of their own.
+        Kind::FissionLogic | Kind::FusionLogic => Layout { slots: [None; 3], gauges: vec![], power: None, progress: None },
         Kind::TurbineValve => Layout {
             slots: [None; 3],
             // `GuiIndustrialTurbine`: a medium steam gauge, the energy bar at the right edge.
@@ -10979,6 +10993,13 @@ fn screen_data(entity: &mut ModBlockEntity, facing: usize) {
         if kind(&entity.id) == Some(Kind::LaserAmplifier) {
             entity.data[2] = get_int(&entity.nbt, "delay").min(32_767) as i32;
             entity.data[3] = (get_int(&entity.nbt, "omode") % 3) as i32;
+        }
+        // The logic adapters: whether the reactor stands, the mode, the status and (fusion) active cooling.
+        if matches!(kind(&entity.id), Some(Kind::FissionLogic | Kind::FusionLogic)) {
+            entity.data[0] = get_int(&entity.nbt, "formed") as i32;
+            entity.data[1] = get_int(&entity.nbt, "logic") as i32;
+            entity.data[2] = get_int(&entity.nbt, "status") as i32;
+            entity.data[3] = get_int(&entity.nbt, "cooled") as i32;
         }
         // The progress arrow is full while it converted something this tick (`didProcess`).
         if kind(&entity.id) == Some(Kind::Oredictionificator) {
@@ -11295,6 +11316,8 @@ fn screen_width(block: &str) -> f32 {
         Some(Kind::FissionPort) => 195.0,
         // `DEFAULT_IMAGE_WIDTH + 10`.
         Some(Kind::FusionPort) => 186.0,
+        // `DEFAULT_IMAGE_WIDTH + 20`.
+        Some(Kind::FissionLogic | Kind::FusionLogic) => 196.0,
         // `DEFAULT_IMAGE_WIDTH + 60`.
         Some(Kind::Oredictionificator) => 236.0,
         _ => 176.0,
@@ -11414,6 +11437,7 @@ fn tabs(block: &str) -> u8 {
         Some(Kind::EnergyCube(_) | Kind::ChemicalTank(_)) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
         Some(Kind::Vibrator | Kind::Heater | Kind::FuelwoodHeater | Kind::LaserAmplifier) => TAB_REDSTONE | TAB_SECURITY,
         Some(Kind::Oredictionificator) => TAB_REDSTONE | TAB_SECURITY | TAB_SIDES,
+        Some(Kind::FissionLogic | Kind::FusionLogic) => TAB_REDSTONE,
         Some(Kind::FluidTank(_)) => TAB_SECURITY | TAB_EDIT_MODE,
         Some(Kind::DynamicValve) => TAB_EDIT_MODE,
         _ => 0,
@@ -12152,7 +12176,11 @@ pub(super) fn screen_wheel(game: &Game<'_>, block: &str, steps: f32, taken: &mut
         let hidden = count.saturating_sub(SORTER_ROWS);
         if steps > 0.0 { first.min(hidden).saturating_sub(1) } else { (first + 1).min(hidden) }
     };
-    if kind(block) == Some(Kind::SecurityDesk) {
+    if let Some(k @ (Kind::FissionLogic | Kind::FusionLogic)) = kind(block) {
+        let hidden = logic_modes(k).len().saturating_sub(LOGIC_ROWS);
+        LOGIC_SCROLL.set(if steps > 0.0 { LOGIC_SCROLL.get().min(hidden).saturating_sub(1) } else { (LOGIC_SCROLL.get() + 1).min(hidden) });
+        *taken = true;
+    } else if kind(block) == Some(Kind::SecurityDesk) {
         security_desk_wheel(steps);
         *taken = true;
     } else if kind(block) == Some(Kind::ModificationStation) {
@@ -13029,6 +13057,8 @@ const BUTTON_EDIT_NEXT: i32 = 103;
 const BUTTON_EDIT_PREVIOUS: i32 = 104;
 /// The Laser Amplifier's redstone output tab (`GuiInteraction.NEXT_MODE` / `PREVIOUS_MODE`).
 const BUTTON_AMPLIFIER_NEXT: i32 = 105;
+const BUTTON_LOGIC_COOLING: i32 = 340;
+const BUTTON_LOGIC_MODE: i32 = 350;
 const BUTTON_AMPLIFIER_PREVIOUS: i32 = 106;
 
 /// The capacity of a multiblock's tank, from the size its master saved.
@@ -13326,6 +13356,9 @@ fn screen_click_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], r
         adapter_click(game, at);
         return;
     }
+    if matches!(kind(block), Some(Kind::FissionLogic | Kind::FusionLogic)) && logic_click(block, at, button) {
+        return;
+    }
     if upgrade_slot_click(game, block, at, right, button) {
         return;
     }
@@ -13364,9 +13397,28 @@ pub(super) fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBl
     // The redstone tab (`GuiInteraction.NEXT_REDSTONE_CONTROL` / `PREVIOUS_REDSTONE_CONTROL`).
     if matches!(id, BUTTON_REDSTONE_NEXT | BUTTON_REDSTONE_PREVIOUS) && tabs(&entity.id) & TAB_REDSTONE != 0 {
         let now = RedstoneControl::from_ordinal(get_int(&entity.nbt, "control"));
-        let next = if id == BUTTON_REDSTONE_NEXT { now.next() } else { now.previous() };
+        let mut next = if id == BUTTON_REDSTONE_NEXT { now.next() } else { now.previous() };
+        // `supportsMode`: the logic adapters do not allow the disabled mode.
+        if matches!(kind(&entity.id), Some(Kind::FissionLogic | Kind::FusionLogic)) && next == RedstoneControl::Disabled {
+            next = if id == BUTTON_REDSTONE_NEXT { next.next() } else { next.previous() };
+        }
         put_int(&mut entity.nbt, "control", next.ordinal());
         return;
+    }
+    // The logic adapters' mode list (`LOGIC_TYPE`) and the fusion adapter's cooling toggle (`NEXT_MODE`).
+    if let Some(k @ (Kind::FissionLogic | Kind::FusionLogic)) = kind(&entity.id) {
+        if id == BUTTON_LOGIC_COOLING && k == Kind::FusionLogic {
+            let cooled = get_int(&entity.nbt, "cooled").min(1);
+            put_int(&mut entity.nbt, "cooled", 1 - cooled);
+            return;
+        }
+        if (BUTTON_LOGIC_MODE..BUTTON_LOGIC_MODE + 8).contains(&id) {
+            let index = (id - BUTTON_LOGIC_MODE) as u32;
+            if (index as usize) < logic_modes(k).len() {
+                put_int(&mut entity.nbt, "logic", index);
+            }
+            return;
+        }
     }
     // The container edit mode tab (`NEXT_MODE` / `PREVIOUS_MODE`).
     if matches!(id, BUTTON_EDIT_NEXT | BUTTON_EDIT_PREVIOUS) && tabs(&entity.id) & TAB_EDIT_MODE != 0 {
@@ -13647,7 +13699,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         slots,
         inventory_y: h - 82.0,
         inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(),
-        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort | Kind::FusionPort | Kind::SecurityDesk | Kind::ModificationStation | Kind::Heater | Kind::LaserAmplifier)),
+        own_labels: matches!(kind(block), Some(Kind::Nucleosynthesizer | Kind::Evaporation | Kind::BoilerValve | Kind::TurbineValve | Kind::SpsPort | Kind::FissionPort | Kind::FusionPort | Kind::SecurityDesk | Kind::ModificationStation | Kind::Heater | Kind::LaserAmplifier | Kind::FissionLogic | Kind::FusionLogic)),
         alt: None,
         ..Default::default()
     });
@@ -15066,6 +15118,12 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         centred(game, batch, &title, ox, width, oy + 4.0, 0x40_4040);
         game.native_text(batch, "Inventory", [ox + 8.0, oy + height - 92.0], 0x40_4040, false);
     }
+    if matches!(kind(block), Some(Kind::FissionLogic | Kind::FusionLogic)) {
+        let title = game.native_screen_title().unwrap_or_default();
+        centred(game, batch, &title, ox, width, oy + 4.0, 0x40_4040);
+        game.native_text(batch, "Inventory", [ox + 18.0, oy + height - 94.0], 0x40_4040, false);
+        draw_logic_screen(game, batch, block, data, origin);
+    }
     if kind(block) == Some(Kind::LaserAmplifier) {
         // `renderTitleTextWithOffset(energyGauge.getRelativeRight())`: centred from 24 to the edge, 4 px in each side.
         let title = game.native_screen_title().unwrap_or_default();
@@ -15452,6 +15510,9 @@ fn heater_temperature(data: &[i32]) -> f64 {
 }
 
 fn screen_tooltip_inner(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
+    if let Some(k @ (Kind::FissionLogic | Kind::FusionLogic)) = kind(block) {
+        logic_tooltip(k, data, at, lines);
+    }
     if miner_cfg_open(block) {
         miner_cfg_tooltip(game, at, lines);
         return;
@@ -15749,6 +15810,258 @@ fn screen_tooltip_base(game: &Game<'_>, block: &str, data: &[i32], at: [f32; 2],
         let fe = mekanism_core::energy::format_fe;
         lines.push(format!("Using: {}/t", fe(read_wide(data, DATA_USAGE))));
         lines.push(format!("Needed: {}", fe(read_wide(data, DATA_CAPACITY).saturating_sub(read_wide(data, DATA_STORED)))));
+    }
+}
+
+// --- Reactor logic adapters ---------------------------------------------------------------------------
+
+const FISSION_LOGIC: &str = "mekanismgenerators:fission_reactor_logic_adapter";
+const FUSION_LOGIC: &str = "mekanismgenerators:fusion_reactor_logic_adapter";
+
+/// A mode of `FissionReactorLogic` / `FusionReactorLogic`: its name, description, icon and colour code.
+struct LogicMode {
+    name: &'static str,
+    description: &'static str,
+    item: &'static str,
+    /// The `EnumColor` as a legacy code for the mode's name in the status line.
+    code: &'static str,
+    rgb: u32,
+}
+
+const fn mode(name: &'static str, description: &'static str, item: &'static str, code: &'static str, rgb: u32) -> LogicMode {
+    LogicMode { name, description, item, code, rgb }
+}
+
+fn logic_modes(k: Kind) -> &'static [LogicMode] {
+    const RED: u32 = enum_color::RED;
+    static FISSION: [LogicMode; 6] = [
+        mode("Disabled", "Will not handle redstone", "minecraft:gunpowder", "\u{a7}8", enum_color::DARK_GRAY),
+        mode("Activation", "Activate the reactor when powered, and deactivate when unpowered", "minecraft:flint_and_steel", "\u{a7}b", enum_color::AQUA),
+        mode("High Temperature", "Output when the reactor reaches dangerous temperatures", "minecraft:redstone", "\u{a7}c", RED),
+        mode("Critical Waste Level", "Output when the reactor has reached a critical level of waste (90%)", "minecraft:redstone", "\u{a7}c", RED),
+        mode("Damage Critical", "Output when the reactor reaches critical damage levels (100%+).", "minecraft:redstone", "\u{a7}c", RED),
+        mode("Insufficient Fuel", "Output when the reactor has insufficient fuel to sustain a reaction", "minecraft:redstone", "\u{a7}c", RED),
+    ];
+    static FUSION: [LogicMode; 4] = [
+        mode("Disabled", "Will not handle redstone", "minecraft:gunpowder", "\u{a7}c", RED),
+        mode("Ready for Ignition", "Output when the reactor has reached the required heat level to ignite", "minecraft:redstone", "\u{a7}c", RED),
+        mode("Heat Capacity Met", "Output when the reactor's core heat capacity has been met", "minecraft:redstone", "\u{a7}c", RED),
+        mode("Insufficient Fuel", "Output when the reactor has insufficient fuel to sustain a reaction", "minecraft:redstone", "\u{a7}c", RED),
+    ];
+    if k == Kind::FusionLogic { &FUSION } else { &FISSION }
+}
+
+/// The adapter's name for a mode, from the mod's lang when it has it.
+fn logic_text(key: &str, fallback: &str) -> String {
+    let key = format!("reactor.mekanismgenerators.{key}");
+    if horizon_client::lang::has(&key) { horizon_client::lang::get(&key) } else { fallback.to_owned() }
+}
+
+/// The reactor an adapter belongs to: the master port of the structure around it.
+fn logic_master(game: &Game<'_>, pos: [i32; 3], fusion: bool) -> Option<[i32; 3]> {
+    if fusion {
+        find_fusion(game, pos).map(|(_, ports)| ports[0])
+    } else {
+        find_reactor(game, pos).and_then(|(_, ports, ..)| ports.first().copied())
+    }
+}
+
+/// `TileEntityFissionReactorLogicAdapter.getStatusServer` / `TileEntityFusionReactorLogicAdapter.checkMode`: 0 idle, 1
+/// outputting, 2 powered (the activation mode while it lets the reactor run).
+fn logic_status(game: &mut Game<'_>, master: [i32; 3], fusion: bool, mode: u32, cooled: bool, allowed: bool) -> u32 {
+    let result = game.native_with_mod_block_entity(master, |m| {
+        let nbt = &m.nbt;
+        if fusion {
+            let plasma = fusion_plasma(nbt);
+            let injection = fusion_injection(nbt);
+            let rate = injection.max(get_long(nbt, "last_burned").max(0) as u64);
+            let fuel = get_tank(nbt, "fuel", fusion::FUEL_CAPACITY);
+            return match mode {
+                1 => u32::from(plasma.plasma >= fusion::ignition(cooled)),
+                2 => u32::from(plasma.plasma >= fusion::max_plasma(cooled, rate)),
+                3 => {
+                    if fuel.amount > 0 {
+                        return 0;
+                    }
+                    let portion = injection / 2;
+                    let deuterium = get_tank(nbt, "deuterium", fusion::FUEL_CAPACITY).amount;
+                    let tritium = get_tank(nbt, "tritium", fusion::FUEL_CAPACITY).amount;
+                    u32::from(portion == 0 || deuterium < portion || tritium < portion)
+                }
+                _ => 0,
+            };
+        }
+        let r = reactor_of(nbt);
+        let st = fission_state(nbt, &r);
+        match mode {
+            1 if allowed => 2,
+            2 if st.temperature() >= fission::MIN_DAMAGE_TEMPERATURE => 1,
+            3 => {
+                // `fissionExcessWasteRatio`.
+                let target = (r.fuel_capacity() as f64 * 0.9) as u64;
+                u32::from(get_tank(nbt, "waste", r.fuel_capacity()).amount >= target)
+            }
+            4 if st.damage >= fission::MAX_DAMAGE => 1,
+            5 if get_tank(nbt, "fuel", r.fuel_capacity()).amount == 0 => 1,
+            _ => 0,
+        }
+    });
+    result.unwrap_or(0)
+}
+
+/// A logic adapter's tick: once a second it finds its reactor; each tick it works out its status, powers the block on
+/// that and (activation) starts or stops the fission reactor with the redstone control.
+fn tick_reactor_logic(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    let fusion = kind(&entity.id) == Some(Kind::FusionLogic);
+    // `supportsMode`: the disabled mode is not allowed, so a new adapter starts on "high".
+    if !entity.nbt.contains_key(&JavaString::from("control")) {
+        put_int(&mut entity.nbt, "control", RedstoneControl::High.ordinal());
+    }
+    let ticker = get_int(&entity.nbt, "ticker");
+    put_int(&mut entity.nbt, "ticker", (ticker + 1) % 20);
+    if ticker == 0 {
+        match logic_master(game, pos, fusion) {
+            Some(master) => entity.nbt.insert("master".into(), Tag::IntArray(master.to_vec())),
+            None => entity.nbt.remove(&JavaString::from("master")),
+        };
+    }
+    let master = get_pos(&entity.nbt, "master");
+    let mode = get_int(&entity.nbt, "logic").min(logic_modes(kind(&entity.id).unwrap_or(Kind::FissionLogic)).len() as u32 - 1);
+    let allowed = !fusion && mode == 1 && redstone_allows(game, pos, entity);
+    let status = match master {
+        Some(m) => logic_status(game, m, fusion, mode, get_int(&entity.nbt, "cooled") != 0, allowed),
+        None => 0,
+    };
+    // `onPowerChange`: the activation mode switches the reactor with the signal (not while it is forcibly disabled).
+    if let Some(m) = master.filter(|_| !fusion && mode == 1) {
+        game.native_with_mod_block_entity(m, |m| {
+            if get_long(&m.nbt, "force") != 1 {
+                put_long(&mut m.nbt, "active", u64::from(allowed));
+            }
+        });
+    }
+    put_int(&mut entity.nbt, "formed", u32::from(master.is_some()));
+    put_int(&mut entity.nbt, "logic", mode);
+    put_int(&mut entity.nbt, "status", status);
+    // `getRedstoneLevel`: 15 on the sides that face out of the reactor while it is outputting.
+    game.native_set_block_signal(pos, if status == 1 { 15 } else { 0 });
+}
+
+thread_local! {
+    /// The first mode the adapter's list shows.
+    static LOGIC_SCROLL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+const LOGIC_ROWS: usize = 4;
+const LOGIC_HOLDER: [f32; 4] = [26.0, 31.0, 130.0, 90.0];
+const LOGIC_BAR: [f32; 4] = [156.0, 31.0, 14.0, 90.0];
+const LOGIC_COOLING: [f32; 4] = [26.0, 19.0, 11.0, 11.0];
+
+fn logic_row(i: usize) -> [f32; 4] {
+    [27.0, 32.0 + 22.0 * i as f32, 128.0, 22.0]
+}
+
+fn logic_click(block: &str, at: [f32; 2], button: &mut Option<i32>) -> bool {
+    let Some(k) = kind(block) else {
+        return false;
+    };
+    let modes = logic_modes(k).len();
+    let hidden = modes.saturating_sub(LOGIC_ROWS);
+    if k == Kind::FusionLogic && inside(at, LOGIC_COOLING) {
+        *button = Some(BUTTON_LOGIC_COOLING);
+        return true;
+    }
+    if inside(at, LOGIC_BAR) {
+        let f = ((at[1] - LOGIC_BAR[1] - 8.0) / (LOGIC_BAR[3] - 16.0)).clamp(0.0, 1.0);
+        LOGIC_SCROLL.set(((hidden as f32 + 0.5) * f) as usize);
+        return true;
+    }
+    for i in 0..LOGIC_ROWS {
+        let index = LOGIC_SCROLL.get().min(hidden) + i;
+        if index < modes && inside(at, logic_row(i)) {
+            *button = Some(BUTTON_LOGIC_MODE + index as i32);
+            return true;
+        }
+    }
+    false
+}
+
+/// `GuiFissionReactorLogicAdapter` / `GuiFusionReactorLogicAdapter`: the mode list in its holder with its scroll bar, the
+/// redstone mode and status under it and, for fusion, the cooling toggle.
+fn draw_logic_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: &str, data: &[i32], origin: [f32; 2]) {
+    let [ox, oy] = origin;
+    let Some(k) = kind(block) else {
+        return;
+    };
+    let at = |r: [f32; 4]| [ox + r[0], oy + r[1], r[2], r[3]];
+    let cursor = game.native_cursor();
+    let mouse = [cursor[0] - ox, cursor[1] - oy];
+    let modes = logic_modes(k);
+    let current = (data.get(1).copied().unwrap_or(0).max(0) as usize).min(modes.len() - 1);
+    let status = data.get(2).copied().unwrap_or(0);
+    let fusion = k == Kind::FusionLogic;
+    let width = screen_width(block);
+    nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, at(LOGIC_HOLDER), 0xFFFF_FFFF);
+    let hidden = modes.len().saturating_sub(LOGIC_ROWS);
+    let first = LOGIC_SCROLL.get().min(hidden);
+    nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, at(LOGIC_BAR), 0xFFFF_FFFF);
+    let thumb = if hidden > 0 { (first as f32 / hidden as f32 * (LOGIC_BAR[3] - 2.0 - 15.0)).round() } else { 0.0 };
+    let bar = if hidden > 0 { "scroll/bar" } else { "scroll/bar_inactive" };
+    sprite(game, batch, bar, [0.0, 0.0, 12.0, 15.0], [ox + LOGIC_BAR[0] + 1.0, oy + LOGIC_BAR[1] + 1.0 + thumb, 12.0, 15.0]);
+    for i in 0..LOGIC_ROWS {
+        let index = first + i;
+        let Some(m) = modes.get(index) else {
+            continue;
+        };
+        let row = at(logic_row(i));
+        let argb = 0xFF00_0000 | m.rgb;
+        nine_slice_tinted(game, batch, if index == current { "list/selected" } else { "list/base" }, [12.0, 12.0], 1.0, row, argb);
+        nine_slice_tinted(game, batch, "slot/normal", [18.0, 18.0], 1.0, [row[0] + 2.0, row[1] + 2.0, 18.0, 18.0], argb);
+        game.native_item(batch, m.item, [row[0] + 3.0, row[1] + 3.0], 16.0);
+        let name = logic_text(&format!("logic.{}", logic_key(k, index)), m.name);
+        scrolling_text(game, batch, &format!("\u{a7}f{name}"), [row[0] + 20.0, row[1] + 2.0, row[0] + 128.0 - 2.0, row[1] + 11.0], 0, 0x40_4040, 1.0);
+    }
+    if fusion {
+        let cooled = data.get(3).copied().unwrap_or(0) != 0;
+        let r = at(LOGIC_COOLING);
+        draw_button(game, batch, r, inside(mouse, LOGIC_COOLING), true, 0xFFFF_FFFF, Some((if cooled { "button/toggle_flipped" } else { "button/toggle" }, 11.0)));
+        let label = logic_text("logic.active_cooling", "Active cooling: %1$s").replace("%1$s", &format!("\u{a7}c{}", if cooled { "On" } else { "Off" }));
+        scrolling_text(game, batch, &label, [ox + 23.0, oy + 20.0, ox + width - 16.0, oy + 29.0], 0, 0x40_4040, 1.0);
+    }
+    let m = &modes[current];
+    let name = logic_text(&format!("logic.{}", logic_key(k, current)), m.name);
+    let line = logic_text("logic.redstone_output_mode", "Redstone mode: %1$s").replace("%1$s", &format!("{}{name}", m.code));
+    scrolling_text(game, batch, &line, [ox + 4.0, oy + 123.0, ox + width - 4.0, oy + 132.0], 1, 0x40_4040, 1.0);
+    let word = match (fusion, status) {
+        (_, 1) => logic_text("logic.outputting", "Outputting"),
+        (false, 2) => logic_text("logic.powered", "Powered"),
+        _ => "Idle".to_owned(),
+    };
+    let line = format!("Status: \u{a7}c{word}");
+    scrolling_text(game, batch, &line, [ox + 4.0, oy + 136.0, ox + width - 4.0, oy + 145.0], 1, 0x40_4040, 1.0);
+}
+
+/// A mode's key under `reactor.mekanismgenerators.logic`.
+fn logic_key(k: Kind, index: usize) -> &'static str {
+    const FISSION: [&str; 6] = ["disabled", "activation", "temperature", "critical_waste_level", "damaged", "depleted"];
+    const FUSION: [&str; 4] = ["disabled", "ready", "capacity", "depleted"];
+    if k == Kind::FusionLogic { FUSION[index.min(3)] } else { FISSION[index.min(5)] }
+}
+
+/// `ReactorLogicButton.updateTooltip`: the mode's description; `ToggleButton`'s tooltip of the cooling toggle.
+fn logic_tooltip(k: Kind, data: &[i32], at: [f32; 2], lines: &mut Vec<String>) {
+    let modes = logic_modes(k);
+    let first = LOGIC_SCROLL.get().min(modes.len().saturating_sub(LOGIC_ROWS));
+    let _ = data;
+    if k == Kind::FusionLogic && inside(at, LOGIC_COOLING) {
+        lines.push(logic_text("logic.toggle_cooling", "Toggle Cooling Measurements"));
+        return;
+    }
+    for i in 0..LOGIC_ROWS {
+        if let Some(m) = modes.get(first + i).filter(|_| inside(at, logic_row(i))) {
+            lines.push(m.description.to_owned());
+            return;
+        }
     }
 }
 
