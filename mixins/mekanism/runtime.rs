@@ -6431,7 +6431,11 @@ fn tick_sorter(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) 
         let ranged = opts.filter(|o| o.size_mode && !settings.single_item);
         let take = ranged.map_or(max, |o| u32::from(o.max).clamp(1, max));
         let wanted = |s: &ItemStack| match filter {
-            Some(f) => Sorter::matches_item(f, &s.item, &in_tag),
+            // An item filter that is not fuzzy takes only a plain stack of its item (`itemType.equals(toCheck)`).
+            Some(f) => {
+                Sorter::matches_item(f, &s.item, &in_tag)
+                    && (f.starts_with(['#', '@']) || settings.opts_of(f).fuzzy || (s.damage == 0 && s.extra.is_none()))
+            }
             None => settings.auto_eject_allows(&s.item, &in_tag),
         };
         let stack = game.native_extract_item_where(back, back_face, take, &wanted);
@@ -9606,7 +9610,7 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch
             ]);
         } else if item == SCUBA_TANK && slot == 1 {
             let on = scuba_flowing(stack);
-            lines.push(vec![("Scuba Tank: ".into(), dark), (if on { "On" } else { "Off" }.into(), if on { 0x75FF89 } else { 0xFF5555 })]);
+            lines.push(vec![("Scuba Tank: ".into(), dark), (if on { "on" } else { "off" }.into(), if on { 0x75FF89 } else { 0xFF5555 })]);
             lines.push(vec![("Oxygen: ".into(), dark), (jetpack_fuel(stack).to_string(), orange)]);
         } else if FREE_RUNNERS.contains(&item) && slot == 3 {
             lines.push(vec![(format!("Runners Mode: {}", free_runner_mode(stack).label()), gray)]);
@@ -9760,7 +9764,7 @@ fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
         for (module, icon) in [("mekanism:gravitational_modulating_unit", "gravitational_modulation_unit"), ("mekanism:vision_enhancement_unit", "vision_enhancement_unit")] {
             if installed_modules(stack).get(module).copied().unwrap_or(0) > 0 && flag(stack, module, "render_hud") != Some(0) {
                 let on = flag(stack, module, "enabled") == Some(1);
-                elements.push((icon, if on { "On" } else { "Off" }.to_owned(), if on { regular } else { faded }));
+                elements.push((icon, if on { "ON" } else { "OFF" }.to_owned(), if on { regular } else { faded }));
             }
         }
     }
@@ -11555,7 +11559,7 @@ fn scuba_toggle(game: &mut Game<'_>) {
     let on = !scuba_flowing(stack);
     set_custom_long(stack, SCUBA_MODE_KEY, u64::from(on));
     if let Some(player) = game.native_acting_player() {
-        let line = format!("Flowing: {}", if on { "On" } else { "Off" });
+        let line = format!("Flowing: {}", if on { "\u{a7}aon" } else { "\u{a7}coff" });
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
 }
@@ -13979,7 +13983,7 @@ fn draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, block: 
         nine_slice_tinted(game, batch, button, [200.0, 20.0], 2.0, [bx, oy + by, bw, bh], 0xFFFF_FFFF);
         sprite(game, batch, tab.icon, [0.0, 0.0, 18.0, 18.0], [bx, oy + by, bw, bh]);
         if tab.what == TabKind::Sort {
-            let word = if data.get(redstone_slot(l) + 5 + 9).copied().unwrap_or(0) != 0 { "On" } else { "Off" };
+            let word = if data.get(redstone_slot(l) + 5 + 9).copied().unwrap_or(0) != 0 { "on" } else { "off" };
             let tw = game.native_text_width(word) * 0.75;
             game.native_text_scaled(batch, word, [x + (26.0 - tw) / 2.0 + if left { 1.0 } else { -1.0 }, y + 24.0], 0x40_4040, 0.75);
         }
@@ -14003,7 +14007,7 @@ fn tab_tooltip(block: &str, l: &Layout, data: &[i32], at: [f32; 2], lines: &mut 
         TabKind::Amplifier => lines.push(format!("Redstone Output: {}", ["Off", "Entity Detection", "Energy Contents"][amplifier_mode(data)])),
         TabKind::Visuals => {
             let (shown, too_big) = (miner_visuals_on(data), kind(block) == Some(Kind::DigitalMiner) && miner_view(block, data).radius > 64);
-            lines.push(format!("Visuals: {}", if shown { "On" } else { "Off" }));
+            lines.push(format!("Visuals: {}", if shown { "on" } else { "off" }));
             if too_big {
                 lines.push("\u{a7}cArea too large to display visuals.".into());
             }
@@ -14256,7 +14260,7 @@ fn draw_window(game: &Game<'_>, block: &str, data: &[i32], batch: &mut horizon_c
     let line = if !ejects {
         "Can't Eject".to_owned()
     } else {
-        format!("Eject: {}", if no_eject { "Off" } else { "On" })
+        format!("Eject: {}", if no_eject { "off" } else { "on" })
     };
     game.native_text(batch, &line, [s[0] + 3.0, s[1] + 3.0], 0x3C_FE9A, false);
     draw_button(game, batch, screen(WINDOW_EJECT), hover(WINDOW_EJECT), ejects, 0xFFFF_FFFF, Some(("button/auto_eject", 14.0)));
@@ -23017,6 +23021,9 @@ fn sorter_payload(game: &mut Game<'_>, data: &[u8]) {
             sorter::Op::SizeMode => {
                 s.edit(index, |o| o.size_mode = !o.size_mode);
             }
+            sorter::Op::Fuzzy => {
+                s.edit(index, |o| o.fuzzy = !o.fuzzy);
+            }
             sorter::Op::ColorNext | sorter::Op::ColorPrevious => {
                 let next = r.op == sorter::Op::ColorNext;
                 s.edit(index, |o| o.color = sorter::Opts::step_color(o.color, next));
@@ -23151,7 +23158,8 @@ fn draw_sorter_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
         Some((p, v)) => (p, v),
         None => ([0; 3], SorterView { filters: vec![], disabled: vec![], single: false, eject: false, round_robin: false, opts: Default::default(), qio: None }),
     };
-    let on = |b: bool| if b { "\u{a7}aON" } else { "\u{a7}cOFF" };
+    // `OnOff.of(..).getTextComponent()`: the lang's plain "on" and "off".
+    let on = |b: bool| if b { "on" } else { "off" };
     let small = |batch: &mut horizon_client::hud::HudBatch, text: &str, x: f32, y: f32| {
         game.native_text_scaled(batch, text, [ox + 9.0 + x + 1.0, oy + 17.0 + y + 3.0], 0x3C_FE9A, 0.8);
     };
@@ -23478,6 +23486,8 @@ const FILTER_DELETE: [f32; 4] = [24.0, 62.0, 60.0, 20.0];
 const FILTER_SAVE: [f32; 4] = [86.0, 62.0, 60.0, 20.0];
 const FILTER_DEFAULT: [f32; 4] = [148.0, 18.0, 11.0, 11.0];
 const FILTER_SIZE: [f32; 4] = [148.0, 56.0, 11.0, 11.0];
+/// `GuiSorterItemStackFilter`'s fuzzy button (its text is at 159, 71).
+const FILTER_FUZZY: [f32; 4] = [148.0, 68.0, 11.0, 11.0];
 const FILTER_COLOR: [f32; 4] = [8.0, 44.0, 16.0, 16.0];
 const FILTER_MIN: [f32; 4] = [174.0, 31.0, 20.0, 11.0];
 const FILTER_MAX: [f32; 4] = [174.0, 43.0, 20.0, 11.0];
@@ -23661,6 +23671,10 @@ fn draw_filter_window(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
             draw_button(game, batch, screen(FILTER_SIZE), hover(FILTER_SIZE), true, 0xFFFF_FFFF, Some(("button/silk_touch", 11.0)));
             let size_text = if view.single && o.size_mode { "\u{a7}con!" } else if o.size_mode { "on" } else { "off" };
             game.native_text(batch, size_text, [x + 159.0, y + 58.0], 0x40_4040, false);
+            if e.kind == 0 {
+                draw_button(game, batch, screen(FILTER_FUZZY), hover(FILTER_FUZZY), true, 0xFFFF_FFFF, Some(("button/fuzzy", 11.0)));
+                game.native_text(batch, if o.fuzzy { "on" } else { "off" }, [x + 159.0, y + 71.0], 0x40_4040, false);
+            }
             game.native_text(batch, "Min:", [x + 146.0, y + 32.0], 0x40_4040, false);
             game.native_text(batch, "Max:", [x + 146.0, y + 44.0], 0x40_4040, false);
             for (r, t) in [(FILTER_MIN, &e.min), (FILTER_MAX, &e.max)] {
@@ -23737,6 +23751,11 @@ fn filter_window_click(game: &Game<'_>, pos: [i32; 3], view: &SorterView, at: [f
             Some(i) => send_sorter(game, Op::AllowDefault, pos, i),
             None => draft(&|o| o.allow_default = !o.allow_default),
         }
+    } else if sorter && kind == 0 && on(FILTER_FUZZY) {
+        match index {
+            Some(i) => send_sorter(game, Op::Fuzzy, pos, i),
+            None => draft(&|o| o.fuzzy = !o.fuzzy),
+        }
     } else if sorter && on(FILTER_SIZE) {
         match index {
             Some(i) => send_sorter(game, Op::SizeMode, pos, i),
@@ -23808,6 +23827,9 @@ fn filter_window_save(game: &Game<'_>, pos: [i32; 3], view: &SorterView, index: 
             }
             if draft.size_mode {
                 send_sorter(game, Op::SizeMode, pos, at);
+            }
+            if draft.fuzzy && kind == 0 {
+                send_sorter(game, Op::Fuzzy, pos, at);
             }
             if let Some(c) = draft.color {
                 send_sorter_value(game, Op::SetColor, pos, at, u16::from(c) + 1);
@@ -24531,7 +24553,7 @@ fn draw_transporter_window(game: &Game<'_>, block: &str, data: &[i32], batch: &m
     centred(game, batch, "Transporter Config", x, w - 18.0, y + 5.0, 0x40_4040);
     let s = screen(TRANSPORTER_SCREEN);
     nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 6.0, s, 0xFFFF_FFFF);
-    game.native_text_scaled(batch, &format!("Strict Input: {}", if strict { "On" } else { "Off" }), [s[0] + 3.0, s[1] + 3.0], 0x3C_FE9A, 0.8);
+    game.native_text_scaled(batch, &format!("Strict Input ({})", if strict { "on" } else { "off" }), [s[0] + 3.0, s[1] + 3.0], 0x3C_FE9A, 0.8);
     draw_button(game, batch, screen(TRANSPORTER_STRICT), hover(TRANSPORTER_STRICT), true, 0xFFFF_FFFF, Some(("button/exclamation", 14.0)));
     sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [x + 111.0, y + 48.0, 18.0, 18.0]);
     if let Some(c) = out {
@@ -26783,7 +26805,7 @@ fn security_desk_tooltip(at: [f32; 2], lines: &mut Vec<String>) -> bool {
     }
     if inside(at, SEC_OVERRIDE) {
         let on = view.freq.as_ref().is_some_and(|f| f.1);
-        lines.push(format!("Security Override: {}", if on { "On" } else { "Off" }));
+        lines.push(format!("Security Override: {}", if on { "on" } else { "off" }));
         return true;
     }
     false
@@ -32522,7 +32544,7 @@ fn electric_bow_use(game: &mut Game<'_>, claimed: &mut bool) {
     set_custom_string(held, BOW_FIRE_KEY, if fire { "fire" } else { "normal" });
     *claimed = true;
     if let Some(player) = game.native_acting_player() {
-        let line = format!("Fire mode: {}", if fire { "On" } else { "Off" });
+        let line = format!("Fire Mode: {}", if fire { "\u{a7}aon" } else { "\u{a7}coff" });
         game.native_action_bar(player.uuid, horizon_client::text::Text::literal(line));
     }
 }
