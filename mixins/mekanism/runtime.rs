@@ -20182,7 +20182,7 @@ fn draw_qio_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, b
         // `GuiQIOFrequencyDataScreen`: the frequency, and digital bars for the items and types held.
         nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, [ox + 15.0, oy + 19.0, w - 32.0, 46.0], 0xFFFF_FFFF);
         if let Some(f) = &frequency {
-            game.native_text_scaled(batch, &format!("Frequency: {f}"), [ox + 20.0, oy + 24.0], 0x3C_FE9A, 0.8);
+            scrolling_text(game, batch, &format!("Frequency: {f}"), [ox + 20.0, oy + 24.0, ox + 15.0 + (w - 32.0) - 5.0, oy + 33.0], 0, 0x3C_FE9A, 0.8);
         }
         let ratio = |a: u64, b: u64| if b == 0 { 0.0 } else { (a as f64 / b as f64).clamp(0.0, 1.0) as f32 };
         let (items, types) = view.as_ref().map_or((0.0, 0.0), |v| (ratio(v.items, v.item_cap), ratio(v.types, v.type_cap)));
@@ -20192,13 +20192,12 @@ fn draw_qio_screen(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, b
             if filled > 0.0 {
                 game.native_fill(batch, [ox + x + 1.0, oy + 40.0, filled, 6.0], 0xFF3C_FE9A);
             }
-            let lw = game.native_text_width(label) * 0.8;
-            game.native_text_scaled(batch, label, [ox + x + (50.0 - lw) / 2.0, oy + 51.0], 0x3C_FE9A, 0.8);
+            scrolling_text(game, batch, label, [ox + x, oy + 51.0, ox + x + 50.0, oy + 60.0], 1, 0x3C_FE9A, 0.8);
         }
     } else {
         nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, [ox + 7.0, oy + 15.0, w - 16.0, 12.0], 0xFFFF_FFFF);
         let line = frequency.map_or("No frequency".to_owned(), |f| format!("Frequency: {f}"));
-        game.native_text_scaled(batch, &line, [ox + 10.0, oy + 18.0], 0x3C_FE9A, 0.8);
+        scrolling_text(game, batch, &line, [ox + 10.0, oy + 18.0, ox + 7.0 + (w - 16.0) - 3.0, oy + 27.0], 0, 0x3C_FE9A, 0.8);
         let label_w = game.native_text_width("Search:");
         game.native_text(batch, "Search:", [ox + 4.0 + (46.0 - label_w) / 2.0 - 2.0, oy + 31.0], 0x40_4040, false);
         let [bx, by, bw, bh] = QIO_SEARCH_BOX;
