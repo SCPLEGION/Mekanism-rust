@@ -17946,8 +17946,50 @@ fn amplifier_max(nbt: &Compound) -> u64 {
     }
 }
 
+/// How `IFancyFontRenderer.drawScaledScrollingString` places a text in `area` (min x, min y, max x, max y): aligned when it
+/// fits, else scrolled back and forth, clipped to the area (`align`: 0 left, 1 centre, 2 right).
+fn scrolling_text(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, text: &str, area: [f32; 4], align: u8, rgb: u32, scale: f32) {
+    let [min_x, min_y, max_x, max_y] = area;
+    let width = game.native_text_width(text) * scale;
+    let room = max_x - min_x;
+    let target_y = (min_y + max_y - 9.0) / 2.0;
+    // `prepTextScale`: the text is scaled about its top left, moved down by the half line it lost.
+    let y = target_y + 4.5 - 4.5 * scale;
+    let scrolling = width > room;
+    let x = if scrolling {
+        // `getOverflowedBy`: a cosine through the sine, so the text rests at both ends.
+        let overflow = f64::from(width - room);
+        let seconds = scroll_millis() as f64 / 1_000.0;
+        let period = (overflow * 0.5).max(3.0);
+        let modifier = -(2.0 * std::f64::consts::PI * seconds / period).cos();
+        let scrolled = (std::f64::consts::FRAC_PI_2 * modifier).sin() / 2.0 + 0.5;
+        min_x - (scrolled * overflow) as f32
+    } else {
+        match align {
+            1 => min_x + (room - width) / 2.0,
+            2 => max_x - width,
+            _ => min_x,
+        }
+    };
+    let start = batch.vertices.len();
+    if (scale - 1.0).abs() < f32::EPSILON {
+        game.native_text(batch, text, [x, y], rgb, false);
+    } else {
+        game.native_text_scaled(batch, text, [x, y], rgb, scale);
+    }
+    if scrolling {
+        batch.clip_since(start, min_x, min_y, max_x, max_y);
+    }
+}
+
+/// Milliseconds on a clock the screens share (`Util.getMillis() - msVisible`).
+fn scroll_millis() -> u128 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis()
+}
+
 /// `GuiLaserAmplifier.drawForegroundText`: the delay and the two thresholds beside their fields, in the 72 px left of
-/// x = 96 (a longer text is squeezed to fit, where Mekanism scrolls it).
+/// x = 96 (a longer text scrolls).
 fn draw_amplifier_labels(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, data: &[i32], origin: [f32; 2]) {
     let at = DATA_GAUGES;
     let (min, max, delay) = (read_wide(data, at), read_wide(data, at + 4), data.get(2).copied().unwrap_or(0).max(0));
@@ -17958,9 +18000,8 @@ fn draw_amplifier_labels(game: &Game<'_>, batch: &mut horizon_client::hud::HudBa
         (format!("Max: {}", fe(max)), 60.0),
     ];
     for (text, y) in lines {
-        let w = game.native_text_width(&text);
-        let scale = if w > 72.0 { 72.0 / w } else { 1.0 };
-        game.native_text_scaled(batch, &text, [origin[0] + 24.0, origin[1] + y + (1.0 - scale) * 4.0], 0x40_4040, scale);
+        // `drawScrollingString(.., start, y, LEFT, .., TEXT_BOX_START - start, 2, ..)`: from 26 to 94, scrolled when longer.
+        scrolling_text(game, batch, &text, [origin[0] + 26.0, origin[1] + y, origin[0] + 94.0, origin[1] + y + 9.0], 0, 0x40_4040, 1.0);
     }
 }
 
@@ -24641,8 +24682,9 @@ fn dict_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
         let thumb = if hidden > 0 { (ui.scroll as f32 / hidden as f32 * (bar_max - 4.0)).round() } else { 0.0 };
         sprite(game, batch, "scroll/list_bar", [0.0, 0.0, 4.0, 4.0], [o[0] + bar_x, o[1] + bar_y + thumb, 4.0, 4.0]);
         for (i, tag) in tags.iter().skip(ui.scroll).take(4).enumerate() {
-            let fit = (((lw - 10.0) / (game.native_text_width(tag) * 0.8)).min(1.0)) * 0.8;
-            game.native_text_scaled(batch, tag, [o[0] + lx + 2.0, o[1] + ly + 3.0 + 10.0 * i as f32], 0x3C_FE9A, fit);
+            // `GuiTextScrollList`: scaled 0.8, scrolled inside the list but for its bar.
+            let top = o[1] + ly + 2.0 + 10.0 * i as f32;
+            scrolling_text(game, batch, tag, [o[0] + lx + 2.0, top, o[0] + lx + lw - 8.0, top + 9.0], 0, 0x3C_FE9A, 0.8);
         }
         // The dropdown (`GuiDropdown`): the current type, and the options below it while open.
         let [dx, dy, dw, dh] = DICT_DROPDOWN;
