@@ -24528,13 +24528,63 @@ fn draw_miner_windows(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch
 
 const MCFG_BACK_WIN: [f32; 4] = [6.0, 6.0, 11.0, 11.0];
 
+/// Hook `native_screen_drop` (API 86): an item of the item panel released over a ghost slot, as a recipe viewer's drag does:
+/// an item filter's slot (the Digital Miner's only with `easyMinerFilters`), a miner filter's replacement block, the QIO
+/// Redstone Adapter's item.
+pub(super) fn screen_drop(game: &Game<'_>, block: &str, at: [f32; 2], stack: &ItemStack) {
+    if !game.native_on(MOD_ID) {
+        return;
+    }
+    let item = stack.item.to_string();
+    if miner_cfg_open(block) {
+        if !MINER_UI.with_borrow(|ui| ui.edit.is_some()) {
+            return;
+        }
+        let on = |r: [f32; 4]| inside(at, [MWIN[0] + r[0], MWIN[1] + r[1], r[2], r[3]]);
+        let item_filter = MINER_UI.with_borrow(|ui| ui.edit.as_ref().is_some_and(|e| e.filter.kind == miner::FilterKind::Item));
+        let easy = config_flag("general", "digital_miner", "easyMinerFilters", false);
+        if (on(FILTER_SLOT) && item_filter && easy) || on(MWIN_REPLACE) {
+            miner_cfg_press(game, at, false, Some(item), true);
+        }
+        return;
+    }
+    if kind(block) == Some(Kind::QioRedstoneAdapter) {
+        if let Some(v) = adapter_view(game)
+            && inside(at, ADAPTER_SLOT)
+        {
+            send_adapter_item(game, v.pos, &item);
+        }
+        return;
+    }
+    if matches!(kind(block), Some(Kind::LogisticalSorter | Kind::QioImporter | Kind::QioExporter)) {
+        let Some((pos, _)) = sorter_view(game) else {
+            return;
+        };
+        let wat = window_at(block, at);
+        let (index, kind) = FILTER_EDIT.with_borrow(|e| e.as_ref().map(|e| (e.index, e.kind))).unwrap_or((None, 1));
+        if filter_edit_open(pos) && kind == 0 && index.is_none() && inside(wat, window_rect(FILTER_SLOT)) {
+            let key = net_key(stack);
+            FILTER_EDIT.with_borrow_mut(|e| {
+                if let Some(e) = e {
+                    e.name = freq::TextBox { cursor: key.len(), value: key, focused: false };
+                }
+            });
+        }
+    }
+}
+
 /// A press on the config screen (hook point `native_screen_click`).
 fn miner_cfg_click(game: &Game<'_>, at: [f32; 2], right: bool) {
+    let held = game.inventory.get(game.selected).cloned().flatten().map(|h| h.item.to_string());
+    miner_cfg_press(game, at, right, held, false);
+}
+
+/// `miner_cfg_click` with `held` as the item the press carries: the hand's, or one dropped from the item panel (`dropped`).
+fn miner_cfg_press(game: &Game<'_>, at: [f32; 2], right: bool, held: Option<String>, dropped: bool) {
     let Some(c) = miner_cfg(game) else {
         return;
     };
-    let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);
-    let held = game.inventory.get(game.selected).cloned().flatten().map(|h| h.item.to_string());
+    let shift = !dropped && (game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight));
     let is_block = |id: &str| game.pack.assets.registry.default_state(id).is_some();
     // The windows take every press while one is open.
     if MINER_UI.with_borrow(|ui| ui.select) {
@@ -25075,6 +25125,8 @@ fn adapter_payload(game: &mut Game<'_>, data: &[u8]) {
         return;
     }
     let held = game.inventory.get(game.selected).cloned().flatten().map(|h| h.item.to_string());
+    let dropped = data.get(17..).and_then(|b| std::str::from_utf8(b).ok()).map(str::to_owned);
+    let dropped = dropped.filter(|i| game.pack.assets.registry.default_state(i).is_some() || i.contains(':') && i.len() < 128);
     let count = u32::from_be_bytes([count[0], count[1], count[2], count[3]]).min(i32::MAX as u32);
     game.native_with_mod_block_entity(pos, |m| match op {
         0 => {
@@ -25094,6 +25146,12 @@ fn adapter_payload(game: &mut Game<'_>, data: &[u8]) {
             put_int(&mut m.nbt, "fuzzy", flipped)
         }
         4 => put_long(&mut m.nbt, "count", u64::from(count)),
+        // An item dropped from the item panel (`GuiQIORedstoneAdapter`'s ghost handler).
+        5 => {
+            if let Some(item) = dropped.filter(|i| !i.is_empty()) {
+                m.nbt.insert("filter".into(), Tag::String(item.into()));
+            }
+        }
         _ => {}
     });
 }
@@ -25105,6 +25163,18 @@ fn send_adapter(game: &Game<'_>, pos: [i32; 3], op: u8, count: u32) {
     }
     data.push(op);
     data.extend(count.to_be_bytes());
+    game.native_send_to_server(ADAPTER_CHANNEL, &data);
+}
+
+/// An item dropped on the adapter's slot: op 5 with the item's id after the count.
+fn send_adapter_item(game: &Game<'_>, pos: [i32; 3], item: &str) {
+    let mut data = Vec::new();
+    for c in pos {
+        data.extend(c.to_be_bytes());
+    }
+    data.push(5);
+    data.extend(0u32.to_be_bytes());
+    data.extend(item.as_bytes());
     game.native_send_to_server(ADAPTER_CHANNEL, &data);
 }
 
