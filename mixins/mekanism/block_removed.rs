@@ -10,5 +10,6 @@ fn on_block_removed(
     crate::game::mekanism::radiation_spill(game, pos);
     crate::game::mekanism::transporter_spill(game, pos, old, new);
     crate::game::mekanism::turbine_rotor_spill(game, pos, old, new);
+    crate::game::mekanism::obsidian_tnt_removed(game, pos, old, new);
     crate::game::mekanism::clear_bounding_blocks(game, pos, old, old_properties);
 }
