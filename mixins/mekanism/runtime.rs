@@ -2766,6 +2766,7 @@ pub(super) fn world_models(game: &Game<'_>, models: &mut Vec<super::native_hooks
             true
         });
     });
+    balloon_models(models);
     // `RenderObsidianTnt` through `TntRenderer`: the block's model, swelling over its last ten ticks and lit white
     // every fifth tick.
     for (_, at, _, fuse) in CLIENT_TNT.with_borrow(|v| v.clone()) {
@@ -8028,6 +8029,10 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
         }
         return;
     }
+    if !*claimed && game.native_on(MOD_ID) && let Some(color) = balloon_color(&stack.item) {
+        balloon_use(game, color, claimed);
+        return;
+    }
     if !*claimed && &*stack.item == CONFIG_CARD && game.native_on(MOD_ID) {
         config_card_clear(game, claimed);
         return;
@@ -9753,10 +9758,12 @@ fn module_icons(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
 pub(super) fn client_tick(game: &mut Game<'_>) {
     if !game.native_window() && game.native_on(MOD_ID) {
         obsidian_tnt_tick(game);
+        balloon_tick(game);
         radiation_server_tick(game);
         player_state_broadcast(game);
     }
     if game.native_window() && game.native_on(MOD_ID) {
+        balloon_client(game);
         for at in TNT_SOUNDS.with_borrow_mut(std::mem::take) {
             game.audio.play("minecraft:entity.tnt.primed", Some(at), 1.0, 1.0);
         }
@@ -9866,6 +9873,10 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
 /// A client's packet, with its player swapped in (API 26): a jetpack thrust spends one mB of the
 /// hydrogen in the jetpack they wear and stops their fall here too.
 pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
+    if channel == BALLOON_CHANNEL && game.native_on(MOD_ID) {
+        balloon_payload(game, data);
+        return;
+    }
     if channel == FREQUENCY_CHANNEL && game.native_on(MOD_ID) {
         frequency_payload(game, data);
         return;
@@ -10339,6 +10350,383 @@ fn obsidian_tnt_payload(data: &[u8]) {
         seen.push((id, pos, [f(16), f(20), f(24)], fuse));
     }
     CLIENT_TNT.with_borrow_mut(|v| *v = seen);
+}
+
+// --- Balloons -----------------------------------------------------------------------------------------
+
+const BALLOON_CHANNEL: &str = "mekanismadditions:balloon";
+const BALLOON_POP_CHANNEL: &str = "mekanismadditions:balloon_pop";
+/// `EntityBalloon.OFFSET`: the box sits this far below the entity's position.
+const BALLOON_OFFSET: f64 = -0.275;
+const BALLOON_WIDTH: f64 = 0.4;
+const BALLOON_HEIGHT: f64 = 0.45;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Latch {
+    Free,
+    Block([i32; 3]),
+    Mob(u32),
+}
+
+/// One balloon, kept by the server (`EntityBalloon`).
+#[derive(Clone, Debug)]
+struct Balloon {
+    id: u32,
+    pos: [f64; 3],
+    vel: [f64; 3],
+    color: u8,
+    latch: Latch,
+}
+
+thread_local! {
+    static BALLOONS: std::cell::RefCell<Vec<Balloon>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BALLOON_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+    static BALLOON_SENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The client's view: id, position, colour, and whether it holds on to something.
+    static CLIENT_BALLOONS: std::cell::RefCell<Vec<(u32, [f64; 3], u8, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BALLOON_POPS: std::cell::RefCell<Vec<[f64; 3]>> = const { std::cell::RefCell::new(Vec::new()) };
+    static ATTACK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The colour of a balloon item (`ItemBalloon.getColor`): its index in `EnumColor`.
+fn balloon_color(item: &str) -> Option<u8> {
+    let name = item.strip_prefix("mekanismadditions:")?.strip_suffix("_balloon")?;
+    tnet::COLORS.iter().position(|(label, _)| label.to_lowercase().replace(' ', "_") == name).map(|i| i as u8)
+}
+
+fn make_balloon(pos: [f64; 3], color: u8, latch: Latch) {
+    let id = BALLOON_ID.get();
+    BALLOON_ID.set(id.wrapping_add(1).max(1));
+    // `EntityBalloon`: it starts rising at 0.04.
+    BALLOONS.with_borrow_mut(|v| v.push(Balloon { id, pos, vel: [0.0, 0.04, 0.0], color, latch }));
+}
+
+fn balloon_near(pos: [i32; 3], min_up: i32, max_up: i32) -> bool {
+    BALLOONS.with_borrow(|v| {
+        v.iter().any(|b| {
+            let (x, y, z) = (b.pos[0], b.pos[1] - BALLOON_OFFSET, b.pos[2]);
+            x + BALLOON_WIDTH / 2.0 > f64::from(pos[0])
+                && x - BALLOON_WIDTH / 2.0 < f64::from(pos[0] + 1)
+                && z + BALLOON_WIDTH / 2.0 > f64::from(pos[2])
+                && z - BALLOON_WIDTH / 2.0 < f64::from(pos[2] + 1)
+                && y + BALLOON_HEIGHT > f64::from(pos[1] + min_up)
+                && y < f64::from(pos[1] + max_up + 1)
+        })
+    })
+}
+
+fn balloon_consume(game: &mut Game<'_>) {
+    if game.creative {
+        return;
+    }
+    let selected = game.selected;
+    if let Some(Some(held)) = game.inventory.get(selected).cloned() {
+        let left = held.count - 1;
+        game.inventory[selected] = (left > 0).then(|| ItemStack { count: left, ..held });
+    }
+}
+
+/// `ItemBalloon.use`: a balloon let go at the player's hand.
+fn balloon_use(game: &mut Game<'_>, color: u8, claimed: &mut bool) {
+    let Some(player) = game.native_player() else {
+        return;
+    };
+    // `Vec3(-0.4, 0, 0.3).yRot(-bodyYaw)`: beside the right hand, a little forward.
+    let turn = -f64::from(game.yaw).to_radians();
+    let (x, z) = (-0.4, 0.3);
+    let at = [player.x + x * turn.cos() + z * turn.sin(), player.y, player.z - x * turn.sin() + z * turn.cos()];
+    // `create(world, x - 0.5, y - 1.25, z - 0.5)` puts it 1.75 above and centred on that spot.
+    make_balloon([at[0], at[1] + 1.75, at[2]], color, Latch::Free);
+    balloon_consume(game);
+    *claimed = true;
+}
+
+/// `ItemBalloon.useOn`: sneaking on a block ties a balloon above it.
+pub(super) fn use_balloon_on_block(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) || !shift_down(game) {
+        return false;
+    }
+    let Some(Some(held)) = game.inventory.get(game.selected).cloned() else {
+        return false;
+    };
+    let Some(color) = balloon_color(&held.item) else {
+        return false;
+    };
+    if balloon_near(pos, 0, 2) {
+        return true;
+    }
+    let replaceable = |game: &Game<'_>, p: [i32; 3]| {
+        let name = block_name(game, p);
+        is_air(name) || cell_is_free(name)
+    };
+    let mut base = pos;
+    if replaceable(game, base) {
+        base[1] -= 1;
+    }
+    if !game.native_face_sturdy(base, horizon_core::geometry::Direction::Up) {
+        return true;
+    }
+    let (one, two) = ([base[0], base[1] + 1, base[2]], [base[0], base[1] + 2, base[2]]);
+    if replaceable(game, one) && replaceable(game, two) {
+        game.native_set_block(one, "minecraft:air", &[]);
+        game.native_set_block(two, "minecraft:air", &[]);
+        make_balloon([f64::from(base[0]) + 0.5, f64::from(base[1]) + 1.8, f64::from(base[2]) + 0.5], color, Latch::Block(base));
+        balloon_consume(game);
+    }
+    true
+}
+
+/// `ItemBalloon.interactLivingEntity`, from the window that clicked: a sneaking click on a mob with a balloon in hand.
+pub(super) fn balloon_mob_click(game: &mut Game<'_>, id: u32, claimed: &mut bool) {
+    if *claimed || !game.native_on(MOD_ID) || !shift_down(game) {
+        return;
+    }
+    if game.inventory.get(game.selected).and_then(|s| s.as_ref()).is_some_and(|s| balloon_color(&s.item).is_some()) {
+        let mut out = vec![1];
+        out.extend(id.to_be_bytes());
+        game.native_send_to_server(BALLOON_CHANNEL, &out);
+        *claimed = true;
+    }
+}
+
+fn balloon_payload(game: &mut Game<'_>, data: &[u8]) {
+    let Some(&op) = data.first() else {
+        return;
+    };
+    let id = data.get(1..5).map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    match op {
+        // Latch a balloon to the mob.
+        1 => {
+            let Some(Some(held)) = game.inventory.get(game.selected).cloned() else {
+                return;
+            };
+            let Some(color) = balloon_color(&held.item) else {
+                return;
+            };
+            if BALLOONS.with_borrow(|v| v.iter().any(|b| b.latch == Latch::Mob(id))) {
+                return;
+            }
+            let Some((at, height)) = game.native_with_mob(id, |m| (m.health > 0.0).then(|| (m.position, m.kind.height))).flatten() else {
+                return;
+            };
+            make_balloon([at.x, at.y + height + 1.7, at.z], color, Latch::Mob(id));
+            balloon_consume(game);
+        }
+        // A punch: pop it, when the player is near.
+        2 => {
+            let Some(player) = game.native_player() else {
+                return;
+            };
+            let popped = BALLOONS.with_borrow_mut(|v| {
+                let at = v.iter().position(|b| b.id == id)?;
+                let b = &v[at];
+                let d = [b.pos[0] - player.x, b.pos[1] - player.y, b.pos[2] - player.z];
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 100.0).then(|| v.remove(at))
+            });
+            if let Some(b) = popped {
+                pop_balloon(game, &b);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `EntityBalloon.pop`: the sound for everyone near it.
+fn pop_balloon(game: &mut Game<'_>, b: &Balloon) {
+    let mut data = Vec::new();
+    for c in b.pos {
+        data.extend_from_slice(&(c as f32).to_be_bytes());
+    }
+    for to in game.native_online_players() {
+        game.native_send_to_player(to, BALLOON_POP_CHANNEL, &data);
+    }
+}
+
+/// `EntityBalloon.getTargetElevation`: one block above the first collidable block under the mob.
+fn balloon_target_elevation(game: &Game<'_>, at: [f64; 3]) -> f64 {
+    let (x, z) = (at[0].floor() as i32, at[2].floor() as i32);
+    let mut y = at[1].floor() as i32;
+    while y > 0 {
+        let name = block_name(game, [x, y, z]);
+        if !is_air(name) && !cell_is_free(name) && !matches!(name, "minecraft:water" | "minecraft:lava") {
+            return f64::from(y) + 1.0 + 1.0;
+        }
+        y -= 1;
+    }
+    0.0
+}
+
+/// `EntityBalloon.tick` for every balloon on the server.
+fn balloon_tick(game: &mut Game<'_>) {
+    let mut list = BALLOONS.with_borrow_mut(std::mem::take);
+    if list.is_empty() && !BALLOON_SENT.get() {
+        return;
+    }
+    let mut popped = Vec::new();
+    list.retain_mut(|b| {
+        if b.pos[1] < -64.0 || b.pos[1] >= 320.0 {
+            popped.push(b.clone());
+            return false;
+        }
+        if let Latch::Block(p) = b.latch
+            && is_air(block_name(game, p))
+        {
+            b.latch = Latch::Free;
+        }
+        if let Latch::Mob(id) = b.latch {
+            let state = game.native_with_mob(id, |m| (m.health > 0.0).then(|| (m.position, m.velocity, m.kind.height))).flatten();
+            let Some((at, vel, height)) = state else {
+                b.latch = Latch::Free;
+                return true;
+            };
+            let target = balloon_target_elevation(game, [at.x, at.y, at.z]);
+            let new_vy = if at.y - 1e-5 < target {
+                (vel.y * 1.015).max(0.04)
+            } else if at.y - 0.1 > target {
+                (vel.y * 1.015).min(-0.04)
+            } else {
+                0.0
+            };
+            game.native_with_mob(id, |m| {
+                m.velocity.y = new_vy;
+                m.needs_sync = true;
+            });
+            b.pos = [at.x, at.y + height + 0.8, at.z];
+            return true;
+        }
+        if matches!(b.latch, Latch::Block(_)) {
+            b.vel = [0.0; 3];
+            return true;
+        }
+        // Free: rising to 0.2, stopping under a ceiling and starting again.
+        let mut vy = (b.vel[1] * 1.02).min(0.2);
+        let next = b.pos[1] + vy;
+        let head = [b.pos[0], next - BALLOON_OFFSET + BALLOON_HEIGHT, b.pos[2]];
+        let cell = [head[0].floor() as i32, head[1].floor() as i32, head[2].floor() as i32];
+        let name = block_name(game, cell);
+        if vy > 0.0 && !is_air(name) && !cell_is_free(name) {
+            vy = 0.0;
+        } else {
+            b.pos[1] = next;
+        }
+        b.vel = [b.vel[0] * 0.98, vy, b.vel[2] * 0.98];
+        if b.vel[1] == 0.0 {
+            b.vel[1] = 0.04;
+        }
+        true
+    });
+    BALLOONS.with_borrow_mut(|v| {
+        list.append(v);
+        *v = list;
+    });
+    for b in &popped {
+        pop_balloon(game, b);
+    }
+    // Tell the clients: `id, x, y, z, colour, latched`.
+    let now = BALLOONS.with_borrow(|v| v.clone());
+    let mut data = Vec::with_capacity(now.len() * 18);
+    for b in &now {
+        data.extend_from_slice(&b.id.to_be_bytes());
+        for c in b.pos {
+            data.extend_from_slice(&(c as f32).to_be_bytes());
+        }
+        data.push(b.color);
+        data.push(u8::from(b.latch != Latch::Free));
+    }
+    BALLOON_SENT.set(!now.is_empty());
+    for to in game.native_online_players() {
+        game.native_send_to_player(to, BALLOON_CHANNEL, &data);
+    }
+}
+
+fn balloon_client_payload(channel: &str, data: &[u8]) {
+    if channel == BALLOON_POP_CHANNEL && data.len() >= 12 {
+        let f = |i: usize| f64::from(f32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]));
+        BALLOON_POPS.with_borrow_mut(|v| v.push([f(0), f(4), f(8)]));
+    }
+    if channel == BALLOON_CHANNEL {
+        let seen = data
+            .chunks_exact(18)
+            .map(|c| {
+                let f = |i: usize| f64::from(f32::from_be_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]));
+                (u32::from_be_bytes([c[0], c[1], c[2], c[3]]), [f(4), f(8), f(12)], c[16], c[17] == 1)
+            })
+            .collect();
+        CLIENT_BALLOONS.with_borrow_mut(|v| *v = seen);
+    }
+}
+
+/// The window: the pop sounds, and a punch at a balloon (`EntityBalloon.skipAttackInteraction`).
+fn balloon_client(game: &mut Game<'_>) {
+    for at in BALLOON_POPS.with_borrow_mut(std::mem::take) {
+        game.audio.play("mekanismadditions:entity.balloon.pop", Some(at), 1.0, 1.0);
+    }
+    let down = game.native_mapping("key.attack").is_some_and(|(down, _)| down);
+    let was = ATTACK_HELD.replace(down);
+    if !down || was || !game.native_playing() {
+        return;
+    }
+    let Some(eye) = game.native_eye() else {
+        return;
+    };
+    let (yaw, pitch) = (f64::from(game.yaw).to_radians(), f64::from(game.pitch).to_radians());
+    let look = [-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos()];
+    // The first block in the way bounds the reach (3 blocks for an entity).
+    let reach = game.native_clip(eye, [0, 1, 2].map(|i| eye[i] + look[i] * 3.0)).map_or(3.0, |(p, _, _)| {
+        ((p[0] - eye[0]).powi(2) + (p[1] - eye[1]).powi(2) + (p[2] - eye[2]).powi(2)).sqrt()
+    });
+    let mut best: Option<(f64, u32)> = None;
+    for (id, pos, _, _) in CLIENT_BALLOONS.with_borrow(|v| v.clone()) {
+        let lo = [pos[0] - BALLOON_WIDTH / 2.0, pos[1] - BALLOON_OFFSET, pos[2] - BALLOON_WIDTH / 2.0];
+        let hi = [pos[0] + BALLOON_WIDTH / 2.0, pos[1] - BALLOON_OFFSET + BALLOON_HEIGHT, pos[2] + BALLOON_WIDTH / 2.0];
+        // Slab test.
+        let (mut near, mut far) = (0.0f64, reach);
+        let mut hit = true;
+        for i in 0..3 {
+            if look[i].abs() < 1e-9 {
+                if eye[i] < lo[i] || eye[i] > hi[i] {
+                    hit = false;
+                }
+                continue;
+            }
+            let (a, b) = ((lo[i] - eye[i]) / look[i], (hi[i] - eye[i]) / look[i]);
+            near = near.max(a.min(b));
+            far = far.min(a.max(b));
+        }
+        if hit && near <= far && best.is_none_or(|(d, _)| near < d) {
+            best = Some((near, id));
+        }
+    }
+    if let Some((_, id)) = best {
+        let mut out = vec![2];
+        out.extend(id.to_be_bytes());
+        game.native_send_to_server(BALLOON_CHANNEL, &out);
+    }
+}
+
+/// `BalloonRenderer`: the model of a balloon tinted by its colour, with its string.
+fn balloon_models(models: &mut Vec<super::native_hooks::NativeWorldModel>) {
+    for (_, pos, color, latched) in CLIENT_BALLOONS.with_borrow(|v| v.clone()) {
+        let variant = if latched { "latched" } else { "free" };
+        let rgb = tnet::COLORS.get(usize::from(color)).map_or(0xFFFFFF, |c| c.1);
+        let cell = [pos[0].floor() as i32, pos[1].floor() as i32, pos[2].floor() as i32];
+        for (part, tint) in [("body", 0xFF00_0000 | rgb), ("string", 0xFFFF_FFFF)] {
+            models.push(super::native_hooks::NativeWorldModel {
+                model: format!("mekanismadditions:balloon_{variant}_{part}"),
+                // The item model is drawn from `(-0.5, -1, -0.5)`: its centre is half a block above that corner.
+                position: [pos[0], pos[1] - 0.5, pos[2]],
+                yaw: 0.0,
+                pitch: 0.0,
+                roll: 0.0,
+                light_at: cell,
+                color: tint,
+                rotation: None,
+                full_bright: true,
+                scale: 1.0,
+                parts: Vec::new(),
+            });
+        }
+    }
 }
 
 // --- Configuration Card -----------------------------------------------------------------------------
@@ -28511,6 +28899,100 @@ pub(super) fn mob_types(types: &mut std::collections::HashMap<String, horizon_cl
     t.attributes = Arc::new(attributes);
     types.insert(robit::TYPE.to_owned(), t);
     horizon_client::mobs::register_mod_mob_base(robit::TYPE, robit::BASE);
+    baby_types(types);
+}
+
+/// `BabyType`: the parent, the height scale and the eye height scale of `AdditionsEntityTypes.baby`.
+const BABIES: [(&str, f64, f64); 7] = [
+    ("bogged", 0.5, 0.815),
+    ("creeper", 0.6, 0.9),
+    ("enderman", 0.625, 0.88),
+    ("parched", 0.5, 0.815),
+    ("skeleton", 0.5, 0.815),
+    ("stray", 0.5, 0.815),
+    ("wither_skeleton", 0.5, 0.815),
+];
+
+/// The mob types of Mekanism Additions' babies: each its parent's with `AdditionsEntityTypes.baby`'s dimensions and
+/// `setupBabyModifiers`' nerfs (half the speed and health, a quarter of the attack), sent as the parent.
+fn baby_types(types: &mut std::collections::HashMap<String, horizon_client::mobs::MobType>) {
+    for (name, height_scale, eye_scale) in BABIES {
+        let Some(mut t) = types.get(&format!("minecraft:{name}")).cloned() else {
+            continue;
+        };
+        let id = format!("mekanismadditions:baby_{name}");
+        t.id.clone_from(&id);
+        t.width *= 0.817;
+        t.height *= height_scale;
+        t.eye_height = t.height * eye_scale;
+        t.max_health *= 0.5;
+        t.speed *= 0.5;
+        t.attack_damage *= 0.25;
+        let mut attributes = (*t.attributes).clone();
+        for (key, factor) in [("minecraft:max_health", 0.5), ("minecraft:movement_speed", 0.5), ("minecraft:attack_damage", 0.25)] {
+            if let Some(v) = attributes.get_mut(key) {
+                *v *= factor;
+            }
+        }
+        t.attributes = Arc::new(attributes);
+        types.insert(id.clone(), t);
+        horizon_client::mobs::register_mod_mob_base(&id, &format!("minecraft:{name}"));
+    }
+}
+
+thread_local! {
+    /// The client's list of the mobs it sees that are babies, and their scale in hundredths.
+    static BABY_SCALES: std::cell::RefCell<std::collections::HashMap<u32, u8>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+const BABY_CHANNEL: &str = "mekanismadditions:babies";
+
+/// Every tick: the server tells the clients which mobs are babies; every client draws them at their scale.
+fn babies_tick(game: &mut Game<'_>) {
+    if !game.native_window() {
+        if game.ticks % 20 == 0 {
+            let mut list = Vec::new();
+            for (name, scale, _) in BABIES {
+                for id in game.native_mob_ids(&format!("mekanismadditions:baby_{name}")) {
+                    list.extend(id.to_be_bytes());
+                    list.push((scale * 100.0) as u8);
+                }
+            }
+            for to in game.native_online_players() {
+                game.native_send_to_player(to, BABY_CHANNEL, &list);
+            }
+        }
+        return;
+    }
+    for (id, scale) in BABY_SCALES.with_borrow(|m| m.iter().map(|(i, s)| (*i, *s)).collect::<Vec<_>>()) {
+        game.native_with_mob(id, |m| m.extra.mod_scale = f32::from(scale) / 100.0);
+    }
+}
+
+fn babies_payload(data: &[u8]) {
+    BABY_SCALES.with_borrow_mut(|m| {
+        *m = data.chunks_exact(5).map(|c| (u32::from_be_bytes([c[0], c[1], c[2], c[3]]), c[4])).collect();
+    });
+}
+
+/// A baby's spawn egg used on a block (`SpawnEggItem.useOn`): the baby stands beside the face clicked.
+pub(super) fn use_baby_egg(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3]) -> bool {
+    if !game.native_on(MOD_ID) {
+        return false;
+    }
+    let Some(Some(held)) = game.inventory.get(game.selected).cloned() else {
+        return false;
+    };
+    let Some(name) = held.item.strip_prefix("mekanismadditions:baby_").and_then(|n| n.strip_suffix("_spawn_egg")) else {
+        return false;
+    };
+    if !BABIES.iter().any(|(b, _, _)| *b == name) {
+        return false;
+    }
+    let at = [f64::from(pos[0] + face[0]) + 0.5, f64::from(pos[1] + face[1]), f64::from(pos[2] + face[2]) + 0.5];
+    if game.spawn_mob(&format!("mekanismadditions:baby_{name}"), at, true).is_some() {
+        balloon_consume(game);
+    }
+    true
 }
 
 /// The Robit's data on its mob (`mod_data`): owner, energy, follow and pickup switches, home, items.
@@ -28618,6 +29100,7 @@ pub(super) fn mobs_tick(game: &mut Game<'_>) {
     register_game_events();
     flames_tick(game);
     tick_meltdowns(game);
+    babies_tick(game);
     let ids = game.native_mob_ids(robit::TYPE);
     if ids.is_empty() {
         return;
@@ -28814,6 +29297,10 @@ pub(super) fn mob_died(game: &mut Game<'_>, kind: &str, at: [f64; 3], data: Opti
 
 /// The window's client got the Robits' ids.
 pub(super) fn client_payload(channel: &str, data: &[u8]) {
+    if channel == BABY_CHANNEL {
+        babies_payload(data);
+    }
+    balloon_client_payload(channel, data);
     if channel == TNT_CHANNEL {
         obsidian_tnt_payload(data);
     }
@@ -28876,6 +29363,7 @@ pub(super) fn client_payload(channel: &str, data: &[u8]) {
 
 /// A right click on a Robit (the client sees its base type): the Robit's screen opens.
 pub(super) fn use_mob(game: &mut Game<'_>, id: u32, claimed: &mut bool) {
+    balloon_mob_click(game, id, claimed);
     if game.native_on(MOD_ID) && ROBITS.with_borrow(|set| set.contains(&id)) {
         if ROBIT_VIEWS.with_borrow(|v| v.get(&id).is_some_and(|v| !v.access)) {
             // The server answers with "You don't have access." and the screen stays shut.

@@ -503,6 +503,24 @@ def build_module(ns, out):
                         if (d / ns / "textures/block/models/obsidian_tnt.png").is_file()), None)
         if tnt is not None and texture is not None:
             worn_models.build_element_world_model(ns, "obsidian_tnt", json.loads(tnt.read_text()), texture, out, report)
+        # Balloons (`BalloonRenderer`): the latched and the free model, each as the tinted body and the string
+        # apart, since a part tree has one texture.
+        for variant in ("latched", "free"):
+            src = next((d / ns / f"models/item/balloon_{variant}.json" for d in search
+                        if (d / ns / f"models/item/balloon_{variant}.json").is_file()), None)
+            if src is None:
+                continue
+            model = json.loads(src.read_text())
+            for part, key, png in (("body", "#all", "balloon"), ("string", "#1", "balloon_string")):
+                texture = next((d / ns / f"textures/entity/{png}.png" for d in search
+                                if (d / ns / f"textures/entity/{png}.png").is_file()), None)
+                elements = []
+                for el in model.get("elements", []):
+                    faces = {k: f for k, f in el.get("faces", {}).items() if f.get("texture") == key}
+                    if faces:
+                        elements.append({**el, "faces": faces})
+                if texture is not None and elements:
+                    worn_models.build_element_world_model(ns, f"balloon_{variant}_{part}", {**model, "elements": elements}, texture, out, report)
     if ns == "mekanism":
         # The Robit (`RenderRobit`): its element model, the glowing eyes and back light apart from the body.
         # The Robit item (`RenderRobitItem`) draws its base skin model; Horizon has no such special model, so the item

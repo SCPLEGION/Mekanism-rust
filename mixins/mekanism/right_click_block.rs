@@ -16,6 +16,8 @@ fn on_right_click_block(game: &mut crate::game::Game<'_>, pos: [i32; 3], face: [
         || crate::game::mekanism::use_fission_port(game, pos)
         || crate::game::mekanism::use_turbine_rotor(game, pos)
         || crate::game::mekanism::use_obsidian_tnt(game, pos)
+        || crate::game::mekanism::use_balloon_on_block(game, pos)
+        || crate::game::mekanism::use_baby_egg(game, pos, face)
         || crate::game::mekanism::show_turbine(game, pos)
         || crate::game::mekanism::use_fusion(game, pos)
         || crate::game::mekanism::use_boiler(game, pos)
