@@ -16221,7 +16221,7 @@ fn screen_base(block: &str, screen: &mut Option<super::native_hooks::NativeScree
         }
         let w = screen_width(block);
         let h = screen_height(block);
-        *screen = Some(super::native_hooks::NativeScreen { width: w, height: h, slots, inventory_y: h - 82.0, inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(), own_labels: false, alt: None, ..Default::default() });
+        *screen = Some(super::native_hooks::NativeScreen { width: w, height: h, slots, inventory_y: h - 82.0, inventory_x: 8.0 + ((w - 176.0) / 2.0).floor(), own_labels: true, alt: None, ..Default::default() });
         return;
     }
     let (w, h) = (screen_width(block), screen_height(block));
@@ -17636,6 +17636,15 @@ fn screen_draw_base(game: &Game<'_>, block: &str, data: &[i32], batch: &mut hori
         let title = game.native_screen_title().unwrap_or_default();
         centred(game, batch, &title, ox, width, oy + 4.0, 0x40_4040);
         game.native_text(batch, "Inventory", [ox + 8.0, oy + height - 93.0], 0x40_4040, false);
+    }
+    if let Some(Kind::Factory(n, recipe, _)) = kind(block) {
+        // `GuiFactory`: `titleLabelY -= 2`; the inventory label is 2 px down (3 without the secondary bar or
+        // row) and, in the ultimate tier, 18 px in.
+        let title = game.native_screen_title().unwrap_or_default();
+        centred(game, batch, &title, ox, width, oy + 4.0, 0x40_4040);
+        let tall = factory::takes_chemical(recipe) || recipe == "sawing";
+        let (x, y) = (8.0 + if n == 9 { 18.0 } else { 0.0 }, height - 94.0 + if tall { 2.0 } else { 3.0 });
+        game.native_text(batch, "Inventory", [ox + x, oy + y], 0x40_4040, false);
     }
     if kind(block) == Some(Kind::FissionPort) {
         // `inventoryLabelX -= 2`, `inventoryLabelY += 2`, `titleLabelY -= 1`.
