@@ -6950,6 +6950,10 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
         portable_teleporter_use(game, claimed);
         return;
     }
+    if !*claimed && &*stack.item == qio::PORTABLE && game.native_on(MOD_ID) {
+        portable_qio_use(game, claimed);
+        return;
+    }
     if !*claimed && &*stack.item == GEIGER_COUNTER && game.native_on(MOD_ID) {
         geiger_counter_use(game, claimed);
         return;
@@ -8647,6 +8651,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
         tweaker_key(game);
         seismic_open(game);
         pt_open(game);
+        pq_open(game);
         dict_open(game);
         radial_key(game);
     }
@@ -8757,6 +8762,10 @@ pub(super) fn server_payload(game: &mut Game<'_>, channel: &str, data: &[u8]) {
         if data.first() == Some(&1) {
             portable_teleport(game);
         }
+        return;
+    }
+    if channel == PQ_CHANNEL && game.native_on(MOD_ID) {
+        pq_op_payload(game, data);
         return;
     }
     if channel == ADAPTER_CHANNEL && game.native_on(MOD_ID) {
@@ -19660,7 +19669,7 @@ fn frequency_payload(game: &mut Game<'_>, data: &[u8]) {
     let (Some(r), Some(player)) = (freq::Request::decode(data), game.native_acting_player()) else {
         return;
     };
-    if r.pos == PT_POS {
+    if r.pos == PT_POS || r.pos == PQ_POS {
         portable_frequency(game, &r, player.uuid, &player.name);
         return;
     }
@@ -19762,6 +19771,9 @@ struct FreqView {
 }
 
 fn freq_view(game: &Game<'_>) -> Option<([i32; 3], FreqView)> {
+    if PQ_OPEN.get() {
+        return PQ_STATE.with_borrow(|s| Some((PQ_POS, FreqView { own: s.own.clone(), list: s.entries.clone(), status: 0, trust: vec![] })));
+    }
     if PT_OPEN.get() {
         return PT_STATE.with_borrow(|s| s.as_ref().map(|s| (PT_POS, FreqView { own: s.view.own.clone(), list: s.view.list.clone(), status: s.view.status, trust: vec![] })));
     }
@@ -19843,7 +19855,7 @@ fn is_freq_screen(block: &str) -> bool {
 
 /// A selector is showing: the teleporters' and entangloporters' own screens, or a QIO block's.
 fn freq_open(block: &str) -> bool {
-    is_freq_screen(block) || qio_select_open(block)
+    is_freq_screen(block) || qio_select_open(block) || (block == PQ_ID && PQ_SELECT.get())
 }
 
 /// The listed frequencies in the selector's mode.
@@ -25653,6 +25665,8 @@ pub(super) fn ui_draw(game: &Game<'_>, id: &str, batch: &mut horizon_client::hud
         dict_draw(game, batch);
     } else if id == PT_ID {
         pt_draw(game, batch);
+    } else if id == PQ_ID {
+        pq_draw(game, batch);
     } else if id == SEISMIC_ID {
         seismic_draw(game, batch);
     } else if id == TW_ID {
@@ -25679,6 +25693,8 @@ pub(super) fn ui_click(game: &mut Game<'_>, id: &str, at: [f32; 2], button: u8, 
         if pressed {
             pt_click(game, at, button);
         }
+    } else if id == PQ_ID {
+        pq_click(game, at, button, pressed);
     } else if id == SEISMIC_ID {
         if pressed && button == 0 {
             seismic_click(game, at);
@@ -25697,6 +25713,12 @@ pub(super) fn ui_key(game: &mut Game<'_>, id: &str, key: &str, text: Option<&str
     if id == PT_ID {
         if pressed {
             pt_key(game, key, text);
+        }
+        return;
+    }
+    if id == PQ_ID {
+        if pressed {
+            pq_key(game, key, text);
         }
         return;
     }
@@ -25753,6 +25775,8 @@ pub(super) fn ui_wheel(game: &mut Game<'_>, id: &str, steps: f32) {
             let hidden = ui.tags(&ui.shown()).len().saturating_sub(4);
             ui.scroll = (ui.scroll as i32 - steps.signum() as i32).clamp(0, hidden as i32) as usize;
         });
+    } else if id == PQ_ID {
+        pq_wheel(steps);
     } else if id == SEISMIC_ID {
         seismic_scroll(if steps > 0.0 { 1 } else { -1 });
     } else if id == TW_ID {
@@ -26015,7 +26039,9 @@ fn pt_push(game: &mut Game<'_>) {
 fn portable_frequency(game: &mut Game<'_>, r: &freq::Request, uuid: u128, name: &str) {
     let owner = if r.security == freq::Security::Public && r.op != freq::Op::Set { r.owner } else { uuid };
     let key = freq::key(&r.name, r.security, owner);
-    let held_key = game.held_mut().as_ref().filter(|s| &*s.item == teleporter::PORTABLE).map(|s| custom_data(s).and_then(|c| get_string(c, FREQUENCY_KEY)));
+    // The Portable Teleporter keeps a teleporter frequency (list 0), the Portable QIO Dashboard a QIO one (list 2).
+    let (item, list_type) = if r.pos == PQ_POS { (qio::PORTABLE, 2u8) } else { (teleporter::PORTABLE, 0u8) };
+    let held_key = game.held_mut().as_ref().filter(|s| &*s.item == item).map(|s| custom_data(s).and_then(|c| get_string(c, FREQUENCY_KEY)));
     let Some(held_key) = held_key else {
         return;
     };
@@ -26023,14 +26049,14 @@ fn portable_frequency(game: &mut Game<'_>, r: &freq::Request, uuid: u128, name: 
         let Ok(mut lists) = FREQ_LISTS.lock() else {
             return;
         };
-        let list = lists.entry(0).or_default();
+        let list = lists.entry(list_type).or_default();
         match r.op {
             freq::Op::Set => {
                 if !list.iter().any(|e| e.key() == key) {
                     list.push(freq::Entry { name: r.name.clone(), security: r.security, owner, owner_name: name.to_owned(), color: freq::DEFAULT_COLOR });
                 }
                 if let Ok(mut d) = FREQ_DELETED.lock() {
-                    d.remove(&(0, key.clone()));
+                    d.remove(&(list_type, key.clone()));
                 }
                 drop(lists);
                 if let Some(stack) = game.held_mut().as_mut() {
@@ -26044,7 +26070,7 @@ fn portable_frequency(game: &mut Game<'_>, r: &freq::Request, uuid: u128, name: 
                 list.remove(at);
                 drop(lists);
                 if let Ok(mut d) = FREQ_DELETED.lock() {
-                    d.insert((0, key.clone()));
+                    d.insert((list_type, key.clone()));
                 }
                 if let Ok(mut all) = FREQUENCIES.lock() {
                     all.remove(&key);
@@ -26064,7 +26090,12 @@ fn portable_frequency(game: &mut Game<'_>, r: &freq::Request, uuid: u128, name: 
             }
         }
     }
-    pt_push(game);
+    if list_type == 2 {
+        pq_push_frequency(game);
+        pq_push_items(game, false);
+    } else {
+        pt_push(game);
+    }
 }
 
 struct PtState {
@@ -26929,6 +26960,9 @@ pub(super) fn mob_died(game: &mut Game<'_>, kind: &str, at: [f64; 3], data: Opti
 pub(super) fn client_payload(channel: &str, data: &[u8]) {
     if channel == PT_CHANNEL {
         pt_payload(data);
+    }
+    if channel == PQ_CHANNEL {
+        pq_payload(data);
     }
     if channel == DICT_CHANNEL {
         DICT_PENDING.set(true);
@@ -28273,6 +28307,9 @@ pub(super) fn ui_closed(game: &mut Game<'_>, id: &str) {
     if id == PT_ID {
         PT_OPEN.set(false);
         FREQ_UI.with_borrow_mut(|ui| *ui = FreqUi::default());
+    }
+    if id == PQ_ID {
+        pq_closed(game);
     }
     if id == TW_ID {
         TW_COLOR.with_borrow_mut(|c| *c = None);
@@ -30160,4 +30197,982 @@ pub(super) fn attack_speed(game: &Game<'_>, stack: &ItemStack, add: &mut f64) {
         _ => return,
     };
     *add = mekanism_core::config::gear_decimal(key, -2.4);
+}
+
+// --- Portable QIO Dashboard (GuiPortableQIODashboard over GuiQIOItemViewer) ---------------------------------
+//
+// A screen of the mod's own: the item's frequency picks the network, the server keeps the cursor stack and does
+// every take, place and shift-click, the client sorts, filters and scrolls what the server lists.
+
+const PQ_ID: &str = "mekanism:portable_qio_dashboard";
+const PQ_CHANNEL: &str = "mekanism:portable_qio_dashboard";
+/// The position a frequency request carries when it is for the held Portable QIO Dashboard.
+const PQ_POS: [i32; 3] = [i32::MIN, 1, 0];
+/// `qioItemViewerSlotsX` and `qioItemViewerSlotsY`, at their defaults.
+const PQ_SLOTS_X: usize = 8;
+const PQ_SLOTS_Y: usize = 4;
+/// `QIOItemViewerContainer.SLOTS_START_Y`.
+const PQ_SLOTS_START_Y: f32 = 43.0;
+const PQ_SORTS: [&str; 4] = ["Name", "Count", "Mod", "Item ID"];
+const PQ_SORT_TIPS: [&str; 4] = ["Sort items by name.", "Sort items by count.", "Sort items by mod.", "Sort items by registry name."];
+
+fn pq_size() -> [f32; 2] {
+    [16.0 + 18.0 * PQ_SLOTS_X as f32 + 18.0, PQ_SLOTS_START_Y + 18.0 * PQ_SLOTS_Y as f32 + 96.0]
+}
+
+#[derive(Clone, Default)]
+struct PqState {
+    frequency: Option<String>,
+    items: u64,
+    item_cap: u64,
+    types: u64,
+    type_cap: u64,
+    list: Vec<(String, u64)>,
+    inv: Vec<Option<(String, u32)>>,
+    cursor: Option<(String, u32)>,
+    own: Option<freq::Entry>,
+    entries: Vec<freq::Entry>,
+}
+
+struct PqUi {
+    origin: [f32; 2],
+    select_origin: [f32; 2],
+    scroll: f32,
+    drag: Option<f32>,
+    search: freq::TextBox,
+    sort: usize,
+    descending: bool,
+    open: bool,
+    /// The list as it is shown: filtered by the search, then sorted.
+    shown: Vec<(String, u64)>,
+    dirty: bool,
+    last_refresh: u64,
+    focus_set: bool,
+}
+
+impl Default for PqUi {
+    fn default() -> Self {
+        PqUi {
+            origin: [0.0; 2],
+            select_origin: [0.0; 2],
+            scroll: 0.0,
+            drag: None,
+            search: freq::TextBox::default(),
+            sort: 0,
+            descending: false,
+            open: false,
+            shown: vec![],
+            dirty: true,
+            last_refresh: 0,
+            focus_set: false,
+        }
+    }
+}
+
+thread_local! {
+    static PQ_STATE: std::cell::RefCell<PqState> = std::cell::RefCell::new(PqState::default());
+    static PQ_UI: std::cell::RefCell<PqUi> = std::cell::RefCell::new(PqUi::default());
+    static PQ_FRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PQ_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The frequency selector is showing over the viewer (`GuiQIOItemFrequencySelect`).
+    static PQ_SELECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Item -> its tags, built when the screen opens (the `#` search).
+    static PQ_TAGS: std::cell::RefCell<std::collections::HashMap<String, Vec<String>>> = std::cell::RefCell::new(Default::default());
+    /// On the server: what each viewing player holds on their cursor.
+    static PQ_CURSORS: std::cell::RefCell<std::collections::HashMap<String, ItemStack>> = std::cell::RefCell::new(Default::default());
+}
+
+fn pq_held(game: &mut Game<'_>) -> Option<ItemStack> {
+    game.held_mut().clone().filter(|s| &*s.item == qio::PORTABLE)
+}
+
+/// The dashboard in the hand was used: the screen opens on the state the server sends.
+fn portable_qio_use(game: &mut Game<'_>, claimed: &mut bool) {
+    if pq_held(game).is_some() {
+        *claimed = true;
+        pq_push_frequency(game);
+        pq_push_items(game, true);
+    }
+}
+
+fn put_stack(out: &mut Vec<u8>, s: &Option<ItemStack>) {
+    match s {
+        Some(s) => {
+            out.extend((s.count.min(65_535) as u16).to_be_bytes());
+            out.push(s.item.len() as u8);
+            out.extend(s.item.bytes());
+        }
+        None => out.extend([0, 0, 0]),
+    }
+}
+
+/// What the viewer's tab shows: the frequency in the item and the ones to pick from.
+fn pq_push_frequency(game: &mut Game<'_>) {
+    let Some(player) = game.native_acting_player() else {
+        return;
+    };
+    let Some(held) = pq_held(game) else {
+        return;
+    };
+    let key = custom_data(&held).and_then(|c| get_string(c, FREQUENCY_KEY));
+    let list = FREQ_LISTS.lock().ok().and_then(|l| l.get(&2).cloned()).unwrap_or_default();
+    let own = key.as_ref().and_then(|k| list.iter().find(|e| &e.key() == k)).cloned();
+    let mut out = vec![0, u8::from(own.is_some())];
+    if let Some(e) = &own {
+        put_entry(&mut out, e);
+    }
+    out.extend((list.len().min(65_535) as u16).to_be_bytes());
+    for e in list.iter().take(65_535) {
+        put_entry(&mut out, e);
+    }
+    game.native_send_to_player(player.uuid, PQ_CHANNEL, &out);
+}
+
+/// The network the held dashboard looks at.
+fn pq_network(game: &mut Game<'_>) -> Option<(String, qio::Network, Vec<([i32; 3], usize)>)> {
+    let held = pq_held(game)?;
+    let key = custom_data(&held).and_then(|c| get_string(c, FREQUENCY_KEY))?;
+    let list = FREQ_LISTS.lock().ok().and_then(|l| l.get(&2).cloned()).unwrap_or_default();
+    let label = list.iter().find(|e| e.key() == key).map(|e| e.name.clone())?;
+    let (net, at) = load_network(game, &key);
+    Some((label, net, at))
+}
+
+/// What the screen lists: the frequency, its totals and items, the player's inventory and the cursor.
+fn pq_push_items(game: &mut Game<'_>, fresh: bool) {
+    let Some(player) = game.native_acting_player() else {
+        return;
+    };
+    if pq_held(game).is_none() {
+        return;
+    }
+    let cursor = PQ_CURSORS.with_borrow(|c| c.get(&player.name).cloned());
+    let net = pq_network(game);
+    let mut out = vec![1, u8::from(fresh)];
+    match &net {
+        Some((label, _, _)) => {
+            out.push(1);
+            let b = label.as_bytes();
+            out.extend((b.len().min(255) as u16).to_be_bytes());
+            out.extend(&b[..b.len().min(255)]);
+        }
+        None => out.push(0),
+    }
+    let (items, item_cap, types, type_cap) = net.as_ref().map_or((0, 0, 0, 0), |(_, n, _)| {
+        let (a, b, c, d) = n.totals();
+        (a, b, c as u64, d as u64)
+    });
+    for v in [items, item_cap, types, type_cap] {
+        out.extend(v.to_be_bytes());
+    }
+    put_stack(&mut out, &cursor);
+    for i in 0..36 {
+        put_stack(&mut out, &game.inventory.get(player_slot(i)).cloned().flatten());
+    }
+    let list = net.as_ref().map(|(_, n, _)| n.list()).unwrap_or_default();
+    out.extend((list.len() as u32).to_be_bytes());
+    for (item, count) in list {
+        out.push(item.len() as u8);
+        out.extend(item.bytes());
+        out.extend(count.to_be_bytes());
+    }
+    game.native_send_to_player(player.uuid, PQ_CHANNEL, &out);
+}
+
+/// A click on the dashboard's screen, on the server. Ops: 0 refresh, 1 take, 2 place, 3 shift-take, 4 inventory
+/// slot, 5 closed.
+fn pq_op_payload(game: &mut Game<'_>, data: &[u8]) {
+    let Some(player) = game.native_acting_player() else {
+        return;
+    };
+    let Some(&op) = data.first() else {
+        return;
+    };
+    if op == 5 {
+        if let Some(s) = PQ_CURSORS.with_borrow_mut(|c| c.remove(&player.name)) {
+            game.give_or_drop(s);
+        }
+        return;
+    }
+    if pq_held(game).is_none() {
+        if let Some(s) = PQ_CURSORS.with_borrow_mut(|c| c.remove(&player.name)) {
+            game.give_or_drop(s);
+        }
+        return;
+    }
+    let name = player.name.clone();
+    let item_at = |at: usize| -> Option<String> {
+        let n = usize::from(*data.get(at)?);
+        String::from_utf8(data.get(at + 1..at + 1 + n)?.to_vec()).ok()
+    };
+    let cursor = PQ_CURSORS.with_borrow(|c| c.get(&name).cloned());
+    match op {
+        0 => {}
+        // `PacketQIOItemViewerSlotTake`: from the list onto the cursor.
+        1 => {
+            let (Some(&button), Some(item)) = (data.get(1), item_at(2)) else {
+                return;
+            };
+            let Some((_, mut net, at)) = pq_network(game) else {
+                return;
+            };
+            let max = max_stack(game, &item);
+            let stored = net.stored(&item);
+            match cursor {
+                None if stored > 0 => {
+                    let most = (stored.min(u64::from(max))) as u32;
+                    // Left: as much as possible, right: half a stack, middle: one.
+                    let n = match button {
+                        0 => most,
+                        2 => 1,
+                        _ => (most / 2).max(1),
+                    };
+                    let took = net.extract(&item, u64::from(n)) as u32;
+                    if took > 0 {
+                        PQ_CURSORS.with_borrow_mut(|c| c.insert(name, stack_of(&item, took)));
+                        save_network(game, &net, &at);
+                    }
+                }
+                // Middle click with the same item held: one more onto the stack.
+                Some(held) if button == 2 && *held.item == *item && plain(&held) && held.count < max && stored > 0 => {
+                    if net.extract(&item, 1) == 1 {
+                        PQ_CURSORS.with_borrow_mut(|c| c.insert(name, ItemStack { count: held.count + 1, ..held }));
+                        save_network(game, &net, &at);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // `PacketQIOItemViewerSlotPlace`: from the cursor into the frequency.
+        2 => {
+            let (Some(&button), Some(held)) = (data.get(1), cursor) else {
+                return;
+            };
+            let Some((_, mut net, at)) = pq_network(game) else {
+                return;
+            };
+            if !plain(&held) {
+                return;
+            }
+            let add = if button == 0 { held.count } else { 1 };
+            let put = net.insert(&held.item, u64::from(add)) as u32;
+            if put > 0 {
+                let left = held.count - put;
+                PQ_CURSORS.with_borrow_mut(|c| {
+                    if left == 0 {
+                        c.remove(&name);
+                    } else {
+                        c.insert(name, ItemStack { count: left, ..held });
+                    }
+                });
+                save_network(game, &net, &at);
+            }
+        }
+        // `PacketQIOItemViewerSlotShiftTake`: a stack straight into the inventory.
+        3 => {
+            let Some(item) = item_at(1) else {
+                return;
+            };
+            let Some((_, mut net, at)) = pq_network(game) else {
+                return;
+            };
+            let n = net.stored(&item).min(u64::from(max_stack(game, &item))) as u32;
+            let took = net.extract(&item, u64::from(n)) as u32;
+            if took > 0 {
+                let given = game.native_give_items(&item, took);
+                if given < took {
+                    net.insert(&item, u64::from(took - given));
+                }
+                save_network(game, &net, &at);
+            }
+        }
+        // A player slot: a shift-click puts the stack into the frequency, the others are the menu's pickup.
+        4 => {
+            let (Some(&slot), Some(&how)) = (data.get(1), data.get(2)) else {
+                return;
+            };
+            let slot = usize::from(slot);
+            if slot >= 36 {
+                return;
+            }
+            let at_slot = player_slot(slot);
+            if how == 2 {
+                let Some(s) = game.inventory.get(at_slot).cloned().flatten().filter(plain) else {
+                    return;
+                };
+                let Some((_, mut net, at)) = pq_network(game) else {
+                    return;
+                };
+                let put = net.insert(&s.item, u64::from(s.count)) as u32;
+                if put > 0 {
+                    game.inventory[at_slot] = (s.count > put).then(|| ItemStack { count: s.count - put, ..s });
+                    save_network(game, &net, &at);
+                }
+            } else {
+                let wrap = |game: &Game<'_>, s: ItemStack| {
+                    let m = max_stack(game, &s.item);
+                    Wrapped { stack: s, max: m }
+                };
+                let mut slots: Vec<Option<Wrapped>> = vec![game.inventory.get(at_slot).cloned().flatten().map(|s| wrap(game, s))];
+                let mut held = cursor.map(|s| wrap(game, s));
+                slot_click::click(&mut slots, &mut held, 0, if how == 1 { slot_click::Click::Right } else { slot_click::Click::Left }, &|_, _| true, &[]);
+                if let Some(s) = game.inventory.get_mut(at_slot) {
+                    *s = slots[0].take().map(|w| w.stack);
+                }
+                PQ_CURSORS.with_borrow_mut(|c| match held {
+                    Some(w) => {
+                        c.insert(name, w.stack);
+                    }
+                    None => {
+                        c.remove(&name);
+                    }
+                });
+            }
+        }
+        _ => return,
+    }
+    pq_push_items(game, false);
+}
+
+/// The server's state arrived on the client.
+fn pq_payload(data: &[u8]) {
+    let mut at = 1;
+    match data.first() {
+        Some(0) => {
+            let own = if data.get(1) == Some(&1) {
+                at = 2;
+                read_entry(data, &mut at)
+            } else {
+                at = 2;
+                None
+            };
+            let Some(n) = data.get(at..at + 2).map(|b| usize::from(u16::from_be_bytes([b[0], b[1]]))) else {
+                return;
+            };
+            at += 2;
+            let mut entries = Vec::new();
+            for _ in 0..n {
+                match read_entry(data, &mut at) {
+                    Some(e) => entries.push(e),
+                    None => return,
+                }
+            }
+            PQ_STATE.with_borrow_mut(|s| {
+                s.own = own;
+                s.entries = entries;
+            });
+        }
+        Some(1) => {
+            let mut next = PqState::default();
+            let (Some(&fresh), Some(has)) = (data.get(1), data.get(2)) else {
+                return;
+            };
+            at = 3;
+            if *has == 1 {
+                let Some(n) = data.get(at..at + 2).map(|b| usize::from(u16::from_be_bytes([b[0], b[1]]))) else {
+                    return;
+                };
+                let Some(s) = data.get(at + 2..at + 2 + n).and_then(|b| String::from_utf8(b.to_vec()).ok()) else {
+                    return;
+                };
+                at += 2 + n;
+                next.frequency = Some(s);
+            }
+            let mut nums = [0u64; 4];
+            for v in &mut nums {
+                let Some(b) = data.get(at..at + 8) else {
+                    return;
+                };
+                *v = u64::from_be_bytes(b.try_into().unwrap_or([0; 8]));
+                at += 8;
+            }
+            [next.items, next.item_cap, next.types, next.type_cap] = nums;
+            let mut stack = |at: &mut usize| -> Option<Option<(String, u32)>> {
+                let count = u16::from_be_bytes([*data.get(*at)?, *data.get(*at + 1)?]);
+                let len = usize::from(*data.get(*at + 2)?);
+                let id = String::from_utf8(data.get(*at + 3..*at + 3 + len)?.to_vec()).ok()?;
+                *at += 3 + len;
+                Some((count > 0).then_some((id, u32::from(count))))
+            };
+            let Some(cursor) = stack(&mut at) else {
+                return;
+            };
+            next.cursor = cursor;
+            for _ in 0..36 {
+                let Some(s) = stack(&mut at) else {
+                    return;
+                };
+                next.inv.push(s);
+            }
+            let Some(n) = data.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize) else {
+                return;
+            };
+            at += 4;
+            for _ in 0..n {
+                let Some(&len) = data.get(at) else {
+                    return;
+                };
+                let len = usize::from(len);
+                let (Some(id), Some(c)) = (data.get(at + 1..at + 1 + len).and_then(|b| String::from_utf8(b.to_vec()).ok()), data.get(at + 1 + len..at + 9 + len)) else {
+                    return;
+                };
+                next.list.push((id, u64::from_be_bytes(c.try_into().unwrap_or([0; 8]))));
+                at += 9 + len;
+            }
+            PQ_STATE.with_borrow_mut(|s| {
+                next.own = s.own.take();
+                next.entries = std::mem::take(&mut s.entries);
+                *s = next;
+            });
+            PQ_UI.with_borrow_mut(|ui| ui.dirty = true);
+            if fresh == 1 {
+                PQ_FRESH.set(true);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Opens the window when the server's first state arrives and asks for a refresh once a second while it is
+/// open (hook point `native_tick`): the network changes under other hands too.
+fn pq_open(game: &mut Game<'_>) {
+    if PQ_FRESH.take() && !PQ_OPEN.get() && game.native_ui_open().is_none() {
+        PQ_OPEN.set(true);
+        PQ_SELECT.set(false);
+        PQ_TAGS.with_borrow_mut(|t| {
+            t.clear();
+            for (tag, members) in &world_items!(game).item_tags {
+                for m in members {
+                    t.entry(m.clone()).or_default().push(tag.clone());
+                }
+            }
+        });
+        let focus = game.native_setting(MOD_ID, "qio_auto_focus").is_none_or(|v| v != "false");
+        PQ_AUTOFOCUS.set(focus);
+        let sort = game.native_setting(MOD_ID, "qio_sort_type").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(3);
+        let descending = game.native_setting(MOD_ID, "qio_sort_descending").as_deref() == Some("true");
+        PQ_UI.with_borrow_mut(|ui| {
+            *ui = PqUi { sort, descending, ..PqUi::default() };
+            ui.search.focused = focus;
+        });
+        game.native_open_ui(PQ_ID);
+    }
+    if PQ_OPEN.get() && game.native_ui_open() == Some(PQ_ID) {
+        let due = PQ_UI.with_borrow_mut(|ui| {
+            let due = game.ticks as u64 >= ui.last_refresh + 20;
+            if due {
+                ui.last_refresh = game.ticks as u64;
+            }
+            due
+        });
+        if due {
+            game.native_send_to_server(PQ_CHANNEL, &[0]);
+        }
+    }
+}
+
+/// `ListSortType`'s comparators, with `SortDirection`.
+fn pq_sort(game: &Game<'_>, list: &mut [(String, u64)], sort: usize, descending: bool) {
+    let name = |id: &str| game.pack.names.display_item(id);
+    let modid = |id: &str| id.split_once(':').map_or("minecraft", |(m, _)| m).to_owned();
+    let ns_path = |id: &str| {
+        let (n, p) = id.split_once(':').unwrap_or(("minecraft", id));
+        (n.to_owned(), p.to_owned())
+    };
+    list.sort_by(|a, b| {
+        use std::cmp::Ordering;
+        let by_name = || name(&a.0).cmp(&name(&b.0));
+        match sort {
+            0 => {
+                let o = by_name();
+                if descending { o.reverse() } else { o }
+            }
+            // Count, then name; descending reverses the count only.
+            1 => {
+                let o = a.1.cmp(&b.1);
+                (if descending { o.reverse() } else { o }).then_with(by_name)
+            }
+            2 => {
+                let o = modid(&a.0).cmp(&modid(&b.0));
+                (if descending { o.reverse() } else { o }).then_with(by_name)
+            }
+            _ => {
+                let o = ns_path(&a.0).cmp(&ns_path(&b.0));
+                if descending { o.reverse().then(a.1.cmp(&b.1)) } else { o.then(a.1.cmp(&b.1)) }
+            }
+        }
+        .then(Ordering::Equal)
+    });
+}
+
+struct PqItem<'a> {
+    game: &'a Game<'a>,
+    id: &'a str,
+}
+
+impl qio_search::Item for PqItem<'_> {
+    fn name(&self) -> String {
+        self.game.pack.names.display_item(self.id)
+    }
+    fn mod_id(&self) -> String {
+        self.id.split_once(':').map_or("minecraft", |(m, _)| m).to_owned()
+    }
+    fn tooltip(&self) -> Vec<String> {
+        vec![self.name()]
+    }
+    fn tags(&self) -> Vec<String> {
+        PQ_TAGS.with_borrow(|t| t.get(self.id).cloned().unwrap_or_default())
+    }
+}
+
+use mekanism_core::qio_search;
+
+/// Rebuilds the shown list when the state, the search or the sorting changed (`QIOItemViewerContainer.updateSearch`).
+fn pq_refresh(game: &Game<'_>) {
+    let dirty = PQ_UI.with_borrow(|ui| ui.dirty);
+    if !dirty {
+        return;
+    }
+    let (text, sort, descending) = PQ_UI.with_borrow(|ui| (ui.search.value.clone(), ui.sort, ui.descending));
+    let query = qio_search::parse(&text).unwrap_or_default();
+    let mut list: Vec<(String, u64)> = PQ_STATE.with_borrow(|s| s.list.iter().filter(|(id, _)| query.test(&PqItem { game, id })).cloned().collect());
+    pq_sort(game, &mut list, sort, descending);
+    PQ_UI.with_borrow_mut(|ui| {
+        ui.shown = list;
+        ui.dirty = false;
+    });
+}
+
+/// `UnitDisplayUtils.getDisplay(count, 1)`: the unit it is above, one decimal, cut off, not rounded.
+fn pq_count_text(count: u64) -> String {
+    if count < 10_000 {
+        return count.to_string();
+    }
+    let value = count as f64;
+    let (div, unit) = [(1e12, "T"), (1e9, "G"), (1e6, "M"), (1e3, "k")].into_iter().find(|(d, _)| value >= *d).unwrap_or((1.0, ""));
+    let v = ((value / div) * 10.0).floor() / 10.0;
+    let mut s = format!("{v:.1}");
+    if s.ends_with(".0") {
+        s.truncate(s.len() - 2);
+    }
+    format!("{s}{unit}")
+}
+
+fn pq_grid_rect() -> [f32; 4] {
+    [7.0, PQ_SLOTS_START_Y, 18.0 * PQ_SLOTS_X as f32, 18.0 * PQ_SLOTS_Y as f32]
+}
+
+fn pq_bar_rect() -> [f32; 4] {
+    [7.0 + 18.0 * PQ_SLOTS_X as f32 + 4.0, PQ_SLOTS_START_Y, 14.0, 18.0 * PQ_SLOTS_Y as f32]
+}
+
+/// Where the player's slot `i` (0..36, hotbar last) is, its frame.
+fn pq_inv_rect(i: usize) -> [f32; 4] {
+    let [w, h] = pq_size();
+    let (row, col) = (i / 9, i % 9);
+    let y = if row < 3 { h - 82.0 + 18.0 * row as f32 } else { h - 82.0 + 58.0 };
+    [(w - 176.0) / 2.0 + 7.0 + 18.0 * col as f32, y - 1.0, 18.0, 18.0]
+}
+
+fn pq_dropdown_rect(open: bool) -> [f32; 4] {
+    let [w, _] = pq_size();
+    [w - 63.0, PQ_SLOTS_START_Y + 18.0 * PQ_SLOTS_Y as f32 + 1.0, 41.0, if open { 12.0 + 10.0 * PQ_SORTS.len() as f32 + 1.0 } else { 12.0 }]
+}
+
+fn pq_direction_rect() -> [f32; 4] {
+    let [w, _] = pq_size();
+    [w - 9.0 - 12.0, PQ_SLOTS_START_Y + 18.0 * PQ_SLOTS_Y as f32 + 1.0, 12.0, 12.0]
+}
+
+fn pq_search_rect() -> [f32; 4] {
+    let [w, _] = pq_size();
+    [50.0, 30.0, w - 50.0 - 10.0, 10.0]
+}
+
+fn pq_scroll_first(ui: &PqUi) -> usize {
+    let rows = ui.shown.len().div_ceil(PQ_SLOTS_X) as i32;
+    tw_first(ui.scroll, rows, PQ_SLOTS_Y as i32).max(0) as usize
+}
+
+fn pq_slot_at(ui: &PqUi, at: [f32; 2]) -> Option<usize> {
+    let [gx, gy, gw, gh] = pq_grid_rect();
+    let rel = [at[0] - ui.origin[0], at[1] - ui.origin[1]];
+    if !inside(rel, [gx, gy, gw, gh]) {
+        return None;
+    }
+    let (cx, cy) = (((rel[0] - gx) / 18.0) as usize, ((rel[1] - gy) / 18.0) as usize);
+    // The border of a slot is not part of it.
+    let (ix, iy) = (rel[0] - gx - 18.0 * cx as f32, rel[1] - gy - 18.0 * cy as f32);
+    if !(1.0..17.0).contains(&ix) || !(1.0..17.0).contains(&iy) {
+        return None;
+    }
+    let index = (cy + pq_scroll_first(ui)) * PQ_SLOTS_X + cx;
+    (index < ui.shown.len()).then_some(index)
+}
+
+fn pq_draw(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    if PQ_SELECT.get() {
+        pq_draw_select(game, batch);
+        return;
+    }
+    pq_refresh(game);
+    let [w, h] = pq_size();
+    let o = [((batch.width - w) / 2.0).floor(), ((batch.height - h) / 2.0).floor()];
+    let cursor = game.native_cursor();
+    let state = PQ_STATE.with_borrow(Clone::clone);
+    PQ_UI.with_borrow_mut(|ui| {
+        ui.origin = o;
+        let mouse = [cursor[0] - o[0], cursor[1] - o[1]];
+        // The thumb follows the mouse while it is dragged (`GuiScrollableElement.onDrag`).
+        if let Some(offset) = ui.drag {
+            let bar = pq_bar_rect();
+            let travel = bar[3] - 2.0 - 15.0;
+            ui.scroll = ((mouse[1] - 1.0 - bar[1] - offset) / travel).clamp(0.0, 1.0);
+        }
+        nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [o[0] - 3.0, o[1] - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
+        nine_slice(game, batch, "base", 16.0, 4.0, [o[0], o[1], w, h]);
+        // The tabs: the frequency (left, 6) and the search bar focus (right, 6).
+        pq_draw_tabs(game, batch, o, mouse);
+        let title = "Portable QIO Dashboard";
+        let tw = game.native_text_width(title);
+        game.native_text(batch, title, [o[0] + (w - tw) / 2.0, o[1] + 5.0], 0x40_4040, false);
+        // `GuiInnerScreen(7, 15, imageWidth - 16, 12)`: the frequency.
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, [o[0] + 7.0, o[1] + 15.0, w - 16.0, 12.0], 0xFFFF_FFFF);
+        let line = state.frequency.as_ref().map_or("No frequency".to_owned(), |f| format!("Frequency: {f}"));
+        scrolling_text(game, batch, &line, [o[0] + 10.0, o[1] + 18.0, o[0] + 7.0 + (w - 16.0) - 3.0, o[1] + 27.0], 0, 0x3C_FE9A, 0.8);
+        // The search label and box.
+        scrolling_text(game, batch, "Search:", [o[0] + 7.0, o[1] + 31.0, o[0] + 47.0, o[1] + 40.0], 2, 0x40_4040, 1.0);
+        let [bx, by, bw, bh] = pq_search_rect();
+        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, [o[0] + bx - 1.0, o[1] + by - 1.0, bw + 2.0, bh + 2.0], 0xFFFF_FFFF);
+        game.native_text(batch, &ui.search.value, [o[0] + bx + 2.0, o[1] + by + 1.0], 0xFF_FFFF, true);
+        if ui.search.focused && (game.ticks / 6) % 2 == 0 {
+            let before: String = ui.search.value.chars().take(ui.search.cursor).collect();
+            game.native_text(batch, "_", [o[0] + bx + 2.0 + game.native_text_width(&before), o[1] + by + 1.0], 0xFF_FFFF, true);
+        }
+        // `GuiSlotScroll`: the grid of what the frequency holds.
+        let [gx, gy, gw, gh] = pq_grid_rect();
+        nine_slice_tinted(game, batch, if ui.shown.is_empty() { "slot/dark" } else { "slot/normal" }, [18.0, 18.0], 1.0, [o[0] + gx, o[1] + gy, gw, gh], 0xFFFF_FFFF);
+        let first = pq_scroll_first(ui);
+        let hovered = pq_slot_at(ui, cursor);
+        for i in 0..PQ_SLOTS_X * PQ_SLOTS_Y {
+            let Some((id, count)) = ui.shown.get(first * PQ_SLOTS_X + i) else {
+                break;
+            };
+            let (sx, sy) = (o[0] + gx + 18.0 * (i % PQ_SLOTS_X) as f32, o[1] + gy + 18.0 * (i / PQ_SLOTS_X) as f32);
+            game.native_item(batch, id, [sx + 1.0, sy + 1.0], 16.0);
+            let text = if *count == 0 { Some("0".to_owned()) } else if *count > 1 { Some(pq_count_text(*count)) } else { None };
+            if let Some(text) = text {
+                let mut scale = 0.6;
+                if game.native_text_width(&text) * scale >= 16.0 {
+                    scale = 0.5;
+                }
+                let tw = game.native_text_width(&text) * scale;
+                let color = if *count == 0 { 0xFF_FF55 } else { 0xFF_FFFF };
+                let (tx, ty) = (sx + 1.0 + 16.0 - tw, sy + 1.0 + 9.0 + 4.5 - 4.5 * scale);
+                game.native_text_scaled(batch, &text, [tx + scale, ty + scale], 0x38_3838, scale);
+                game.native_text_scaled(batch, &text, [tx, ty], color, scale);
+            }
+        }
+        if let Some(i) = hovered {
+            let k = i - first * PQ_SLOTS_X;
+            game.native_fill(batch, [o[0] + gx + 18.0 * (k % PQ_SLOTS_X) as f32 + 1.0, o[1] + gy + 18.0 * (k / PQ_SLOTS_X) as f32 + 1.0, 16.0, 16.0], 0x80_FFFFFF);
+        }
+        // The bar (`GuiScrollBar`): a holder with the thumb riding in it.
+        let [bx, by, _, bh] = pq_bar_rect();
+        nine_slice_tinted(game, batch, "element_holder", [16.0, 16.0], 2.0, [o[0] + bx, o[1] + by, 14.0, bh], 0xFFFF_FFFF);
+        let rows = ui.shown.len().div_ceil(PQ_SLOTS_X);
+        let scrolls = rows > PQ_SLOTS_Y;
+        let travel = bh - 2.0 - 15.0;
+        let thumb = if scrolls { ((ui.scroll * travel) as i32).clamp(0, travel as i32) as f32 } else { 0.0 };
+        sprite(game, batch, if scrolls { "scroll/bar" } else { "scroll/bar_inactive" }, [0.0, 0.0, 12.0, 15.0], [o[0] + bx + 1.0, o[1] + by + 1.0 + thumb, 12.0, 15.0]);
+        // The inventory, and the sort row under the grid.
+        let label_x = (w - 176.0) / 2.0 + 8.0;
+        let label_y = h - 93.0;
+        scrolling_text(game, batch, "Inventory", [o[0] + label_x, o[1] + label_y, o[0] + label_x + 53.0, o[1] + label_y + 9.0], 0, 0x40_4040, 1.0);
+        let right_start = label_x + 50.0;
+        let sort_w = w - right_start - (w - (w - 63.0) - 5.0);
+        scrolling_text(game, batch, "Sort:", [o[0] + right_start + 6.0, o[1] + label_y, o[0] + right_start + sort_w - 6.0, o[1] + label_y + 9.0], 2, 0x40_4040, 1.0);
+        for i in 0..36 {
+            let r = pq_inv_rect(i);
+            sprite(game, batch, "slot/normal", [0.0, 0.0, 18.0, 18.0], [o[0] + r[0], o[1] + r[1], 18.0, 18.0]);
+            if let Some((id, count)) = state.inv.get(i).cloned().flatten() {
+                game.native_item(batch, &id, [o[0] + r[0] + 1.0, o[1] + r[1] + 1.0], 16.0);
+                if count > 1 {
+                    let text = count.to_string();
+                    let tw = game.native_text_width(&text);
+                    game.native_text(batch, &text, [o[0] + r[0] + 17.0 - tw, o[1] + r[1] + 9.0], 0xFF_FFFF, true);
+                }
+            }
+            if inside(mouse, r) {
+                game.native_fill(batch, [o[0] + r[0] + 1.0, o[1] + r[1] + 1.0, 16.0, 16.0], 0x80_FFFFFF);
+            }
+        }
+        // `GuiDigitalIconToggle`: the direction, then the dropdown with its options below it.
+        let d = pq_direction_rect();
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, [o[0] + d[0], o[1] + d[1], d[2], d[3]], 0xFFFF_FFFF);
+        sprite(game, batch, if ui.descending { "button/arrow_down" } else { "button/arrow_up" }, [0.0, 0.0, 6.0, 6.0], [o[0] + d[0] + 3.0, o[1] + d[1] + 3.0, d[2] - 6.0, d[3] - 6.0]);
+        let dd = pq_dropdown_rect(ui.open);
+        nine_slice_tinted(game, batch, "inner_screen", [256.0, 256.0], 32.0, [o[0] + dd[0], o[1] + dd[1], dd[2], dd[3]], 0xFFFF_FFFF);
+        scrolling_text(game, batch, PQ_SORTS[ui.sort], [o[0] + dd[0] + 3.0, o[1] + dd[1] + 2.0, o[0] + dd[0] + dd[2] - 3.0, o[1] + dd[1] + 12.0], 0, 0x3C_FE9A, 0.8);
+        if ui.open {
+            for (i, name) in PQ_SORTS.iter().enumerate() {
+                let y = o[1] + dd[1] + 13.0 + 10.0 * i as f32;
+                if inside(mouse, [dd[0] + 1.0, dd[1] + 12.0 + 10.0 * i as f32, dd[2] - 2.0, 10.0]) {
+                    for r in [[o[0] + dd[0] + 1.0, y - 1.0, dd[2] - 2.0, 1.0], [o[0] + dd[0] + 1.0, y + 9.0, dd[2] - 2.0, 1.0], [o[0] + dd[0] + 1.0, y - 1.0, 1.0, 10.0], [o[0] + dd[0] + dd[2] - 2.0, y - 1.0, 1.0, 10.0]] {
+                        game.native_fill(batch, r, 0xFF3C_FE9A);
+                    }
+                }
+                scrolling_text(game, batch, name, [o[0] + dd[0] + 3.0, y, o[0] + dd[0] + dd[2] - 3.0, y + 10.0], 0, 0x3C_FE9A, 0.8);
+            }
+        }
+        // The cursor stack, then the tooltips.
+        if let Some((id, count)) = &state.cursor {
+            game.native_item(batch, id, [cursor[0] - 8.0, cursor[1] - 8.0], 16.0);
+            if *count > 1 {
+                game.native_text(batch, &count.to_string(), [cursor[0] + 3.0, cursor[1] + 1.0], 0xFF_FFFF, true);
+            }
+        } else {
+            let mut lines: Vec<String> = vec![];
+            if let Some(i) = hovered {
+                let (id, count) = &ui.shown[i];
+                lines.push(game.pack.names.display_item(id));
+                if *count >= 10_000 {
+                    lines.push(format!("\u{a7}7Stored count: \u{a7}9{count}"));
+                }
+            } else if let Some(i) = (0..36).find(|&i| inside(mouse, pq_inv_rect(i))) {
+                if let Some((id, _)) = state.inv.get(i).cloned().flatten() {
+                    lines.push(game.pack.names.display_item(&id));
+                }
+            }
+            pq_tooltips(&state, ui, mouse, w, &mut lines);
+            if !lines.is_empty() {
+                let text: Vec<horizon_client::text::Text> = lines.iter().map(|l| horizon_client::text::Text::legacy(l)).collect();
+                horizon_client::ui::tooltip(batch, &game.gui.atlas, &text, (cursor[0], cursor[1]));
+            }
+        }
+    });
+}
+
+fn pq_tooltips(state: &PqState, ui: &PqUi, mouse: [f32; 2], w: f32, lines: &mut Vec<String>) {
+    if inside(mouse, [7.0, 15.0, w - 16.0, 12.0]) && state.frequency.is_some() {
+        lines.push(format!("\u{a7}7Items: \u{a7}9{}\u{a7}7 / \u{a7}9{}", state.items, state.item_cap));
+        lines.push(format!("\u{a7}7Types: \u{a7}9{}\u{a7}7 / \u{a7}9{}", state.types, state.type_cap));
+    }
+    if inside(mouse, pq_direction_rect()) {
+        lines.push(if ui.descending { "Descending" } else { "Ascending" }.to_owned());
+        lines.push(if ui.descending { "Sort items in descending order." } else { "Sort items in ascending order." }.to_owned());
+    }
+    if ui.open {
+        for (i, tip) in PQ_SORT_TIPS.iter().enumerate() {
+            let d = pq_dropdown_rect(true);
+            if inside(mouse, [d[0] + 1.0, d[1] + 12.0 + 10.0 * i as f32, d[2] - 2.0, 10.0]) {
+                lines.push((*tip).to_owned());
+            }
+        }
+    }
+    if inside(mouse, PQ_TAB_FREQ) {
+        lines.push("QIO Frequency Select".to_owned());
+    }
+    if inside(mouse, [w, 6.0, 26.0, 18.0]) {
+        lines.push("Auto focus the QIO search bar when opening a dashboard.".to_owned());
+    }
+}
+
+/// `GuiQIOFrequencyTab` at (-26, 6): the holder and its 18 px button.
+const PQ_TAB_FREQ: [f32; 4] = [-22.0, 10.0, 18.0, 18.0];
+
+fn pq_draw_tabs(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, o: [f32; 2], mouse: [f32; 2]) {
+    let [w, _] = pq_size();
+    nine_slice_tinted(game, batch, "holder_left", [26.0, 9.0], 4.0, [o[0] - 26.0, o[1] + 6.0, 26.0, 26.0], 0xFFFF_FFFF);
+    let b = [o[0] + PQ_TAB_FREQ[0] + 1.0, o[1] + PQ_TAB_FREQ[1], 18.0, 18.0];
+    nine_slice_tinted(game, batch, if inside(mouse, PQ_TAB_FREQ) { "button_focus" } else { "button" }, [200.0, 20.0], 2.0, b, 0xFFFF_FFFF);
+    sprite(game, batch, "button/frequency", [0.0, 0.0, 18.0, 18.0], b);
+    // `GuiToggleClientConfigTab(.., 6, false, ..)`: a right tab that flips the auto focus.
+    let on = PQ_AUTOFOCUS.get();
+    nine_slice_tinted(game, batch, "holder_right", [26.0, 9.0], 4.0, [o[0] + w, o[1] + 6.0, 26.0, 26.0], 0xFFFF_FFFF);
+    let r = [o[0] + w + 7.0, o[1] + 10.0, 18.0, 18.0];
+    nine_slice_tinted(game, batch, if inside(mouse, [w + 7.0, 10.0, 18.0, 18.0]) { "button_focus" } else { "button" }, [200.0, 20.0], 2.0, r, 0xFFFF_FFFF);
+    sprite(game, batch, if on { "button/searchbar_autofocus_on" } else { "button/searchbar_autofocus_off" }, [0.0, 0.0, 18.0, 18.0], r);
+}
+
+thread_local! {
+    static PQ_AUTOFOCUS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// `GuiQIOItemFrequencySelect`: the selector over a 176 x 155 panel, the back button at (6, 6).
+fn pq_draw_select(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    let [w, h] = [176.0, 155.0];
+    let o = [((batch.width - w) / 2.0).floor(), ((batch.height - h) / 2.0).floor()];
+    PQ_UI.with_borrow_mut(|ui| ui.select_origin = o);
+    let mouse = [game.native_cursor()[0] - o[0], game.native_cursor()[1] - o[1]];
+    nine_slice_tinted(game, batch, "shadow", [9.0, 9.0], 3.0, [o[0] - 3.0, o[1] - 3.0, w + 6.0, h + 6.0], 0xBFFF_FFFF);
+    nine_slice(game, batch, "base", 16.0, 4.0, [o[0], o[1], w, h]);
+    let title = "QIO Frequency Select";
+    let tw = game.native_text_width(title);
+    game.native_text(batch, title, [o[0] + 17.0 + (w - 17.0 - tw) / 2.0, o[1] + 3.0], 0x40_4040, false);
+    let back = [o[0] + QIO_BACK[0], o[1] + QIO_BACK[1], QIO_BACK[2], QIO_BACK[3]];
+    draw_mek_button(game, batch, back, true, inside(mouse, QIO_BACK));
+    sprite(game, batch, "button/back", [0.0, 0.0, 14.0, 14.0], back);
+    draw_freq_selector(game, batch, PQ_ID, [o[0], o[1] + QIO_SELECT_DY]);
+}
+
+fn pq_send(game: &Game<'_>, data: &[u8]) {
+    game.native_send_to_server(PQ_CHANNEL, data);
+}
+
+fn pq_click(game: &mut Game<'_>, at: [f32; 2], button: u8, pressed: bool) {
+    if PQ_SELECT.get() {
+        if pressed {
+            let o = PQ_UI.with_borrow(|ui| ui.select_origin);
+            let rel = [at[0] - o[0], at[1] - o[1]];
+            if button == 0 && inside(rel, QIO_BACK) {
+                PQ_SELECT.set(false);
+            } else {
+                frequency_click(game, PQ_ID, [rel[0], rel[1] - QIO_SELECT_DY], button == 1);
+            }
+        }
+        return;
+    }
+    if !pressed {
+        PQ_UI.with_borrow_mut(|ui| ui.drag = None);
+        return;
+    }
+    pq_refresh(game);
+    let [w, _] = pq_size();
+    let state = PQ_STATE.with_borrow(Clone::clone);
+    let shift = game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);
+    let mut after: Option<Vec<u8>> = None;
+    let mut select = false;
+    PQ_UI.with_borrow_mut(|ui| {
+        let o = ui.origin;
+        let m = [at[0] - o[0], at[1] - o[1]];
+        // The dropdown: a press on an option picks it, the field opens and closes it.
+        let dd = pq_dropdown_rect(ui.open);
+        if ui.open && button == 0 && inside(m, [dd[0], dd[1] + 12.0, dd[2], dd[3] - 12.0]) {
+            let i = (((m[1] - dd[1] - 12.0) / 10.0) as usize).min(PQ_SORTS.len() - 1);
+            ui.sort = i;
+            ui.open = false;
+            ui.dirty = true;
+            ui.scroll = 0.0;
+            game.native_set_setting(MOD_ID, "qio_sort_type", &i.to_string());
+            return;
+        }
+        if button == 0 && inside(m, dd) {
+            ui.open = !ui.open;
+            return;
+        }
+        ui.open = false;
+        if button == 0 && inside(m, pq_direction_rect()) {
+            ui.descending = !ui.descending;
+            ui.dirty = true;
+            game.native_set_setting(MOD_ID, "qio_sort_descending", if ui.descending { "true" } else { "false" });
+            return;
+        }
+        ui.search.focused = inside(m, pq_search_rect());
+        if button == 0 && inside(m, [PQ_TAB_FREQ[0], PQ_TAB_FREQ[1], 18.0, 18.0]) {
+            select = true;
+            return;
+        }
+        if button == 0 && inside(m, [w + 7.0, 10.0, 18.0, 18.0]) {
+            let on = !PQ_AUTOFOCUS.get();
+            PQ_AUTOFOCUS.set(on);
+            game.native_set_setting(MOD_ID, "qio_auto_focus", if on { "true" } else { "false" });
+            return;
+        }
+        // The scroll bar: a press on the thumb starts dragging it.
+        let bar = pq_bar_rect();
+        let rows = ui.shown.len().div_ceil(PQ_SLOTS_X);
+        if rows > PQ_SLOTS_Y && button == 0 {
+            let travel = bar[3] - 2.0 - 15.0;
+            let thumb = ((ui.scroll * travel) as i32).clamp(0, travel as i32) as f32;
+            let top = bar[1] + 1.0 + thumb;
+            if inside(m, [bar[0] + 1.0, top, 12.0, 15.0]) {
+                ui.drag = Some(m[1] - top);
+                return;
+            }
+        }
+        // The grid: `QIOItemViewerContainer.onClick`.
+        if let Some(i) = pq_slot_at(ui, at) {
+            let (id, count) = ui.shown[i].clone();
+            let id_bytes = id.as_bytes();
+            let named = |op: u8, extra: &[u8]| {
+                let mut v = vec![op];
+                v.extend(extra);
+                v.push(id_bytes.len() as u8);
+                v.extend(id_bytes);
+                v
+            };
+            if shift {
+                after = Some(named(3, &[]));
+            } else if state.cursor.is_none() {
+                if count > 0 {
+                    after = Some(named(1, &[button.min(2)]));
+                }
+            } else if button == 2 && state.cursor.as_ref().is_some_and(|(c, _)| *c == id) {
+                after = Some(named(1, &[2]));
+            } else if button <= 1 {
+                after = Some(vec![2, button]);
+            }
+            return;
+        }
+        // The grid's empty part and the rest of the frame: dropping onto the frequency, in `QIOItemViewerContainer`
+        // a click on the empty grid with a stack in hand places it.
+        if state.cursor.is_some() && button <= 1 && inside(m, pq_grid_rect()) {
+            after = Some(vec![2, button]);
+            return;
+        }
+        for i in 0..36 {
+            if inside(m, pq_inv_rect(i)) {
+                after = Some(vec![4, i as u8, if shift { 2 } else { button.min(1) }]);
+                return;
+            }
+        }
+    });
+    if select {
+        FREQ_UI.with_borrow_mut(|ui| *ui = FreqUi::default());
+        PQ_SELECT.set(true);
+    }
+    if let Some(d) = after {
+        pq_send(game, &d);
+    }
+}
+
+fn pq_wheel(steps: f32) {
+    PQ_UI.with_borrow_mut(|ui| {
+        let rows = ui.shown.len().div_ceil(PQ_SLOTS_X) as i32;
+        tw_notch(&mut ui.scroll, steps > 0.0, rows, PQ_SLOTS_Y as i32, 1);
+    });
+}
+
+fn pq_key(game: &mut Game<'_>, key: &str, text: Option<&str>) {
+    if PQ_SELECT.get() {
+        let game = &*game;
+        FREQ_UI.with_borrow_mut(|ui| {
+            if ui.text.focused && ui.text.key(key, text, freq::valid_char, freq::MAX_FREQ_LENGTH) == freq::Typed::Enter {
+                submit_frequency_field(game, PQ_POS, ui);
+            }
+        });
+        return;
+    }
+    PQ_UI.with_borrow_mut(|ui| {
+        if !ui.search.focused {
+            // `AbstractContainerScreen.keyPressed`: the inventory key closes the screen unless the search has focus.
+            if key == "key.keyboard.e" {
+                game.native_close_ui();
+            }
+            return;
+        }
+        let valid = |c: char| qio::valid_search_char(c) || qio_search::PREFIXES.contains(&c);
+        if ui.search.key(key, text, valid, qio::MAX_SEARCH) == freq::Typed::Changed {
+            ui.dirty = true;
+            ui.scroll = 0.0;
+        }
+    });
+}
+
+fn pq_closed(game: &mut Game<'_>) {
+    PQ_OPEN.set(false);
+    PQ_SELECT.set(false);
+    FREQ_UI.with_borrow_mut(|ui| *ui = FreqUi::default());
+    game.native_send_to_server(PQ_CHANNEL, &[5]);
 }
