@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 
 pub const DRIVE_ARRAY: &str = "mekanism:qio_drive_array";
 pub const DASHBOARD: &str = "mekanism:qio_dashboard";
+/// The Portable QIO Dashboard item.
+pub const PORTABLE: &str = "mekanism:portable_qio_dashboard";
 pub const IMPORTER: &str = "mekanism:qio_importer";
 pub const EXPORTER: &str = "mekanism:qio_exporter";
 pub const REDSTONE_ADAPTER: &str = "mekanism:qio_redstone_adapter";
