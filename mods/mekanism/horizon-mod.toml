@@ -1,0 +1,14 @@
+id = "mekanism"
+name = "Mekanism"
+version = "0.1.0"
+description = "Mekanism for Horizon: machines, generators, logistics, chemicals and gear."
+authors = []
+api = "0.2"
+side = "both"
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+# The fork's main (upstream + generic helpers #90/#91), the same pin as mods/jei.
+horizon = "04d81384506100f21a6e995d28fcc154a0ad9224"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
