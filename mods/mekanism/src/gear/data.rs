@@ -203,3 +203,18 @@ pub(crate) fn suit_paste_capacity() -> u64 {
 pub(crate) fn is_jetpack(stack: &ItemStack, id: &str) -> bool {
     matches!(id, "mekanism:jetpack" | "mekanism:jetpack_armored") || (id == modules::BODYARMOR && enabled_modules(stack).contains_key(JETPACK_UNIT))
 }
+
+// --- Atomic Disassembler ---------------------------------------------------------------------------------------
+
+pub(crate) const MODE_KEY: &str = "mekanism:disassembler_mode";
+
+/// The mode as stored; a mode the config switched off reads back as normal (`DisassemblerMode.CODEC`).
+pub(crate) fn disassembler_mode(stack: &ItemStack) -> gear::DisassemblerMode {
+    let mode = custom_data(stack).and_then(|c| get_string(c, MODE_KEY)).as_deref().and_then(gear::DisassemblerMode::from_name).unwrap_or_default();
+    if mode.enabled(&gear_config()) { mode } else { gear::DisassemblerMode::Normal }
+}
+
+/// `GearConfig` of the running world.
+pub(crate) fn gear_config() -> mekanism_core::config::GearConfig {
+    mekanism_core::config::GearConfig::default()
+}
