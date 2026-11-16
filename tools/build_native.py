@@ -3,6 +3,7 @@
 
   tools/build_native.py check                 # cargo horizon-mod check (fetches the pinned SDK on first run)
   tools/build_native.py build [--instance N]  # horizon-launcher native-build, asks for native-code trust
+  tools/build_native.py check-local HORIZON   # cargo check against a checkout of the fork (no signed SDK needed)
   tools/build_native.py dev-install HORIZON   # local, unsigned base from a checkout of SCPLEGION/horizon
 
 It replaces tools/manual_stage.py and tools/horizon.py, which staged the old hook bundle (mixins/mekanism) into a
@@ -27,11 +28,22 @@ def main():
     sub.add_parser("check")
     b = sub.add_parser("build")
     b.add_argument("--instance")
+    c = sub.add_parser("check-local")
+    c.add_argument("horizon", type=pathlib.Path)
     d = sub.add_parser("dev-install")
     d.add_argument("horizon", type=pathlib.Path)
     a = p.parse_args()
     if a.cmd == "check":
         run(["cargo", "horizon-mod", "check"], cwd=MOD)
+    elif a.cmd == "check-local":
+        import shutil, tempfile
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="mek-check-"))
+        shutil.copytree(MOD, tmp / "mod", ignore=shutil.ignore_patterns(".horizon", "target"))
+        t = (tmp / "mod/Cargo.toml").read_text()
+        t = t.replace(".horizon/sdk/api/crates/horizon-mod-api", str(a.horizon.resolve() / "crates/horizon-mod-api"))
+        t = t.replace("../../mixins/mekanism/core", str(MOD.parents[1] / "mixins/mekanism/core"))
+        (tmp / "mod/Cargo.toml").write_text(t)
+        run(["cargo", "check"], cwd=tmp / "mod")
     elif a.cmd == "build":
         cmd = ["horizon-launcher", "native-build", str(MOD), "--trust-native-code"]
         if a.instance:
