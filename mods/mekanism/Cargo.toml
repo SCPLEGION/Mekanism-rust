@@ -1,0 +1,13 @@
+[package]
+name = "mod-mekanism"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command.
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
+# All game logic, no game types (68k lines, unchanged by the move to the upstream API).
+mekanism-core = { path = "../../mixins/mekanism/core" }

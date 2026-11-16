@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Type-check the bundle's glue without horizon-mixins: a hand-rolled stand-in for `horizon-mixins apply`.
+"""OBSOLETE (docs/horizon-api-migration.md): the fork's native-hooks.json no longer exists on Horizon main; use tools/build_native.py.
+Type-check the bundle's glue without horizon-mixins: a hand-rolled stand-in for `horizon-mixins apply`.
 
 Usage: git -C ../horizon archive <pinned rev> | tar -x -C STAGE
        python3 tools/manual_stage.py STAGE mixins/mekanism
