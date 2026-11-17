@@ -11,6 +11,7 @@ use text::{color, line, translate_colored};
 pub(crate) mod data;
 mod jetpack;
 mod mekasuit;
+mod scuba;
 pub(crate) mod text;
 
 /// State of this area, held in `Mod`. Items carry their own state in `custom_data`, so there is none yet.
@@ -379,10 +380,14 @@ pub(crate) fn server_tick(m: &crate::Mod, host: &mut dyn mod_api::ServerHost, ev
     if !matches!(event.phase, mod_api::ServerTickPhase::ServerTickEnd { world_running: true }) {
         return;
     }
+    let players = host.players().server_players();
+    for player in &players {
+        scuba::breathe(host, *player);
+    }
     if m.gear.second.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 20 != 0 {
         return;
     }
-    for player in host.players().server_players() {
+    for player in players {
         mekasuit::distribute(host, player);
     }
 }
