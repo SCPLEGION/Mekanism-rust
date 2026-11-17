@@ -38,6 +38,10 @@ impl Hooks for Mod {
         world::register(r);
     }
 
+    fn block_changed(&self, level: &dyn mod_api::LevelHost, event: &mut mod_api::BlockChangedEvent) {
+        world::transmit::block_changed(level, event)
+    }
+
     fn player_break_speed(&self, host: HostSide, event: &mut PlayerBreakSpeedEvent) -> Flow {
         gear::player_break_speed(host, event)
     }

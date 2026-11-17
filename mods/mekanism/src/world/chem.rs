@@ -205,10 +205,11 @@ pub(crate) fn convert_item_into_tank(
     }
 }
 
-/// `push_chemical` of `runtime.rs`: gives up to `rate` of `from` to the chemical handlers beside `pos`.
-/// The neighbours' chemical capability (and the side configuration that decides which faces give out) belongs to the
-/// transmitter and side-config stages; until they land nothing is pushed and the tank keeps what it made.
-pub(crate) fn push_chemical(_host: &mut dyn mod_api::ServerHost, _pos: [i32; 3], _from: &mut ChemicalTank, _rate: u64) {}
+/// `push_chemical` of `runtime.rs`: gives up to `rate` of `from` to the chemical handlers beside `pos`
+/// (`transmit::push_chemical`). Every face of the giver lets it out until the side configuration lands.
+pub(crate) fn push_chemical(host: &mut dyn mod_api::ServerHost, pos: [i32; 3], from: &mut ChemicalTank, rate: u64) {
+    super::transmit::push_chemical(host, pos, from, None, rate, false, &|_, _| true);
+}
 
 /// An item stack of `count` of the item `id`.
 pub(crate) fn stack_of(host: &dyn Host, id: &str, count: u32) -> Option<ItemStack> {
@@ -229,3 +230,161 @@ pub(crate) fn machine_power(
     (u, usage, ticks, capacity)
 }
 
+
+// --- Buckets and fluid items --------------------------------------------------------------------------------
+
+/// The fluid in a bucket item: vanilla's water or lava bucket, or a Mekanism `<fluid>_bucket`.
+pub(crate) fn bucket_fluid(item: &str) -> Option<String> {
+    match item {
+        "minecraft:water_bucket" => return Some("minecraft:water".into()),
+        "minecraft:lava_bucket" => return Some("minecraft:lava".into()),
+        _ => {}
+    }
+    let fluid = item.strip_suffix("_bucket")?;
+    fluid.starts_with("mekanism:").then(|| fluid.to_owned())
+}
+
+/// The bucket that holds `fluid`: the reverse of [`bucket_fluid`].
+pub(crate) fn fluid_bucket(fluid: &str) -> Option<String> {
+    match fluid {
+        "minecraft:water" => Some("minecraft:water_bucket".into()),
+        "minecraft:lava" => Some("minecraft:lava_bucket".into()),
+        f if f.starts_with("mekanism:") => Some(format!("{f}_bucket")),
+        _ => None,
+    }
+}
+
+/// One of `item` into slot `index`, when it is empty or holds the same item with room.
+pub(crate) fn put_item(host: &dyn Host, entity: &mut ModBlockEntityView<'_>, index: usize, item: &str) -> bool {
+    match entity.items.get(index).cloned() {
+        None => return false,
+        Some(None) => entity.items[index] = stack_of(host, item, 1),
+        Some(Some(mut s)) if super::item_id(host, &s) == item && s.count() < super::common::max_stack(host, item) => {
+            let _ = s.grow(1);
+            entity.items[index] = Some(s);
+        }
+        Some(Some(_)) => return false,
+    }
+    true
+}
+
+/// One item out of slot `index`.
+pub(crate) fn take_one(entity: &mut ModBlockEntityView<'_>, index: usize) {
+    if let Some(Some(s)) = entity.items.get(index).cloned() {
+        entity.items[index] = s.shrink(1);
+    }
+}
+
+/// `FluidInventorySlot.fill`: a full bucket in slot `from` empties into `tank` (1000 mB, when `accepts` the fluid and
+/// it fits). The empty bucket goes to slot `out`, or stays in `from` without one.
+pub(crate) fn fill_tank_from_bucket(
+    host: &dyn Host,
+    entity: &mut ModBlockEntityView<'_>,
+    from: usize,
+    out: Option<usize>,
+    tank: &mut ChemicalTank,
+    accepts: impl Fn(&str) -> bool,
+) -> bool {
+    let Some(Some(bucket)) = entity.items.get(from).cloned() else {
+        return false;
+    };
+    let Some(fluid) = bucket_fluid(&super::item_id(host, &bucket)) else {
+        return false;
+    };
+    if !accepts(&fluid) || !tank.accepts(&fluid) || tank.amount + 1_000 > tank.capacity {
+        return false;
+    }
+    match out {
+        Some(o) => {
+            if !put_item(host, entity, o, "minecraft:bucket") {
+                return false;
+            }
+            take_one(entity, from);
+        }
+        None if bucket.count() == 1 => entity.items[from] = stack_of(host, "minecraft:bucket", 1),
+        None => return false,
+    }
+    tank.insert(&fluid, 1_000);
+    true
+}
+
+/// `FluidInventorySlot.drain`: an empty bucket in slot `from` fills from `tank` (1000 mB). The full bucket goes to slot
+/// `out`, or replaces a lone empty one in `from` without one. A MekaSuit helmet with a Nutritional Injection Unit and a
+/// Canteen take nutritional paste as it comes (`FluidInventorySlot.drainTank`).
+pub(crate) fn drain_tank_into_bucket(
+    host: &dyn Host,
+    entity: &mut ModBlockEntityView<'_>,
+    from: usize,
+    out: Option<usize>,
+    tank: &mut ChemicalTank,
+) -> bool {
+    let Some(Some(bucket)) = entity.items.get(from).cloned() else {
+        return false;
+    };
+    let id = super::item_id(host, &bucket);
+    let paste = tank.chemical.as_deref() == Some(chem::NUTRITIONAL_PASTE);
+    if id == mekanism_core::modules::HELMET && gdata::installed_modules(&bucket).contains_key(gdata::NUTRITION_UNIT) {
+        if !paste {
+            return false;
+        }
+        let rate = mekanism_core::config::gear_int("mekasuit.nutritionalTransferRate", 256).max(1);
+        let held = gdata::suit_paste(&bucket);
+        let moved = tank.amount.min(gdata::suit_paste_capacity().saturating_sub(held)).min(rate);
+        if moved == 0 {
+            return false;
+        }
+        let mut suit = bucket;
+        gdata::set_custom(&mut suit, gdata::SUIT_PASTE_KEY, Some(Tag::Long((held + moved).min(i64::MAX as u64) as i64)));
+        entity.items[from] = Some(suit);
+        tank.extract(moved);
+        return true;
+    }
+    if id == "mekanism:canteen" {
+        if !paste {
+            return false;
+        }
+        let held = gdata::fuel(&bucket, &id);
+        let rate = mekanism_core::config::gear_int("canteen.transferRate", 128).max(1);
+        let moved = tank.amount.min(gdata::tank_capacity(&bucket, &id).saturating_sub(held)).min(rate);
+        if moved == 0 {
+            return false;
+        }
+        let mut canteen = bucket;
+        gdata::set_fuel(&mut canteen, &id, held + moved);
+        entity.items[from] = Some(canteen);
+        tank.extract(moved);
+        return true;
+    }
+    if id != "minecraft:bucket" || tank.amount < 1_000 {
+        return false;
+    }
+    let Some(full) = tank.chemical.as_deref().and_then(fluid_bucket) else {
+        return false;
+    };
+    match out {
+        Some(o) => {
+            if !put_item(host, entity, o, &full) {
+                return false;
+            }
+            take_one(entity, from);
+        }
+        None if bucket.count() == 1 => entity.items[from] = stack_of(host, &full, 1),
+        None => return false,
+    }
+    tank.extract(1_000);
+    true
+}
+
+/// `drainTankIntoSlot(outputSlot)`: a chemical tank item in slot `from` that is full goes to the empty slot `to`.
+pub(crate) fn move_full_chemical_item(host: &dyn Host, entity: &mut ModBlockEntityView<'_>, from: usize, to: usize) {
+    let Some(Some(stack)) = entity.items.get(from).cloned() else {
+        return;
+    };
+    let Some(capacity) = chemical_item_capacity(&super::item_id(host, &stack)) else {
+        return;
+    };
+    if entity.items.get(to).is_some_and(Option::is_none) && item_tank(&stack, capacity).is_some_and(|t| t.amount >= capacity) {
+        entity.items[to] = Some(stack);
+        entity.items[from] = None;
+    }
+}

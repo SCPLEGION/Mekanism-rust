@@ -42,3 +42,7 @@ pub(crate) fn get_double(nbt: &Compound, key: &str) -> Option<f64> {
         _ => None,
     }
 }
+
+pub(crate) fn put_double(nbt: &mut Compound, key: &str, v: f64) {
+    nbt.insert(key.into(), Tag::Double(v.to_bits()));
+}
