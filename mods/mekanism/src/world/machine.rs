@@ -1,7 +1,7 @@
 //! The basic electric machines (`TileEntityElectricMachine`): enrichment chamber, crusher, energized smelter,
 //! precision sawmill and combiner. Port of `tick_machine` and its container of `runtime.rs`.
-use super::common::{discharge_slot, key_of, max_stack, set_slot, slot, upgrades, set_active};
-use super::nbt::{get_int, get_long, put_int, put_long, wide};
+use super::common::{MenuData, discharge_slot, key_of, max_stack, set_slot, slot, upgrades, set_active};
+use super::nbt::{get_int, get_long, put_int, put_long };
 use crate::gear::data as item_data;
 use mekanism_core::machine::{self, ElectricMachine, Operation, Slot, MACHINES};
 use mod_api::{
@@ -105,7 +105,7 @@ fn set_secondary(nbt: &mut Compound, waiting: Option<&(String, u32)>) {
 
 /// A number in [0, 1) for the sawmill's chance: a splitmix64 step kept in the block entity, so each
 /// machine has its own sequence that survives saving.
-fn roll(nbt: &mut Compound) -> f64 {
+pub(super) fn roll(nbt: &mut Compound) -> f64 {
     let mut x = get_long(nbt, "seed") ^ 0x9E37_79B9_7F4A_7C15;
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     put_long(nbt, "seed", x & (i64::MAX as u64));
@@ -118,7 +118,7 @@ fn roll(nbt: &mut Compound) -> f64 {
 
 /// What the machine does with the stack in its input slot: the operation, the stack limit of its output and
 /// the sawmill's chance of a secondary output.
-fn find_operation(
+pub(super) fn find_operation(
     host: &dyn Host,
     recipe: &str,
     stack: Option<&ItemStack>,
@@ -268,17 +268,14 @@ fn tick(host: &mut dyn ServerHost, entity: &mut ModBlockEntityView<'_>, recipe: 
     }
     // The furnace menu's bars: the flame shows stored energy, the arrow the progress. Data slots are
     // 16 bits, so energy goes as thousandths of the capacity.
-    entity.data = vec![
-        (m.energy.stored * 1000 / m.energy.capacity.max(1)) as i32,
-        1000,
-        m.progress as i32,
-        m.ticks_required as i32,
-    ];
-    // Mekanism's screen reads the rest.
-    let u = upgrades(&entity.nbt);
-    entity.data.extend(wide(m.energy.stored));
-    entity.data.extend(wide(m.energy.capacity));
-    entity.data.extend([(u.speed | u.anchor << 14 | u.chemical << 15 | u.muffling << 19 | u.stone_generator << 20) as i32, u.energy as i32]);
-    entity.data.extend(wide(m.usage));
+    MenuData::new(m.energy.stored, m.energy.capacity, m.usage)
+        .furnace([
+            (m.energy.stored * 1000 / m.energy.capacity.max(1)) as i32,
+            1000,
+            m.progress as i32,
+            m.ticks_required as i32,
+        ])
+        .upgrades(&upgrades(&entity.nbt))
+        .write(entity);
     m.active
 }

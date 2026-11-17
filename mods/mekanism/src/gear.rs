@@ -9,6 +9,9 @@ use mod_api::HostBlockStates;
 use text::{color, line, translate_colored};
 
 pub(crate) mod data;
+mod jetpack;
+mod mekasuit;
+mod scuba;
 pub(crate) mod text;
 
 /// State of this area, held in `Mod`. Items carry their own state in `custom_data`, so there is none yet.
@@ -16,6 +19,8 @@ pub(crate) mod text;
 pub(crate) struct State {
     /// Extra damage the next hit on an entity takes (set when the attack starts, taken when its damage is worked out).
     pending: std::sync::Mutex<std::collections::HashMap<i32, f32>>,
+    /// Server ticks since the last second's work (the MekaSuit's units run once a second).
+    second: std::sync::atomic::AtomicU32,
 }
 
 const SCUBA_TANK: &str = "mekanism:scuba_tank";
@@ -28,6 +33,7 @@ const TANK_ITEMS: [&str; 5] = [JETPACKS[0], JETPACKS[1], SCUBA_TANK, CANTEEN, FL
 
 /// Every item of the gear area gets a [`GearPart`].
 pub(crate) fn register(r: &mut dyn Registrar) {
+    crate::world::net::channel(r, jetpack::CHANNEL, Some(jetpack::server_receive), None);
     let mut ids = core_gear::energy_item_ids();
     ids.extend(TANK_ITEMS.map(str::to_owned));
     ids.sort();
@@ -367,4 +373,26 @@ pub(crate) fn living_damage_pre(m: &crate::Mod, _: &mut dyn LevelRandomHost, eve
         let now = event.container.new_damage();
         event.container.set_new_damage(now + extra);
     }
+}
+
+/// `server_tick`: once a second, each player's MekaSuit works (`ModuleChargeDistributionUnit.tickServer`).
+pub(crate) fn server_tick(m: &crate::Mod, host: &mut dyn mod_api::ServerHost, event: &mod_api::ServerTickEvent<'_>) {
+    if !matches!(event.phase, mod_api::ServerTickPhase::ServerTickEnd { world_running: true }) {
+        return;
+    }
+    let players = host.players().server_players();
+    for player in &players {
+        scuba::breathe(host, *player);
+    }
+    if m.gear.second.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 20 != 0 {
+        return;
+    }
+    for player in players {
+        mekasuit::distribute(host, player);
+    }
+}
+
+/// `client_tick_post`: the window's player thrusts with a jetpack on.
+pub(crate) fn client_tick_post(_: &crate::Mod, host: &mut dyn ClientHost) {
+    jetpack::client_tick(host);
 }
