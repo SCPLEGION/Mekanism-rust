@@ -6,8 +6,10 @@
 //! in its saved compound exactly as on the fork, so worlds and the logic in `mekanism-core` carry over.
 use mod_api::{Host, Registrar};
 
-pub(crate) mod chem;
+pub(crate) mod cable;
 pub(crate) mod common;
+pub(crate) mod conductor;
+pub(crate) mod chem;
 pub(crate) mod generators;
 pub(crate) mod fission;
 pub(crate) mod multiblock;
@@ -16,6 +18,7 @@ pub(crate) mod item_chem;
 pub(crate) mod machine;
 pub(crate) mod nbt;
 pub(crate) mod net;
+pub(crate) mod transmit;
 
 /// State of this area, held in `Mod`. Block entities keep their state in their own compound, so there is none yet.
 #[derive(Default)]
@@ -24,6 +27,8 @@ pub(crate) struct State {}
 /// Declares every block entity type, container and part of the area.
 pub(crate) fn register(r: &mut dyn Registrar) {
     machine::register(r);
+    cable::register(r);
+    conductor::register(r);
     generators::register(r);
     fission::register(r);
     factory::register(r);
