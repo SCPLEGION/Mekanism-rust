@@ -5,7 +5,7 @@ use super::nbt::{get_int, get_long, put_int, put_long, wide};
 use crate::gear::data as item_data;
 use mekanism_core::machine::{self, ElectricMachine, Operation, Slot, MACHINES};
 use mod_api::{
-    BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart, Compound, Host, ItemStack,
+    BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockEntityUpdateTagEvent, BlockPart, Compound, Host, ItemStack,
     ModBlockEntityView, ModContainer, Registrar, ServerHost, Tag,
 };
 
@@ -62,6 +62,10 @@ impl BlockPart for MachinePart {}
 impl BlockEntityPart for MachinePart {
     fn block_entity_ticks(&self, _: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
         event.ticks = true;
+    }
+
+    fn block_entity_update_tag(&self, event: &mut BlockEntityUpdateTagEvent<'_>) -> Option<Compound> {
+        super::common::client_tag(event.entity)
     }
 
     fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
