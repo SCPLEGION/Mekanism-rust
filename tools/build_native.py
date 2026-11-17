@@ -10,6 +10,7 @@ It replaces tools/manual_stage.py and tools/horizon.py, which staged the old hoo
 fork whose native-hooks.json upstream removed. The old bundle stays in the tree until the port is complete.
 """
 import argparse
+import os
 import pathlib
 import subprocess
 import sys
@@ -37,13 +38,16 @@ def main():
         run(["cargo", "horizon-mod", "check"], cwd=MOD)
     elif a.cmd == "check-local":
         import shutil, tempfile
-        tmp = pathlib.Path(tempfile.mkdtemp(prefix="mek-check-"))
+        cache = pathlib.Path.home() / ".cache" / "mek-check"
+        tmp = cache / "src"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
         shutil.copytree(MOD, tmp / "mod", ignore=shutil.ignore_patterns(".horizon", "target"))
         t = (tmp / "mod/Cargo.toml").read_text()
         t = t.replace(".horizon/sdk/api/crates/horizon-mod-api", str(a.horizon.resolve() / "crates/horizon-mod-api"))
         t = t.replace("../../mixins/mekanism/core", str(MOD.parents[1] / "mixins/mekanism/core"))
         (tmp / "mod/Cargo.toml").write_text(t)
-        run(["cargo", "check"], cwd=tmp / "mod")
+        run(["cargo", "check"], cwd=tmp / "mod", env={**os.environ, "CARGO_TARGET_DIR": str(cache / "target")})
     elif a.cmd == "build":
         cmd = ["horizon-launcher", "native-build", str(MOD), "--trust-native-code"]
         if a.instance:

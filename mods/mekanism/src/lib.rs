@@ -34,5 +34,6 @@ impl Hooks for Mod {
 
     fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
         gear::register(r);
+        world::register(r);
     }
 }
