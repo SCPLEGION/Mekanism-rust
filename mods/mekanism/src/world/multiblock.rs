@@ -2,8 +2,7 @@
 //! induction matrix, dynamic tank): finding the ticking level, reading block names, the cuboid search of
 //! `StructureHelper.fetchCuboid`, chemical tanks kept in a block entity's compound and the fills clients draw.
 //! Port of the helpers of `runtime.rs` those multiblocks shared.
-use super::nbt::{get_int, get_long, put_int, put_long};
-use mekanism_core::chemical::ChemicalTank;
+use super::nbt::{get_int, put_int};
 use mod_api::{Compound, Host, LevelRef, ModBlockEntityView, Tag};
 use std::collections::HashSet;
 
@@ -91,29 +90,7 @@ pub(crate) fn remove(nbt: &mut Compound, key: &str) {
     nbt.retain(|k, _| k.to_string_lossy() != key);
 }
 
-/// A chemical tank saved as `{id, amount}` under `key` (the layout of the fork, so saves carry over).
-pub(crate) fn get_tank(nbt: &Compound, key: &str, capacity: u64) -> ChemicalTank {
-    let mut t = ChemicalTank::new(capacity);
-    if let Some(Tag::Compound(c)) = crate::gear::data::get(nbt, key)
-        && let Some(Tag::String(id)) = crate::gear::data::get(c, "id")
-        && let Ok(id) = id.to_string()
-    {
-        t.insert(&id, get_long(c, "amount"));
-    }
-    t
-}
-
-pub(crate) fn put_tank(nbt: &mut Compound, key: &str, t: &ChemicalTank) {
-    match &t.chemical {
-        Some(id) if t.amount > 0 => {
-            let mut c = Compound::new();
-            c.insert("id".into(), Tag::String(id.as_str().into()));
-            put_long(&mut c, "amount", t.amount);
-            nbt.insert(key.into(), Tag::Compound(c));
-        }
-        _ => remove(nbt, key),
-    }
-}
+pub(crate) use super::chem::{get_tank, put_tank};
 
 /// A fluid or chemical filling part of a multiblock's inside (`MultiblockTileEntityRenderer`): where its
 /// interior starts, the interior's size, how full it is and with what.
