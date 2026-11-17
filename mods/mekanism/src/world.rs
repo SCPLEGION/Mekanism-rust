@@ -6,6 +6,7 @@
 //! in its saved compound exactly as on the fork, so worlds and the logic in `mekanism-core` carry over.
 use mod_api::{Host, Registrar};
 
+pub(crate) mod common;
 pub(crate) mod machine;
 pub(crate) mod nbt;
 

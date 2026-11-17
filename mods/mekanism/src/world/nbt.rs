@@ -27,3 +27,18 @@ pub(crate) fn wide(v: u64) -> [i32; 4] {
     let v = v.min((1 << 60) - 1);
     [0, 1, 2, 3].map(|k| ((v >> (15 * k)) & 0x7FFF) as i32)
 }
+
+/// An int array of the block entity, empty when there is none.
+pub(crate) fn get_ints(nbt: &Compound, key: &str) -> Vec<i32> {
+    match get(nbt, key) {
+        Some(Tag::IntArray(v)) => v.clone(),
+        _ => Vec::new(),
+    }
+}
+
+pub(crate) fn get_double(nbt: &Compound, key: &str) -> Option<f64> {
+    match get(nbt, key) {
+        Some(Tag::Double(bits)) => Some(f64::from_bits(*bits)),
+        _ => None,
+    }
+}
