@@ -34,7 +34,14 @@ fn blocks() -> Vec<String> {
     all
 }
 
+/// A factory takes energy up to the buffer its upgrades give it, through any face.
+fn energy_receiver(id: &str, nbt: &mod_api::Compound, _: bool, _: bool) -> Option<super::transmit::Receiver> {
+    let (n, _, usage) = factory::factory(id)?;
+    Some(super::transmit::Receiver::new(Factory::new(n, usage, upgrades(nbt)).machine.energy.capacity, u64::MAX))
+}
+
 pub(crate) fn register(r: &mut dyn Registrar) {
+    super::transmit::register_energy_receiver(energy_receiver);
     let ids = blocks();
     let ids: Vec<&str> = ids.iter().map(String::as_str).filter(|id| factory::factory(id).is_some()).collect();
     let kind = r.block_entity_type(TYPE).blocks(&ids).build();

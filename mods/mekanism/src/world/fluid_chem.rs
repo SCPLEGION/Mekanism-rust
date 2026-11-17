@@ -47,7 +47,69 @@ fn kind(id: &str) -> Option<Kind> {
     BLOCKS.iter().find(|(b, _)| *b == id).map(|(_, k)| *k)
 }
 
+/// The energy buffer of a machine of this family (`receiver` of `runtime.rs`).
+fn energy_receiver(id: &str, nbt: &Compound, _: bool, _: bool) -> Option<super::transmit::Receiver> {
+    let capacity = match kind(id)? {
+        Kind::Separator => machine_power(nbt, chem::SEPARATOR_USAGE, None).3,
+        Kind::Rotary => machine_power(nbt, usage_const("rotaryCondensentrator", chem::ROTARY_USAGE), None).3,
+        Kind::ChemicalInfuser => machine_power(nbt, usage_const("chemicalInfuser", chem::CHEMICAL_INFUSER_USAGE), None).3,
+        Kind::PigmentMixer => machine_power(nbt, usage_const("pigmentMixer", chem::PIGMENT_MIXER_USAGE), None).3,
+        Kind::Centrifuge => machine_power(nbt, usage_const("isotopicCentrifuge", nuclear::CENTRIFUGE_USAGE), None).3,
+        Kind::Washer => machine_power(nbt, usage_const("chemicalWasher", nuclear::WASHER_USAGE), None).3,
+        Kind::Liquifier => {
+            machine_power(nbt, usage_const("nutritionalLiquifier", chem::LIQUIFIER_USAGE), Some(chem::LIQUIFIER_TICKS)).3
+        }
+    };
+    Some(super::transmit::Receiver::new(capacity, u64::MAX))
+}
+
+/// Which pipes and tubes reach these machines, and the tank that takes what they bring.
+fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, _: bool, _: [i32; 3]) -> Option<(&'static str, u64)> {
+    let kind = kind(id)?;
+    if super::transmit::is_fluid(chemical) {
+        return match kind {
+            Kind::Separator if chem::separates(chemical) => Some(("fluid", chem::SEPARATOR_FLUID)),
+            Kind::Rotary if chem::rotary_chemical(chemical).is_some() => Some(("fluid", chem::ROTARY_TANK)),
+            Kind::Washer if chemical == "minecraft:water" => Some(("fluid", nuclear::WASHER_TANK)),
+            _ => None,
+        };
+    }
+    // The infuser and the mixer fill whichever input tank holds this chemical, else an empty one.
+    let (cap, valid): (u64, fn(&str) -> bool) = match kind {
+        Kind::ChemicalInfuser => (chem::CHEMICAL_INFUSER_TANK, mekanism_core::recipes::infusing_input),
+        Kind::PigmentMixer => (chem::PIGMENT_MIXER_TANK, mekanism_core::recipes::pigment_mixing_input),
+        Kind::Centrifuge => return nuclear::centrifuging(chemical).map(|_| ("input", nuclear::CENTRIFUGE_TANK)),
+        Kind::Washer => return nuclear::find_washing(chemical).map(|_| ("input", nuclear::WASHER_TANK)),
+        _ => return None,
+    };
+    if !valid(chemical) {
+        return None;
+    }
+    let (left, right) = (get_tank(nbt, "left", cap), get_tank(nbt, "right", cap));
+    let holds = |t: &ChemicalTank| t.chemical.as_deref() == Some(chemical);
+    let key = if holds(&left) || (!holds(&right) && left.amount == 0) {
+        "left"
+    } else if holds(&right) || right.amount == 0 {
+        "right"
+    } else {
+        return None;
+    };
+    Some((key, cap))
+}
+
+/// Pipes reach the liquifier, separator, rotary and washer; tubes all but the liquifier (`serves` of `runtime.rs`).
+fn serves(id: &str) -> u8 {
+    match kind(id) {
+        Some(Kind::Liquifier) => 1,
+        Some(Kind::Separator | Kind::Rotary | Kind::Washer) => 3,
+        Some(_) => 2,
+        None => 0,
+    }
+}
+
 pub(crate) fn register(r: &mut dyn Registrar) {
+    super::transmit::register_energy_receiver(energy_receiver);
+    super::transmit::register_chemical_family(super::transmit::ChemicalFamily { serves, receiver: chemical_receiver, source: |_, _| None });
     let ids: Vec<&str> = BLOCKS.iter().map(|(id, _)| *id).collect();
     let entity = r.block_entity_type(TYPE).blocks(&ids).build();
     r.block_entity_part(&entity, FluidChemicalPart).expect("native block entity type");
@@ -192,10 +254,10 @@ fn tick_separator(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBloc
     }
     // `setCanTankEject`: a tank that dumps does not eject.
     if mode_left != 2 {
-        push_chemical(host, pos, &mut left, u64::MAX);
+        push_chemical(host, pos, &entity.nbt.clone(), &mut left, None, u64::MAX);
     }
     if mode_right != 2 {
-        push_chemical(host, pos, &mut right, u64::MAX);
+        push_chemical(host, pos, &entity.nbt.clone(), &mut right, None, u64::MAX);
     }
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_tank(&mut entity.nbt, "fluid", &fluid);
@@ -248,7 +310,7 @@ fn tick_rotary(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEn
         gas.insert(output, 1);
         active = true;
     }
-    push_chemical(host, pos, &mut gas, u64::MAX);
+    push_chemical(host, pos, &entity.nbt.clone(), &mut gas, None, u64::MAX);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_tank(&mut entity.nbt, "fluid", &fluid);
     put_tank(&mut entity.nbt, "chemical", &gas);
@@ -301,7 +363,7 @@ fn tick_chemical_infuser(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut 
             active = true;
         }
     }
-    push_chemical(host, pos, &mut out, u64::MAX);
+    push_chemical(host, pos, &entity.nbt.clone(), &mut out, None, u64::MAX);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_tank(&mut entity.nbt, "left", &left);
     put_tank(&mut entity.nbt, "right", &right);
@@ -334,7 +396,7 @@ fn tick_centrifuge(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlo
         output.insert(made, amount);
         active = true;
     }
-    push_chemical(host, pos, &mut output, u64::MAX);
+    push_chemical(host, pos, &entity.nbt.clone(), &mut output, None, u64::MAX);
     let warn = match input.chemical.as_deref().and_then(nuclear::centrifuging) {
         None if input.chemical.is_some() => 8,
         Some((need, made, amount)) => {
@@ -380,7 +442,7 @@ fn tick_washer(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEn
         output.insert(r.output, r.amount);
         active = true;
     }
-    push_chemical(host, pos, &mut output, u64::MAX);
+    push_chemical(host, pos, &entity.nbt.clone(), &mut output, None, u64::MAX);
     let warn = match input.chemical.as_deref().map(nuclear::find_washing) {
         Some(None) => 8,
         Some(Some(r)) => {
