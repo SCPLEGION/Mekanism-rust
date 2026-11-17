@@ -6,8 +6,10 @@
 //! in its saved compound exactly as on the fork, so worlds and the logic in `mekanism-core` carry over.
 use mod_api::{Host, Registrar};
 
+pub(crate) mod chem;
 pub(crate) mod common;
 pub(crate) mod generators;
+pub(crate) mod factory;
 pub(crate) mod machine;
 pub(crate) mod nbt;
 pub(crate) mod net;
@@ -20,6 +22,7 @@ pub(crate) struct State {}
 pub(crate) fn register(r: &mut dyn Registrar) {
     machine::register(r);
     generators::register(r);
+    factory::register(r);
 }
 
 /// Item ids by key and back. The game's registry is fixed once a world is open, so the table is built once:

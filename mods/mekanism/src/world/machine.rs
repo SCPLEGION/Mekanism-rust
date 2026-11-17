@@ -105,7 +105,7 @@ fn set_secondary(nbt: &mut Compound, waiting: Option<&(String, u32)>) {
 
 /// A number in [0, 1) for the sawmill's chance: a splitmix64 step kept in the block entity, so each
 /// machine has its own sequence that survives saving.
-fn roll(nbt: &mut Compound) -> f64 {
+pub(super) fn roll(nbt: &mut Compound) -> f64 {
     let mut x = get_long(nbt, "seed") ^ 0x9E37_79B9_7F4A_7C15;
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     put_long(nbt, "seed", x & (i64::MAX as u64));
@@ -118,7 +118,7 @@ fn roll(nbt: &mut Compound) -> f64 {
 
 /// What the machine does with the stack in its input slot: the operation, the stack limit of its output and
 /// the sawmill's chance of a secondary output.
-fn find_operation(
+pub(super) fn find_operation(
     host: &dyn Host,
     recipe: &str,
     stack: Option<&ItemStack>,
