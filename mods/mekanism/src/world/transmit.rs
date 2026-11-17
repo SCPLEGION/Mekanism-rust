@@ -97,7 +97,7 @@ pub(crate) fn update<R>(
     let mut data = before.clone();
     let result = change(&id, &mut data);
     if data != before {
-        let _ = entity.merge_data(host, data);
+        let _ = entity.replace_data(host, data);
     }
     Some(result)
 }
@@ -198,4 +198,176 @@ pub(crate) fn ambient_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> f64
         .and_then(|biome| level.biome_properties(host, &biome))
         .map_or(0.8, |p| f64::from(p.temperature));
     mekanism_core::heat::ambient_temp(temperature)
+}
+
+
+/// A transmitter network (`DynamicNetwork`): its transmitters, the acceptors it emits to, and when it last ran.
+pub(crate) struct Net {
+    pub(crate) built: u64,
+    pub(crate) last_tick: i64,
+    pub(crate) members: Vec<[i32; 3]>,
+    /// Acceptor position, its face toward the network, and the network's direction to it.
+    pub(crate) targets: Vec<([i32; 3], [i32; 3], [i32; 3])>,
+}
+
+/// What a network's discovery finds from one transmitter.
+pub(crate) struct Discovered {
+    pub(crate) members: Vec<[i32; 3]>,
+    pub(crate) targets: Vec<([i32; 3], [i32; 3], [i32; 3])>,
+}
+
+#[derive(Default)]
+pub(crate) struct Registry {
+    pub(crate) nets: std::collections::HashMap<u64, Net>,
+    by_pos: std::collections::HashMap<(String, [i32; 3]), u64>,
+    next: u64,
+}
+
+static NETS: Mutex<Option<Registry>> = Mutex::new(None);
+
+pub(crate) fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
+    f(NETS.lock().unwrap().get_or_insert_with(Registry::default))
+}
+
+/// The network of the transmitter at `own`, formed (or formed again by `discover`) when the world around changed;
+/// `Some` only to the first of its transmitters to tick in a game tick, which runs the whole network that tick.
+pub(crate) fn claim(
+    host: &dyn Host,
+    own: &mut Own<'_, '_>,
+    level: LevelRef,
+    discover: &dyn Fn(&dyn Host, &mut Own<'_, '_>, LevelRef, [i32; 3]) -> Discovered,
+) -> Option<u64> {
+    let version = topology();
+    let dim = host.dimension().to_owned();
+    let pos = own.pos;
+    let known = with_registry(|r| r.by_pos.get(&(dim.clone(), pos)).copied().filter(|id| r.nets.get(id).is_some_and(|n| n.built == version)));
+    let id = match known {
+        Some(id) => id,
+        None => {
+            let Discovered { members, targets } = discover(host, own, level, pos);
+            with_registry(|r| {
+                // The networks these transmitters were in (and now merged with or split from) are gone.
+                for m in &members {
+                    if let Some(old) = r.by_pos.remove(&(dim.clone(), *m)) {
+                        r.nets.remove(&old);
+                    }
+                }
+                r.next += 1;
+                let id = r.next;
+                for m in &members {
+                    r.by_pos.insert((dim.clone(), *m), id);
+                }
+                r.nets.insert(id, Net { built: version, last_tick: -1, members, targets });
+                id
+            })
+        }
+    };
+    let now = level.game_time(host).unwrap_or(0);
+    with_registry(|r| {
+        let net = r.nets.get_mut(&id)?;
+        (net.last_tick != now).then(|| {
+            net.last_tick = now;
+            id
+        })
+    })
+}
+
+
+/// The fluids that travel in pipes; every other chemical travels in tubes (`tank_transmission`).
+pub(crate) fn is_fluid(chemical: &str) -> bool {
+    ["minecraft:water", "minecraft:lava", "mekanism:brine", mekanism_core::chemical::HEAVY_WATER].contains(&chemical)
+}
+
+/// What a family answers to the tubes and pipes: which of them reach its blocks, where a block keeps a chemical or
+/// fluid it takes, and which tanks a pulling face may empty.
+#[derive(Clone, Copy)]
+pub(crate) struct ChemicalFamily {
+    /// Bit 0: a mechanical pipe reaches the block `id`; bit 1: a pressurized tube does (`serves`).
+    pub(crate) serves: fn(&str) -> u8,
+    /// `(block id, saved data, chemical, from_tube, the receiver's offset from the giver)` to the compound key of the
+    /// tank that takes it and that tank's capacity (`chemical_receiver`). `from_tube` is true for a transmitter giving.
+    pub(crate) receiver: fn(&str, &Compound, &str, bool, [i32; 3]) -> Option<(&'static str, u64)>,
+    /// `(block id, is fluid)` to the key and capacity of the tank a pull face empties.
+    pub(crate) source: fn(&str, bool) -> Option<(&'static str, u64)>,
+}
+
+static CHEMICAL_FAMILIES: Mutex<Vec<ChemicalFamily>> = Mutex::new(Vec::new());
+
+/// Declares a family's chemical and fluid acceptors, during `register`.
+pub(crate) fn register_chemical_family(family: ChemicalFamily) {
+    CHEMICAL_FAMILIES.lock().unwrap().push(family);
+}
+
+fn chemical_families() -> Vec<ChemicalFamily> {
+    CHEMICAL_FAMILIES.lock().unwrap().clone()
+}
+
+/// Whether a pipe (`fluid`) or a tube reaches the block `id`.
+pub(crate) fn carrier_serves(id: &str, fluid: bool) -> bool {
+    let bit = if fluid { 1 } else { 2 };
+    chemical_families().iter().any(|f| (f.serves)(id) & bit != 0)
+}
+
+/// The tank of the block `id` that takes `chemical` from a giver whose offset to it is `d`.
+pub(crate) fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, from_tube: bool, d: [i32; 3]) -> Option<(&'static str, u64)> {
+    chemical_families().iter().find_map(|f| (f.receiver)(id, nbt, chemical, from_tube, d))
+}
+
+/// The tank of the block `id` a pulling transmitter may empty.
+pub(crate) fn chemical_source(id: &str, fluid: bool) -> Option<(&'static str, u64)> {
+    chemical_families().iter().find_map(|f| (f.source)(id, fluid))
+}
+
+/// `push_chemical` of `runtime.rs`: gives up to `rate` of `from`'s chemical to the tanks and machines beside `pos`
+/// (or only the one at `only`) that take it; `gives` says whether the giver's face toward `d` lets it out.
+pub(crate) fn push_chemical(
+    host: &mut dyn ServerHost,
+    pos: [i32; 3],
+    from: &mut mekanism_core::chemical::ChemicalTank,
+    only: Option<[i32; 3]>,
+    rate: u64,
+    from_tube: bool,
+    gives: &dyn Fn([i32; 3], Transmission) -> bool,
+) {
+    let Some(level) = level(&*host) else {
+        return;
+    };
+    let mut budget = rate;
+    for (_, d) in DIRECTIONS {
+        let Some(chemical) = from.chemical.clone() else {
+            return;
+        };
+        let kind = if is_fluid(&chemical) { Transmission::Fluid } else { Transmission::Chemical };
+        if only.is_some_and(|o| o != d) || !gives(d, kind) {
+            continue;
+        }
+        let offer = from.amount.min(budget);
+        if offer == 0 {
+            return;
+        }
+        let at = offset(pos, d);
+        let Some(entity) = host.block_entity(level, at) else {
+            continue;
+        };
+        let Some(id) = block_id(&*host, level, at) else {
+            continue;
+        };
+        let Some(mut data) = entity.data(&*host) else {
+            continue;
+        };
+        if !takes_in(&data, neg(d), kind) {
+            continue;
+        }
+        let Some((key, capacity)) = chemical_receiver(&id, &data, &chemical, from_tube, d) else {
+            continue;
+        };
+        let mut to = super::chem::get_tank(&data, key, capacity);
+        let n = to.insert(&chemical, offer);
+        if n > 0 {
+            super::chem::put_tank(&mut data, key, &to);
+            let _ = entity.replace_data(host, data);
+            from.extract(n);
+            budget -= n;
+        }
+    }
 }
