@@ -1,6 +1,7 @@
 //! The old runtime drew through `game.native_*(batch, ..)`; these keep those names over the upstream
 //! `DrawContext` and `ClientHost`, so the screens move across with their bodies unchanged.
-use mod_api::{ClientHost, DrawContext, GuiDraw, ItemStack, PoseOp, Text};
+use mod_api::client::hud_layout::PoseOp;
+use mod_api::{ClientHost, DrawContext, GuiDraw, ItemStack, Text};
 use std::cell::RefCell;
 use std::borrow::Cow;
 
@@ -59,7 +60,7 @@ impl<'a> Gfx<'a> {
     }
 
     pub fn native_text_width(&self, text: &str) -> f32 {
-        self.with(|d| d.text_width(text)).unwrap_or_else(|| self.host.text_width(text))
+        self.with(|d| d.text_width(text)).unwrap_or(0.0)
     }
 
     pub fn native_item_stack(&self, _: &mut Batch, stack: &ItemStack, at: [f32; 2], size: f32) -> bool {

@@ -12,6 +12,11 @@ use mekanism_core::{boiler, dynamic_tank, factory, fusion, isotopes, laser, modu
 use mekanism_core::{chargepad, formulaic as fa, machine, oredictionificator as od, security as sec, stabilizer as st};
 use mekanism_core::generator::HeatGenerator;
 use mod_api::ItemStack;
+use mekanism_core::frequency as freq;
+use mekanism_core::evaporation as evap;
+const FUSION_MAX_TEMP: u64 = 500_000_000;
+const REACTION_TANK: u64 = 10_000;
+const MINER_SLOTS: usize = 27;
 
 const HEAT_GENERATOR: &str = "mekanismgenerators:heat_generator";
 const FISSION_LOGIC: &str = "mekanismgenerators:fission_reactor_logic_adapter";
@@ -1442,3 +1447,135 @@ fn centred(game: &Gfx<'_>, batch: &mut Batch, text: &str, x: f32, width: f32, y:
     let w = game.native_text_width(text);
     game.native_text(batch, text, [x + (width - w) / 2.0, y], rgb, false);
 }
+
+fn nine_slice(game: &Gfx<'_>, batch: &mut Batch, name: &str, size: f32, border: f32, dst: [f32; 4]) {
+    let [x, y, w, h] = dst;
+    let (b, inner) = (border, size - 2.0 * border);
+    let cols = [(0.0, b, x, b), (b, inner, x + b, w - 2.0 * b), (size - b, b, x + w - b, b)];
+    let rows = [(0.0, b, y, b), (b, inner, y + b, h - 2.0 * b), (size - b, b, y + h - b, b)];
+    for (su, sw, dx, dw) in cols {
+        for (sv, sh, dy, dh) in rows {
+            if dw > 0.0 && dh > 0.0 {
+                game.native_sprite(batch, &format!("{SPRITES}{name}"), [su, sv, sw, sh], [dx, dy, dw, dh]);
+            }
+        }
+    }
+}
+
+fn sprite(game: &Gfx<'_>, batch: &mut Batch, name: &str, src: [f32; 4], dst: [f32; 4]) {
+    game.native_sprite(batch, &format!("{SPRITES}{name}"), src, dst);
+}
+
+/// The rectangle a power bar covers.
+fn power_rect(p: PowerBar) -> [f32; 4] {
+    match p {
+        PowerBar::Vertical([x, y]) => [x, y, 6.0, 54.0],
+        PowerBar::Tall([x, y], h) => [x, y, 6.0, h],
+        PowerBar::Horizontal([x, y]) => [x, y, 54.0, 6.0],
+        PowerBar::Gauge([x, y]) => [x, y, WIDE[0], WIDE[1]],
+        PowerBar::SmallGauge([x, y]) => [x, y, SMALL_MED[0], SMALL_MED[1]],
+        PowerBar::Sized([x, y], [w, h]) => [x, y, w, h],
+    }
+}
+
+/// What the miner's screen reads from its data (`miner_flags` and the count after it).
+struct MinerView {
+    state: u32,
+    running: bool,
+    eject: bool,
+    pull: bool,
+    silk: bool,
+    low_power: bool,
+    to_mine: u32,
+    radius: i32,
+}
+
+fn miner_view(block: &str, data: &[i32]) -> MinerView {
+    let at = layout(block).map_or(0, |l| redstone_slot(&l));
+    let v = data.get(at).copied().unwrap_or(0).max(0) as u32 >> 4;
+    let n = |i: usize| data.get(at + i).copied().unwrap_or(0).max(0) as u32;
+    MinerView {
+        state: v >> 4 & 3,
+        running: v >> 6 & 1 == 1,
+        eject: v >> 7 & 1 == 1,
+        pull: v >> 8 & 1 == 1,
+        silk: v >> 9 & 1 == 1,
+        low_power: v >> 10 & 1 == 1,
+        to_mine: n(1) | n(2) << 15,
+        radius: n(3) as i32,
+    }
+}
+
+fn inside(at: [f32; 2], rect: [f32; 4]) -> bool {
+    at[0] >= rect[0] && at[0] < rect[0] + rect[2] && at[1] >= rect[1] && at[1] < rect[1] + rect[3]
+}
+
+fn amplifier_mode(data: &[i32]) -> usize {
+    data.get(3).copied().unwrap_or(0).max(0) as usize % 3
+}
+
+
+/// What the open screen shows of its block's security.
+#[derive(Clone, Default)]
+struct SecView {
+    /// The owner's name, if the block has one.
+    name: Option<String>,
+    /// Whether the viewer is the owner.
+    mine: bool,
+    mode: u8,
+    overridden: bool,
+    /// The desk's frequency: its mode, override and trusted names; None while offline.
+    freq: Option<(u8, bool, Vec<String>)>,
+}
+
+thread_local! {
+    static SEC_VIEW: std::cell::RefCell<SecView> = std::cell::RefCell::new(SecView::default());
+    static SEC_UI: std::cell::RefCell<SecUi> = std::cell::RefCell::new(SecUi::default());
+}
+
+#[derive(Default)]
+struct SecUi {
+    pos: [i32; 3],
+    text: freq::TextBox,
+    selected: Option<usize>,
+    scroll: usize,
+}
+
+fn sec_tab_icon() -> &'static str {
+    match SEC_VIEW.with_borrow(|v| v.mode) {
+        1 => "security/private",
+        2 => "security/protected",
+        _ => "security/public",
+    }
+}
+
+/// `OwnerDisplay`: "Owner: name", or "No Owner" in red.
+fn owner_line(view: &SecView, coloured: bool) -> String {
+    match &view.name {
+        None => "\u{a7}cNo Owner".to_owned(),
+        Some(n) if coloured => format!("\u{a7}8Owner: {}{n}", if view.mine { "\u{a7}a" } else { "\u{a7}c" }),
+        Some(n) => format!("\u{a7}8Owner: {n}"),
+    }
+}
+
+/// The security tab's tooltip (`GuiSecurityTab.updateTooltip`).
+fn sec_tab_tooltip(lines: &mut Vec<String>) {
+    let view = SEC_VIEW.with_borrow(Clone::clone);
+    lines.push(format!("\u{a7}7Security: {}", sec::Mode::from_ordinal(i64::from(view.mode)).name()));
+    lines.push(owner_line(&view, true));
+    if view.overridden {
+        lines.push("\u{a7}c(Overridden)".to_owned());
+    }
+}
+
+thread_local! {
+    /// The miners whose region this player shows (`clientRendering`).
+    static MINER_VISUALS: std::cell::RefCell<std::collections::HashSet<[i32; 3]>> = std::cell::RefCell::new(Default::default());
+    /// The miner the open screen belongs to, for the tooltip, which gets no game.
+    static MINER_OPEN: std::cell::Cell<[i32; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+fn miner_visuals_on(_data: &[i32]) -> bool {
+    MINER_VISUALS.with_borrow(|v| v.contains(&MINER_OPEN.get()))
+}
+
