@@ -6,7 +6,8 @@ use super::chem::{
     chemical_need, convert_item_into_tank, drain_tank_into_item, fill_tank_from_item, get_tank, machine_power, push_chemical,
     put_tank, stack_of, usage_const,
 };
-use super::common::{discharge_slot, max_stack, set_active};
+use super::common::{MenuData, discharge_slot, max_stack, set_active};
+use super::multiblock::chemical_index;
 use super::machine::roll;
 use super::nbt::{get_int, get_long, put_int, put_long};
 use mekanism_core::chemical as chem;
@@ -164,9 +165,25 @@ fn finish_item(
     };
 }
 
-/// The data slots of the furnace menu: the flame shows `flame` (thousandths), the arrow the progress.
-fn bars(entity: &mut ModBlockEntityView<'_>, flame: u64, progress: u32, ticks: u32) {
-    entity.data = vec![flame as i32, 1000, progress as i32, ticks as i32];
+/// The menu data (`MenuData`): the furnace's flame and arrow, the energy and one gauge for each of `tanks`, in the
+/// order of the screen's gauges. `flame` is thousandths.
+fn publish(
+    entity: &mut ModBlockEntityView<'_>,
+    energy: &EnergyContainer,
+    usage: u64,
+    flame: u64,
+    progress: u32,
+    ticks: u32,
+    tanks: &[&mekanism_core::chemical::ChemicalTank],
+) {
+    let u = super::common::upgrades(&entity.nbt);
+    let mut data = MenuData::new(energy.stored, energy.capacity, usage)
+        .furnace([flame as i32, 1000, progress as i32, ticks as i32])
+        .upgrades(&u);
+    for t in tanks {
+        data = data.gauge(t.amount, t.capacity, chemical_index(t.chemical.as_deref()));
+    }
+    data.write(entity);
 }
 
 /// An advanced electric machine: the Purification Chamber (ore + 1 mB oxygen a tick → 3 clumps), the Osmium
@@ -231,7 +248,7 @@ fn tick_advanced(host: &mut dyn ServerHost, entity: &mut ModBlockEntityView<'_>,
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "chemical", &tank);
-    bars(entity, energy.stored * 1000 / capacity, progress, ticks);
+    publish(entity, &energy, usage, energy.stored * 1000 / capacity, progress, ticks, &[&tank]);
     active
 }
 
@@ -279,7 +296,7 @@ fn tick_nucleosynthesizer(host: &mut dyn ServerHost, entity: &mut ModBlockEntity
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "chemical", &tank);
-    bars(entity, energy.stored * 1000 / capacity, progress, ticks);
+    publish(entity, &energy, usage, energy.stored * 1000 / capacity, progress, ticks, &[&tank]);
     active
 }
 
@@ -333,7 +350,7 @@ fn tick_painting(host: &mut dyn ServerHost, entity: &mut ModBlockEntityView<'_>)
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "pigment", &tank);
-    bars(entity, energy.stored * 1000 / capacity, progress, ticks);
+    publish(entity, &energy, usage, energy.stored * 1000 / capacity, progress, ticks, &[&tank]);
     active
 }
 
@@ -389,7 +406,7 @@ fn tick_infuser(host: &mut dyn ServerHost, entity: &mut ModBlockEntityView<'_>) 
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "infuse", &tank);
     // The flame shows the infuse tank, the arrow the progress.
-    bars(entity, tank.amount * 1000 / chem::INFUSER_TANK, progress, ticks);
+    publish(entity, &energy, usage, tank.amount * 1000 / chem::INFUSER_TANK, progress, ticks, &[&tank]);
     active
 }
 
@@ -473,7 +490,7 @@ fn tick_dissolution(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBl
     put_int(&mut entity.nbt, "used", used);
     put_tank(&mut entity.nbt, "input", &input);
     put_tank(&mut entity.nbt, "output", &output);
-    bars(entity, energy.stored * 1000 / capacity, progress, ticks);
+    publish(entity, &energy, usage, energy.stored * 1000 / capacity, progress, ticks, &[&input, &output]);
     active
 }
 
@@ -521,7 +538,7 @@ fn tick_crystallizer(host: &mut dyn ServerHost, entity: &mut ModBlockEntityView<
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "input", &input);
-    bars(entity, energy.stored * 1000 / capacity, progress, ticks);
+    publish(entity, &energy, usage, energy.stored * 1000 / capacity, progress, ticks, &[&input]);
     active
 }
 
@@ -579,6 +596,6 @@ fn tick_oxidizer(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlock
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "output", &tank);
     // The pigment arrow's colour hint (data[1], `PigmentColorDetails.getColorTo`) is the screen's, sent with it.
-    bars(entity, energy.stored * 1000 / capacity, progress, ticks);
+    publish(entity, &energy, usage, energy.stored * 1000 / capacity, progress, ticks, &[&tank]);
     active
 }
