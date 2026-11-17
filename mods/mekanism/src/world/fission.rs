@@ -7,7 +7,6 @@ use super::multiblock::{
     ticking_level, Fill, DIRECTIONS,
 };
 use super::nbt::{get_double, get_ints, get_long, put_int, put_long};
-use mekanism_core::chemical::ChemicalTank;
 use mekanism_core::fission::{self, Reactor, State};
 use mod_api::{
     BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart, Compound, ExplosionInteraction,
@@ -23,6 +22,7 @@ const FISSILE_FUEL: &str = "mekanism:fissile_fuel";
 const NUCLEAR_WASTE: &str = "mekanism:nuclear_waste";
 
 pub(crate) fn register(r: &mut dyn Registrar) {
+    register_ports();
     let kind = r.block_entity_type(TYPE).blocks(&[PORT]).build();
     r.block_entity_part(&kind, FissionPart).expect("native block entity type");
 }
@@ -312,17 +312,62 @@ fn meltdown_happened(host: &mut dyn ServerHost, level: LevelRef, m: &Meltdown) {
     let _ = entity.replace_data(host, data);
 }
 
-/// Where chemicals and fluids go in and out of the reactor's ports. The tubes, pipes and tanks beside a port are the
-/// transmitters' side of the port: they reach a reactor through the chemical and fluid capabilities, which the
-/// skeleton of the move owns (the reactor itself reads and writes tanks in its compound, as on the fork).
-mod io {
-    use super::*;
-    /// Fills `into` with `chemical` from what the ports can draw (`pull_from_carriers`).
-    pub(super) fn pull(_: &mut dyn ServerHost, _: LevelRef, _: [i32; 3], _: &mut ChemicalTank, _: &str) -> u64 {
-        0
+/// The tubes and pipes push into a port (`ChemicalFamily::receiver`): what a port takes in waits in its own `in_fuel`
+/// and `in_water` tanks, which the master empties into the reactor's tanks every tick (`pull_from_carriers`).
+fn port_receiver(id: &str, nbt: &Compound, chemical: &str, _from_tube: bool, _d: [i32; 3]) -> Option<(&'static str, u64)> {
+    if id != PORT {
+        return None;
     }
-    /// Gives `from` to the neighbours of the port (`push_chemical`).
-    pub(super) fn push(_: &mut dyn ServerHost, _: LevelRef, _: [i32; 3], _: &mut ChemicalTank) {}
+    let r = reactor_of(nbt);
+    if r.assemblies == 0 {
+        return None;
+    }
+    match chemical {
+        FISSILE_FUEL => Some(("in_fuel", r.fuel_capacity())),
+        "minecraft:water" | fission::SODIUM_COOLANT => Some(("in_water", r.water_capacity())),
+        _ => None,
+    }
+}
+
+fn register_ports() {
+    super::transmit::register_chemical_family(super::transmit::ChemicalFamily {
+        serves: |id| if id == PORT { 3 } else { 0 },
+        receiver: port_receiver,
+        source: |_, _| None,
+    });
+}
+
+/// `pull_from_carriers` for the port at `p`: what its input tanks hold goes into the reactor's tank `into`.
+fn pull_port(host: &mut dyn ServerHost, level: LevelRef, own: Option<&mut Compound>, p: [i32; 3], from_key: &str, into: &mut mekanism_core::chemical::ChemicalTank) {
+    let mut take = |data: &mut Compound| -> bool {
+        let mut theirs = get_tank(data, from_key, u64::MAX);
+        let Some(chemical) = theirs.chemical.clone() else {
+            return false;
+        };
+        let n = into.insert(&chemical, theirs.amount);
+        if n == 0 {
+            return false;
+        }
+        theirs.extract(n);
+        put_tank(data, from_key, &theirs);
+        true
+    };
+    match own {
+        Some(data) => {
+            take(data);
+        }
+        None => {
+            let Some(entity) = host.block_entity(level, p) else {
+                return;
+            };
+            let Some(mut data) = entity.data(&*host) else {
+                return;
+            };
+            if take(&mut data) {
+                let _ = entity.replace_data(host, data);
+            }
+        }
+    }
 }
 
 fn tick_port(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut mod_api::ModBlockEntityView<'_>) {
@@ -384,9 +429,10 @@ fn tick_port(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut mod_api::Mod
     let modes: Vec<Option<usize>> = ports.iter().map(|&p| port_mode(&*host, level, p)).collect();
     for (&p, mode) in ports.iter().zip(&modes) {
         if mode.is_none_or(|m| m == 0) {
-            io::pull(host, level, p, &mut fuel, FISSILE_FUEL);
-            io::pull(host, level, p, &mut water, "minecraft:water");
-            io::pull(host, level, p, &mut water, fission::SODIUM_COOLANT);
+            let own = (p == pos).then_some(&mut entity.nbt);
+            pull_port(host, level, own, p, "in_fuel", &mut fuel);
+            let own = (p == pos).then_some(&mut entity.nbt);
+            pull_port(host, level, own, p, "in_water", &mut water);
         }
     }
     let mut st = state_of(&entity.nbt, &r);
@@ -417,10 +463,10 @@ fn tick_port(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut mod_api::Mod
     }
     for (&p, mode) in ports.iter().zip(&modes) {
         if mode.is_none_or(|m| m == 2) {
-            io::push(host, level, p, &mut steam);
+            super::transmit::push_chemical(host, p, &mut steam, None, u64::MAX, false, &|_, _| true);
         }
         if mode.is_none_or(|m| m == 1) {
-            io::push(host, level, p, &mut waste);
+            super::transmit::push_chemical(host, p, &mut waste, None, u64::MAX, false, &|_, _| true);
         }
     }
     // `simulateEnvironment`, then `handleDamage`.
