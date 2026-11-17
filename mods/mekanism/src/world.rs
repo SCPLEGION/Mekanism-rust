@@ -8,6 +8,7 @@ use mod_api::{Host, Registrar};
 
 pub(crate) mod chem;
 pub(crate) mod common;
+pub(crate) mod generators;
 pub(crate) mod fission;
 pub(crate) mod multiblock;
 pub(crate) mod factory;
@@ -23,6 +24,7 @@ pub(crate) struct State {}
 /// Declares every block entity type, container and part of the area.
 pub(crate) fn register(r: &mut dyn Registrar) {
     machine::register(r);
+    generators::register(r);
     fission::register(r);
     factory::register(r);
     item_chem::register(r);
