@@ -11,6 +11,8 @@ pub struct Batch;
 /// One call of a screen hook: the host, and the draw context when the hook draws.
 pub struct Gfx<'a> {
     pub host: &'a dyn ClientHost,
+    /// The block of the open screen.
+    pub container: Option<(i32, i32, i32)>,
     draw: RefCell<Option<&'a mut dyn DrawContext>>,
 }
 
@@ -21,11 +23,11 @@ fn opaque(argb: u32) -> u32 {
 
 impl<'a> Gfx<'a> {
     pub fn drawing(host: &'a dyn ClientHost, draw: &'a mut dyn DrawContext) -> Self {
-        Self { host, draw: RefCell::new(Some(draw)) }
+        Self { host, container: host.screen_pos().map(|p| (p[0], p[1], p[2])), draw: RefCell::new(Some(draw)) }
     }
 
     pub fn reading(host: &'a dyn ClientHost) -> Self {
-        Self { host, draw: RefCell::new(None) }
+        Self { host, container: host.screen_pos().map(|p| (p[0], p[1], p[2])), draw: RefCell::new(None) }
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut dyn DrawContext) -> R) -> Option<R> {

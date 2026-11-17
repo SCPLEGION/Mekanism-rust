@@ -12,6 +12,7 @@ use mekanism_core::{boiler, dynamic_tank, factory, fusion, isotopes, laser, modu
 use mekanism_core::{chargepad, formulaic as fa, machine, oredictionificator as od, security as sec, stabilizer as st};
 use mekanism_core::generator::HeatGenerator;
 use mod_api::ItemStack;
+use crate::world::nbt::{get_int, get_long, put_int, put_long};
 use mekanism_core::frequency as freq;
 use mekanism_core::evaporation as evap;
 const FUSION_MAX_TEMP: u64 = 500_000_000;
@@ -27,6 +28,11 @@ const OBSIDIAN_TNT: &str = "mekanismadditions:obsidian_tnt";
 const REACTION_CHAMBER: &str = "mekanism:pressurized_reaction_chamber";
 const WASTE_BARREL: &str = "mekanism:radioactive_waste_barrel";
 const CARDBOARD: &str = "mekanism:cardboard_box";
+const BUTTON_REDSTONE_NEXT: i32 = 100;
+const BUTTON_REDSTONE_PREVIOUS: i32 = 101;
+const BUTTON_EDIT_NEXT: i32 = 103;
+const BUTTON_EDIT_PREVIOUS: i32 = 104;
+pub(super) mod screen;
 fn usage_of(_recipe: &str, default: u64) -> u64 { default }
 
 /// The slots in a row of the chest menu a factory shows.
