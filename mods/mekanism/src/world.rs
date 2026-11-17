@@ -7,6 +7,7 @@
 use mod_api::{Host, Registrar};
 
 pub(crate) mod chem;
+pub(crate) mod chemical;
 pub(crate) mod common;
 pub(crate) mod generators;
 pub(crate) mod fission;
