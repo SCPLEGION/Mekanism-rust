@@ -68,3 +68,164 @@ pub(crate) fn chemical_need(
         (remaining as f64 / ticks_left as f64) as u64
     }
 }
+
+// --- Chemical tank items ------------------------------------------------------------------------------------
+
+use super::common::key_of;
+use crate::gear::data::{self as gdata, CHEMICAL_KEY};
+use mekanism_core::tier::BaseTier;
+use mod_api::{Host, ItemStack, ModBlockEntityView};
+
+/// What a chemical item holds at most: a chemical tank of any tier, or the hohlraum.
+pub(crate) fn chemical_item_capacity(id: &str) -> Option<u64> {
+    if id == mekanism_core::fusion::HOHLRAUM {
+        return Some(mekanism_core::fusion::HOHLRAUM_CAPACITY);
+    }
+    let tier = id.strip_prefix("mekanism:")?.strip_suffix("_chemical_tank")?;
+    let tier = BaseTier::ALL.into_iter().find(|t| t.name() == tier)?;
+    Some(chem::chemical_tank(tier).0)
+}
+
+use mekanism_core::chemical as chem;
+
+/// What a chemical item takes or gives in one operation (the hohlraum's `fillRate`).
+fn chemical_item_rate(id: &str) -> u64 {
+    if id == mekanism_core::fusion::HOHLRAUM { mekanism_core::fusion::HOHLRAUM_FILL_RATE } else { u64::MAX }
+}
+
+fn chemical_item_accepts(id: &str, chemical: &str) -> bool {
+    id != mekanism_core::fusion::HOHLRAUM || chemical == mekanism_core::fusion::FUSION_FUEL
+}
+
+/// The chemical an item holds, when it holds some.
+pub(crate) fn item_tank(stack: &ItemStack, capacity: u64) -> Option<ChemicalTank> {
+    let mut c = Compound::new();
+    c.insert("t".into(), gdata::get(gdata::custom_data(stack)?, CHEMICAL_KEY)?.clone());
+    let tank = get_tank(&c, "t", capacity);
+    (tank.amount > 0).then_some(tank)
+}
+
+/// Writes `tank` as the chemical an item holds.
+pub(crate) fn set_item_tank(stack: &mut ItemStack, tank: &ChemicalTank) {
+    let mut c = Compound::new();
+    put_tank(&mut c, "t", tank);
+    let value = match gdata::get(&c, "t") {
+        Some(Tag::Compound(t)) => Some(Tag::Compound(t.clone())),
+        _ => None,
+    };
+    gdata::set_custom(stack, CHEMICAL_KEY, value);
+}
+
+/// `ChemicalInventorySlot.fill`: a chemical tank item in slot `from` gives what it holds to `tank` while the tank
+/// takes it (`accepts`) and has room.
+pub(crate) fn fill_tank_from_item(
+    host: &dyn Host,
+    entity: &mut ModBlockEntityView<'_>,
+    from: usize,
+    tank: &mut ChemicalTank,
+    accepts: impl Fn(&str) -> bool,
+) -> bool {
+    let Some(Some(mut stack)) = entity.items.get(from).cloned() else {
+        return false;
+    };
+    let id = super::item_id(host, &stack);
+    let Some(capacity) = chemical_item_capacity(&id) else {
+        return false;
+    };
+    let Some(mut held) = item_tank(&stack, capacity) else {
+        return false;
+    };
+    let Some(chemical) = held.chemical.clone() else {
+        return false;
+    };
+    if !accepts(&chemical) || !tank.accepts(&chemical) {
+        return false;
+    }
+    let moved = held.amount.min(tank.capacity - tank.amount).min(chemical_item_rate(&id));
+    if moved == 0 {
+        return false;
+    }
+    tank.insert(&chemical, moved);
+    held.extract(moved);
+    set_item_tank(&mut stack, &held);
+    entity.items[from] = Some(stack);
+    true
+}
+
+/// `ChemicalInventorySlot.drain`: `tank`'s chemical goes into a chemical tank item in slot `from` that is empty or
+/// holds the same chemical, while it has room.
+pub(crate) fn drain_tank_into_item(
+    host: &dyn Host,
+    entity: &mut ModBlockEntityView<'_>,
+    from: usize,
+    tank: &mut ChemicalTank,
+) -> bool {
+    let Some(Some(mut stack)) = entity.items.get(from).cloned() else {
+        return false;
+    };
+    let id = super::item_id(host, &stack);
+    let (Some(capacity), Some(chemical)) = (chemical_item_capacity(&id), tank.chemical.clone()) else {
+        return false;
+    };
+    let mut held = item_tank(&stack, capacity).unwrap_or_else(|| ChemicalTank::new(capacity));
+    if !held.accepts(&chemical) || !chemical_item_accepts(&id, &chemical) {
+        return false;
+    }
+    let moved = tank.amount.min(held.capacity - held.amount).min(chemical_item_rate(&id));
+    if moved == 0 {
+        return false;
+    }
+    held.insert(&chemical, moved);
+    tank.extract(moved);
+    set_item_tank(&mut stack, &held);
+    entity.items[from] = Some(stack);
+    true
+}
+
+/// A chemical item in slot `from` that converts into `tank`'s chemical (`find_conversion`), one item at a time
+/// when all of its chemical fits (`ChemicalInventorySlot.fillOrConvert`).
+pub(crate) fn convert_item_into_tank(
+    host: &dyn Host,
+    entity: &mut ModBlockEntityView<'_>,
+    from: usize,
+    tank: &mut ChemicalTank,
+    accepts: impl Fn(&str) -> bool,
+) {
+    let Some(Some(item)) = entity.items.get(from).cloned() else {
+        return;
+    };
+    let in_tag = |tag: &str, i: &str| super::in_tag(host, i, tag.trim_start_matches('#'));
+    if let Some(c) = mekanism_core::recipes::find_conversion(&super::item_id(host, &item), &in_tag)
+        && accepts(c.output)
+        && tank.accepts(c.output)
+        && tank.amount + c.amount <= tank.capacity
+    {
+        tank.insert(c.output, c.amount);
+        entity.items[from] = item.shrink(1);
+    }
+}
+
+/// `push_chemical` of `runtime.rs`: gives up to `rate` of `from` to the chemical handlers beside `pos`.
+/// The neighbours' chemical capability (and the side configuration that decides which faces give out) belongs to the
+/// transmitter and side-config stages; until they land nothing is pushed and the tank keeps what it made.
+pub(crate) fn push_chemical(_host: &mut dyn mod_api::ServerHost, _pos: [i32; 3], _from: &mut ChemicalTank, _rate: u64) {}
+
+/// An item stack of `count` of the item `id`.
+pub(crate) fn stack_of(host: &dyn Host, id: &str, count: u32) -> Option<ItemStack> {
+    key_of(host, id).and_then(|k| ItemStack::new(k, count))
+}
+
+/// `capacity` of a machine's energy and its upgraded numbers (`machine_power` of `runtime.rs`): the upgrades, the
+/// energy per tick, the ticks one operation takes (0 with none), and the most it stores.
+pub(crate) fn machine_power(
+    nbt: &Compound,
+    base_usage: u64,
+    base_ticks: Option<u32>,
+) -> (mekanism_core::upgrades::Upgrades, u64, u32, u64) {
+    let u = super::common::upgrades(nbt);
+    let usage = u.energy_per_tick(base_usage);
+    let ticks = base_ticks.map_or(0, |t| u.ticks(t));
+    let capacity = usage.saturating_mul(u64::from(ticks).max(mekanism_core::machine::STORAGE_MULTIPLIER)).max(usage);
+    (u, usage, ticks, capacity)
+}
+
