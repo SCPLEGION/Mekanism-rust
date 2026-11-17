@@ -6,7 +6,7 @@
 //! each holds at most. The first cable of a network to tick in a game tick runs the whole network that tick.
 use super::nbt::{get_long, put_long};
 use super::transmit::{
-    self, conn_of, direction, face_index, neg, offset, sides_of, takes_in, topology, Own, Receiver, DIRECTIONS,
+    self, conn_of, direction, face_index, neg, offset, sides_of, takes_in, Discovered, Own, Receiver, DIRECTIONS,
 };
 use mekanism_core::distribution;
 use mekanism_core::energy::{Action, EnergyContainer};
@@ -16,8 +16,7 @@ use mod_api::{
     BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockEntityUpdateTagEvent, BlockPart, Compound, Host,
     LevelRef, Registrar, ServerHost,
 };
-use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::collections::HashSet;
 
 /// The id of the block entity type of the cables (`mekanism:cable`).
 pub(crate) const TYPE: &str = "cable";
@@ -93,81 +92,16 @@ impl BlockEntityPart for CablePart {
             return;
         };
         let mut own = Own { pos: event.pos, entity: &mut event.entity };
-        let Some(net) = claim(host, &mut own, level) else {
+        let Some(net) = transmit::claim(host, &mut own, level, &discover) else {
             return;
         };
         step(host, &mut own, level, net);
     }
 }
 
-/// A transmitter network (`DynamicNetwork`): its cables, the acceptors it emits to, and when it last ran.
-struct Net {
-    built: u64,
-    last_tick: i64,
-    members: Vec<[i32; 3]>,
-    /// Acceptor position, its face toward the network, and the network's direction to it.
-    targets: Vec<([i32; 3], [i32; 3], [i32; 3])>,
-}
-
-#[derive(Default)]
-struct Registry {
-    nets: HashMap<u64, Net>,
-    by_pos: HashMap<(String, [i32; 3]), u64>,
-    next: u64,
-}
-
-static NETS: Mutex<Option<Registry>> = Mutex::new(None);
-
-fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
-    f(NETS.lock().unwrap().get_or_insert_with(Registry::default))
-}
-
-/// The network of the cable at `own`, formed (or formed again) when the world around changed; `Some` only to the
-/// first of its cables to tick in a game tick, which runs the whole network that tick.
-fn claim(host: &dyn Host, own: &mut Own<'_, '_>, level: LevelRef) -> Option<u64> {
-    let version = topology();
-    let dim = host.dimension().to_owned();
-    let pos = own.pos;
-    let known = with_registry(|r| r.by_pos.get(&(dim.clone(), pos)).copied().filter(|id| r.nets.get(id).is_some_and(|n| n.built == version)));
-    let id = match known {
-        Some(id) => id,
-        None => {
-            let (members, targets) = discover(host, own, level, pos);
-            with_registry(|r| {
-                // The networks these cables were in (and now merged with or split from) are gone.
-                for m in &members {
-                    if let Some(old) = r.by_pos.remove(&(dim.clone(), *m)) {
-                        r.nets.remove(&old);
-                    }
-                }
-                r.next += 1;
-                let id = r.next;
-                for m in &members {
-                    r.by_pos.insert((dim.clone(), *m), id);
-                }
-                r.nets.insert(id, Net { built: version, last_tick: -1, members, targets });
-                id
-            })
-        }
-    };
-    let now = level.game_time(host).unwrap_or(0);
-    with_registry(|r| {
-        let net = r.nets.get_mut(&id)?;
-        (net.last_tick != now).then(|| {
-            net.last_tick = now;
-            id
-        })
-    })
-}
-
 /// The cables joined to the one at `start` through connections neither side disabled, and the acceptors they reach
 /// (`NetworkAcceptorCache`). A pulling face only takes from its acceptor; the others are emitted to.
-fn discover(
-    host: &dyn Host,
-    own: &mut Own<'_, '_>,
-    level: LevelRef,
-    start: [i32; 3],
-) -> (Vec<[i32; 3]>, Vec<([i32; 3], [i32; 3], [i32; 3])>) {
+fn discover(host: &dyn Host, own: &mut Own<'_, '_>, level: LevelRef, start: [i32; 3]) -> Discovered {
     let mut members = Vec::new();
     let mut targets = Vec::new();
     let mut seen = HashSet::from([start]);
@@ -202,7 +136,7 @@ fn discover(
             }
         }
     }
-    (members, targets)
+    Discovered { members, targets }
 }
 
 /// What the block at `at` takes of `amount` from a cable network through its face `back` (the one toward the
@@ -236,7 +170,7 @@ fn accept(host: &mut dyn ServerHost, own: &mut Own<'_, '_>, level: LevelRef, at:
 
 /// One tick of a cable network (`EnergyNetwork.onUpdate`).
 fn step(host: &mut dyn ServerHost, own: &mut Own<'_, '_>, level: LevelRef, net: u64) {
-    let Some((members, targets)) = with_registry(|r| r.nets.get(&net).map(|n| (n.members.clone(), n.targets.clone()))) else {
+    let Some((members, targets)) = transmit::with_registry(|r| r.nets.get(&net).map(|n| (n.members.clone(), n.targets.clone()))) else {
         return;
     };
     let mut rates: Vec<u64> = Vec::new();
@@ -300,7 +234,7 @@ fn step(host: &mut dyn ServerHost, own: &mut Own<'_, '_>, level: LevelRef, net: 
 
 /// How `total` is shared among holders that can hold `caps` each, in proportion to those, the remainder going one
 /// unit at a time to the first that have room (`EmitUtils` on the save targets).
-fn share_out(total: u64, caps: &[u64]) -> Vec<u64> {
+pub(crate) fn share_out(total: u64, caps: &[u64]) -> Vec<u64> {
     let sum: u64 = caps.iter().sum();
     if sum == 0 {
         return vec![0; caps.len()];
