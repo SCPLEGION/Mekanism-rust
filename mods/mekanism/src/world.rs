@@ -11,6 +11,7 @@ pub(crate) mod carrier;
 pub(crate) mod common;
 pub(crate) mod conductor;
 pub(crate) mod bin;
+pub(crate) mod tank;
 pub(crate) mod chem;
 pub(crate) mod generators;
 pub(crate) mod fission;
@@ -37,6 +38,7 @@ pub(crate) fn register(r: &mut dyn Registrar) {
     fission::register(r);
     factory::register(r);
     bin::register(r);
+    tank::register(r);
     fluid_chem::register(r);
     item_chem::register(r);
 }

@@ -205,10 +205,32 @@ pub(crate) fn convert_item_into_tank(
     }
 }
 
-/// `push_chemical` of `runtime.rs`: gives up to `rate` of `from` to the chemical handlers beside `pos`
-/// (`transmit::push_chemical`). Every face of the giver lets it out until the side configuration lands.
-pub(crate) fn push_chemical(host: &mut dyn mod_api::ServerHost, pos: [i32; 3], from: &mut ChemicalTank, rate: u64) {
-    super::transmit::push_chemical(host, pos, from, None, rate, false, &|_, _| true);
+/// The faces a machine gives out of, per transmission type, as its ticking read them (`TICKING` of `runtime.rs`): a type
+/// whose auto-eject is off gives out through no face (the window's eject button), else the side configuration decides.
+pub(crate) fn sides_of_machine(nbt: &Compound) -> [mekanism_core::sides::Sides; 5] {
+    use mekanism_core::sides::{Sides, Transmission};
+    let no_eject = super::nbt::get_int(nbt, "no_eject");
+    let mut all = [Sides(0); 5];
+    for (i, t) in Transmission::ALL.into_iter().enumerate() {
+        all[i] = if no_eject & (1 << t as u32) != 0 { Sides(0xAAA) } else { super::transmit::sides_of(nbt, t) };
+    }
+    all
+}
+
+/// `push_chemical` of `runtime.rs` for a machine: gives up to `rate` of `from` to the chemical handlers beside `pos`
+/// (or only the one at `only`) through the faces its side configuration lets out.
+pub(crate) fn push_chemical(
+    host: &mut dyn mod_api::ServerHost,
+    pos: [i32; 3],
+    nbt: &Compound,
+    from: &mut ChemicalTank,
+    only: Option<[i32; 3]>,
+    rate: u64,
+) {
+    let sides = sides_of_machine(nbt);
+    super::transmit::push_chemical(host, pos, from, only, rate, false, &|d, t| {
+        sides[t as usize].get(super::transmit::face_index(d)).gives_out()
+    });
 }
 
 /// An item stack of `count` of the item `id`.

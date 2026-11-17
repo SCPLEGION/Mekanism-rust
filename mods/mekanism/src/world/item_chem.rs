@@ -60,7 +60,59 @@ fn all_blocks() -> Vec<&'static str> {
     v
 }
 
+/// The energy buffer of a machine of this family (`receiver` of `runtime.rs`).
+fn energy_receiver(id: &str, nbt: &Compound, _: bool, _: bool) -> Option<super::transmit::Receiver> {
+    let capacity = match kind(id)? {
+        Kind::Advanced(m) => machine_power(nbt, advanced_usage(m), Some(chem::ADVANCED_TICKS)).3,
+        Kind::Infuser => chem::INFUSER_USAGE * u64::from(chem::INFUSER_TICKS),
+        Kind::Painting => usage_const("paintingMachine", chem::PAINTING_USAGE) * u64::from(chem::PAINTING_TICKS),
+        Kind::Nucleosynthesizer => {
+            mekanism_core::machine::STORAGE_MULTIPLIER * usage_const("antiprotonicNucleosynthesizer", chem::NUCLEOSYNTHESIZER_USAGE)
+        }
+        Kind::Dissolution => machine_power(nbt, usage_const("chemicalDissolutionChamber", nuclear::DISSOLUTION_USAGE), Some(nuclear::DISSOLUTION_TICKS)).3,
+        Kind::Crystallizer => machine_power(nbt, usage_const("chemicalCrystallizer", nuclear::CRYSTALLIZER_USAGE), Some(nuclear::CRYSTALLIZER_TICKS)).3,
+        Kind::Oxidizer => machine_power(nbt, usage_const("chemicalOxidizer", chem::OXIDIZER_USAGE), Some(chem::OXIDIZER_TICKS)).3,
+        Kind::PigmentExtractor => machine_power(nbt, usage_const("pigmentExtractor", chem::PIGMENT_EXTRACTOR_USAGE), Some(chem::PIGMENT_EXTRACTOR_TICKS)).3,
+    };
+    Some(super::transmit::Receiver::new(capacity, u64::MAX))
+}
+
+/// Which pipes and tubes reach these machines, and the tank that takes what they bring.
+fn chemical_receiver(id: &str, nbt: &Compound, chemical: &str, _: bool, _: [i32; 3]) -> Option<(&'static str, u64)> {
+    use super::transmit::is_fluid;
+    if is_fluid(chemical) {
+        // Brine crystallizes into salt.
+        return (kind(id)? == Kind::Crystallizer && nuclear::find_crystallizing(chemical).is_some())
+            .then_some(("input", nuclear::CRYSTALLIZER_TANK));
+    }
+    match kind(id)? {
+        Kind::Advanced(m) if m.chemicals.contains(&chemical) && super::chem::get_tank(nbt, "chemical", chem::ADVANCED_TANK).accepts(chemical) => {
+            Some(("chemical", chem::ADVANCED_TANK))
+        }
+        Kind::Painting
+            if mekanism_core::recipes::painting_pigment(chemical)
+                && super::chem::get_tank(nbt, "pigment", chem::PAINTING_TANK).accepts(chemical) =>
+        {
+            Some(("pigment", chem::PAINTING_TANK))
+        }
+        Kind::Dissolution if nuclear::dissolves_with(chemical) => Some(("input", nuclear::DISSOLUTION_TANK)),
+        Kind::Crystallizer if nuclear::find_crystallizing(chemical).is_some() => Some(("input", nuclear::CRYSTALLIZER_TANK)),
+        Kind::Nucleosynthesizer if chemical == chem::ANTIMATTER => Some(("chemical", chem::NUCLEOSYNTHESIZER_TANK)),
+        _ => None,
+    }
+}
+
+/// Tubes reach the chemical machines of this family (`serves` of `runtime.rs`; the painting machine takes none).
+fn serves(id: &str) -> u8 {
+    match kind(id) {
+        Some(Kind::Painting | Kind::Infuser) | None => 0,
+        Some(_) => 2,
+    }
+}
+
 pub(crate) fn register(r: &mut dyn Registrar) {
+    super::transmit::register_energy_receiver(energy_receiver);
+    super::transmit::register_chemical_family(super::transmit::ChemicalFamily { serves, receiver: chemical_receiver, source: |_, _| None });
     let blocks = all_blocks();
     let entity = r.block_entity_type(TYPE).blocks(&blocks).build();
     r.block_entity_part(&entity, ItemChemicalPart).expect("native block entity type");
@@ -484,7 +536,7 @@ fn tick_dissolution(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBl
             used = 0;
         }
     }
-    push_chemical(host, pos, &mut output, u64::MAX);
+    push_chemical(host, pos, &entity.nbt.clone(), &mut output, None, u64::MAX);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_int(&mut entity.nbt, "used", used);
@@ -591,7 +643,7 @@ fn tick_oxidizer(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlock
         }
         _ => progress = 0,
     }
-    push_chemical(host, pos, &mut tank, u64::MAX);
+    push_chemical(host, pos, &entity.nbt.clone(), &mut tank, None, u64::MAX);
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_int(&mut entity.nbt, "progress", progress);
     put_tank(&mut entity.nbt, "output", &tank);
