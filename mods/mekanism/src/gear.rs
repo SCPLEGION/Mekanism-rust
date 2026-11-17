@@ -9,6 +9,7 @@ use mod_api::HostBlockStates;
 use text::{color, line, translate_colored};
 
 pub(crate) mod data;
+mod mekasuit;
 pub(crate) mod text;
 
 /// State of this area, held in `Mod`. Items carry their own state in `custom_data`, so there is none yet.
@@ -16,6 +17,8 @@ pub(crate) mod text;
 pub(crate) struct State {
     /// Extra damage the next hit on an entity takes (set when the attack starts, taken when its damage is worked out).
     pending: std::sync::Mutex<std::collections::HashMap<i32, f32>>,
+    /// Server ticks since the last second's work (the MekaSuit's units run once a second).
+    second: std::sync::atomic::AtomicU32,
 }
 
 const SCUBA_TANK: &str = "mekanism:scuba_tank";
@@ -366,5 +369,18 @@ pub(crate) fn living_damage_pre(m: &crate::Mod, _: &mut dyn LevelRandomHost, eve
     if let Some(extra) = m.gear.pending.lock().unwrap().remove(&event.entity) {
         let now = event.container.new_damage();
         event.container.set_new_damage(now + extra);
+    }
+}
+
+/// `server_tick`: once a second, each player's MekaSuit works (`ModuleChargeDistributionUnit.tickServer`).
+pub(crate) fn server_tick(m: &crate::Mod, host: &mut dyn mod_api::ServerHost, event: &mod_api::ServerTickEvent<'_>) {
+    if !matches!(event.phase, mod_api::ServerTickPhase::ServerTickEnd { world_running: true }) {
+        return;
+    }
+    if m.gear.second.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 20 != 0 {
+        return;
+    }
+    for player in host.players().server_players() {
+        mekasuit::distribute(host, player);
     }
 }
