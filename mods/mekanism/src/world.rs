@@ -9,6 +9,7 @@ use mod_api::{Host, Registrar};
 pub(crate) mod common;
 pub(crate) mod machine;
 pub(crate) mod nbt;
+pub(crate) mod net;
 
 /// State of this area, held in `Mod`. Block entities keep their state in their own compound, so there is none yet.
 #[derive(Default)]

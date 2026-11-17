@@ -56,16 +56,19 @@ fi
 log "Content of Mekanism (blocks, items, recipes, models)"
 ( cd "$SRC/Mekanism-rust" && python3 tools/carry_content.py )
 C="$SRC/Mekanism-rust/target/content"
-# One folder of mods, built together into one game: the native mod "mekanism" carries the main module's
-# assets and data itself (a native mod and a content mod cannot share the id), JEI is built as it is, and
-# Mekanism's other three modules stay content mods.
+# One folder of mods, built together into one game: the native mod "mekanism" carries the assets and data of
+# all four modules (a native mod and a content mod cannot share the id), and JEI is built as it is.
 MODS="$HOME_DIR/mods"; rm -rf "$MODS"; mkdir -p "$MODS"
 cp -r "$SRC/Mekanism-rust/mods/mekanism" "$MODS/mekanism"; rm -rf "$MODS/mekanism/.horizon" "$MODS/mekanism/target"
 sed -i "s#\.\./\.\./mixins/mekanism/core#$SRC/Mekanism-rust/mixins/mekanism/core#" "$MODS/mekanism/Cargo.toml"
-[ -d "$C/mekanism/assets" ] && cp -r "$C/mekanism/assets" "$MODS/mekanism/assets"
-[ -d "$C/mekanism/data" ] && cp -r "$C/mekanism/data" "$MODS/mekanism/data"
+# All four modules go into the native mod: its block entity types and payloads may only name blocks and
+# namespaces the package owns, and Mekanism's generators and additions have blocks of the same families.
+mkdir -p "$MODS/mekanism/assets" "$MODS/mekanism/data"
+for ns in mekanism mekanismgenerators mekanismadditions mekanismtools; do
+  [ -d "$C/$ns/assets" ] && cp -r "$C/$ns/assets/." "$MODS/mekanism/assets/" || true
+  [ -d "$C/$ns/data" ] && cp -r "$C/$ns/data/." "$MODS/mekanism/data/" || true
+done
 cp -r "$SRC/JustEnoughItems-rust/mods/jei" "$MODS/jei"; rm -rf "$MODS/jei/.horizon" "$MODS/jei/target"
-for ns in generators additions tools; do cp "$C"/mekanism$ns-*.hmod "$MODS/" 2>/dev/null || true; done
 if ! horizon-launcher instance list 2>/dev/null | grep -q "$INSTANCE"; then horizon-launcher instance create "$INSTANCE"; fi
 horizon-launcher instance version "$INSTANCE" "$TAG"
 export HORIZON_LAUNCHER_DEVELOPER_SDK="$SDK"
