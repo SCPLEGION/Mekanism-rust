@@ -1,10 +1,9 @@
 //! The basic electric machines (`TileEntityElectricMachine`): enrichment chamber, crusher, energized smelter,
 //! precision sawmill and combiner. Port of `tick_machine` and its container of `runtime.rs`.
+use super::common::{discharge_slot, key_of, max_stack, set_slot, slot, upgrades, set_active};
 use super::nbt::{get_int, get_long, put_int, put_long, wide};
 use crate::gear::data as item_data;
-use mekanism_core::energy::{Action, EnergyContainer};
 use mekanism_core::machine::{self, ElectricMachine, Operation, Slot, MACHINES};
-use mekanism_core::upgrades::{Upgrade, Upgrades};
 use mod_api::{
     BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart, Compound, Host, ItemStack,
     ModBlockEntityView, ModContainer, Registrar, ServerHost, Tag,
@@ -71,49 +70,8 @@ impl BlockEntityPart for MachinePart {
         };
         let active = tick(host, &mut event.entity, recipe, usage);
         // The block's `lit` shows whether the machine ran (the furnace's property); it only changes when it differs.
-        host.set_block_property(event.pos, "lit", if active { "true" } else { "false" });
+        set_active(host, event.pos, active);
     }
-}
-
-/// One slot of the block entity as the machine's logic sees it.
-fn slot(host: &dyn Host, stack: Option<&ItemStack>) -> Slot {
-    match stack {
-        Some(s) => Slot { item: Some(super::item_id(host, s)), count: s.count() },
-        None => Slot::default(),
-    }
-}
-
-/// Writes `slot` back to item slot `index`, keeping the stack's components when the item is the same.
-fn set_slot(host: &dyn Host, entity: &mut ModBlockEntityView<'_>, index: usize, slot: &Slot) {
-    let Some(place) = entity.items.get_mut(index) else {
-        return;
-    };
-    *place = match (&slot.item, place.take()) {
-        (None, _) => None,
-        (Some(_), Some(mut old)) if super::item_id(host, &old) == *slot.item.as_ref().unwrap() => {
-            old.set_count(slot.count).ok().map(|()| old)
-        }
-        (Some(item), _) => key_of(host, item).and_then(|k| ItemStack::new(k, slot.count)),
-    };
-}
-
-fn key_of(host: &dyn Host, id: &str) -> Option<mod_api::ItemKey> {
-    super::item_key(host, id)
-}
-
-fn max_stack(host: &dyn Host, id: &str) -> u32 {
-    key_of(host, id).and_then(|k| host.max_stack_size(k)).unwrap_or(64)
-}
-
-fn upgrades(nbt: &Compound) -> Upgrades {
-    let Some(Tag::Compound(c)) = item_data::get(nbt, "upgrades") else {
-        return Upgrades::default();
-    };
-    let mut u = Upgrades::default();
-    for kind in Upgrade::ALL {
-        u.install(kind, get_int(c, kind.name()));
-    }
-    u
 }
 
 /// A Precision Sawmill's secondary output still waiting for the output slot.
@@ -152,37 +110,6 @@ fn roll(nbt: &mut Compound) -> f64 {
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^= z >> 31;
     (z >> 11) as f64 / (1u64 << 53) as f64
-}
-
-/// `EnergyInventorySlot.fillContainerOrConvert`: empties the item in slot `index` into `target`, or, for
-/// redstone, turns one of it into energy when all of that fits.
-fn discharge_slot(host: &dyn Host, entity: &mut ModBlockEntityView<'_>, index: usize, target: &mut EnergyContainer) {
-    const REDSTONE_ENERGY: [(&str, u64); 2] = [("minecraft:redstone", 10_000), ("minecraft:redstone_block", 90_000)];
-    let Some(Some(stack)) = entity.items.get(index) else {
-        return;
-    };
-    let id = super::item_id(host, stack);
-    if let Some(item) = item_data::item_energy_of(stack, &id) {
-        let stored = item_data::stored_energy(stack).min(item.capacity);
-        let after = mekanism_core::gear::discharge(item, stored, target);
-        if after != stored
-            && let Some(Some(stack)) = entity.items.get_mut(index)
-        {
-            item_data::set_energy(stack, after);
-        }
-    } else if let Some(&(_, energy)) = REDSTONE_ENERGY.iter().find(|(r, _)| *r == id)
-        && target.stored + energy <= target.capacity
-    {
-        target.insert(energy, Action::Execute);
-        let Some(Some(stack)) = entity.items.get_mut(index) else {
-            return;
-        };
-        if stack.count() <= 1 {
-            entity.items[index] = None;
-        } else {
-            let _ = stack.set_count(stack.count() - 1);
-        }
-    }
 }
 
 /// What the machine does with the stack in its input slot: the operation, the stack limit of its output and
