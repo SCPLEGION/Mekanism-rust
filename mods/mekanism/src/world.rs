@@ -7,6 +7,7 @@
 use mod_api::{Host, Registrar};
 
 pub(crate) mod cable;
+pub(crate) mod carrier;
 pub(crate) mod common;
 pub(crate) mod conductor;
 pub(crate) mod bin;
@@ -30,6 +31,7 @@ pub(crate) struct State {}
 pub(crate) fn register(r: &mut dyn Registrar) {
     machine::register(r);
     cable::register(r);
+    carrier::register(r);
     conductor::register(r);
     generators::register(r);
     fission::register(r);

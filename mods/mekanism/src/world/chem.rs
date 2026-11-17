@@ -205,10 +205,11 @@ pub(crate) fn convert_item_into_tank(
     }
 }
 
-/// `push_chemical` of `runtime.rs`: gives up to `rate` of `from` to the chemical handlers beside `pos`.
-/// The neighbours' chemical capability (and the side configuration that decides which faces give out) belongs to the
-/// transmitter and side-config stages; until they land nothing is pushed and the tank keeps what it made.
-pub(crate) fn push_chemical(_host: &mut dyn mod_api::ServerHost, _pos: [i32; 3], _from: &mut ChemicalTank, _rate: u64) {}
+/// `push_chemical` of `runtime.rs`: gives up to `rate` of `from` to the chemical handlers beside `pos`
+/// (`transmit::push_chemical`). Every face of the giver lets it out until the side configuration lands.
+pub(crate) fn push_chemical(host: &mut dyn mod_api::ServerHost, pos: [i32; 3], from: &mut ChemicalTank, rate: u64) {
+    super::transmit::push_chemical(host, pos, from, None, rate, false, &|_, _| true);
+}
 
 /// An item stack of `count` of the item `id`.
 pub(crate) fn stack_of(host: &dyn Host, id: &str, count: u32) -> Option<ItemStack> {
