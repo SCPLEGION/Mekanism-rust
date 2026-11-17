@@ -4,7 +4,7 @@
 //! On the fork every gear item went through global hooks that asked the item's name; here each gear item gets a
 //! [`GearPart`] in `register`, and the game asks it only for its own item (docs/horizon-api-migration.md).
 use mekanism_core::{gear as core_gear, modules};
-use mod_api::{Flow, Hand, Host, HostSide, ItemStack, PlayerBreakSpeedEvent, ClientHost, ItemBarEvent, ItemDecorationsEvent, ItemPart, Registrar, TooltipEvent};
+use mod_api::{Flow, Hand, Host, HostSide, ItemStack, PlayerBreakSpeedEvent, ClientHost, ItemBarEvent, ItemDecorationsEvent, ItemPart, Registrar, TooltipEvent, InteractionResult, Text, UseItemEvent};
 use mod_api::HostBlockStates;
 use text::{color, line, translate_colored};
 
@@ -94,6 +94,35 @@ impl ItemPart for GearPart {
         let (x, y) = (event.x, event.y);
         event.draw.fill([x + 2.0, y + 12.0, 13.0, 2.0], 0xFF00_0000);
         event.draw.fill([x + 2.0, y + 12.0, width(amount, capacity) as f32, 1.0], 0xFF00_0000 | color);
+    }
+
+    /// Sneak + right click with the Atomic Disassembler cycles its mode (`ItemAtomicDisassembler.changeMode`, Mekanism's
+    /// mode key on the fork), with the new mode on the action bar.
+    fn use_item(&self, host: HostSide<'_>, event: &mut UseItemEvent<'_>) -> Option<InteractionResult> {
+        if self.id == modules::MEKA_TOOL {
+            return meka_tool_teleport(host, event);
+        }
+        if self.id != DISASSEMBLER {
+            return None;
+        }
+        // The mode is stored on the server, which tells the client its new stack.
+        let HostSide::Server(host) = host else {
+            return None;
+        };
+        let player = host.player(event.player)?;
+        if !player.is_secondary_use_active(&*host)? {
+            return None;
+        }
+        let living = host.living(player.entity())?;
+        let mut stack = event.stack.clone();
+        let config = data::gear_config();
+        let mode = data::disassembler_mode(&stack).next_enabled(&config);
+        data::set_disassembler_mode(&mut stack, mode);
+        living.set_hand_item(host, event.hand, Some(stack)).ok()?;
+        // `MekanismLang.DISASSEMBLER_MODE_CHANGE.translate(INDIGO, mode, AQUA, efficiency)`.
+        let line = Text::translate("disassembler.mekanism.mode_change", vec![text::colored(mode.label(), color::INDIGO), text::colored(mode.efficiency().to_string(), color::AQUA)]);
+        let _ = player.action_bar(host, line);
+        Some(InteractionResult::Success)
     }
 
     /// What the gear adds under its name (`Item.appendHoverText` with Mekanism's components), in the order the
@@ -223,4 +252,63 @@ fn held(host: &dyn Host, player: u32) -> Option<(String, ItemStack)> {
 fn hardness_at(host: &dyn Host, player: u32, pos: [i32; 3]) -> Option<f32> {
     let level = host.entity(player)?.level(host)?;
     host.block_states().destroy_speed(level.block_state(host, pos)?)
+}
+
+/// Right click with the Meka-Tool and its Teleportation Unit: to the top of the block looked at, up to the reach away, for
+/// `teleport_energy` FE (`ItemMekaTool.use`, `ModuleTeleportationUnit.onItemUse`). Server-side; the client predicts nothing.
+/// Gap: the 100 portal particles of `PacketPortalFX` are not sent yet.
+fn meka_tool_teleport(host: HostSide<'_>, event: &mut UseItemEvent<'_>) -> Option<InteractionResult> {
+    let HostSide::Server(host) = host else {
+        return None;
+    };
+    let stack = event.stack;
+    let installed = data::enabled_modules(stack);
+    if !installed.contains_key("mekanism:teleportation_unit") {
+        return None;
+    }
+    let player = host.player(event.player)?;
+    let entity = player.entity();
+    let eye = entity.eye_position(&*host)?;
+    let dir = entity.view_vector(&*host)?;
+    let reach = mekanism_core::config::gear_int("mekatool.maxTeleportReach", modules::TOOL_TELEPORT_REACH as u64) as f64;
+    // `ModuleTeleportationUnit.requiresBlockTarget`: without it a miss teleports to the end of the reach.
+    let requires_block = data::module_choice(stack, "mekanism:teleportation_unit", "teleportation_requires_block") != Some(0);
+    let level = entity.level(&*host)?;
+    let end = [0, 1, 2].map(|k| eye[k] + dir[k] * reach);
+    let hit = level.clip(&*host, eye, end, mod_api::ClipBlock::Collider, mod_api::ClipFluid::None)?;
+    let target = if !hit.miss {
+        hit.block
+    } else if !requires_block {
+        end.map(|v| v.floor() as i32)
+    } else {
+        return None;
+    };
+    // `isValidDestinationBlock`: air or a liquid.
+    let free = |dy: i32| {
+        let at = [target[0], target[1] + dy, target[2]];
+        level.block(&*host, at).map(|b| b.id(&*host)).is_some_and(|id| id.ends_with("air") || matches!(id.as_str(), "minecraft:water" | "minecraft:lava"))
+    };
+    if !free(1) || !free(2) {
+        return None;
+    }
+    let at = entity.position(&*host)?;
+    let distance_sq: f64 = (0..3).map(|k| (at[k] - f64::from(target[k])).powi(2)).sum();
+    if distance_sq < 5.0 {
+        return None;
+    }
+    let cost = modules::teleport_energy(distance_sq);
+    let creative = player.is_creative(&*host).unwrap_or(false);
+    let mut paid = stack.clone();
+    if !creative {
+        let stored = data::stored_energy(&paid);
+        if stored < cost {
+            return None;
+        }
+        data::set_energy(&mut paid, stored - cost);
+        host.living(entity)?.set_hand_item(host, event.hand, Some(paid)).ok()?;
+    }
+    // `player.teleportTo(x + 0.5, y + 1.5, z + 0.5)` and the teleport sound.
+    entity.teleport_to(host, [f64::from(target[0]) + 0.5, f64::from(target[1]) + 1.5, f64::from(target[2]) + 0.5], None);
+    entity.play_sound(host, "minecraft:entity.player.teleport", 1.0, 1.0);
+    Some(InteractionResult::Success)
 }
