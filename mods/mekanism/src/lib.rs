@@ -9,7 +9,7 @@
 //! A hook is implemented once, here, as a one-line call into the area file that owns it
 //! (`world::server_tick(self, host, event)`). To add a hook: add the method below and the function in
 //! your area file; never put logic in this file.
-use mod_api::{self, ServerTickEvent, AttackEntityEvent, LevelRandomHost, LivingDamagePreEvent, Flow, Hooks, HostSide, PlayerBreakSpeedEvent, PlayerLoggedInEvent, Registrar, RegistrationContext, ServerHost, Text};
+use mod_api::{self, ClientHost, ClientTickPostEvent, ServerTickEvent, AttackEntityEvent, LevelRandomHost, LivingDamagePreEvent, Flow, Hooks, HostSide, PlayerBreakSpeedEvent, PlayerLoggedInEvent, Registrar, RegistrationContext, ServerHost, Text};
 
 mod gear;
 mod gui;
@@ -33,6 +33,7 @@ impl Hooks for Mod {
     }
 
     fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
+        gui::register(r);
         gear::register(r);
         world::register(r);
     }
@@ -51,5 +52,9 @@ impl Hooks for Mod {
 
     fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
         gear::server_tick(self, host, event)
+    }
+
+    fn client_tick_post(&self, host: &mut dyn ClientHost, _: &mut ClientTickPostEvent) {
+        gear::client_tick_post(self, host)
     }
 }
