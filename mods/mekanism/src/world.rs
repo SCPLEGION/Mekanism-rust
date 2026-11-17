@@ -14,6 +14,7 @@ pub(crate) mod generators;
 pub(crate) mod fission;
 pub(crate) mod multiblock;
 pub(crate) mod factory;
+pub(crate) mod fluid_chem;
 pub(crate) mod item_chem;
 pub(crate) mod machine;
 pub(crate) mod nbt;
@@ -32,6 +33,7 @@ pub(crate) fn register(r: &mut dyn Registrar) {
     generators::register(r);
     fission::register(r);
     factory::register(r);
+    fluid_chem::register(r);
     item_chem::register(r);
 }
 
