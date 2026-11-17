@@ -3,9 +3,7 @@
 //! `tick_wind`, `tick_gas_generator`, `tick_bio_generator` and `tick_cube` of `runtime.rs`, with their
 //! containers and the numbers of their screens.
 //!
-//! Not here yet (they belong to the shared skeleton and the transmitters): handing energy to the neighbours
-//! (an energy cube's front, a generator's every side), heat flowing into adjacent heat handlers, lava and
-//! bioethanol arriving from pipes, and filling the gas generator's tank from a chemical tank item.
+//! Energy leaves through `world/energy.rs` (a cube's front, every face of a generator).
 use super::common::{charge_slot, discharge_slot, put_client, set_active};
 use super::nbt::{get_double, get_int, get_long, put_int, put_long};
 use crate::gear::data as item_data;
@@ -13,6 +11,7 @@ use mekanism_core::chemical::{self as chem, ChemicalTank};
 use mekanism_core::energy::{Action, EnergyContainer};
 use mekanism_core::generator::{self as g, HeatGenerator};
 use mekanism_core::tier::{self, BaseTier};
+use mod_api::HostBlockStates as _;
 use mod_api::{
     BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockEntityUpdateTagEvent, BlockPart, Compound, Host,
     ItemStack, ModBlockEntityView, ModContainer, Registrar, ServerHost, Tag,
@@ -64,11 +63,35 @@ pub(crate) fn register(r: &mut dyn Registrar) {
     let entity_type = r.block_entity_type(TYPE).blocks(&blocks).build();
     r.block_entity_part(&entity_type, GeneratorPart).expect("native block entity type");
     for id in &ids {
+        provide_energy(r, id);
         // The plain solar generator is an iron block with no menu.
         if let Some(c) = container(id) {
             let block = r.block_key(id);
             r.block_container(&block, c);
         }
+    }
+}
+
+/// What each block gives to or takes from its neighbours: a generator gives its buffer out of every face and takes
+/// none; a cube gives out of its front only and takes through the other five.
+fn provide_energy(r: &mut dyn Registrar, id: &str) {
+    use super::energy::{provide, Port};
+    match kind(id) {
+        Some(Kind::Heat) => provide(r, id, |_, _, _| Some(Port { capacity: g::STORAGE, insert: 0, extract: g::STORAGE })),
+        Some(Kind::Solar(_, storage)) => provide(r, id, move |_, _, _| Some(Port { capacity: storage, insert: 0, extract: storage })),
+        Some(Kind::Wind) => provide(r, id, |_, _, _| Some(Port { capacity: g::WIND_STORAGE, insert: 0, extract: g::WIND_STORAGE })),
+        Some(Kind::Gas) => provide(r, id, |_, _, _| Some(Port { capacity: chem::GAS_GENERATOR_STORAGE, insert: 0, extract: chem::GAS_GENERATOR_STORAGE })),
+        Some(Kind::Bio) => provide(r, id, |_, _, _| Some(Port { capacity: g::BIO_STORAGE, insert: 0, extract: g::BIO_STORAGE })),
+        Some(Kind::Cube(tier)) => provide(r, id, move |_, side, facing| {
+            let (capacity, rate) = tier::energy_cube(tier);
+            let front = side.is_some() && side == facing;
+            Some(if front {
+                Port { capacity, insert: 0, extract: rate }
+            } else {
+                Port { capacity, insert: rate, extract: 0 }
+            })
+        }),
+        None => {}
     }
 }
 
@@ -121,9 +144,40 @@ impl BlockEntityPart for GeneratorPart {
                 None
             }
         };
+        emit(host, pos, &mut event.entity, kind);
         if let Some(active) = active {
             set_active(host, pos, active);
         }
+    }
+}
+
+/// `push_energy`: hands the buffer to the neighbours: a generator out of every face, a cube out of its front only.
+fn emit(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEntityView<'_>, kind: Kind) {
+    use super::energy::{direction, Faces};
+    let (capacity, rate, faces) = match kind {
+        Kind::Heat => (g::STORAGE, g::STORAGE, Faces::ALL),
+        Kind::Solar(_, storage) => (storage, storage, Faces::ALL),
+        Kind::Wind => (g::WIND_STORAGE, g::WIND_STORAGE, Faces::ALL),
+        Kind::Gas => (chem::GAS_GENERATOR_STORAGE, chem::GAS_GENERATOR_STORAGE, Faces::ALL),
+        Kind::Bio => (g::BIO_STORAGE, g::BIO_STORAGE, Faces::ALL),
+        Kind::Cube(tier) => {
+            let (capacity, rate) = tier::energy_cube(tier);
+            let Some(level) = level_of(host) else {
+                return;
+            };
+            let state = level.block_state(host, pos);
+            let facing = state.and_then(|s| s.property(&host.block_states(), "facing").ok().flatten().and_then(direction));
+            let faces = facing.map_or(Faces::NONE, Faces::only);
+            (capacity, rate, faces)
+        }
+    };
+    let Some(level) = level_of(host) else {
+        return;
+    };
+    let mut energy = EnergyContainer::new(capacity, u64::MAX);
+    energy.stored = get_long(&entity.nbt, "energy").min(capacity);
+    if super::energy::push(host, level, pos, &mut energy, faces, rate) > 0 {
+        put_long(&mut entity.nbt, "energy", energy.stored);
     }
 }
 
