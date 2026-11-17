@@ -7,7 +7,7 @@
 //! (an energy cube's front, a generator's every side), heat flowing into adjacent heat handlers, lava and
 //! bioethanol arriving from pipes, and filling the gas generator's tank from a chemical tank item.
 use super::common::{charge_slot, discharge_slot, put_client, set_active};
-use super::nbt::{get_double, get_int, get_long, put_int, put_long, wide};
+use super::nbt::{get_double, get_int, get_long, put_int, put_long};
 use crate::gear::data as item_data;
 use mekanism_core::chemical::{self as chem, ChemicalTank};
 use mekanism_core::energy::{Action, EnergyContainer};
@@ -161,11 +161,7 @@ fn put_double(nbt: &mut Compound, key: &str, v: f64) {
 /// The data a Mekanism screen reads past the furnace's four slots: energy and its capacity (four 15-bit slots
 /// each), the upgrades (generators take none), the usage slot (the screens show what the block makes there).
 fn screen(entity: &mut ModBlockEntityView<'_>, head: [i32; 4], stored: u64, capacity: u64, produced: u64) {
-    entity.data = head.to_vec();
-    entity.data.extend(wide(stored));
-    entity.data.extend(wide(capacity));
-    entity.data.extend([0, 0]);
-    entity.data.extend(wide(produced));
+    super::common::MenuData::new(stored, capacity, produced).furnace(head).write(entity);
 }
 
 /// `Level.getSkyDarken`, as a brightness: the sun's share of the sky light factor with the weather
