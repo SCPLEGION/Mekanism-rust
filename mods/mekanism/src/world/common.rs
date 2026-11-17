@@ -137,3 +137,59 @@ pub(crate) fn put_client(entity: &mut ModBlockEntityView<'_>, owned: &[&str], ne
         entity.set_client_update_fields(fields);
     }
 }
+
+/// The layout of a block entity's menu data slots, which `gui/machines.rs` reads (the fork's `screen_data`): the
+/// furnace menu's four (`furnace`), then the stored energy, the capacity, the upgrades and the usage, then one
+/// block of [`GAUGE_SLOTS`] per gauge the screen draws. Data slots are 16 bits, so a 64-bit value takes four of 15.
+pub(crate) const DATA_STORED: usize = 4;
+pub(crate) const DATA_CAPACITY: usize = 8;
+pub(crate) const DATA_SPEED: usize = 12;
+pub(crate) const DATA_ENERGY_UPGRADES: usize = 13;
+pub(crate) const DATA_USAGE: usize = 14;
+pub(crate) const DATA_GAUGES: usize = 18;
+
+/// Builds `entity.data` in that layout, so every family publishes it the same way:
+/// `MenuData::new(stored, capacity, usage).furnace([..]).upgrades(&u).gauge(..).write(entity)`.
+pub(crate) struct MenuData {
+    data: Vec<i32>,
+}
+
+impl MenuData {
+    /// Energy stored, its capacity and the usage a tick (the first four slots are the furnace's, zero until set).
+    pub(crate) fn new(stored: u64, capacity: u64, usage: u64) -> Self {
+        let mut data = vec![0; DATA_USAGE + 4];
+        data[DATA_STORED..DATA_STORED + 4].copy_from_slice(&super::nbt::wide(stored));
+        data[DATA_CAPACITY..DATA_CAPACITY + 4].copy_from_slice(&super::nbt::wide(capacity));
+        data[DATA_USAGE..DATA_USAGE + 4].copy_from_slice(&super::nbt::wide(usage));
+        Self { data }
+    }
+
+    /// The furnace menu's four slots: the flame (energy in thousandths), its maximum, the progress, its maximum.
+    pub(crate) fn furnace(mut self, slots: [i32; 4]) -> Self {
+        self.data[..4].copy_from_slice(&slots);
+        self
+    }
+
+    /// The speed upgrade count packed with the other upgrades the screen shows, and the energy upgrades.
+    pub(crate) fn upgrades(mut self, u: &Upgrades) -> Self {
+        self.data[DATA_SPEED] =
+            (u.speed | u.anchor << 14 | u.chemical << 15 | u.muffling << 19 | u.stone_generator << 20) as i32;
+        self.data[DATA_ENERGY_UPGRADES] = u.energy as i32;
+        self
+    }
+
+    /// One gauge after the previous ones: its amount, capacity (four slots each) and the index of what it holds.
+    pub(crate) fn gauge(mut self, amount: u64, capacity: u64, chemical: i32) -> Self {
+        self.data.extend(super::nbt::wide(amount));
+        self.data.extend(super::nbt::wide(capacity));
+        self.data.push(chemical);
+        self
+    }
+
+    pub(crate) fn write(self, entity: &mut ModBlockEntityView<'_>) {
+        entity.data = self.data;
+    }
+}
+
+/// Slots one gauge takes in the menu data: amount, capacity and the chemical's index.
+pub(crate) const GAUGE_SLOTS: usize = 9;
