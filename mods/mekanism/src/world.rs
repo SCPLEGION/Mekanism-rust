@@ -21,6 +21,7 @@ pub(crate) mod machine;
 pub(crate) mod nbt;
 pub(crate) mod net;
 pub(crate) mod transmit;
+pub(crate) mod transporter;
 
 /// State of this area, held in `Mod`. Block entities keep their state in their own compound, so there is none yet.
 #[derive(Default)]
@@ -31,6 +32,7 @@ pub(crate) fn register(r: &mut dyn Registrar) {
     machine::register(r);
     cable::register(r);
     carrier::register(r);
+    transporter::register(r);
     conductor::register(r);
     generators::register(r);
     fission::register(r);
