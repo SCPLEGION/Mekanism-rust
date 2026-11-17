@@ -5,7 +5,7 @@
 //! [`GearPart`] in `register`, and the game asks it only for its own item (docs/horizon-api-migration.md).
 use mekanism_core::{gear as core_gear, modules};
 use mod_api::{Flow, Hand, Host, HostSide, ItemStack, PlayerBreakSpeedEvent, ClientHost, ItemBarEvent, ItemDecorationsEvent, ItemPart, Registrar, TooltipEvent};
-use mod_api::prelude::*;
+use mod_api::HostBlockStates;
 use text::{color, line, translate_colored};
 
 pub(crate) mod data;
@@ -215,7 +215,7 @@ pub(crate) fn player_break_speed(host: HostSide<'_>, event: &mut PlayerBreakSpee
 fn held(host: &dyn Host, player: u32) -> Option<(String, ItemStack)> {
     let living = host.living(host.entity(player)?)?;
     let stack = living.hand_item(host, Hand::Main)?;
-    let id = host.item_key_id(stack.item());
+    let id = stack.item().id(host);
     id.starts_with("mekanism:").then_some((id, stack))
 }
 
