@@ -7,6 +7,8 @@
 use mod_api::{Host, Registrar};
 
 pub(crate) mod common;
+pub(crate) mod fission;
+pub(crate) mod multiblock;
 pub(crate) mod machine;
 pub(crate) mod nbt;
 pub(crate) mod net;
@@ -18,6 +20,7 @@ pub(crate) struct State {}
 /// Declares every block entity type, container and part of the area.
 pub(crate) fn register(r: &mut dyn Registrar) {
     machine::register(r);
+    fission::register(r);
 }
 
 /// Item ids by key and back. The game's registry is fixed once a world is open, so the table is built once:
