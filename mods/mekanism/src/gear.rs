@@ -4,7 +4,7 @@
 //! On the fork every gear item went through global hooks that asked the item's name; here each gear item gets a
 //! [`GearPart`] in `register`, and the game asks it only for its own item (docs/horizon-api-migration.md).
 use mekanism_core::{gear as core_gear, modules};
-use mod_api::{Flow, Hand, Host, HostSide, ItemStack, PlayerBreakSpeedEvent, ClientHost, ItemBarEvent, ItemDecorationsEvent, ItemPart, Registrar, TooltipEvent};
+use mod_api::{Flow, Hand, Host, HostSide, ItemStack, PlayerBreakSpeedEvent, ClientHost, ItemBarEvent, ItemDecorationsEvent, ItemPart, Registrar, TooltipEvent, InteractionResult, Text, UseItemEvent};
 use mod_api::HostBlockStates;
 use text::{color, line, translate_colored};
 
@@ -94,6 +94,32 @@ impl ItemPart for GearPart {
         let (x, y) = (event.x, event.y);
         event.draw.fill([x + 2.0, y + 12.0, 13.0, 2.0], 0xFF00_0000);
         event.draw.fill([x + 2.0, y + 12.0, width(amount, capacity) as f32, 1.0], 0xFF00_0000 | color);
+    }
+
+    /// Sneak + right click with the Atomic Disassembler cycles its mode (`ItemAtomicDisassembler.changeMode`, Mekanism's
+    /// mode key on the fork), with the new mode on the action bar.
+    fn use_item(&self, host: HostSide<'_>, event: &mut UseItemEvent<'_>) -> Option<InteractionResult> {
+        if self.id != DISASSEMBLER {
+            return None;
+        }
+        // The mode is stored on the server, which tells the client its new stack.
+        let HostSide::Server(host) = host else {
+            return None;
+        };
+        let player = host.player(event.player)?;
+        if !player.is_secondary_use_active(&*host)? {
+            return None;
+        }
+        let living = host.living(player.entity())?;
+        let mut stack = event.stack.clone();
+        let config = data::gear_config();
+        let mode = data::disassembler_mode(&stack).next_enabled(&config);
+        data::set_disassembler_mode(&mut stack, mode);
+        living.set_hand_item(host, event.hand, Some(stack)).ok()?;
+        // `MekanismLang.DISASSEMBLER_MODE_CHANGE.translate(INDIGO, mode, AQUA, efficiency)`.
+        let line = Text::translate("disassembler.mekanism.mode_change", vec![text::colored(mode.label(), color::INDIGO), text::colored(mode.efficiency().to_string(), color::AQUA)]);
+        let _ = player.action_bar(host, line);
+        Some(InteractionResult::Success)
     }
 
     /// What the gear adds under its name (`Item.appendHoverText` with Mekanism's components), in the order the

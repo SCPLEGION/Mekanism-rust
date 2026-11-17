@@ -218,3 +218,8 @@ pub(crate) fn disassembler_mode(stack: &ItemStack) -> gear::DisassemblerMode {
 pub(crate) fn gear_config() -> mekanism_core::config::GearConfig {
     mekanism_core::config::GearConfig::default()
 }
+
+/// Stores the disassembler's mode, keeping the rest of the item's data.
+pub(crate) fn set_disassembler_mode(stack: &mut ItemStack, mode: gear::DisassemblerMode) {
+    set_custom(stack, MODE_KEY, Some(Tag::String(mode.name().into())));
+}
