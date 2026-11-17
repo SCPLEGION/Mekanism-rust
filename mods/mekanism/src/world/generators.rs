@@ -4,12 +4,15 @@
 //! containers and the numbers of their screens.
 //!
 //! Energy leaves through `world/energy.rs` (a cube's front, every face of a generator).
+use super::chem::{fill_tank_from_item, get_tank, put_tank};
+use super::transmit::{self, Own, DIRECTIONS};
 use super::common::{charge_slot, discharge_slot, put_client, set_active};
 use super::nbt::{get_double, get_int, get_long, put_int, put_long};
 use crate::gear::data as item_data;
 use mekanism_core::chemical::{self as chem, ChemicalTank};
 use mekanism_core::energy::{Action, EnergyContainer};
 use mekanism_core::generator::{self as g, HeatGenerator};
+use mekanism_core::sides::Transmission;
 use mekanism_core::tier::{self, BaseTier};
 use mod_api::HostBlockStates as _;
 use mod_api::{
@@ -52,46 +55,63 @@ fn kind(id: &str) -> Option<Kind> {
     BaseTier::ALL.into_iter().find(|t| t.name() == tier && *t != BaseTier::Creative).map(Kind::Cube)
 }
 
+/// An energy cube takes energy through every face but its front.
+fn cube_receiver(id: &str, _: &Compound, facing_away: bool, _: bool) -> Option<transmit::Receiver> {
+    let Some(Kind::Cube(tier)) = kind(id) else {
+        return None;
+    };
+    facing_away.then(|| {
+        let (capacity, rate) = tier::energy_cube(tier);
+        transmit::Receiver::new(capacity, rate)
+    })
+}
+
+/// The heat generator is warmed by the heat beside it (`HEAT_CAPACITY` and the generator's coefficients).
+fn heat_sink(id: &str, nbt: &mut Compound, _: [i32; 3], heat: &mut mekanism_core::heat::HeatCapacitor) -> Option<f64> {
+    (id == HEAT).then(|| {
+        transmit::plain_heat_sink(nbt, (g::HEAT_CAPACITY, g::INVERSE_CONDUCTION_COEFFICIENT, g::INVERSE_INSULATION_COEFFICIENT), heat)
+    })
+}
+
+/// Bit 0: a mechanical pipe reaches the block (lava); bit 1: a pressurized tube does (bioethanol, fuel gases).
+fn serves(id: &str) -> u8 {
+    match kind(id) {
+        Some(Kind::Heat) => 1,
+        Some(Kind::Bio | Kind::Gas) => 2,
+        _ => 0,
+    }
+}
+
+/// The tank a pipe or tube fills: the heat generator's `lava_in`, the bio generator's bioethanol and the gas
+/// generator's fuel gas, both in `fuel`.
+fn chemical_receiver(id: &str, _: &Compound, chemical: &str, _: bool, _: [i32; 3]) -> Option<(&'static str, u64)> {
+    match kind(id)? {
+        Kind::Heat if chemical == "minecraft:lava" => Some(("lava_in", u64::from(g::TANK_CAPACITY))),
+        Kind::Bio if chemical == g::BIOETHANOL => Some(("fuel", g::BIO_TANK)),
+        Kind::Gas if chem::fuel(chemical).is_some() => Some(("fuel", chem::GAS_GENERATOR_TANK)),
+        _ => None,
+    }
+}
+
 fn cube_id(tier: BaseTier) -> String {
     format!("mekanism:{}_energy_cube", tier.name())
 }
 
 pub(crate) fn register(r: &mut dyn Registrar) {
+    transmit::register_energy_receiver(cube_receiver);
+    transmit::register_heat_sink(heat_sink);
+    transmit::register_chemical_family(transmit::ChemicalFamily { serves, receiver: chemical_receiver, source: |_, _| None });
     let mut ids: Vec<String> = [HEAT, SOLAR, ADVANCED_SOLAR, WIND, GAS, g::BIO_GENERATOR].map(String::from).into();
     ids.extend(BaseTier::ALL.into_iter().filter(|t| *t != BaseTier::Creative).map(cube_id));
     let blocks: Vec<&str> = ids.iter().map(String::as_str).collect();
     let entity_type = r.block_entity_type(TYPE).blocks(&blocks).build();
     r.block_entity_part(&entity_type, GeneratorPart).expect("native block entity type");
     for id in &ids {
-        provide_energy(r, id);
         // The plain solar generator is an iron block with no menu.
         if let Some(c) = container(id) {
             let block = r.block_key(id);
             r.block_container(&block, c);
         }
-    }
-}
-
-/// What each block gives to or takes from its neighbours: a generator gives its buffer out of every face and takes
-/// none; a cube gives out of its front only and takes through the other five.
-fn provide_energy(r: &mut dyn Registrar, id: &str) {
-    use super::energy::{provide, Port};
-    match kind(id) {
-        Some(Kind::Heat) => provide(r, id, |_, _, _| Some(Port { capacity: g::STORAGE, insert: 0, extract: g::STORAGE })),
-        Some(Kind::Solar(_, storage)) => provide(r, id, move |_, _, _| Some(Port { capacity: storage, insert: 0, extract: storage })),
-        Some(Kind::Wind) => provide(r, id, |_, _, _| Some(Port { capacity: g::WIND_STORAGE, insert: 0, extract: g::WIND_STORAGE })),
-        Some(Kind::Gas) => provide(r, id, |_, _, _| Some(Port { capacity: chem::GAS_GENERATOR_STORAGE, insert: 0, extract: chem::GAS_GENERATOR_STORAGE })),
-        Some(Kind::Bio) => provide(r, id, |_, _, _| Some(Port { capacity: g::BIO_STORAGE, insert: 0, extract: g::BIO_STORAGE })),
-        Some(Kind::Cube(tier)) => provide(r, id, move |_, side, facing| {
-            let (capacity, rate) = tier::energy_cube(tier);
-            let front = side.is_some() && side == facing;
-            Some(if front {
-                Port { capacity, insert: 0, extract: rate }
-            } else {
-                Port { capacity, insert: rate, extract: 0 }
-            })
-        }),
-        None => {}
     }
 }
 
@@ -151,62 +171,74 @@ impl BlockEntityPart for GeneratorPart {
     }
 }
 
-/// `push_energy`: hands the buffer to the neighbours: a generator out of every face, a cube out of its front only.
+/// `push_energy`: hands the buffer to the neighbours that take it (`transmit::energy_receiver`): a generator out of
+/// every face its side configuration lets energy out of, a cube out of its front only.
 fn emit(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEntityView<'_>, kind: Kind) {
-    use super::energy::{direction, Faces};
-    let (capacity, rate, faces) = match kind {
-        Kind::Heat => (g::STORAGE, g::STORAGE, Faces::ALL),
-        Kind::Solar(_, storage) => (storage, storage, Faces::ALL),
-        Kind::Wind => (g::WIND_STORAGE, g::WIND_STORAGE, Faces::ALL),
-        Kind::Gas => (chem::GAS_GENERATOR_STORAGE, chem::GAS_GENERATOR_STORAGE, Faces::ALL),
-        Kind::Bio => (g::BIO_STORAGE, g::BIO_STORAGE, Faces::ALL),
-        Kind::Cube(tier) => {
-            let (capacity, rate) = tier::energy_cube(tier);
-            let Some(level) = level_of(host) else {
-                return;
-            };
-            let state = level.block_state(host, pos);
-            let facing = state.and_then(|s| s.property(&host.block_states(), "facing").ok().flatten().and_then(direction));
-            let faces = facing.map_or(Faces::NONE, Faces::only);
-            (capacity, rate, faces)
-        }
+    let (capacity, only_front) = match kind {
+        Kind::Heat => (g::STORAGE, false),
+        Kind::Solar(_, storage) => (storage, false),
+        Kind::Wind => (g::WIND_STORAGE, false),
+        Kind::Gas => (chem::GAS_GENERATOR_STORAGE, false),
+        Kind::Bio => (g::BIO_STORAGE, false),
+        Kind::Cube(tier) => (tier::energy_cube(tier).0, true),
     };
-    let Some(level) = level_of(host) else {
+    let Some(level) = transmit::level(&*host) else {
         return;
     };
+    let front = only_front
+        .then(|| level.block_property(&*host, pos, "facing").and_then(|f| transmit::direction(&f)))
+        .flatten();
+    if only_front && front.is_none() {
+        return;
+    }
     let mut energy = EnergyContainer::new(capacity, u64::MAX);
     energy.stored = get_long(&entity.nbt, "energy").min(capacity);
-    if super::energy::push(host, level, pos, &mut energy, faces, rate) > 0 {
-        put_long(&mut entity.nbt, "energy", energy.stored);
+    let before = energy.stored;
+    let gives = transmit::sides_of(&entity.nbt, Transmission::Energy);
+    let mut own = Own { pos, entity };
+    let faces: Vec<[i32; 3]> = DIRECTIONS
+        .iter()
+        .map(|(_, d)| *d)
+        .filter(|d| front.is_none_or(|f| f == *d) && gives.get(transmit::face_index(*d)).gives_out())
+        .collect();
+    for (i, d) in faces.iter().enumerate() {
+        let offer = energy.extract(u64::MAX, Action::Simulate) / (faces.len() - i) as u64;
+        if offer == 0 {
+            continue;
+        }
+        let at = transmit::offset(pos, *d);
+        let back = transmit::neg(*d);
+        let accepted = level.block_property(&*host, at, "facing").and_then(|f| transmit::direction(&f)).is_none_or(|f| f != back);
+        let taken = transmit::update(host, &mut own, level, at, |id, nbt| {
+            if !transmit::takes_in(nbt, back, Transmission::Energy) {
+                return 0;
+            }
+            let Some(mut receiver) = transmit::energy_receiver(id, nbt, accepted, false) else {
+                return 0;
+            };
+            if let Some(key) = receiver.counted {
+                receiver.rate = receiver.rate.saturating_sub(get_long(nbt, key));
+            }
+            let mut to = EnergyContainer::new(receiver.capacity, receiver.rate);
+            to.stored = get_long(nbt, "energy").min(receiver.capacity);
+            let refused = to.insert(offer, Action::Execute);
+            put_long(nbt, "energy", to.stored);
+            if let Some(key) = receiver.counted {
+                let counted = get_long(nbt, key) + (offer - refused);
+                put_long(nbt, key, counted);
+            }
+            offer - refused
+        });
+        if let Some(taken) = taken {
+            energy.extract(taken, Action::Execute);
+        }
+    }
+    if energy.stored != before {
+        put_long(&mut own.entity.nbt, "energy", energy.stored);
     }
 }
 
 // --- Helpers -------------------------------------------------------------------------------------------
-
-fn get_tank(nbt: &Compound, key: &str, capacity: u64) -> ChemicalTank {
-    let mut t = ChemicalTank::new(capacity);
-    if let Some(Tag::Compound(c)) = item_data::get(nbt, key)
-        && let Some(Tag::String(id)) = item_data::get(c, "id")
-        && let Ok(id) = id.to_string()
-    {
-        t.insert(&id, get_long(c, "amount"));
-    }
-    t
-}
-
-fn put_tank(nbt: &mut Compound, key: &str, t: &ChemicalTank) {
-    match &t.chemical {
-        Some(id) if t.amount > 0 => {
-            let mut c = Compound::new();
-            c.insert("id".into(), Tag::String(id.as_str().into()));
-            put_long(&mut c, "amount", t.amount);
-            nbt.insert(key.into(), Tag::Compound(c));
-        }
-        _ => {
-            nbt.retain(|k, _| k.to_string_lossy() != key);
-        }
-    }
-}
 
 fn put_double(nbt: &mut Compound, key: &str, v: f64) {
     nbt.insert(key.into(), Tag::Double(v.to_bits()));
@@ -256,13 +288,33 @@ fn level_of(host: &dyn ServerHost) -> Option<mod_api::LevelRef> {
     host.level(host.dimension())
 }
 
+/// `ITileHeatHandler.simulateAdjacent`: gives `heat` to each neighbour of `pos` that is a heat sink (a family
+/// registered it with `transmit::register_heat_sink`). Returns the temperature moved.
+fn adjacent_heat(host: &mut dyn ServerHost, own: &mut Own<'_, '_>, level: mod_api::LevelRef, pos: [i32; 3], heat: &mut mekanism_core::heat::HeatCapacitor) -> f64 {
+    let mut total = 0.0;
+    for (_, d) in DIRECTIONS {
+        let at = transmit::offset(pos, d);
+        let back = transmit::neg(d);
+        let moved = transmit::update(host, own, level, at, |id, nbt| {
+            transmit::takes_in(nbt, back, Transmission::Heat).then(|| transmit::heat_into(id, nbt, back, heat)).flatten()
+        })
+        .flatten();
+        if let Some(moved) = moved
+            && moved != 0.0
+        {
+            total += moved;
+        }
+    }
+    total
+}
+
 // --- Heat generator ------------------------------------------------------------------------------------
 
 fn tick_heat(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEntityView<'_>) -> bool {
-    let host: &dyn ServerHost = &*host;
+    let level = level_of(&*host);
     let mut gen_ = HeatGenerator::new();
-    if let Some(level) = level_of(host) {
-        gen_.set_ambient(mekanism_core::heat::ambient_temp(f64::from(biome_temperature(host, level, pos))));
+    if let Some(level) = level {
+        gen_.set_ambient(mekanism_core::heat::ambient_temp(f64::from(biome_temperature(&*host, level, pos))));
     }
     gen_.energy.stored = get_long(&entity.nbt, "energy").min(gen_.energy.capacity);
     gen_.lava = get_int(&entity.nbt, "lava");
@@ -271,7 +323,7 @@ fn tick_heat(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
     }
     // FluidFuelInventorySlot.fillOrBurn: one furnace fuel item at a time becomes lava, when it fits.
     if let Some(Some(fuel)) = entity.items.get(1).cloned() {
-        let burn = super::item_key(host, &super::item_id(host, &fuel))
+        let burn = super::item_key(&*host, &super::item_id(&*host, &fuel))
             .and_then(|k| host.item_burn_time(k))
             .unwrap_or(0)
             .max(0) as u32;
@@ -281,15 +333,29 @@ fn tick_heat(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
             entity.items[1] = if left > 0 {
                 let mut rest = fuel;
                 rest.set_count(left).ok().map(|()| rest)
-            } else if super::item_id(host, &fuel) == "minecraft:lava_bucket" {
-                super::item_key(host, "minecraft:bucket").and_then(|k| ItemStack::new(k, 1))
+            } else if super::item_id(&*host, &fuel) == "minecraft:lava_bucket" {
+                super::item_key(&*host, "minecraft:bucket").and_then(|k| ItemStack::new(k, 1))
             } else {
                 None
             };
         }
     }
-    gen_.tick();
-    charge_slot(host, entity, 0, &mut gen_.energy);
+    // Lava the pipes left in the tank beside it (`lava_in`) joins the generator's own.
+    let mut piped = get_tank(&entity.nbt, "lava_in", u64::from(g::TANK_CAPACITY));
+    let room = u64::from(g::TANK_CAPACITY.saturating_sub(gen_.lava));
+    let moved = piped.amount.min(room);
+    if moved > 0 {
+        piped.extract(moved);
+        gen_.lava += moved as u32;
+        put_tank(&mut entity.nbt, "lava_in", &piped);
+    }
+    // `ITileHeatHandler.simulateAdjacent`: heat flows into every colder neighbour that holds heat.
+    let mut own = Own { pos, entity: &mut *entity };
+    gen_.tick_with(&mut |heat| match level {
+        Some(level) => adjacent_heat(host, &mut own, level, pos, heat),
+        None => 0.0,
+    });
+    charge_slot(&*host, entity, 0, &mut gen_.energy);
     put_long(&mut entity.nbt, "energy", gen_.energy.stored);
     put_int(&mut entity.nbt, "lava", gen_.lava);
     put_double(&mut entity.nbt, "heat", gen_.heat.heat);
@@ -388,6 +454,8 @@ fn tick_gas(host: &mut dyn ServerHost, entity: &mut ModBlockEntityView<'_>) -> b
     let (made, used) = chem::burn_fuel(&mut fuel, energy.capacity - energy.stored);
     energy.insert(made, Action::Execute);
     charge_slot(host, entity, 0, &mut energy);
+    // `ChemicalInventorySlot.fill`: a tank item in the fuel slot gives the generator its gas.
+    fill_tank_from_item(host, entity, 1, &mut fuel, |c| chem::fuel(c).is_some());
     put_long(&mut entity.nbt, "energy", energy.stored);
     put_tank(&mut entity.nbt, "fuel", &fuel);
     put_int(&mut entity.nbt, "used", used as u32);
