@@ -4,7 +4,7 @@
 //! On the fork every gear item went through global hooks that asked the item's name; here each gear item gets a
 //! [`GearPart`] in `register`, and the game asks it only for its own item (docs/horizon-api-migration.md).
 use mekanism_core::{gear as core_gear, modules};
-use mod_api::{Flow, Hand, Host, HostSide, ItemStack, PlayerBreakSpeedEvent, ClientHost, ItemBarEvent, ItemDecorationsEvent, ItemPart, Registrar, TooltipEvent, InteractionResult, Text, UseItemEvent};
+use mod_api::{AttackEntityEvent, LevelRandomHost, LivingDamagePreEvent, Flow, Hand, Host, HostSide, ItemStack, PlayerBreakSpeedEvent, ClientHost, ItemBarEvent, ItemDecorationsEvent, ItemPart, Registrar, TooltipEvent, InteractionResult, Text, UseItemEvent};
 use mod_api::HostBlockStates;
 use text::{color, line, translate_colored};
 
@@ -13,7 +13,10 @@ pub(crate) mod text;
 
 /// State of this area, held in `Mod`. Items carry their own state in `custom_data`, so there is none yet.
 #[derive(Default)]
-pub(crate) struct State {}
+pub(crate) struct State {
+    /// Extra damage the next hit on an entity takes (set when the attack starts, taken when its damage is worked out).
+    pending: std::sync::Mutex<std::collections::HashMap<i32, f32>>,
+}
 
 const SCUBA_TANK: &str = "mekanism:scuba_tank";
 const CANTEEN: &str = "mekanism:canteen";
@@ -311,4 +314,57 @@ fn meka_tool_teleport(host: HostSide<'_>, event: &mut UseItemEvent<'_>) -> Optio
     entity.teleport_to(host, [f64::from(target[0]) + 0.5, f64::from(target[1]) + 1.5, f64::from(target[2]) + 0.5], None);
     entity.play_sound(host, "minecraft:entity.player.teleport", 1.0, 1.0);
     Some(InteractionResult::Success)
+}
+
+/// `attack_entity`: the Meka-Tool's and the Atomic Disassembler's own damage, paid in energy outside creative
+/// (`ItemMekaTool.adjustAttributes` with the Attack Amplification Unit, `ItemAtomicDisassembler.adjustAttributes` /
+/// `postHurtEnemy`). The extra damage waits for the hit's damage to be worked out (`living_damage_pre`).
+/// Gap: the attack strength (`0.2 + strength² * 0.8`) is not known here, so a hit counts as fully charged.
+pub(crate) fn attack_entity(m: &crate::Mod, host: &mut dyn mod_api::ServerHost, event: &mut AttackEntityEvent<'_>) -> Flow {
+    let Some(player) = host.players().acting_player() else {
+        return Flow::Continue;
+    };
+    let entity = player.entity();
+    let Some(living) = host.living(entity) else {
+        return Flow::Continue;
+    };
+    let Some(tool) = living.hand_item(&*host, Hand::Main) else {
+        return Flow::Continue;
+    };
+    let id = tool.item().id(&*host);
+    if id != modules::MEKA_TOOL && id != DISASSEMBLER {
+        return Flow::Continue;
+    }
+    use mekanism_core::config::gear_int;
+    let creative = player.is_creative(&*host).unwrap_or(false);
+    let stored = data::stored_energy(&tool);
+    let (extra, cost) = if id == DISASSEMBLER {
+        let cost = gear_int("atomic_disassembler.energyUsageWeapon", 2_000);
+        let (min, max) = (gear_int("atomic_disassembler.minDamage", 4) as f64, gear_int("atomic_disassembler.maxDamage", 20) as f64);
+        let have = if creative { u64::MAX } else { stored };
+        let damage = if have >= cost || cost == 0 { max } else { min + (max - min) * (have as f64 / cost as f64) };
+        (damage as f32, cost.min(stored))
+    } else {
+        let base = gear_int("mekatool.baseDamage", 4) as f32;
+        let bonus = modules::attack_bonus(&data::enabled_modules(&tool), data::module_choice(&tool, "mekanism:attack_amplification_unit", "attack_damage"));
+        let (extra, cost) = modules::attack(bonus, if creative { u64::MAX } else { stored });
+        (base + extra.max(0.0), if extra > 0.0 { cost } else { 0 })
+    };
+    if !creative && cost > 0 {
+        let mut paid = tool;
+        data::set_energy(&mut paid, stored - cost.min(stored));
+        let _ = living.set_hand_item(host, Hand::Main, Some(paid));
+    }
+    if extra > 0.0 {
+        m.gear.pending.lock().unwrap().insert(event.entity, extra);
+    }
+    Flow::Continue
+}
+
+/// `living_damage_pre`: the hit takes the extra damage `attack_entity` set aside for its target.
+pub(crate) fn living_damage_pre(m: &crate::Mod, _: &mut dyn LevelRandomHost, event: &mut LivingDamagePreEvent<'_>) {
+    if let Some(extra) = m.gear.pending.lock().unwrap().remove(&event.entity) {
+        let now = event.container.new_damage();
+        event.container.set_new_damage(now + extra);
+    }
 }
